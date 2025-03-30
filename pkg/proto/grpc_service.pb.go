@@ -23,6 +23,7 @@ const (
 
 type ServerReadyRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Hostname      string                 `protobuf:"bytes,1,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -57,9 +58,17 @@ func (*ServerReadyRequest) Descriptor() ([]byte, []int) {
 	return file_pkg_proto_grpc_service_proto_rawDescGZIP(), []int{0}
 }
 
+func (x *ServerReadyRequest) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
 type ServerLiveResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Live          bool                   `protobuf:"varint,1,opt,name=live,proto3" json:"live,omitempty"`
+	Hostname      string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -101,8 +110,16 @@ func (x *ServerLiveResponse) GetLive() bool {
 	return false
 }
 
+func (x *ServerLiveResponse) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
 type ServerLiveRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
+	Hostname      string                 `protobuf:"bytes,1,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -137,9 +154,17 @@ func (*ServerLiveRequest) Descriptor() ([]byte, []int) {
 	return file_pkg_proto_grpc_service_proto_rawDescGZIP(), []int{2}
 }
 
+func (x *ServerLiveRequest) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
 type ServerReadyResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ready         bool                   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
+	Hostname      string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -181,17 +206,28 @@ func (x *ServerReadyResponse) GetReady() bool {
 	return false
 }
 
+func (x *ServerReadyResponse) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
 var File_pkg_proto_grpc_service_proto protoreflect.FileDescriptor
 
 const file_pkg_proto_grpc_service_proto_rawDesc = "" +
 	"\n" +
-	"\x1cpkg/proto/grpc_service.proto\x12\tinference\"\x14\n" +
-	"\x12ServerReadyRequest\"(\n" +
+	"\x1cpkg/proto/grpc_service.proto\x12\tinference\"0\n" +
+	"\x12ServerReadyRequest\x12\x1a\n" +
+	"\bhostname\x18\x01 \x01(\tR\bhostname\"D\n" +
 	"\x12ServerLiveResponse\x12\x12\n" +
-	"\x04live\x18\x01 \x01(\bR\x04live\"\x13\n" +
-	"\x11ServerLiveRequest\"+\n" +
+	"\x04live\x18\x01 \x01(\bR\x04live\x12\x1a\n" +
+	"\bhostname\x18\x02 \x01(\tR\bhostname\"/\n" +
+	"\x11ServerLiveRequest\x12\x1a\n" +
+	"\bhostname\x18\x01 \x01(\tR\bhostname\"G\n" +
 	"\x13ServerReadyResponse\x12\x14\n" +
-	"\x05ready\x18\x01 \x01(\bR\x05ready2\xb3\x01\n" +
+	"\x05ready\x18\x01 \x01(\bR\x05ready\x12\x1a\n" +
+	"\bhostname\x18\x02 \x01(\tR\bhostname2\xb3\x01\n" +
 	"\x14GRPCInferenceService\x12K\n" +
 	"\n" +
 	"ServerLive\x12\x1c.inference.ServerLiveRequest\x1a\x1d.inference.ServerLiveResponse\"\x00\x12N\n" +

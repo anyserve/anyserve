@@ -9,6 +9,7 @@ import (
 // ServerReady implements the ServerReady RPC method
 func (s *InferenceService) ServerReady(ctx context.Context, req *proto.ServerReadyRequest) (*proto.ServerReadyResponse, error) {
 	return &proto.ServerReadyResponse{
-		Ready: true,
+		Ready:    true,
+		Hostname: req.Hostname,
 	}, nil
 }

@@ -9,14 +9,20 @@ service GRPCInferenceService {
     rpc ServerReady(ServerReadyRequest) returns (ServerReadyResponse) {}
 }
 
-message ServerReadyRequest {}
+message ServerReadyRequest {
+    string hostname = 1;
+}
 
 message ServerLiveResponse {
     bool live = 1;
+    string hostname = 2;
 }
 
-message ServerLiveRequest {}
+message ServerLiveRequest {
+    string hostname = 1;
+}
 
 message ServerReadyResponse{
     bool ready = 1;
+    string hostname = 2;
 }
