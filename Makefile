@@ -32,6 +32,8 @@ servelet-dev: servelet-build
 anyserve-dev: anyserve-build
 	bin/anyserve
 
+grpc-build:
+	buf generate
 
 help:
 	@echo "Available commands:"
@@ -44,5 +46,5 @@ help:
 	@echo "  fmt            - Format code"
 	@echo "  test           - Run tests"
 	@echo "  upgrade        - Upgrade dependencies"
-
+	@echo "  grpc-build     - Build gRPC files"
 .PHONY: servelet-dev servelet-build anyserve-dev anyserve-build clean build-all test fmt help

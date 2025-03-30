@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package inference;
+
+option go_package = "github.com/anyserve/anyserve/pkg/proto";
+
+service GRPCInferenceService {
+    rpc ServerLive(ServerLiveRequest) returns (ServerLiveResponse) {}
+    rpc ServerReady(ServerReadyRequest) returns (ServerReadyResponse) {}
+}
+
+message ServerReadyRequest {}
+
+message ServerLiveResponse {
+    bool live = 1;
+}
+
+message ServerLiveRequest {}
+
+message ServerReadyResponse{
+    bool ready = 1;
+}
