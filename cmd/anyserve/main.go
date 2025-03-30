@@ -5,7 +5,10 @@ import (
 	"fmt"
 
 	"github.com/anyserve/anyserve/pkg/config"
+	"github.com/anyserve/anyserve/pkg/grpc_server"
+	"github.com/anyserve/anyserve/pkg/grpc_service"
 	"github.com/anyserve/anyserve/pkg/logger"
+	"github.com/anyserve/anyserve/pkg/proto"
 	"github.com/anyserve/anyserve/pkg/server"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -26,17 +29,26 @@ func main() {
 		config.Module,
 		logger.Module,
 		server.Module,
+		grpc_server.Module,
+		grpc_service.Module,
 
 		fx.Invoke(func(
 			cfg *config.Config,
 			logger *zap.Logger,
-			server *server.Server,
+			httpServer *server.Server,
+			grpcServer *grpc_server.Server,
+			inferenceService proto.GRPCInferenceServiceServer,
 			lc fx.Lifecycle,
 		) {
 			logger.Info("Initializing anyserve...")
 
-			server.RegisterHandlers()
-			server.Start(lc)
+			// Initialize HTTP server
+			httpServer.RegisterHandlers()
+			httpServer.Start(lc)
+
+			// Initialize gRPC server
+			grpcServer.RegisterServices(inferenceService)
+			grpcServer.Start(lc)
 		}),
 	)
 

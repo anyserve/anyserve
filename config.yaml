@@ -6,6 +6,8 @@ server:
       - method
       - path
       - status
+  grpc:
+    port: 50052
     
 logger:
   level: "info"

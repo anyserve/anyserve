@@ -21,13 +21,24 @@ type ServerConfig struct {
 	Host   string             `koanf:"host"`
 	Port   int                `koanf:"port"`
 	Logger ServerLoggerConfig `koanf:"logger"`
+	GRPC   GRPCConfig         `koanf:"grpc"`
 }
 
 func (c *ServerConfig) Validate() error {
 	if c.Port <= 0 || c.Port > 65535 {
 		return fmt.Errorf("invalid server port: %d", c.Port)
 	}
+	if c.GRPC.Port <= 0 || c.GRPC.Port > 65535 {
+		return fmt.Errorf("invalid gRPC port: %d", c.GRPC.Port)
+	}
 	return nil
+}
+
+type GRPCConfig struct {
+	Port       int    `koanf:"port"`
+	TLSEnabled bool   `koanf:"tls_enabled"`
+	CertFile   string `koanf:"cert_file"`
+	KeyFile    string `koanf:"key_file"`
 }
 
 type ServerLoggerConfig struct {
@@ -41,11 +52,15 @@ type LoggerConfig struct {
 
 func defaultConfig() map[string]interface{} {
 	defaultConfig := map[string]interface{}{
-		"server.host":          "0.0.0.0",
-		"server.port":          8848,
-		"server.logger.fields": []string{"method", "path", "status"},
-		"logger.level":         "info",
-		"logger.development":   false,
+		"server.host":             "0.0.0.0",
+		"server.port":             8848,
+		"server.logger.fields":    []string{"method", "path", "status"},
+		"server.grpc.port":        50051,
+		"server.grpc.tls_enabled": false,
+		"server.grpc.cert_file":   "",
+		"server.grpc.key_file":    "",
+		"logger.level":            "info",
+		"logger.development":      false,
 	}
 	return defaultConfig
 }

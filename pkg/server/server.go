@@ -22,7 +22,7 @@ func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
 	app := fiber.New(fiber.Config{
 		JSONEncoder: json.Marshal,
 		JSONDecoder: json.Unmarshal,
-		Prefork:     true,
+		Prefork:     false,
 	})
 	return &Server{
 		logger: logger,
