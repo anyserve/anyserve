@@ -9,6 +9,7 @@ import (
 // ServerLive implements the ServerLive RPC method
 func (s *InferenceService) ServerLive(ctx context.Context, req *proto.ServerLiveRequest) (*proto.ServerLiveResponse, error) {
 	return &proto.ServerLiveResponse{
-		Live: true,
+		Live:     true,
+		Hostname: req.Hostname,
 	}, nil
 }
