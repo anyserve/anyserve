@@ -23,6 +23,8 @@ jobs:
 
     - name: Install Buf
       uses: bufbuild/buf-setup-action@v1.50.0
+
+    - name: Check Buf version
       run: buf --version
 
     - name: Lint
