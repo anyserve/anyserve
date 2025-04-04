@@ -18,7 +18,7 @@ clean:
 build-all: servelet-build anyserve-build
 
 lint:
-	go vet ./...
+	golangci-lint run --config=.golangci.yml ./...
 
 test:
 ifdef COVERAGE
