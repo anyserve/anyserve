@@ -10,7 +10,6 @@ on:
     branches: [ "main" ]
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
     steps:
@@ -19,10 +18,27 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v4
       with:
-        go-version: '1.20'
+        go-version: '1.24'
+        cache: true
+
+    - name: Install Buf
+      uses: bufbuild/buf-setup-action@v1.50.0
+      - run: buf --version
+
+    - name: Lint
+      run: go vet ./...
 
     - name: Build
       run: go build -v ./...
 
     - name: Test
-      run: go test -v ./...
+      run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+    - uses: codecov/codecov-action@v5
+      with:
+        fail_ci_if_error: true
+        files: ./coverage.txt
+        flags: unittests
+        name: codecov-umbrella
+        token: "2e86188e-66ed-48b1-9f3a-38a8d190cf9b"
+        verbose: true
