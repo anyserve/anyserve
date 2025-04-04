@@ -1,10 +1,13 @@
-name: Build and test
+name: anyserve CI
 
 on:
   push:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  path:
+    - 'anyserve/**'
+    - 'api/**'
 
 jobs:
   build:
@@ -28,12 +31,13 @@ jobs:
         uses: golangci/golangci-lint-action@v7
         with:
           version: latest
+          working-directory: anyserve
 
       - name: Build
-        run: cd anyserve && make build-all
+        run: make -C anyserve build
 
       - name: Test
-        run: cd anyserve && make test COVERAGE=1
+        run: make -C anyserve test COVERAGE=1
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5
