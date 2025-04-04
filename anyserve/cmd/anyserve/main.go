@@ -67,6 +67,7 @@ func main() {
 			grpcServer.RegisterServices(inferenceService)
 			grpcServer.Start(lc)
 
+			// Initialize embedded NATS server
 			embedNATS.Start(lc)
 		}),
 	)

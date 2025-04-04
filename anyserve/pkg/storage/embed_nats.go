@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
 	"go.uber.org/fx"
@@ -36,11 +37,19 @@ func (s *EmbedNATS) Start(lifecycle fx.Lifecycle) {
 
 			go func() {
 				s.logger.Info("Starting embedded NATS server")
-				ns.Start()
-				ns.WaitForShutdown()
+				s.server.ConfigureLogger()
+				s.server.Start()
+
+				startTimeout := 5 * time.Second
+				if !ns.ReadyForConnections(startTimeout) {
+					s.logger.Fatal("Embedded NATS server failed to start within timeout",
+						zap.Duration("timeout", startTimeout))
+				}
+
+				s.logger.Info("Embedded NATS server started successfully")
+				s.server.WaitForShutdown()
 			}()
 
-			s.logger.Info("Embedded NATS server started successfully")
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
