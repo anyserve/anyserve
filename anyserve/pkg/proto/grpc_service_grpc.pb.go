@@ -11,6 +11,7 @@ import (
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 )
 
 // This is a compile-time assertion to ensure that this generated file
@@ -19,14 +20,30 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	GRPCInferenceService_ServerLive_FullMethodName = "/inference.GRPCInferenceService/ServerLive"
+	GRPCInferenceService_ServerLive_FullMethodName   = "/inference.GRPCInferenceService/ServerLive"
+	GRPCInferenceService_Infer_FullMethodName        = "/inference.GRPCInferenceService/Infer"
+	GRPCInferenceService_InferStream_FullMethodName  = "/inference.GRPCInferenceService/InferStream"
+	GRPCInferenceService_FetchInfer_FullMethodName   = "/inference.GRPCInferenceService/FetchInfer"
+	GRPCInferenceService_SendResponse_FullMethodName = "/inference.GRPCInferenceService/SendResponse"
 )
 
 // GRPCInferenceServiceClient is the client API for GRPCInferenceService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type GRPCInferenceServiceClient interface {
+	// Check liveness of the anyserve server
 	ServerLive(ctx context.Context, in *ServerLiveRequest, opts ...grpc.CallOption) (*ServerLiveResponse, error)
+	// Request anyserve server to infer a model
+	// Absolutely synchronous infer OR asynchronous infer
+	Infer(ctx context.Context, in *InferRequest, opts ...grpc.CallOption) (*InferResponse, error)
+	// Request anyserve server to infer a model in stream mode
+	// Long running synchronous infer
+	InferStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[InferRequest, InferResponse], error)
+	// Client fetch infer request from anyserve server
+	// Write the infer result to the client
+	FetchInfer(ctx context.Context, in *FetchInferRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchInferResponse], error)
+	// Client send infer result to anyserve server
+	SendResponse(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SendResponseRequest, emptypb.Empty], error)
 }
 
 type gRPCInferenceServiceClient struct {
@@ -47,11 +64,78 @@ func (c *gRPCInferenceServiceClient) ServerLive(ctx context.Context, in *ServerL
 	return out, nil
 }
 
+func (c *gRPCInferenceServiceClient) Infer(ctx context.Context, in *InferRequest, opts ...grpc.CallOption) (*InferResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InferResponse)
+	err := c.cc.Invoke(ctx, GRPCInferenceService_Infer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *gRPCInferenceServiceClient) InferStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[InferRequest, InferResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &GRPCInferenceService_ServiceDesc.Streams[0], GRPCInferenceService_InferStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[InferRequest, InferResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GRPCInferenceService_InferStreamClient = grpc.BidiStreamingClient[InferRequest, InferResponse]
+
+func (c *gRPCInferenceServiceClient) FetchInfer(ctx context.Context, in *FetchInferRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchInferResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &GRPCInferenceService_ServiceDesc.Streams[1], GRPCInferenceService_FetchInfer_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FetchInferRequest, FetchInferResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GRPCInferenceService_FetchInferClient = grpc.ServerStreamingClient[FetchInferResponse]
+
+func (c *gRPCInferenceServiceClient) SendResponse(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SendResponseRequest, emptypb.Empty], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &GRPCInferenceService_ServiceDesc.Streams[2], GRPCInferenceService_SendResponse_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SendResponseRequest, emptypb.Empty]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GRPCInferenceService_SendResponseClient = grpc.ClientStreamingClient[SendResponseRequest, emptypb.Empty]
+
 // GRPCInferenceServiceServer is the server API for GRPCInferenceService service.
 // All implementations should embed UnimplementedGRPCInferenceServiceServer
 // for forward compatibility.
 type GRPCInferenceServiceServer interface {
+	// Check liveness of the anyserve server
 	ServerLive(context.Context, *ServerLiveRequest) (*ServerLiveResponse, error)
+	// Request anyserve server to infer a model
+	// Absolutely synchronous infer OR asynchronous infer
+	Infer(context.Context, *InferRequest) (*InferResponse, error)
+	// Request anyserve server to infer a model in stream mode
+	// Long running synchronous infer
+	InferStream(grpc.BidiStreamingServer[InferRequest, InferResponse]) error
+	// Client fetch infer request from anyserve server
+	// Write the infer result to the client
+	FetchInfer(*FetchInferRequest, grpc.ServerStreamingServer[FetchInferResponse]) error
+	// Client send infer result to anyserve server
+	SendResponse(grpc.ClientStreamingServer[SendResponseRequest, emptypb.Empty]) error
 }
 
 // UnimplementedGRPCInferenceServiceServer should be embedded to have
@@ -63,6 +147,18 @@ type UnimplementedGRPCInferenceServiceServer struct{}
 
 func (UnimplementedGRPCInferenceServiceServer) ServerLive(context.Context, *ServerLiveRequest) (*ServerLiveResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ServerLive not implemented")
+}
+func (UnimplementedGRPCInferenceServiceServer) Infer(context.Context, *InferRequest) (*InferResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Infer not implemented")
+}
+func (UnimplementedGRPCInferenceServiceServer) InferStream(grpc.BidiStreamingServer[InferRequest, InferResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method InferStream not implemented")
+}
+func (UnimplementedGRPCInferenceServiceServer) FetchInfer(*FetchInferRequest, grpc.ServerStreamingServer[FetchInferResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method FetchInfer not implemented")
+}
+func (UnimplementedGRPCInferenceServiceServer) SendResponse(grpc.ClientStreamingServer[SendResponseRequest, emptypb.Empty]) error {
+	return status.Errorf(codes.Unimplemented, "method SendResponse not implemented")
 }
 func (UnimplementedGRPCInferenceServiceServer) testEmbeddedByValue() {}
 
@@ -102,6 +198,49 @@ func _GRPCInferenceService_ServerLive_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GRPCInferenceService_Infer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InferRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GRPCInferenceServiceServer).Infer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GRPCInferenceService_Infer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GRPCInferenceServiceServer).Infer(ctx, req.(*InferRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GRPCInferenceService_InferStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(GRPCInferenceServiceServer).InferStream(&grpc.GenericServerStream[InferRequest, InferResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GRPCInferenceService_InferStreamServer = grpc.BidiStreamingServer[InferRequest, InferResponse]
+
+func _GRPCInferenceService_FetchInfer_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchInferRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GRPCInferenceServiceServer).FetchInfer(m, &grpc.GenericServerStream[FetchInferRequest, FetchInferResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GRPCInferenceService_FetchInferServer = grpc.ServerStreamingServer[FetchInferResponse]
+
+func _GRPCInferenceService_SendResponse_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(GRPCInferenceServiceServer).SendResponse(&grpc.GenericServerStream[SendResponseRequest, emptypb.Empty]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GRPCInferenceService_SendResponseServer = grpc.ClientStreamingServer[SendResponseRequest, emptypb.Empty]
+
 // GRPCInferenceService_ServiceDesc is the grpc.ServiceDesc for GRPCInferenceService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -113,7 +252,28 @@ var GRPCInferenceService_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "ServerLive",
 			Handler:    _GRPCInferenceService_ServerLive_Handler,
 		},
+		{
+			MethodName: "Infer",
+			Handler:    _GRPCInferenceService_Infer_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "InferStream",
+			Handler:       _GRPCInferenceService_InferStream_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "FetchInfer",
+			Handler:       _GRPCInferenceService_FetchInfer_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "SendResponse",
+			Handler:       _GRPCInferenceService_SendResponse_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "grpc_service.proto",
 }
