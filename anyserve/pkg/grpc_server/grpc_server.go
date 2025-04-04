@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anyserve/anyserve/pkg/config"
+	"github.com/anyserve/anyserve/pkg/grpc_service"
 	"github.com/anyserve/anyserve/pkg/proto"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
@@ -138,7 +139,7 @@ func loggerInterceptor(logger *zap.Logger) grpc.UnaryServerInterceptor {
 }
 
 // RegisterServices registers all the services with the gRPC server
-func (s *Server) RegisterServices(inferenceService proto.GRPCInferenceServiceServer) {
+func (s *Server) RegisterServices(inferenceService *grpc_service.InferenceService) {
 	s.logger.Info("Registering gRPC services")
 	proto.RegisterGRPCInferenceServiceServer(s.server, inferenceService)
 }

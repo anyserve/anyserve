@@ -13,8 +13,10 @@ import (
 )
 
 type Config struct {
-	Server ServerConfig `koanf:"server"`
-	Logger LoggerConfig `koanf:"logger"`
+	Server       ServerConfig       `koanf:"server"`
+	Logger       LoggerConfig       `koanf:"logger"`
+	Queue        QueueConfig        `koanf:"queue"`
+	EmbeddedNATS EmbeddedNATSConfig `koanf:"embedded_nats"`
 }
 
 type ServerConfig struct {
@@ -22,6 +24,14 @@ type ServerConfig struct {
 	Port   int                `koanf:"port"`
 	Logger ServerLoggerConfig `koanf:"logger"`
 	GRPC   GRPCConfig         `koanf:"grpc"`
+}
+
+type QueueConfig struct {
+	Engine string `koanf:"engine"`
+}
+
+type EmbeddedNATSConfig struct {
+	Port int `koanf:"port"`
 }
 
 func (c *ServerConfig) Validate() error {
@@ -52,15 +62,17 @@ type LoggerConfig struct {
 
 func defaultConfig() map[string]interface{} {
 	defaultConfig := map[string]interface{}{
-		"server.host":             "0.0.0.0",
-		"server.port":             8848,
-		"server.logger.fields":    []string{"method", "path", "status"},
-		"server.grpc.port":        50051,
-		"server.grpc.tls_enabled": false,
-		"server.grpc.cert_file":   "",
-		"server.grpc.key_file":    "",
-		"logger.level":            "info",
-		"logger.development":      false,
+		"server.host":              "0.0.0.0",
+		"server.port":              8848,
+		"server.logger.fields":     []string{"method", "path", "status"},
+		"server.grpc.port":         50051,
+		"server.grpc.tls_enabled":  false,
+		"server.grpc.cert_file":    "",
+		"server.grpc.key_file":     "",
+		"logger.level":             "info",
+		"logger.development":       false,
+		"queue.engine":             QueueEngineEmbeddedNATS,
+		"queue.embedded_nats.port": 4222,
 	}
 	return defaultConfig
 }
