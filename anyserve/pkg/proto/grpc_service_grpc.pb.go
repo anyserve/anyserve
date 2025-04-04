@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.5.1
 // - protoc             (unknown)
-// source: pkg/proto/grpc_service.proto
+// source: grpc_service.proto
 
 package proto
 
@@ -153,5 +153,5 @@ var GRPCInferenceService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "pkg/proto/grpc_service.proto",
+	Metadata: "grpc_service.proto",
 }

@@ -2,7 +2,7 @@
 // versions:
 // 	protoc-gen-go v1.36.6
 // 	protoc        (unknown)
-// source: pkg/proto/grpc_service.proto
+// source: grpc_service.proto
 
 package proto
 
@@ -30,7 +30,7 @@ type ServerReadyRequest struct {
 
 func (x *ServerReadyRequest) Reset() {
 	*x = ServerReadyRequest{}
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[0]
+	mi := &file_grpc_service_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -42,7 +42,7 @@ func (x *ServerReadyRequest) String() string {
 func (*ServerReadyRequest) ProtoMessage() {}
 
 func (x *ServerReadyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[0]
+	mi := &file_grpc_service_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -55,7 +55,7 @@ func (x *ServerReadyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerReadyRequest.ProtoReflect.Descriptor instead.
 func (*ServerReadyRequest) Descriptor() ([]byte, []int) {
-	return file_pkg_proto_grpc_service_proto_rawDescGZIP(), []int{0}
+	return file_grpc_service_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *ServerReadyRequest) GetHostname() string {
@@ -68,14 +68,15 @@ func (x *ServerReadyRequest) GetHostname() string {
 type ServerLiveResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Live          bool                   `protobuf:"varint,1,opt,name=live,proto3" json:"live,omitempty"`
-	Hostname      string                 `protobuf:"bytes,2,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	Version       string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	Hostname      string                 `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ServerLiveResponse) Reset() {
 	*x = ServerLiveResponse{}
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[1]
+	mi := &file_grpc_service_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -87,7 +88,7 @@ func (x *ServerLiveResponse) String() string {
 func (*ServerLiveResponse) ProtoMessage() {}
 
 func (x *ServerLiveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[1]
+	mi := &file_grpc_service_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -100,7 +101,7 @@ func (x *ServerLiveResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerLiveResponse.ProtoReflect.Descriptor instead.
 func (*ServerLiveResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_proto_grpc_service_proto_rawDescGZIP(), []int{1}
+	return file_grpc_service_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *ServerLiveResponse) GetLive() bool {
@@ -108,6 +109,13 @@ func (x *ServerLiveResponse) GetLive() bool {
 		return x.Live
 	}
 	return false
+}
+
+func (x *ServerLiveResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
 }
 
 func (x *ServerLiveResponse) GetHostname() string {
@@ -126,7 +134,7 @@ type ServerLiveRequest struct {
 
 func (x *ServerLiveRequest) Reset() {
 	*x = ServerLiveRequest{}
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[2]
+	mi := &file_grpc_service_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -138,7 +146,7 @@ func (x *ServerLiveRequest) String() string {
 func (*ServerLiveRequest) ProtoMessage() {}
 
 func (x *ServerLiveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[2]
+	mi := &file_grpc_service_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -151,7 +159,7 @@ func (x *ServerLiveRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerLiveRequest.ProtoReflect.Descriptor instead.
 func (*ServerLiveRequest) Descriptor() ([]byte, []int) {
-	return file_pkg_proto_grpc_service_proto_rawDescGZIP(), []int{2}
+	return file_grpc_service_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *ServerLiveRequest) GetHostname() string {
@@ -171,7 +179,7 @@ type ServerReadyResponse struct {
 
 func (x *ServerReadyResponse) Reset() {
 	*x = ServerReadyResponse{}
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[3]
+	mi := &file_grpc_service_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -183,7 +191,7 @@ func (x *ServerReadyResponse) String() string {
 func (*ServerReadyResponse) ProtoMessage() {}
 
 func (x *ServerReadyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_pkg_proto_grpc_service_proto_msgTypes[3]
+	mi := &file_grpc_service_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -196,7 +204,7 @@ func (x *ServerReadyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerReadyResponse.ProtoReflect.Descriptor instead.
 func (*ServerReadyResponse) Descriptor() ([]byte, []int) {
-	return file_pkg_proto_grpc_service_proto_rawDescGZIP(), []int{3}
+	return file_grpc_service_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ServerReadyResponse) GetReady() bool {
@@ -213,16 +221,17 @@ func (x *ServerReadyResponse) GetHostname() string {
 	return ""
 }
 
-var File_pkg_proto_grpc_service_proto protoreflect.FileDescriptor
+var File_grpc_service_proto protoreflect.FileDescriptor
 
-const file_pkg_proto_grpc_service_proto_rawDesc = "" +
+const file_grpc_service_proto_rawDesc = "" +
 	"\n" +
-	"\x1cpkg/proto/grpc_service.proto\x12\tinference\"0\n" +
+	"\x12grpc_service.proto\x12\tinference\"0\n" +
 	"\x12ServerReadyRequest\x12\x1a\n" +
-	"\bhostname\x18\x01 \x01(\tR\bhostname\"D\n" +
+	"\bhostname\x18\x01 \x01(\tR\bhostname\"^\n" +
 	"\x12ServerLiveResponse\x12\x12\n" +
-	"\x04live\x18\x01 \x01(\bR\x04live\x12\x1a\n" +
-	"\bhostname\x18\x02 \x01(\tR\bhostname\"/\n" +
+	"\x04live\x18\x01 \x01(\bR\x04live\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12\x1a\n" +
+	"\bhostname\x18\x03 \x01(\tR\bhostname\"/\n" +
 	"\x11ServerLiveRequest\x12\x1a\n" +
 	"\bhostname\x18\x01 \x01(\tR\bhostname\"G\n" +
 	"\x13ServerReadyResponse\x12\x14\n" +
@@ -234,25 +243,25 @@ const file_pkg_proto_grpc_service_proto_rawDesc = "" +
 	"\vServerReady\x12\x1d.inference.ServerReadyRequest\x1a\x1e.inference.ServerReadyResponse\"\x00B(Z&github.com/anyserve/anyserve/pkg/protob\x06proto3"
 
 var (
-	file_pkg_proto_grpc_service_proto_rawDescOnce sync.Once
-	file_pkg_proto_grpc_service_proto_rawDescData []byte
+	file_grpc_service_proto_rawDescOnce sync.Once
+	file_grpc_service_proto_rawDescData []byte
 )
 
-func file_pkg_proto_grpc_service_proto_rawDescGZIP() []byte {
-	file_pkg_proto_grpc_service_proto_rawDescOnce.Do(func() {
-		file_pkg_proto_grpc_service_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_pkg_proto_grpc_service_proto_rawDesc), len(file_pkg_proto_grpc_service_proto_rawDesc)))
+func file_grpc_service_proto_rawDescGZIP() []byte {
+	file_grpc_service_proto_rawDescOnce.Do(func() {
+		file_grpc_service_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_grpc_service_proto_rawDesc), len(file_grpc_service_proto_rawDesc)))
 	})
-	return file_pkg_proto_grpc_service_proto_rawDescData
+	return file_grpc_service_proto_rawDescData
 }
 
-var file_pkg_proto_grpc_service_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
-var file_pkg_proto_grpc_service_proto_goTypes = []any{
+var file_grpc_service_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_grpc_service_proto_goTypes = []any{
 	(*ServerReadyRequest)(nil),  // 0: inference.ServerReadyRequest
 	(*ServerLiveResponse)(nil),  // 1: inference.ServerLiveResponse
 	(*ServerLiveRequest)(nil),   // 2: inference.ServerLiveRequest
 	(*ServerReadyResponse)(nil), // 3: inference.ServerReadyResponse
 }
-var file_pkg_proto_grpc_service_proto_depIdxs = []int32{
+var file_grpc_service_proto_depIdxs = []int32{
 	2, // 0: inference.GRPCInferenceService.ServerLive:input_type -> inference.ServerLiveRequest
 	0, // 1: inference.GRPCInferenceService.ServerReady:input_type -> inference.ServerReadyRequest
 	1, // 2: inference.GRPCInferenceService.ServerLive:output_type -> inference.ServerLiveResponse
@@ -264,26 +273,26 @@ var file_pkg_proto_grpc_service_proto_depIdxs = []int32{
 	0, // [0:0] is the sub-list for field type_name
 }
 
-func init() { file_pkg_proto_grpc_service_proto_init() }
-func file_pkg_proto_grpc_service_proto_init() {
-	if File_pkg_proto_grpc_service_proto != nil {
+func init() { file_grpc_service_proto_init() }
+func file_grpc_service_proto_init() {
+	if File_grpc_service_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_pkg_proto_grpc_service_proto_rawDesc), len(file_pkg_proto_grpc_service_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_grpc_service_proto_rawDesc), len(file_grpc_service_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
-		GoTypes:           file_pkg_proto_grpc_service_proto_goTypes,
-		DependencyIndexes: file_pkg_proto_grpc_service_proto_depIdxs,
-		MessageInfos:      file_pkg_proto_grpc_service_proto_msgTypes,
+		GoTypes:           file_grpc_service_proto_goTypes,
+		DependencyIndexes: file_grpc_service_proto_depIdxs,
+		MessageInfos:      file_grpc_service_proto_msgTypes,
 	}.Build()
-	File_pkg_proto_grpc_service_proto = out.File
-	file_pkg_proto_grpc_service_proto_goTypes = nil
-	file_pkg_proto_grpc_service_proto_depIdxs = nil
+	File_grpc_service_proto = out.File
+	file_grpc_service_proto_goTypes = nil
+	file_grpc_service_proto_depIdxs = nil
 }

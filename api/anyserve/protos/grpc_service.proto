@@ -15,7 +15,8 @@ message ServerReadyRequest {
 
 message ServerLiveResponse {
     bool live = 1;
-    string hostname = 2;
+    string version = 2;
+    string hostname = 3;
 }
 
 message ServerLiveRequest {
