@@ -17,8 +17,15 @@ clean:
 
 build-all: servelet-build anyserve-build
 
+lint:
+	go vet ./...
+
 test:
-	go test -v ./...
+ifdef COVERAGE
+	go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+else
+	go test -v -race ./...
+endif
 
 fmt:
 	go fmt ./...
@@ -47,4 +54,6 @@ help:
 	@echo "  test           - Run tests"
 	@echo "  upgrade        - Upgrade dependencies"
 	@echo "  grpc-build     - Build gRPC files"
+	@echo "  lint           - Run lint"
+
 .PHONY: servelet-dev servelet-build anyserve-dev anyserve-build clean build-all test fmt help
