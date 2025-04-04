@@ -6,12 +6,8 @@ option go_package = "github.com/anyserve/anyserve/pkg/proto";
 
 service GRPCInferenceService {
     rpc ServerLive(ServerLiveRequest) returns (ServerLiveResponse) {}
-    rpc ServerReady(ServerReadyRequest) returns (ServerReadyResponse) {}
 }
 
-message ServerReadyRequest {
-    string hostname = 1;
-}
 
 message ServerLiveResponse {
     bool live = 1;
@@ -20,10 +16,4 @@ message ServerLiveResponse {
 }
 
 message ServerLiveRequest {
-    string hostname = 1;
-}
-
-message ServerReadyResponse{
-    bool ready = 1;
-    string hostname = 2;
 }

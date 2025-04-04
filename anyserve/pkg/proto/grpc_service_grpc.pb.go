@@ -19,8 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	GRPCInferenceService_ServerLive_FullMethodName  = "/inference.GRPCInferenceService/ServerLive"
-	GRPCInferenceService_ServerReady_FullMethodName = "/inference.GRPCInferenceService/ServerReady"
+	GRPCInferenceService_ServerLive_FullMethodName = "/inference.GRPCInferenceService/ServerLive"
 )
 
 // GRPCInferenceServiceClient is the client API for GRPCInferenceService service.
@@ -28,7 +27,6 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type GRPCInferenceServiceClient interface {
 	ServerLive(ctx context.Context, in *ServerLiveRequest, opts ...grpc.CallOption) (*ServerLiveResponse, error)
-	ServerReady(ctx context.Context, in *ServerReadyRequest, opts ...grpc.CallOption) (*ServerReadyResponse, error)
 }
 
 type gRPCInferenceServiceClient struct {
@@ -49,22 +47,11 @@ func (c *gRPCInferenceServiceClient) ServerLive(ctx context.Context, in *ServerL
 	return out, nil
 }
 
-func (c *gRPCInferenceServiceClient) ServerReady(ctx context.Context, in *ServerReadyRequest, opts ...grpc.CallOption) (*ServerReadyResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ServerReadyResponse)
-	err := c.cc.Invoke(ctx, GRPCInferenceService_ServerReady_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // GRPCInferenceServiceServer is the server API for GRPCInferenceService service.
 // All implementations should embed UnimplementedGRPCInferenceServiceServer
 // for forward compatibility.
 type GRPCInferenceServiceServer interface {
 	ServerLive(context.Context, *ServerLiveRequest) (*ServerLiveResponse, error)
-	ServerReady(context.Context, *ServerReadyRequest) (*ServerReadyResponse, error)
 }
 
 // UnimplementedGRPCInferenceServiceServer should be embedded to have
@@ -76,9 +63,6 @@ type UnimplementedGRPCInferenceServiceServer struct{}
 
 func (UnimplementedGRPCInferenceServiceServer) ServerLive(context.Context, *ServerLiveRequest) (*ServerLiveResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ServerLive not implemented")
-}
-func (UnimplementedGRPCInferenceServiceServer) ServerReady(context.Context, *ServerReadyRequest) (*ServerReadyResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ServerReady not implemented")
 }
 func (UnimplementedGRPCInferenceServiceServer) testEmbeddedByValue() {}
 
@@ -118,24 +102,6 @@ func _GRPCInferenceService_ServerLive_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _GRPCInferenceService_ServerReady_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ServerReadyRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(GRPCInferenceServiceServer).ServerReady(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: GRPCInferenceService_ServerReady_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(GRPCInferenceServiceServer).ServerReady(ctx, req.(*ServerReadyRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // GRPCInferenceService_ServiceDesc is the grpc.ServiceDesc for GRPCInferenceService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -146,10 +112,6 @@ var GRPCInferenceService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ServerLive",
 			Handler:    _GRPCInferenceService_ServerLive_Handler,
-		},
-		{
-			MethodName: "ServerReady",
-			Handler:    _GRPCInferenceService_ServerReady_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
