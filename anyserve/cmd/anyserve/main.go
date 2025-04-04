@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
 
+	"github.com/anyserve/anyserve/internal/version"
 	"github.com/anyserve/anyserve/pkg/config"
 	"github.com/anyserve/anyserve/pkg/grpc_server"
 	"github.com/anyserve/anyserve/pkg/grpc_service"
@@ -14,14 +16,27 @@ import (
 	"go.uber.org/zap"
 )
 
-var configFile string
+var (
+	configFile  string
+	showVersion bool
+)
 
 func init() {
 	flag.StringVar(&configFile, "c", "config.yaml", "config file path")
-	flag.Parse()
+	flag.BoolVar(&showVersion, "version", false, "show version information and exit")
 }
 
 func main() {
+	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("Anyserve Version: %s\n", version.Version)
+		fmt.Printf("Git Commit: %s\n", version.GitCommit)
+		fmt.Printf("Build Date: %s\n", version.BuildDate)
+		fmt.Printf("Go Version: %s\n", version.GoVersion)
+		os.Exit(0)
+	}
+
 	fmt.Println("config file:", configFile)
 
 	app := fx.New(
