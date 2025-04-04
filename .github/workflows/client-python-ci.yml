@@ -1,0 +1,9 @@
+name: client-python CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  path:
+    - 'client-python/**'

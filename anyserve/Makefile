@@ -1,18 +1,16 @@
 .DEFAULT_GOAL := help
 
-anyserve-build:
+build:
 	@go version
 	@echo "GOPATH: $(GOPATH)"
 	@echo "Building anyserve with verbose output..."
 	go build -v -o bin/anyserve cmd/anyserve/main.go
 
 clean:
-	rm -f bin/servelet bin/anyserve
-
-build-all: anyserve-build
+	rm -rf bin/anyserve
 
 lint:
-	golangci-lint run --config=.golangci.yml ./...
+	golangci-lint run --config=../.golangci.yml ./...
 
 test:
 ifdef COVERAGE
@@ -27,19 +25,17 @@ fmt:
 upgrade:
 	go get -u ./... && go mod tidy
 
-anyserve-dev: anyserve-build
+dev: build
 	bin/anyserve
-
 
 help:
 	@echo "Available commands:"
-	@echo "  build-all      - Build all programs"
-	@echo "  anyserve-build - Build anyserve"
-	@echo "  anyserve-dev   - Build and run anyserve"
-	@echo "  clean          - Clean build files"
-	@echo "  fmt            - Format code"
-	@echo "  test           - Run tests"
-	@echo "  upgrade        - Upgrade dependencies"
-	@echo "  lint           - Run lint"
+	@echo "  build - Build anyserve"
+	@echo "  dev   - Build and run anyserve"
+	@echo "  clean - Clean build files"
+	@echo "  fmt   - Format code"
+	@echo "  test  - Run tests"
+	@echo "  upgrade - Upgrade dependencies"
+	@echo "  lint  - Run lint"
 
-.PHONY: anyserve-dev anyserve-build clean build-all test fmt help
+.PHONY: dev build clean lint test fmt upgrade help
