@@ -1,19 +1,17 @@
 package grpc_service
 
 import (
-	"github.com/anyserve/anyserve/pkg/proto"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 )
 
 // InferenceService implements the GRPCInferenceService defined in proto
 type InferenceService struct {
-	proto.UnimplementedGRPCInferenceServiceServer
 	logger *zap.Logger
 }
 
 // NewInferenceService creates a new inference service instance
-func NewInferenceService(logger *zap.Logger) proto.GRPCInferenceServiceServer {
+func NewInferenceService(logger *zap.Logger) *InferenceService {
 	return &InferenceService{
 		logger: logger,
 	}

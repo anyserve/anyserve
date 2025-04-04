@@ -10,7 +10,6 @@ import (
 	"github.com/anyserve/anyserve/pkg/grpc_server"
 	"github.com/anyserve/anyserve/pkg/grpc_service"
 	"github.com/anyserve/anyserve/pkg/logger"
-	"github.com/anyserve/anyserve/pkg/proto"
 	"github.com/anyserve/anyserve/pkg/server"
 	"github.com/anyserve/anyserve/pkg/storage"
 	"go.uber.org/fx"
@@ -53,8 +52,8 @@ func main() {
 			logger *zap.Logger,
 			httpServer *server.Server,
 			grpcServer *grpc_server.Server,
-			inferenceService proto.GRPCInferenceServiceServer,
-			embedNATS *storage.EmbedNATS,
+			inferenceService *grpc_service.InferenceService,
+			embeddedNATS *storage.EmbeddedNATS,
 			lc fx.Lifecycle,
 		) {
 			logger.Info("Initializing anyserve...")
@@ -68,7 +67,7 @@ func main() {
 			grpcServer.Start(lc)
 
 			// Initialize embedded NATS server
-			embedNATS.Start(lc)
+			embeddedNATS.Start(lc)
 		}),
 	)
 

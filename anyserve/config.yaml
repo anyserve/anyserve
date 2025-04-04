@@ -8,7 +8,15 @@ server:
       - status
   grpc:
     port: 50052
-    
+    tls_enabled: false
+    cert_file: ""
+    key_file: ""
+queue:
+  engine: "embedded_nats" # Available options: "embedded_nats", "nats", "redis"
+
+embedded_nats:
+  port: 4222
+
 logger:
   level: "info"
   development: false
