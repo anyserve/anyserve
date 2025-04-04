@@ -81,8 +81,8 @@ func NewConfig(filePath string) (*Config, error) {
 	}
 
 	if err := k.Load(env.Provider("ANYSERVE_", ".", func(s string) string {
-		return strings.Replace(strings.ToLower(
-			strings.TrimPrefix(s, "ANYSERVE_")), "_", ".", -1)
+		return strings.ReplaceAll(strings.ToLower(
+			strings.TrimPrefix(s, "ANYSERVE_")), "_", ".")
 	}), nil); err != nil {
 		return nil, fmt.Errorf("error loading environment variables: %w", err)
 	}
