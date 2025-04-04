@@ -27,8 +27,7 @@ jobs:
     - name: golangci-lint
       uses: golangci/golangci-lint-action@v7
       with:
-        version: v2.0
-        config: .golangci.yml
+        version: latest
 
     - name: Build
       run: make build-all
