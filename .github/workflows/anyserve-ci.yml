@@ -3,11 +3,14 @@ name: anyserve CI
 on:
   push:
     branches: ["main"]
+    paths:
+      - 'anyserve/**'
+      - 'api/**'
   pull_request:
     branches: ["main"]
-  path:
-    - 'anyserve/**'
-    - 'api/**'
+    paths:
+      - 'anyserve/**'
+      - 'api/**'
 
 jobs:
   build:
