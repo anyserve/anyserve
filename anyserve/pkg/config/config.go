@@ -17,6 +17,8 @@ type Config struct {
 	Logger       LoggerConfig       `koanf:"logger"`
 	Queue        QueueConfig        `koanf:"queue"`
 	EmbeddedNATS EmbeddedNATSConfig `koanf:"embedded_nats"`
+	NATS         NATSConfig         `koanf:"nats"`
+	Redis        RedisConfig        `koanf:"redis"`
 }
 
 type ServerConfig struct {
@@ -31,7 +33,17 @@ type QueueConfig struct {
 }
 
 type EmbeddedNATSConfig struct {
-	Port int `koanf:"port"`
+	Port     int    `koanf:"port"`
+	StoreDir string `koanf:"store_dir"`
+}
+
+type NATSConfig struct {
+	Address string `koanf:"address"`
+}
+
+type RedisConfig struct {
+	Address string `koanf:"address"`
+	Prefix  string `koanf:"prefix"`
 }
 
 func (c *ServerConfig) Validate() error {
@@ -62,17 +74,21 @@ type LoggerConfig struct {
 
 func defaultConfig() map[string]interface{} {
 	defaultConfig := map[string]interface{}{
-		"server.host":              "0.0.0.0",
-		"server.port":              8848,
-		"server.logger.fields":     []string{"method", "path", "status"},
-		"server.grpc.port":         50051,
-		"server.grpc.tls_enabled":  false,
-		"server.grpc.cert_file":    "",
-		"server.grpc.key_file":     "",
-		"logger.level":             "info",
-		"logger.development":       false,
-		"queue.engine":             QueueEngineEmbeddedNATS,
-		"queue.embedded_nats.port": 4222,
+		"server.host":             "0.0.0.0",
+		"server.port":             8848,
+		"server.logger.fields":    []string{"method", "path", "status"},
+		"server.grpc.port":        50051,
+		"server.grpc.tls_enabled": false,
+		"server.grpc.cert_file":   "",
+		"server.grpc.key_file":    "",
+		"logger.level":            "info",
+		"logger.development":      false,
+		"queue.engine":            QueueEngineEmbeddedNATS,
+		"embedded_nats.port":      4222,
+		"embedded_nats.store_dir": "/tmp/nats",
+		"nats.address":            "nats://localhost:4222",
+		"redis.address":           "redis://localhost:6379",
+		"redis.prefix":            "anyserve",
 	}
 	return defaultConfig
 }

@@ -20,7 +20,7 @@ LDFLAGS := -s -w \
 
 BINARY_NAME := anyserve
 BINARY_PATH := bin/$(BINARY_NAME)
-CMD_PATH := cmd/anyserve/main.go
+CMD_PATH := main.go
 
 build:
 	@echo ">>> Building $(BINARY_NAME) version $(VERSION) ($(GIT_COMMIT))..."

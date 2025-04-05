@@ -42,7 +42,7 @@ message InferRequest {
 
 message InferResponse {
     string request_id = 1;
-    bytes output = 2;
+    optional bytes output = 2;
 }
 
 message FetchInferRequest
