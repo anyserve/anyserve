@@ -1,4 +1,4 @@
-package storage
+package embedded_nats
 
 import (
 	"context"
@@ -38,6 +38,8 @@ func (s *EmbeddedNATS) Start(lifecycle fx.Lifecycle) {
 				NoSigs:     true,
 				ServerName: "anyserve_embedded_server",
 				Port:       s.cfg.EmbeddedNATS.Port,
+				JetStream:  true,
+				StoreDir:   s.cfg.EmbeddedNATS.StoreDir,
 			}
 			ns, err := server.NewServer(&opts)
 			if err != nil {

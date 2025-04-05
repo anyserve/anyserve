@@ -16,6 +16,7 @@ queue:
 
 embedded_nats:
   port: 4222
+  store_dir: "/tmp/nats"
 
 logger:
   level: "info"

@@ -173,7 +173,7 @@ func (x *InferRequest) GetInput() []byte {
 type InferResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Output        []byte                 `protobuf:"bytes,2,opt,name=output,proto3" json:"output,omitempty"`
+	Output        []byte                 `protobuf:"bytes,2,opt,name=output,proto3,oneof" json:"output,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -382,11 +382,12 @@ const file_grpc_service_proto_rawDesc = "" +
 	"\x11ServerLiveRequest\"?\n" +
 	"\fInferRequest\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x14\n" +
-	"\x05input\x18\x02 \x01(\fR\x05input\"F\n" +
+	"\x05input\x18\x02 \x01(\fR\x05input\"V\n" +
 	"\rInferResponse\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\x12\x16\n" +
-	"\x06output\x18\x02 \x01(\fR\x06output\".\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1b\n" +
+	"\x06output\x18\x02 \x01(\fH\x00R\x06output\x88\x01\x01B\t\n" +
+	"\a_output\".\n" +
 	"\x11FetchInferRequest\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\"I\n" +
 	"\x12FetchInferResponse\x12\x1d\n" +
@@ -452,6 +453,7 @@ func file_grpc_service_proto_init() {
 	if File_grpc_service_proto != nil {
 		return
 	}
+	file_grpc_service_proto_msgTypes[3].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
