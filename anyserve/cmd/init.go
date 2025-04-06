@@ -3,9 +3,12 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/anyserve/anyserve/pkg/meta"
+	"github.com/google/uuid"
 	"github.com/urfave/cli/v3"
+	"go.uber.org/zap"
 )
 
 func cmdInit() *cli.Command {
@@ -13,11 +16,11 @@ func cmdInit() *cli.Command {
 		Name:      "init",
 		Usage:     "Initialize Anyserve system",
 		Action:    initFunc,
-		ArgsUsage: "META-URL NAME",
+		ArgsUsage: "META-URI NAME",
 		Flags:     expandFlags(initFlags()),
 		Description: `
 Create a new Anyserve system. 
-META-URL is used to set up the metadata engine (embedded NATS, sqlite, redis, NATS, etc.) ,
+META-URI is used to set up the metadata engine (embedded NATS, sqlite, redis, NATS, etc.) ,
 NAME is the name of the system.
 
 Examples:
@@ -40,21 +43,34 @@ $ anyserve init nats://localhost:4222 myserve
 func initFunc(ctx context.Context, cmd *cli.Command) error {
 	setup(cmd)
 
-	metaURL := cmd.Args().Get(0)
+	metaURI := cmd.Args().Get(0)
 	name := cmd.Args().Get(1)
 
-	if metaURL == "" || name == "" {
-		return fmt.Errorf("META-URL and NAME are required")
+	if metaURI == "" || name == "" {
+		return fmt.Errorf("META-URI and NAME are required")
 	}
 
-	m, err := meta.NewMeta(metaURL)
+	m, err := meta.NewMeta(metaURI)
 	if err != nil {
-		return fmt.Errorf("failed to create meta: %w", err)
+		return fmt.Errorf("Meta client: %w", err)
 	}
 
-	m.Init(meta.Format{
-		Name: name,
-	}, cmd.Bool("force"))
+	format, err := m.Load()
+	if err == nil {
+		logger.Warn("Meta already initialized. Updating now")
+		format.Name = name
+	} else if strings.HasPrefix(err.Error(), "backend is not formatted") {
+		logger.Info("backend is not formatted. Initializing")
+		format = &meta.Format{
+			Name: name,
+			UUID: uuid.New().String(),
+		}
+	} else {
+		logger.Error("Load meta", zap.Error(err))
+		return fmt.Errorf("Load meta: %w", err)
+	}
+
+	m.Init(format, cmd.Bool("force"))
 
 	return nil
 }
