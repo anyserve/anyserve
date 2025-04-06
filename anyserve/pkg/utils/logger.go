@@ -9,15 +9,15 @@ import (
 )
 
 var logLevel = zap.NewAtomicLevel()
+var logFormat = "console" // 默认使用console格式
 
 var mu sync.Mutex
 var loggers = make(map[string]*logHandle)
 
 type logHandle struct {
 	*zap.Logger
-
+	sugar *zap.SugaredLogger
 	name  string
-	level zapcore.Level
 	pid   int
 }
 
@@ -34,23 +34,29 @@ func GetLogger(name string) *logHandle {
 }
 
 func newLogger(name string) *logHandle {
+	pid := os.Getpid()
 	encoderConfig := zap.NewProductionEncoderConfig()
-	encoderConfig.EncodeTime = zapcore.EpochNanosTimeEncoder
+	encoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
 	logConfig := zap.Config{
 		Level:             logLevel,
 		Development:       false,
 		DisableCaller:     false,
 		DisableStacktrace: false,
 		Sampling:          nil,
-		Encoding:          "json",
+		Encoding:          logFormat,
 		EncoderConfig:     encoderConfig,
 		OutputPaths:       []string{"stdout"},
 		ErrorOutputPaths:  []string{"stderr"},
+		InitialFields: map[string]interface{}{
+			"name": name,
+			"pid":  pid,
+		},
 	}
 
 	logger, _ := logConfig.Build()
 
-	l := &logHandle{Logger: logger, name: name, pid: os.Getpid()}
+	l := &logHandle{Logger: logger, name: name, pid: pid}
+	l.sugar = l.Logger.Sugar()
 	return l
 }
 
@@ -69,4 +75,26 @@ func SetLevel(level string) {
 		zlevel = zapcore.InfoLevel
 	}
 	logLevel.SetLevel(zlevel)
+}
+
+// SetFormat 设置日志格式为json或console
+func SetFormat(format string) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	switch format {
+	case "json", "console":
+		logFormat = format
+	default:
+		logFormat = "console"
+	}
+
+	// 清除并重新创建所有logger
+	oldLoggers := loggers
+	loggers = make(map[string]*logHandle)
+
+	// 为每个旧的logger创建新的实例
+	for name := range oldLoggers {
+		loggers[name] = newLogger(name)
+	}
 }

@@ -6,32 +6,34 @@ import (
 	"fmt"
 
 	"github.com/anyserve/anyserve/pkg/config"
+	"github.com/anyserve/anyserve/pkg/utils"
 	"github.com/gofiber/fiber/v2"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 )
 
+var logger = utils.GetLogger("server")
+
 type Server struct {
-	logger *zap.Logger
-	config *config.Config
-	app    *fiber.App
+	config *config.HTTPConfig
+
+	app *fiber.App
 }
 
-func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
+func NewServer(lc fx.Lifecycle, cfg *config.HTTPConfig) *Server {
 	app := fiber.New(fiber.Config{
 		JSONEncoder: json.Marshal,
 		JSONDecoder: json.Unmarshal,
 		Prefork:     false,
 	})
+
 	return &Server{
-		logger: logger,
 		app:    app,
 		config: cfg,
 	}
 }
 
-func (s *Server) RegisterHandlers() {
-	s.logger.Info("Registering HTTP handlers")
+func (s *Server) Start(lifecycle fx.Lifecycle) {
 
 	s.app.Use(s.zapLogger())
 	s.app.Get("/healthz", healthz)
@@ -39,26 +41,22 @@ func (s *Server) RegisterHandlers() {
 	s.app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, anyserve!")
 	})
-}
 
-func (s *Server) Start(lifecycle fx.Lifecycle) {
-	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, s.config.Server.Port)
-	s.logger.Info("Starting HTTP server", zap.String("addr", addr))
+	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
 
 	lifecycle.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			go func() {
 				if err := s.app.Listen(addr); err != nil {
-					s.logger.Error("Failed to start server", zap.Error(err))
+					logger.Error("Failed to start server", zap.Error(err))
 				}
 			}()
+			logger.Sugar().Infof("HTTP server started on %s", addr)
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
-			s.logger.Info("Stopping HTTP server")
+			logger.Sugar().Info("Stopping HTTP server")
 			return s.app.ShutdownWithContext(ctx)
 		},
 	})
 }
-
-var Module = fx.Provide(NewServer)

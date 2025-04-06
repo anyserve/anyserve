@@ -10,6 +10,7 @@ import (
 	"github.com/anyserve/anyserve/pkg/config"
 	"github.com/anyserve/anyserve/pkg/grpc_service"
 	"github.com/anyserve/anyserve/pkg/proto"
+	"github.com/anyserve/anyserve/pkg/utils"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
@@ -22,14 +23,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Server represents the gRPC server
+var logger = utils.GetLogger("grpc_server")
+
 type Server struct {
-	logger *zap.Logger
-	config *config.Config
+	config           *config.GRPCConfig
+	inferenceService *grpc_service.InferenceService
+
 	server *grpc.Server
 }
 
-// customRecoveryHandler handles panics in gRPC handlers
 func customRecoveryHandler(logger *zap.Logger) grpc_recovery.RecoveryHandlerFunc {
 	return func(p interface{}) error {
 		logger.Error("gRPC handler panic recovered",
@@ -39,16 +41,12 @@ func customRecoveryHandler(logger *zap.Logger) grpc_recovery.RecoveryHandlerFunc
 	}
 }
 
-// NewServer creates a new gRPC server instance
-func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
-	// Setup recovery options
+func NewServer(cfg *config.GRPCConfig, inferenceService *grpc_service.InferenceService) *Server {
 	recoveryOpts := []grpc_recovery.Option{
-		grpc_recovery.WithRecoveryHandler(customRecoveryHandler(logger)),
+		grpc_recovery.WithRecoveryHandler(customRecoveryHandler(logger.Logger)),
 	}
 
-	// Define server options for better performance and monitoring
 	opts := []grpc.ServerOption{
-		// Connection management - optimized keepalive settings
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle:     2 * time.Minute,  // Increased from 1 minute
 			MaxConnectionAge:      10 * time.Minute, // Increased from 5 minutes for longer-lived connections
@@ -60,6 +58,7 @@ func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
 			MinTime:             5 * time.Second, // Reduced minimum time between pings
 			PermitWithoutStream: true,
 		}),
+
 		// Resource limits - optimized for common use cases
 		grpc.MaxRecvMsgSize(8 * 1024 * 1024), // 8MB, increased from 4MB
 		grpc.MaxSendMsgSize(8 * 1024 * 1024), // 8MB, increased from 4MB
@@ -67,7 +66,7 @@ func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
 
 		// Chain multiple interceptors
 		grpc.UnaryInterceptor(grpc_middleware.ChainUnaryServer(
-			loggerInterceptor(logger),
+			loggerInterceptor(logger.Logger),
 			grpc_recovery.UnaryServerInterceptor(recoveryOpts...),
 			grpc_prometheus.UnaryServerInterceptor,
 		)),
@@ -78,8 +77,8 @@ func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
 	}
 
 	// Add TLS if configured
-	if cfg.Server.GRPC.TLSEnabled && cfg.Server.GRPC.CertFile != "" && cfg.Server.GRPC.KeyFile != "" {
-		creds, err := credentials.NewServerTLSFromFile(cfg.Server.GRPC.CertFile, cfg.Server.GRPC.KeyFile)
+	if cfg.TLSEnabled && cfg.CertFile != "" && cfg.KeyFile != "" {
+		creds, err := credentials.NewServerTLSFromFile(cfg.CertFile, cfg.KeyFile)
 		if err != nil {
 			logger.Error("Failed to load TLS credentials", zap.Error(err))
 		} else {
@@ -94,9 +93,9 @@ func NewServer(logger *zap.Logger, cfg *config.Config) *Server {
 	grpc_prometheus.Register(grpcServer)
 
 	return &Server{
-		logger: logger,
-		config: cfg,
-		server: grpcServer,
+		config:           cfg,
+		server:           grpcServer,
+		inferenceService: inferenceService,
 	}
 }
 
@@ -138,57 +137,50 @@ func loggerInterceptor(logger *zap.Logger) grpc.UnaryServerInterceptor {
 	}
 }
 
-// RegisterServices registers all the services with the gRPC server
-func (s *Server) RegisterServices(inferenceService *grpc_service.InferenceService) {
-	s.logger.Info("Registering gRPC services")
-	proto.RegisterGRPCInferenceServiceServer(s.server, inferenceService)
-}
-
-// Start starts the gRPC server
 func (s *Server) Start(lifecycle fx.Lifecycle) {
-	port := s.config.Server.GRPC.Port
-	addr := fmt.Sprintf("%s:%d", s.config.Server.Host, port)
-	s.logger.Info("Starting gRPC server", zap.String("addr", addr))
+
+	proto.RegisterGRPCInferenceServiceServer(s.server, s.inferenceService)
+	logger.Sugar().Debugf("Registered gRPC services")
+
+	port := s.config.Port
+	addr := fmt.Sprintf("%s:%d", s.config.Host, port)
+
+	logger.Sugar().Debugf("Starting gRPC server on %s:%d", s.config.Host, s.config.Port)
 
 	lifecycle.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			lis, err := net.Listen("tcp", addr)
 			if err != nil {
-				s.logger.Error("Failed to listen", zap.Error(err))
+				logger.Error("Failed to listen", zap.Error(err))
 				return err
 			}
 
 			go func() {
 				if err := s.server.Serve(lis); err != nil && err != grpc.ErrServerStopped {
-					s.logger.Error("Failed to start gRPC server", zap.Error(err))
+					logger.Error("Failed to start gRPC server", zap.Error(err))
 				}
 			}()
 
-			s.logger.Info("gRPC server started successfully")
+			logger.Sugar().Infof("gRPC server started on %s:%d", s.config.Host, s.config.Port)
 			return nil
 		},
 		OnStop: func(ctx context.Context) error {
-			s.logger.Info("Stopping gRPC server")
-			// Add a timeout for graceful shutdown
+			logger.Sugar().Info("Stopping gRPC server")
 			done := make(chan struct{})
 			go func() {
 				s.server.GracefulStop()
 				close(done)
 			}()
 
-			// Wait for graceful shutdown or timeout
-			shutdownTimeout := 15 * time.Second // Increased from 10 seconds
+			shutdownTimeout := 15 * time.Second
 			select {
 			case <-done:
-				s.logger.Info("gRPC server stopped gracefully")
+				logger.Sugar().Info("gRPC server stopped gracefully")
 			case <-time.After(shutdownTimeout):
-				s.logger.Warn("gRPC server shutdown timed out, forcing stop")
+				logger.Sugar().Warn("gRPC server shutdown timed out, forcing stop")
 				s.server.Stop()
 			}
 			return nil
 		},
 	})
 }
-
-// Module provides the fx module for the gRPC server
-var Module = fx.Provide(NewServer)
