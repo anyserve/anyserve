@@ -27,7 +27,7 @@ func (s *EmbeddedNATS) Start(lifecycle fx.Lifecycle) {
 		OnStart: func(ctx context.Context) error {
 			opts := server.Options{
 				NoSigs:     true,
-				ServerName: "anyserve_embedded_server",
+				ServerName: "anyserve_embedded",
 				Port:       4222,
 				JetStream:  true,
 				StoreDir:   "/tmp/nats",
@@ -65,5 +65,3 @@ func (s *EmbeddedNATS) Start(lifecycle fx.Lifecycle) {
 		},
 	})
 }
-
-var Module = fx.Provide(NewEmbeddedNATS)

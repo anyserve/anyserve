@@ -7,13 +7,12 @@ import (
 )
 
 type Format struct {
-	Name  string
-	UUID  string
-	Queue string
+	Name string
+	UUID string
 }
 
 type Meta interface {
-	Init(format *Format, force bool) error
+	Init(format Format, force bool) error
 	GetFormat() Format
 
 	QueueInferRequest(ctx context.Context, proto *proto.InferRequest) error
@@ -22,4 +21,8 @@ type Meta interface {
 
 	PopInferRequest(ctx context.Context, modelId string) (<-chan *proto.FetchInferRequest, error)
 	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferResponse, error)
+}
+
+func NewMeta(metaUrl string) (Meta, error) {
+	return nil, nil
 }
