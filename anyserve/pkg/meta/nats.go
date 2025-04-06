@@ -3,34 +3,23 @@ package meta
 import (
 	"sync"
 
-	"github.com/anyserve/anyserve/pkg/config"
 	"github.com/nats-io/nats.go"
-	"go.uber.org/zap"
 )
 
 type NATSStorage struct {
-	logger *zap.Logger
-	cfg    *config.Config
-
 	nc *nats.Conn
 	mu sync.Mutex
 }
 
-func NewNATSStorage(logger *zap.Logger, cfg *config.Config) *NATSStorage {
-	return &NATSStorage{
-		logger: logger,
-		cfg:    cfg,
-	}
+func NewNATSStorage(url string) *NATSStorage {
+	// return &NATSStorage{
+	// 	url: url,
+	// }
+	return nil
 }
 
 func (c *NATSStorage) Connect() error {
-	if c.cfg.Queue.Engine == config.QueueEngineEmbeddedNATS {
-		nc, err := nats.Connect("nats://localhost:4222")
-		if err != nil {
-			return err
-		}
-		c.nc = nc
-	}
+
 	return nil
 }
 

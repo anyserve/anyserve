@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"github.com/anyserve/anyserve/internal/version"
@@ -22,11 +23,11 @@ func Main(args []string) error {
 
 	cmd := &cli.Command{
 		Name:  "anyserve",
-		Usage: "",
+		Usage: "Serve anywhere. Infer everywhere. Anyserve.",
 		Action: func(ctx context.Context, cmd *cli.Command) error {
-			return nil
+			return cli.ShowAppHelp(cmd)
 		},
-		Copyright:       "Apache License 2.0",
+		Copyright:       fmt.Sprintf("Apache License 2.0 @ %s", "https://github.com/anyserve/anyserve"),
 		HideHelpCommand: true,
 		Version:         version.VersionString(),
 		Flags:           globalFlags(),

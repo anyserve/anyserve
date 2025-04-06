@@ -11,7 +11,7 @@ func globalFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "log-level",
-			Usage: "set log level (debug, info, warn, error, error)",
+			Usage: "set log level (debug, info, warn, error)",
 			Value: "info",
 		},
 	}

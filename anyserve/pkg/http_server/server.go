@@ -1,4 +1,4 @@
-package server
+package http_server
 
 import (
 	"context"
@@ -27,24 +27,21 @@ func NewServer(lc fx.Lifecycle, cfg *config.HTTPConfig) *Server {
 		Prefork:     false,
 	})
 
-	return &Server{
+	s := &Server{
 		app:    app,
 		config: cfg,
 	}
-}
 
-func (s *Server) Start(lifecycle fx.Lifecycle) {
-
-	s.app.Use(s.zapLogger())
+	s.app.Use(zapLogger())
 	s.app.Get("/healthz", healthz)
 
 	s.app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, anyserve!")
 	})
 
-	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
-	lifecycle.Append(fx.Hook{
+	lc.Append(fx.Hook{
 		OnStart: func(ctx context.Context) error {
 			go func() {
 				if err := s.app.Listen(addr); err != nil {
@@ -59,4 +56,5 @@ func (s *Server) Start(lifecycle fx.Lifecycle) {
 			return s.app.ShutdownWithContext(ctx)
 		},
 	})
+	return s
 }

@@ -2,8 +2,6 @@ package meta
 
 import (
 	"sync"
-
-	"github.com/anyserve/anyserve/pkg/config"
 )
 
 type baseMeta struct {
@@ -13,7 +11,7 @@ type baseMeta struct {
 	en engine
 }
 
-func newBaseMeta(addr string, conf *config.Config) *baseMeta {
+func newBaseMeta(addr string) *baseMeta {
 	return &baseMeta{}
 }
 
