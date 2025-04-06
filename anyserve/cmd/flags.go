@@ -16,3 +16,11 @@ func globalFlags() []cli.Flag {
 		},
 	}
 }
+
+func expandFlags(compoundFlags ...[]cli.Flag) []cli.Flag {
+	var flags []cli.Flag
+	for _, flag := range compoundFlags {
+		flags = append(flags, flag...)
+	}
+	return flags
+}

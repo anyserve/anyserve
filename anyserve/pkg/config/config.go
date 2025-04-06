@@ -1,133 +1,36 @@
 package config
 
 import (
-	"fmt"
-	"strings"
-
-	"github.com/knadh/koanf/parsers/yaml"
-	"github.com/knadh/koanf/providers/confmap"
-	"github.com/knadh/koanf/providers/env"
-	"github.com/knadh/koanf/providers/file"
-	"github.com/knadh/koanf/v2"
 	"go.uber.org/fx"
 )
 
-type Config struct {
-	Server       ServerConfig       `koanf:"server"`
-	Logger       LoggerConfig       `koanf:"logger"`
-	Queue        QueueConfig        `koanf:"queue"`
-	EmbeddedNATS EmbeddedNATSConfig `koanf:"embedded_nats"`
-	NATS         NATSConfig         `koanf:"nats"`
-	Redis        RedisConfig        `koanf:"redis"`
+type HTTPConfig struct {
+	Host string
+	Port int64
 }
 
-type ServerConfig struct {
-	Host   string             `koanf:"host"`
-	Port   int                `koanf:"port"`
-	Logger ServerLoggerConfig `koanf:"logger"`
-	GRPC   GRPCConfig         `koanf:"grpc"`
-}
-
-type QueueConfig struct {
-	Engine string `koanf:"engine"`
-}
-
-type EmbeddedNATSConfig struct {
-	Port     int    `koanf:"port"`
-	StoreDir string `koanf:"store_dir"`
-}
-
-type NATSConfig struct {
-	Address string `koanf:"address"`
-}
-
-type RedisConfig struct {
-	Address string `koanf:"address"`
-	Prefix  string `koanf:"prefix"`
-}
-
-func (c *ServerConfig) Validate() error {
-	if c.Port <= 0 || c.Port > 65535 {
-		return fmt.Errorf("invalid server port: %d", c.Port)
-	}
-	if c.GRPC.Port <= 0 || c.GRPC.Port > 65535 {
-		return fmt.Errorf("invalid gRPC port: %d", c.GRPC.Port)
-	}
-	return nil
+func NewHTTPConfig() *HTTPConfig {
+	return &HTTPConfig{}
 }
 
 type GRPCConfig struct {
-	Port       int    `koanf:"port"`
-	TLSEnabled bool   `koanf:"tls_enabled"`
-	CertFile   string `koanf:"cert_file"`
-	KeyFile    string `koanf:"key_file"`
+	Host       string
+	Port       int64
+	TLSEnabled bool
+	CertFile   string
+	KeyFile    string
 }
 
-type ServerLoggerConfig struct {
-	Fields []string `koanf:"fields"`
+func NewGRPCConfig() *GRPCConfig {
+	return &GRPCConfig{}
 }
 
-type LoggerConfig struct {
-	Level       string `koanf:"level"`
-	Development bool   `koanf:"development"`
+type EmbeddedNATSConfig struct {
+	Path string
 }
 
-func defaultConfig() map[string]interface{} {
-	defaultConfig := map[string]interface{}{
-		"server.host":             "0.0.0.0",
-		"server.port":             8848,
-		"server.logger.fields":    []string{"method", "path", "status"},
-		"server.grpc.port":        50051,
-		"server.grpc.tls_enabled": false,
-		"server.grpc.cert_file":   "",
-		"server.grpc.key_file":    "",
-		"logger.level":            "info",
-		"logger.development":      false,
-		"queue.engine":            QueueEngineEmbeddedNATS,
-		"embedded_nats.port":      4222,
-		"embedded_nats.store_dir": "/tmp/nats",
-		"nats.address":            "nats://localhost:4222",
-		"redis.address":           "redis://localhost:6379",
-		"redis.prefix":            "anyserve",
-	}
-	return defaultConfig
+func NewEmbeddedNATSConfig() *EmbeddedNATSConfig {
+	return &EmbeddedNATSConfig{}
 }
 
-// Load config order:
-// 1. default config
-// 2. config.yaml
-// 3. environment variables (starts with ANYSERVE_)
-func NewConfig(filePath string) (*Config, error) {
-	k := koanf.New(".")
-
-	if err := k.Load(confmap.Provider(defaultConfig(), "."), nil); err != nil {
-		return nil, fmt.Errorf("error loading default config: %w", err)
-	}
-
-	if err := k.Load(file.Provider(filePath), yaml.Parser()); err != nil {
-		return nil, fmt.Errorf("error loading config: %w", err)
-	}
-
-	if err := k.Load(env.Provider("ANYSERVE_", ".", func(s string) string {
-		return strings.ReplaceAll(strings.ToLower(
-			strings.TrimPrefix(s, "ANYSERVE_")), "_", ".")
-	}), nil); err != nil {
-		return nil, fmt.Errorf("error loading environment variables: %w", err)
-	}
-
-	var cfg Config
-	if err := k.Unmarshal("", &cfg); err != nil {
-		return nil, fmt.Errorf("error unmarshalling config: %w", err)
-	}
-
-	return &cfg, nil
-}
-
-func (c *Config) Validate() error {
-	if err := c.Server.Validate(); err != nil {
-		return fmt.Errorf("invalid server config: %w", err)
-	}
-	return nil
-}
-
-var Module = fx.Provide(NewConfig)
+var Module = fx.Provide(NewHTTPConfig, NewGRPCConfig)

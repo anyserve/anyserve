@@ -1,21 +1,16 @@
 package grpc_service
 
 import (
-	"go.uber.org/fx"
-	"go.uber.org/zap"
+	"github.com/anyserve/anyserve/pkg/utils"
 )
+
+var logger = utils.GetLogger("grpc_service")
 
 // InferenceService implements the GRPCInferenceService defined in proto
 type InferenceService struct {
-	logger *zap.Logger
 }
 
 // NewInferenceService creates a new inference service instance
-func NewInferenceService(logger *zap.Logger) *InferenceService {
-	return &InferenceService{
-		logger: logger,
-	}
+func NewInferenceService() *InferenceService {
+	return &InferenceService{}
 }
-
-// Module provides the fx module for the gRPC service
-var Module = fx.Provide(NewInferenceService)

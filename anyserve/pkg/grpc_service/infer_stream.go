@@ -20,7 +20,7 @@ func (s *InferenceService) InferStream(stream proto.GRPCInferenceService_InferSt
 		}
 
 		requestID := uuid.New().String()
-		s.logger.Debug("Received InferStream request", zap.String("model_id", req.ModelId))
+		logger.Debug("Received InferStream request", zap.String("model_id", req.ModelId))
 
 		if err := stream.Send(&proto.InferResponse{
 			RequestId: requestID,

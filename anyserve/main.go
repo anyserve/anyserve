@@ -8,9 +8,10 @@ import (
 	"go.uber.org/zap"
 )
 
-var logger = utils.GetLogger("anyserve")
+var logger = utils.GetLogger("cmd")
 
 func main() {
+	defer logger.Sync()
 	err := cmd.Main(os.Args)
 	if err != nil {
 		logger.Fatal("failed to run command", zap.Error(err))
