@@ -10,6 +10,9 @@ import (
 
 // InferStream implements the InferStream RPC method
 func (s *InferenceService) InferStream(stream proto.GRPCInferenceService_InferStreamServer) error {
+	requestID := uuid.New().String()
+
+	_logger := logger.With(zap.String("request_id", requestID))
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -19,8 +22,7 @@ func (s *InferenceService) InferStream(stream proto.GRPCInferenceService_InferSt
 			return err
 		}
 
-		requestID := uuid.New().String()
-		logger.Debug("Received InferStream request", zap.String("model_id", req.ModelId))
+		_logger.Info("Received InferStream request", zap.Any("request", req))
 
 		if err := stream.Send(&proto.InferResponse{
 			RequestId: requestID,

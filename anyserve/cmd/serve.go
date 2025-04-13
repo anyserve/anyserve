@@ -2,14 +2,17 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/anyserve/anyserve/pkg/config"
 	"github.com/anyserve/anyserve/pkg/grpc_server"
 	"github.com/anyserve/anyserve/pkg/grpc_service"
 	"github.com/anyserve/anyserve/pkg/http_server"
+	"github.com/anyserve/anyserve/pkg/meta"
 	"github.com/anyserve/anyserve/pkg/utils"
 	"github.com/urfave/cli/v3"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
 var logger = utils.GetLogger("cmd")
@@ -19,15 +22,36 @@ func cmdServe() *cli.Command {
 		Name:      "serve",
 		Action:    serveFunc,
 		Usage:     "Start anyserve server",
-		ArgsUsage: "META-URL",
+		ArgsUsage: "META-URI",
 		Flags:     expandFlags(serveFlags(), httpServerFlags(), grpcServerFlags()),
+		Description: `
+Start an anyserve server, receive inference requests and respond with inference results.
+META-URI is used to connect to the metadata engine (embedded NATS, sqlite, redis, NATS, etc.) ,
+
+Examples:
+# Use embedded NATS
+$ anyserve serve embedded_nats:///tmp/nats
+
+# Use SQLite
+$ anyserve serve sqlite:///tmp/anyserve.db
+
+# Use Redis
+$ anyserve serve redis://localhost:6379
+
+# Use NATS
+$ anyserve serve nats://localhost:4222
+`,
 	}
 }
 
 func serveFunc(ctx context.Context, cmd *cli.Command) error {
-	defer logger.Sync()
-
 	setup(cmd)
+
+	metaURI := cmd.Args().Get(0)
+
+	if metaURI == "" {
+		return fmt.Errorf("META-URI is required")
+	}
 
 	grpcConfig := &config.GRPCConfig{
 		Host:       cmd.String("grpc.host"),
@@ -42,8 +66,20 @@ func serveFunc(ctx context.Context, cmd *cli.Command) error {
 		Port: cmd.Int("http.port"),
 	}
 
+	meta, err := meta.NewMeta(metaURI)
+	if err != nil {
+		return err
+	}
+
+	format, err := meta.Load()
+	if err != nil {
+		return err
+	}
+
+	logger.Info("Loaded format", zap.Any("format", format))
+
 	app := fx.New(
-		fx.Supply(grpcConfig, httpConfig),
+		fx.Supply(grpcConfig, httpConfig, &meta),
 
 		fx.Provide(grpc_service.NewInferenceService),
 		fx.Provide(http_server.NewServer),

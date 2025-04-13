@@ -114,7 +114,7 @@ func NewServer(lc fx.Lifecycle, cfg *config.GRPCConfig, inferenceService *grpc_s
 				close(done)
 			}()
 
-			shutdownTimeout := 15 * time.Second
+			shutdownTimeout := 5 * time.Second
 			select {
 			case <-done:
 				logger.Sugar().Info("gRPC server stopped gracefully")
