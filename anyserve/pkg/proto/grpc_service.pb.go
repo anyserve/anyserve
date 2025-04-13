@@ -297,7 +297,6 @@ func (x *InferResponse) GetMetadata() map[string]string {
 type FetchInferRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Metadata      map[string]string      `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	RequestId     *string                `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3,oneof" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -337,13 +336,6 @@ func (x *FetchInferRequest) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
-}
-
-func (x *FetchInferRequest) GetRequestId() string {
-	if x != nil && x.RequestId != nil {
-		return *x.RequestId
-	}
-	return ""
 }
 
 type FetchInferResponse struct {
@@ -500,15 +492,12 @@ const file_grpc_service_proto_rawDesc = "" +
 	"\x06FINISH\x10\x03\x12\t\n" +
 	"\x05ERROR\x10\x04B\t\n" +
 	"\a_outputB\t\n" +
-	"\a_status\"\xcb\x01\n" +
+	"\a_status\"\x98\x01\n" +
 	"\x11FetchInferRequest\x12F\n" +
-	"\bmetadata\x18\x01 \x03(\v2*.inference.FetchInferRequest.MetadataEntryR\bmetadata\x12\"\n" +
-	"\n" +
-	"request_id\x18\x02 \x01(\tH\x00R\trequestId\x88\x01\x01\x1a;\n" +
+	"\bmetadata\x18\x01 \x03(\v2*.inference.FetchInferRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\r\n" +
-	"\v_request_id\"\xcf\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xcf\x01\n" +
 	"\x12FetchInferResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x14\n" +
@@ -594,7 +583,6 @@ func file_grpc_service_proto_init() {
 		return
 	}
 	file_grpc_service_proto_msgTypes[3].OneofWrappers = []any{}
-	file_grpc_service_proto_msgTypes[4].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
