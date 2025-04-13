@@ -78,6 +78,45 @@ func (m *redisMeta) doLoad() ([]byte, error) {
 	return body, err
 }
 
+func (m *redisMeta) doSetRequest(ctx context.Context, requestId string, input []byte) error {
+	return m.rdb.Set(ctx, m.key(requestId), input, 0).Err()
+}
+
+func (m *redisMeta) doPushRequestQueue(ctx context.Context, requestId string, metadata map[string]string) error {
+	return m.rdb.HSet(ctx, m.key(requestId), metadata).Err()
+}
+
+func (m *redisMeta) doPopRequestQueue(ctx context.Context, metadata map[string]string) ([]string, error) {
+	return []string{}, nil
+}
+
+func (m *redisMeta) doGetRequest(ctx context.Context, requestId string) ([]byte, error) {
+	return m.rdb.Get(ctx, m.key(requestId)).Bytes()
+}
+
+func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, response any) error {
+	return m.rdb.RPush(ctx, m.key(requestId), response).Err()
+}
+
+func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (any, error) {
+	return m.rdb.LPop(ctx, m.key(requestId)).Result()
+}
+
+func (m *redisMeta) doExists(ctx context.Context, key string) (bool, error) {
+	exists, err := m.rdb.Exists(ctx, m.key(key)).Result()
+	return exists > 0, err
+}
+
 func (m *redisMeta) setting() string {
-	return m.prefix + "setting"
+	if m.prefix == "" {
+		return "setting"
+	}
+	return fmt.Sprintf("%s:setting", m.prefix)
+}
+
+func (m *redisMeta) key(key string) string {
+	if m.prefix == "" {
+		return key
+	}
+	return fmt.Sprintf("%s:%s", m.prefix, key)
 }

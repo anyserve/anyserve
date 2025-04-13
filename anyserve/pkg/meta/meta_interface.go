@@ -1,9 +1,11 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
+	"github.com/anyserve/anyserve/pkg/proto"
 	"github.com/anyserve/anyserve/pkg/utils"
 	"go.uber.org/zap"
 )
@@ -26,23 +28,26 @@ func Register(name string, register Backend) {
 type Meta interface {
 
 	// Init the meta data to backend
-	// Implement in baseMeta
 	Init(format *Format, force bool) error
 
 	// GetFormat returns current format
-	// Implement in baseMeta
 	GetFormat() Format
 
 	// Load the meta data from the backend
-	// Implement in baseMeta
 	Load() (*Format, error)
 
-	// QueueInferRequest(ctx context.Context, proto *proto.InferRequest) error
-	// QueueInferRequestStream(ctx context.Context, inferRequestChan <-chan *proto.InferRequest) <-chan error
+	// Queue an inference request to Queue
+	QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error
+	// TODO: Implement
+	// QueueInferRequestStream(ctx context.Context, inferRequestChan <-chan *proto.InferRequest, requestId string) <-chan error
+	// TODO: Implement
 	// QueueSendResponseStream(ctx context.Context, sendResponseRequestChan <-chan *proto.SendResponseRequest) <-chan error
 
-	// PopInferRequest(ctx context.Context, modelId string) (<-chan *proto.FetchInferRequest, error)
-	// PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferResponse, error)
+	// Pop inference request from
+	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferRequest, error)
+
+	// Pop inference result from response queue
+	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferResponse, error)
 }
 
 func NewMeta(metaURI string) (Meta, error) {
