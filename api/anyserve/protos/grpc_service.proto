@@ -55,7 +55,6 @@ message InferResponse {
 message FetchInferRequest
 {
     map<string, string> metadata = 1;
-    optional string request_id = 2;
 }
 
 message FetchInferResponse {
