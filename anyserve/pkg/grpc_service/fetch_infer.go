@@ -2,19 +2,23 @@ package grpc_service
 
 import (
 	"github.com/anyserve/anyserve/pkg/proto"
-	"github.com/google/uuid"
 )
 
 // FetchInfer implements the FetchInfer RPC method
 func (s *InferenceService) FetchInfer(req *proto.FetchInferRequest, stream proto.GRPCInferenceService_FetchInferServer) error {
-	// Simple implementation to satisfy the interface
-	// Replace with actual implementation as needed
-	requestID := uuid.New().String()
+	ctx := stream.Context()
 
-	response := &proto.FetchInferResponse{
-		RequestId: requestID,
-		Input:     []byte("sample input"),
+	responseChan, err := s.meta.PopInferRequest(ctx, req.Metadata)
+	if err != nil {
+		return err
 	}
 
-	return stream.Send(response)
+	for response := range responseChan {
+		logger.Sugar().Debugf("FetchInfer response: %v", response)
+		if err := stream.Send(response); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

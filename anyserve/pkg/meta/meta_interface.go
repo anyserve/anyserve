@@ -44,7 +44,7 @@ type Meta interface {
 	// QueueSendResponseStream(ctx context.Context, sendResponseRequestChan <-chan *proto.SendResponseRequest) <-chan error
 
 	// Pop inference request from
-	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferRequest, error)
+	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferResponse, error)
 
 	// Pop inference result from response queue
 	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferResponse, error)

@@ -54,22 +54,46 @@ func (m *baseMeta) Load() (*Format, error) {
 }
 
 func (m *baseMeta) QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error {
+	logger := zap.L().With(zap.String("request_id", requestId))
 	var err error
 	err = m.e.doSetRequest(ctx, requestId, proto.Input)
 	if err != nil {
+		logger.Error("SetRequest", zap.Error(err))
 		return err
 	}
 	err = m.e.doPushRequestQueue(ctx, requestId, proto.Metadata)
 	if err != nil {
+		logger.Error("PushRequestQueue", zap.Error(err))
 		return err
 	}
 	return nil
 }
-func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferRequest, error) {
-	inferRequestChan := make(chan *proto.FetchInferRequest)
+func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferResponse, error) {
+	inferRequestChan := make(chan *proto.FetchInferResponse)
+
 	go func() {
 		defer close(inferRequestChan)
+		requestIds, err := m.e.doPopRequestQueue(ctx, metadata)
+		if err != nil {
+			logger.Error("PopRequestQueue", zap.Error(err))
+			return
+		}
+
+		for _, requestId := range requestIds {
+			request, err := m.e.doGetRequest(ctx, requestId)
+			if err != nil {
+				logger.Error("GetRequest", zap.Error(err))
+				return
+			}
+			logger.Sugar().Debugf("PopInferRequest request: %v", request)
+			inferRequestChan <- &proto.FetchInferResponse{
+				RequestId: requestId,
+				Input:     request,
+				Metadata:  metadata,
+			}
+		}
 	}()
+
 	return inferRequestChan, nil
 }
 
