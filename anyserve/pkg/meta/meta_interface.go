@@ -40,14 +40,14 @@ type Meta interface {
 	QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error
 	// TODO: Implement
 	// QueueInferRequestStream(ctx context.Context, inferRequestChan <-chan *proto.InferRequest, requestId string) <-chan error
-	// TODO: Implement
-	// QueueSendResponseStream(ctx context.Context, sendResponseRequestChan <-chan *proto.SendResponseRequest) <-chan error
+
+	QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error
 
 	// Pop inference request from
 	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferResponse, error)
 
 	// Pop inference result from response queue
-	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferResponse, error)
+	PopInferResponse(ctx context.Context, requestId string) (<-chan *any, error)
 }
 
 func NewMeta(metaURI string) (Meta, error) {

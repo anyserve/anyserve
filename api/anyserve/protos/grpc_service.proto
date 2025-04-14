@@ -66,5 +66,11 @@ message FetchInferResponse {
 message SendResponseRequest {
     string request_id = 1;
     bytes output = 2;
+    enum Status {
+        PROCESSING = 0;
+        FINISH = 1;
+        ERROR = 2;
+    }
     map<string, string> metadata = 3;
+    map<string, string> metrics = 4;
 }

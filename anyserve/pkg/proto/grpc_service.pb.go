@@ -78,6 +78,55 @@ func (InferResponse_Status) EnumDescriptor() ([]byte, []int) {
 	return file_grpc_service_proto_rawDescGZIP(), []int{3, 0}
 }
 
+type SendResponseRequest_Status int32
+
+const (
+	SendResponseRequest_PROCESSING SendResponseRequest_Status = 0
+	SendResponseRequest_FINISH     SendResponseRequest_Status = 1
+	SendResponseRequest_ERROR      SendResponseRequest_Status = 2
+)
+
+// Enum value maps for SendResponseRequest_Status.
+var (
+	SendResponseRequest_Status_name = map[int32]string{
+		0: "PROCESSING",
+		1: "FINISH",
+		2: "ERROR",
+	}
+	SendResponseRequest_Status_value = map[string]int32{
+		"PROCESSING": 0,
+		"FINISH":     1,
+		"ERROR":      2,
+	}
+)
+
+func (x SendResponseRequest_Status) Enum() *SendResponseRequest_Status {
+	p := new(SendResponseRequest_Status)
+	*p = x
+	return p
+}
+
+func (x SendResponseRequest_Status) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SendResponseRequest_Status) Descriptor() protoreflect.EnumDescriptor {
+	return file_grpc_service_proto_enumTypes[1].Descriptor()
+}
+
+func (SendResponseRequest_Status) Type() protoreflect.EnumType {
+	return &file_grpc_service_proto_enumTypes[1]
+}
+
+func (x SendResponseRequest_Status) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SendResponseRequest_Status.Descriptor instead.
+func (SendResponseRequest_Status) EnumDescriptor() ([]byte, []int) {
+	return file_grpc_service_proto_rawDescGZIP(), []int{6, 0}
+}
+
 type ServerLiveResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Live          bool                   `protobuf:"varint,1,opt,name=live,proto3" json:"live,omitempty"`
@@ -403,6 +452,7 @@ type SendResponseRequest struct {
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	Output        []byte                 `protobuf:"bytes,2,opt,name=output,proto3" json:"output,omitempty"`
 	Metadata      map[string]string      `protobuf:"bytes,3,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metrics       map[string]string      `protobuf:"bytes,4,rep,name=metrics,proto3" json:"metrics,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -458,6 +508,13 @@ func (x *SendResponseRequest) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *SendResponseRequest) GetMetrics() map[string]string {
+	if x != nil {
+		return x.Metrics
+	}
+	return nil
+}
+
 var File_grpc_service_proto protoreflect.FileDescriptor
 
 const file_grpc_service_proto_rawDesc = "" +
@@ -505,15 +562,25 @@ const file_grpc_service_proto_rawDesc = "" +
 	"\bmetadata\x18\x03 \x03(\v2+.inference.FetchInferResponse.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd3\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x87\x03\n" +
 	"\x13SendResponseRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x16\n" +
 	"\x06output\x18\x02 \x01(\fR\x06output\x12H\n" +
-	"\bmetadata\x18\x03 \x03(\v2,.inference.SendResponseRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x03 \x03(\v2,.inference.SendResponseRequest.MetadataEntryR\bmetadata\x12E\n" +
+	"\ametrics\x18\x04 \x03(\v2+.inference.SendResponseRequest.MetricsEntryR\ametrics\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x012\x86\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a:\n" +
+	"\fMetricsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"/\n" +
+	"\x06Status\x12\x0e\n" +
+	"\n" +
+	"PROCESSING\x10\x00\x12\n" +
+	"\n" +
+	"\x06FINISH\x10\x01\x12\t\n" +
+	"\x05ERROR\x10\x022\x86\x03\n" +
 	"\x14GRPCInferenceService\x12K\n" +
 	"\n" +
 	"ServerLive\x12\x1c.inference.ServerLiveRequest\x1a\x1d.inference.ServerLiveResponse\"\x00\x12>\n" +
@@ -535,46 +602,49 @@ func file_grpc_service_proto_rawDescGZIP() []byte {
 	return file_grpc_service_proto_rawDescData
 }
 
-var file_grpc_service_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_grpc_service_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_grpc_service_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_grpc_service_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_grpc_service_proto_goTypes = []any{
-	(InferResponse_Status)(0),   // 0: inference.InferResponse.Status
-	(*ServerLiveResponse)(nil),  // 1: inference.ServerLiveResponse
-	(*ServerLiveRequest)(nil),   // 2: inference.ServerLiveRequest
-	(*InferRequest)(nil),        // 3: inference.InferRequest
-	(*InferResponse)(nil),       // 4: inference.InferResponse
-	(*FetchInferRequest)(nil),   // 5: inference.FetchInferRequest
-	(*FetchInferResponse)(nil),  // 6: inference.FetchInferResponse
-	(*SendResponseRequest)(nil), // 7: inference.SendResponseRequest
-	nil,                         // 8: inference.InferRequest.MetadataEntry
-	nil,                         // 9: inference.InferResponse.MetadataEntry
-	nil,                         // 10: inference.FetchInferRequest.MetadataEntry
-	nil,                         // 11: inference.FetchInferResponse.MetadataEntry
-	nil,                         // 12: inference.SendResponseRequest.MetadataEntry
-	(*emptypb.Empty)(nil),       // 13: google.protobuf.Empty
+	(InferResponse_Status)(0),       // 0: inference.InferResponse.Status
+	(SendResponseRequest_Status)(0), // 1: inference.SendResponseRequest.Status
+	(*ServerLiveResponse)(nil),      // 2: inference.ServerLiveResponse
+	(*ServerLiveRequest)(nil),       // 3: inference.ServerLiveRequest
+	(*InferRequest)(nil),            // 4: inference.InferRequest
+	(*InferResponse)(nil),           // 5: inference.InferResponse
+	(*FetchInferRequest)(nil),       // 6: inference.FetchInferRequest
+	(*FetchInferResponse)(nil),      // 7: inference.FetchInferResponse
+	(*SendResponseRequest)(nil),     // 8: inference.SendResponseRequest
+	nil,                             // 9: inference.InferRequest.MetadataEntry
+	nil,                             // 10: inference.InferResponse.MetadataEntry
+	nil,                             // 11: inference.FetchInferRequest.MetadataEntry
+	nil,                             // 12: inference.FetchInferResponse.MetadataEntry
+	nil,                             // 13: inference.SendResponseRequest.MetadataEntry
+	nil,                             // 14: inference.SendResponseRequest.MetricsEntry
+	(*emptypb.Empty)(nil),           // 15: google.protobuf.Empty
 }
 var file_grpc_service_proto_depIdxs = []int32{
-	8,  // 0: inference.InferRequest.metadata:type_name -> inference.InferRequest.MetadataEntry
+	9,  // 0: inference.InferRequest.metadata:type_name -> inference.InferRequest.MetadataEntry
 	0,  // 1: inference.InferResponse.status:type_name -> inference.InferResponse.Status
-	9,  // 2: inference.InferResponse.metadata:type_name -> inference.InferResponse.MetadataEntry
-	10, // 3: inference.FetchInferRequest.metadata:type_name -> inference.FetchInferRequest.MetadataEntry
-	11, // 4: inference.FetchInferResponse.metadata:type_name -> inference.FetchInferResponse.MetadataEntry
-	12, // 5: inference.SendResponseRequest.metadata:type_name -> inference.SendResponseRequest.MetadataEntry
-	2,  // 6: inference.GRPCInferenceService.ServerLive:input_type -> inference.ServerLiveRequest
-	3,  // 7: inference.GRPCInferenceService.Infer:input_type -> inference.InferRequest
-	3,  // 8: inference.GRPCInferenceService.InferStream:input_type -> inference.InferRequest
-	5,  // 9: inference.GRPCInferenceService.FetchInfer:input_type -> inference.FetchInferRequest
-	7,  // 10: inference.GRPCInferenceService.SendResponse:input_type -> inference.SendResponseRequest
-	1,  // 11: inference.GRPCInferenceService.ServerLive:output_type -> inference.ServerLiveResponse
-	4,  // 12: inference.GRPCInferenceService.Infer:output_type -> inference.InferResponse
-	4,  // 13: inference.GRPCInferenceService.InferStream:output_type -> inference.InferResponse
-	6,  // 14: inference.GRPCInferenceService.FetchInfer:output_type -> inference.FetchInferResponse
-	13, // 15: inference.GRPCInferenceService.SendResponse:output_type -> google.protobuf.Empty
-	11, // [11:16] is the sub-list for method output_type
-	6,  // [6:11] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	10, // 2: inference.InferResponse.metadata:type_name -> inference.InferResponse.MetadataEntry
+	11, // 3: inference.FetchInferRequest.metadata:type_name -> inference.FetchInferRequest.MetadataEntry
+	12, // 4: inference.FetchInferResponse.metadata:type_name -> inference.FetchInferResponse.MetadataEntry
+	13, // 5: inference.SendResponseRequest.metadata:type_name -> inference.SendResponseRequest.MetadataEntry
+	14, // 6: inference.SendResponseRequest.metrics:type_name -> inference.SendResponseRequest.MetricsEntry
+	3,  // 7: inference.GRPCInferenceService.ServerLive:input_type -> inference.ServerLiveRequest
+	4,  // 8: inference.GRPCInferenceService.Infer:input_type -> inference.InferRequest
+	4,  // 9: inference.GRPCInferenceService.InferStream:input_type -> inference.InferRequest
+	6,  // 10: inference.GRPCInferenceService.FetchInfer:input_type -> inference.FetchInferRequest
+	8,  // 11: inference.GRPCInferenceService.SendResponse:input_type -> inference.SendResponseRequest
+	2,  // 12: inference.GRPCInferenceService.ServerLive:output_type -> inference.ServerLiveResponse
+	5,  // 13: inference.GRPCInferenceService.Infer:output_type -> inference.InferResponse
+	5,  // 14: inference.GRPCInferenceService.InferStream:output_type -> inference.InferResponse
+	7,  // 15: inference.GRPCInferenceService.FetchInfer:output_type -> inference.FetchInferResponse
+	15, // 16: inference.GRPCInferenceService.SendResponse:output_type -> google.protobuf.Empty
+	12, // [12:17] is the sub-list for method output_type
+	7,  // [7:12] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_grpc_service_proto_init() }
@@ -588,8 +658,8 @@ func file_grpc_service_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_grpc_service_proto_rawDesc), len(file_grpc_service_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   12,
+			NumEnums:      2,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
