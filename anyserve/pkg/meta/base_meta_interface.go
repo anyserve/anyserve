@@ -109,7 +109,7 @@ func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-ch
 	go func() {
 		defer close(inferResponseChan)
 		for {
-			exists, err := m.e.doExists(ctx, requestId)
+			exists, err := m.e.doResponseQueueExists(ctx, requestId)
 			if err != nil {
 				logger.Error("QueueExists", zap.Error(err))
 				return

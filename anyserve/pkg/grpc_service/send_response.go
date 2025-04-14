@@ -9,11 +9,13 @@ import (
 
 // SendResponse implements the SendResponse RPC method
 func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendResponseServer) error {
+
 	for {
 		sendResponseRequest, err := stream.Recv()
 		if err == io.EOF {
 			return stream.SendAndClose(&emptypb.Empty{})
 		}
+
 		if err != nil {
 			return err
 		}
@@ -22,4 +24,5 @@ func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendRe
 			return err
 		}
 	}
+
 }

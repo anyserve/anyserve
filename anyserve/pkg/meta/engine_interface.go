@@ -20,5 +20,5 @@ type engine interface {
 	doPushResponseQueue(ctx context.Context, requestId string, response *proto.ResponseCore) error
 	doPopResponseQueue(ctx context.Context, requestId string) (*proto.ResponseCore, error)
 
-	doExists(ctx context.Context, key string) (bool, error)
+	doResponseQueueExists(ctx context.Context, requestId string) (bool, error)
 }

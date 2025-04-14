@@ -96,7 +96,7 @@ func (m *redisMeta) doPopRequestQueue(ctx context.Context, metadata map[string]s
 	searchResult, err := m.rdb.FTSearchWithArgs(ctx, "tsIndex", "*", &redis.FTSearchOptions{
 		SortBy: []redis.FTSearchSortBy{
 			{
-				FieldName: "_timestamp",
+				FieldName: "@timestamp",
 				Asc:       true,
 			},
 		},
@@ -156,8 +156,8 @@ func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (*
 	return &response, nil
 }
 
-func (m *redisMeta) doExists(ctx context.Context, key string) (bool, error) {
-	exists, err := m.rdb.Exists(ctx, m.key("response:"+key)).Result()
+func (m *redisMeta) doResponseQueueExists(ctx context.Context, requestId string) (bool, error) {
+	exists, err := m.rdb.Exists(ctx, m.key("response:"+requestId)).Result()
 	return exists > 0, err
 }
 
