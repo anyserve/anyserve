@@ -22,8 +22,7 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 	if req.Infer.Metadata == nil {
 		req.Infer.Metadata = make(map[string]string)
 	}
-
-	// inject timestamp to request metadata
+	// inject timestamp to request metadata for basic schedule
 	if _, ok := req.Infer.Metadata[config.INFER_METADATA_TIMESTAMP]; !ok {
 		req.Infer.Metadata[config.INFER_METADATA_TIMESTAMP] = strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
@@ -38,16 +37,21 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 		return err
 	}
 
+	// send ACK to client
 	ack := &proto.ResponseCore{
 		Output: []byte(""),
 		Metadata: map[string]string{
 			config.RESPONSE_METADATA_TYPE: config.RESPONSE_METADATA_TYPE_VALUE_ACK,
 		},
 	}
-	_ = stream.Send(&proto.InferResponse{
+	err = stream.Send(&proto.InferResponse{
 		RequestId: requestID,
 		Response:  ack,
 	})
+	if err != nil {
+		_logger.Error("Failed to send ACK", zap.Error(err))
+		return err
+	}
 
 	responseCoreChan, err := s.meta.PopInferResponse(ctx, requestID)
 	if err != nil {
