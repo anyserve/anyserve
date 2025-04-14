@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/anyserve/anyserve/pkg/proto"
 	"github.com/redis/go-redis/v9"
+	protobufproto "google.golang.org/protobuf/proto"
 )
 
 // FT.CREATE tsIndex ON HASH PREFIX 1 "meta:" SCHEMA _timestamp NUMERIC SORTABLE
@@ -133,12 +135,25 @@ func (m *redisMeta) doGetRequest(ctx context.Context, requestId string) ([]byte,
 	return m.rdb.Get(ctx, m.key(requestId)).Bytes()
 }
 
-func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, response any) error {
-	return m.rdb.RPush(ctx, m.key("response:"+requestId), response).Err()
+func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, response *proto.ResponseCore) error {
+	data, err := protobufproto.Marshal(response)
+	if err != nil {
+		return err
+	}
+	return m.rdb.RPush(ctx, m.key("response:"+requestId), data).Err()
 }
 
-func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (any, error) {
-	return m.rdb.LPop(ctx, m.key("response:"+requestId)).Result()
+func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (*proto.ResponseCore, error) {
+	result, err := m.rdb.LPop(ctx, m.key("response:"+requestId)).Result()
+	if err != nil {
+		return nil, err
+	}
+	var response proto.ResponseCore
+	err = protobufproto.Unmarshal([]byte(result), &response)
+	if err != nil {
+		return nil, err
+	}
+	return &response, nil
 }
 
 func (m *redisMeta) doExists(ctx context.Context, key string) (bool, error) {

@@ -33,14 +33,25 @@ message ServerLiveResponse {
 message ServerLiveRequest {
 }
 
-message InferRequest {
+message InferCore {
     bytes input = 1;
     map<string, string> metadata = 2;
 }
 
+message ResponseCore {
+    bytes output = 1;
+    map<string, string> metadata = 2;
+}
+
+message InferRequest {
+    InferCore infer = 1;
+}
+
+
+
 message InferResponse {
     string request_id = 1;
-    optional bytes output = 2;
+    optional ResponseCore response = 2;
     enum Status {
         UNKNOWN = 0;
         ACK = 1;
@@ -49,7 +60,6 @@ message InferResponse {
         ERROR = 4;
     }
     optional Status status = 3;
-    map<string, string> metadata = 4;
 }
 
 message FetchInferRequest
@@ -59,18 +69,18 @@ message FetchInferRequest
 
 message FetchInferResponse {
     string request_id = 1;
-    bytes input = 2;
-    map<string, string> metadata = 3;
+    InferCore infer = 2;
 }
 
 message SendResponseRequest {
     string request_id = 1;
-    bytes output = 2;
+    optional ResponseCore response = 2;
+    
     enum Status {
         PROCESSING = 0;
         FINISH = 1;
         ERROR = 2;
     }
-    map<string, string> metadata = 3;
+    optional Status status = 3;
     map<string, string> metrics = 4;
 }

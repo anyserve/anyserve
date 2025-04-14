@@ -36,18 +36,13 @@ type Meta interface {
 	// Load the meta data from the backend
 	Load() (*Format, error)
 
-	// Queue an inference request to Queue
 	QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error
+	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferResponse, error)
 	// TODO: Implement
 	// QueueInferRequestStream(ctx context.Context, inferRequestChan <-chan *proto.InferRequest, requestId string) <-chan error
 
 	QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error
-
-	// Pop inference request from
-	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferResponse, error)
-
-	// Pop inference result from response queue
-	PopInferResponse(ctx context.Context, requestId string) (<-chan *any, error)
+	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.ResponseCore, error)
 }
 
 func NewMeta(metaURI string) (Meta, error) {

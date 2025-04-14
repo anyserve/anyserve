@@ -1,6 +1,10 @@
 package meta
 
-import "context"
+import (
+	"context"
+
+	"github.com/anyserve/anyserve/pkg/proto"
+)
 
 // engine define the operations of the meta engine
 type engine interface {
@@ -13,8 +17,8 @@ type engine interface {
 	doPopRequestQueue(ctx context.Context, metadata map[string]string) ([]string, error)
 	doGetRequest(ctx context.Context, requestId string) ([]byte, error)
 
-	doPushResponseQueue(ctx context.Context, requestId string, response any) error
-	doPopResponseQueue(ctx context.Context, requestId string) (any, error)
+	doPushResponseQueue(ctx context.Context, requestId string, response *proto.ResponseCore) error
+	doPopResponseQueue(ctx context.Context, requestId string) (*proto.ResponseCore, error)
 
 	doExists(ctx context.Context, key string) (bool, error)
 }

@@ -56,12 +56,12 @@ func (m *baseMeta) Load() (*Format, error) {
 func (m *baseMeta) QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error {
 	logger := zap.L().With(zap.String("request_id", requestId))
 	var err error
-	err = m.e.doSetRequest(ctx, requestId, proto.Input)
+	err = m.e.doSetRequest(ctx, requestId, proto.Infer.Input)
 	if err != nil {
 		logger.Error("SetRequest", zap.Error(err))
 		return err
 	}
-	err = m.e.doPushRequestQueue(ctx, requestId, proto.Metadata)
+	err = m.e.doPushRequestQueue(ctx, requestId, proto.Infer.Metadata)
 	if err != nil {
 		logger.Error("PushRequestQueue", zap.Error(err))
 		return err
@@ -88,8 +88,7 @@ func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]stri
 			logger.Sugar().Debugf("PopInferRequest request: %v", request)
 			inferRequestChan <- &proto.FetchInferResponse{
 				RequestId: requestId,
-				Input:     request,
-				Metadata:  metadata,
+				Infer:     &proto.InferCore{Input: request, Metadata: metadata},
 			}
 		}
 	}()
@@ -98,15 +97,15 @@ func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]stri
 }
 
 func (m *baseMeta) QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error {
-	err := m.e.doPushResponseQueue(ctx, sendResponseRequest.RequestId, sendResponseRequest.Output)
+	err := m.e.doPushResponseQueue(ctx, sendResponseRequest.RequestId, sendResponseRequest.Response)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-chan *any, error) {
-	inferResponseChan := make(chan *any)
+func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.ResponseCore, error) {
+	inferResponseChan := make(chan *proto.ResponseCore)
 	go func() {
 		defer close(inferResponseChan)
 		for {
@@ -123,7 +122,7 @@ func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-ch
 				logger.Error("PopInferResponse", zap.Error(err))
 				return
 			}
-			inferResponseChan <- &response
+			inferResponseChan <- response
 		}
 	}()
 	return inferResponseChan, nil
