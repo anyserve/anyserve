@@ -97,12 +97,20 @@ func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]stri
 	return inferRequestChan, nil
 }
 
-func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferResponse, error) {
-	inferResponseChan := make(chan *proto.InferResponse)
+func (m *baseMeta) QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error {
+	err := m.e.doPushResponseQueue(ctx, sendResponseRequest.RequestId, sendResponseRequest.Output)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-chan *any, error) {
+	inferResponseChan := make(chan *any)
 	go func() {
 		defer close(inferResponseChan)
 		for {
-			exists, err := m.e.doExists(ctx, fmt.Sprintf("r:%s", requestId))
+			exists, err := m.e.doExists(ctx, requestId)
 			if err != nil {
 				logger.Error("QueueExists", zap.Error(err))
 				return
@@ -110,12 +118,12 @@ func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-ch
 			if !exists {
 				continue
 			}
-			response, err := m.e.doPopResponseQueue(ctx, fmt.Sprintf("r:%s", requestId))
+			response, err := m.e.doPopResponseQueue(ctx, requestId)
 			if err != nil {
 				logger.Error("PopInferResponse", zap.Error(err))
 				return
 			}
-			inferResponseChan <- response.(*proto.InferResponse)
+			inferResponseChan <- &response
 		}
 	}()
 	return inferResponseChan, nil

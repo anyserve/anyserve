@@ -67,7 +67,6 @@ func (m *redisMeta) doInit(format *Format, force bool) error {
 		return fmt.Errorf("json: %s", err)
 	}
 
-	logger.Sugar().Debugf("Redis SET %s %s", m.key("setting"), data)
 	if err = m.rdb.Set(ctx, m.key("setting"), data, 0).Err(); err != nil {
 		return err
 	}
@@ -75,7 +74,6 @@ func (m *redisMeta) doInit(format *Format, force bool) error {
 }
 
 func (m *redisMeta) doLoad() ([]byte, error) {
-	logger.Sugar().Debugf("Redis GET %s", m.key("setting"))
 	body, err := m.rdb.Get(context.Background(), m.key("setting")).Bytes()
 	if err == redis.Nil {
 		return nil, nil
@@ -84,19 +82,16 @@ func (m *redisMeta) doLoad() ([]byte, error) {
 }
 
 func (m *redisMeta) doSetRequest(ctx context.Context, requestId string, input []byte) error {
-	logger.Sugar().Debugf("Redis SET %s %s", requestId, input)
 	return m.rdb.Set(ctx, m.key(requestId), input, 0).Err()
 }
 
 func (m *redisMeta) doPushRequestQueue(ctx context.Context, requestId string, metadata map[string]string) error {
-	logger.Sugar().Debugf("Redis HSET %s %v", requestId, metadata)
 	return m.rdb.HSet(ctx, m.key("meta:"+requestId), metadata).Err()
 }
 
 func (m *redisMeta) doPopRequestQueue(ctx context.Context, metadata map[string]string) ([]string, error) {
-	logger.Sugar().Debugf("Redis FT.SEARCH tsIndex * SORTBY _timestamp ASC LIMIT 0 1")
 
-	result, err := m.rdb.FTSearchWithArgs(ctx, "tsIndex", "*", &redis.FTSearchOptions{
+	searchResult, err := m.rdb.FTSearchWithArgs(ctx, "tsIndex", "*", &redis.FTSearchOptions{
 		SortBy: []redis.FTSearchSortBy{
 			{
 				FieldName: "_timestamp",
@@ -112,38 +107,42 @@ func (m *redisMeta) doPopRequestQueue(ctx context.Context, metadata map[string]s
 		logger.Sugar().Errorf("Redis search error: %v", err)
 		return []string{}, err
 	}
+	if searchResult == nil {
+		return []string{}, nil
+	}
+	_searchResult := searchResult.(map[any]any)
+	if _searchResult == nil {
+		return []string{}, nil
+	}
+	_allDocs := _searchResult["results"].([]any)
+	if len(_allDocs) == 0 {
+		return []string{}, nil
+	}
 
-	resultMap := result.(map[any]any)
-	docs := resultMap["results"].([]any)
-	requestId := docs[0].(map[any]any)["id"].(string)
+	requestId := _allDocs[0].(map[any]any)["id"].(string)
+	requestId = m.unkey(requestId)
 
 	// Remove "meta:" prefix if present
 	if len(requestId) > 5 && requestId[:5] == "meta:" {
 		requestId = requestId[5:]
 	}
-
-	logger.Sugar().Debugf("Found request ID: %s", requestId)
 	return []string{requestId}, nil
 }
 
 func (m *redisMeta) doGetRequest(ctx context.Context, requestId string) ([]byte, error) {
-	logger.Sugar().Debugf("Redis GET %s", requestId)
 	return m.rdb.Get(ctx, m.key(requestId)).Bytes()
 }
 
 func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, response any) error {
-	logger.Sugar().Debugf("Redis RPUSH %s %v", requestId, response)
-	return m.rdb.RPush(ctx, m.key(requestId), response).Err()
+	return m.rdb.RPush(ctx, m.key("response:"+requestId), response).Err()
 }
 
 func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (any, error) {
-	logger.Sugar().Debugf("Redis LPOP %s", requestId)
-	return m.rdb.LPop(ctx, m.key(requestId)).Result()
+	return m.rdb.LPop(ctx, m.key("response:"+requestId)).Result()
 }
 
 func (m *redisMeta) doExists(ctx context.Context, key string) (bool, error) {
-	logger.Sugar().Debugf("Redis EXISTS %s", key)
-	exists, err := m.rdb.Exists(ctx, m.key(key)).Result()
+	exists, err := m.rdb.Exists(ctx, m.key("response:"+key)).Result()
 	return exists > 0, err
 }
 
