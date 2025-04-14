@@ -2,12 +2,10 @@ package grpc_service
 
 import (
 	"context"
-	"reflect"
 	"strconv"
 	"time"
 
 	"github.com/anyserve/anyserve/pkg/proto"
-	"github.com/anyserve/anyserve/pkg/utils"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
@@ -19,13 +17,13 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 
 	_logger := logger.With(zap.String("request_id", requestID))
 
-	if req.Metadata == nil {
-		req.Metadata = make(map[string]string)
+	if req.Infer.Metadata == nil {
+		req.Infer.Metadata = make(map[string]string)
 	}
 
 	// inject timestamp to request metadata
-	if _, ok := req.Metadata["_timestamp"]; !ok {
-		req.Metadata["_timestamp"] = strconv.FormatInt(time.Now().UnixNano(), 10)
+	if _, ok := req.Infer.Metadata["_timestamp"]; !ok {
+		req.Infer.Metadata["_timestamp"] = strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
 
 	err := s.meta.QueueInferRequest(ctx, req, requestID)
@@ -39,9 +37,17 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 		return err
 	}
 
+	// Send ACK to client
+	ack := &proto.ResponseCore{
+		Output: []byte(""),
+		Metadata: map[string]string{
+			"_timestamp": strconv.FormatInt(time.Now().UnixNano(), 10),
+		},
+	}
 	_ = stream.Send(&proto.InferResponse{
 		RequestId: requestID,
 		Status:    proto.InferResponse_ACK.Enum(),
+		Response:  ack,
 	})
 
 	responseChan, err := s.meta.PopInferResponse(ctx, requestID)
@@ -51,16 +57,10 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 	}
 
 	for response := range responseChan {
-		logger.Info("Received inference type", zap.Any("type", reflect.TypeOf(*response)))
-		outputBytes, err := utils.ToBytes(*response)
-		if err != nil {
-			_logger.Error("Failed to convert inference response to []byte", zap.Error(err))
-			return err
-		}
 		if err := stream.Send(&proto.InferResponse{
 			RequestId: requestID,
 			Status:    proto.InferResponse_PROCESSING.Enum(),
-			Output:    outputBytes,
+			Response:  response,
 		}); err != nil {
 			_logger.Error("Failed to send inference response", zap.Error(err))
 			return err

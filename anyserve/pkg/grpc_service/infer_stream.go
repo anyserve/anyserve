@@ -26,7 +26,7 @@ func (s *InferenceService) InferStream(stream proto.GRPCInferenceService_InferSt
 
 		if err := stream.Send(&proto.InferResponse{
 			RequestId: requestID,
-			Output:    []byte("processed stream output"),
+			Response:  &proto.ResponseCore{Output: []byte("processed stream output")},
 		}); err != nil {
 			return err
 		}
