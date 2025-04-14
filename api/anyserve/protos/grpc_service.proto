@@ -52,14 +52,6 @@ message InferRequest {
 message InferResponse {
     string request_id = 1;
     optional ResponseCore response = 2;
-    enum Status {
-        UNKNOWN = 0;
-        ACK = 1;
-        PROCESSING = 2;
-        FINISH = 3;
-        ERROR = 4;
-    }
-    optional Status status = 3;
 }
 
 message FetchInferRequest
@@ -74,13 +66,7 @@ message FetchInferResponse {
 
 message SendResponseRequest {
     string request_id = 1;
-    optional ResponseCore response = 2;
-    
-    enum Status {
-        PROCESSING = 0;
-        FINISH = 1;
-        ERROR = 2;
-    }
-    optional Status status = 3;
+    string type = 2;
+    optional ResponseCore response = 3;
     map<string, string> metrics = 4;
 }
