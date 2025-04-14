@@ -32,14 +32,14 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 
 	if err != nil {
 		_logger.Error("Failed to queue inference request", zap.Error(err))
-		stream.Send(&proto.InferResponse{
+		_ = stream.Send(&proto.InferResponse{
 			RequestId: requestID,
 			Status:    proto.InferResponse_ERROR.Enum(),
 		})
 		return err
 	}
 
-	stream.Send(&proto.InferResponse{
+	_ = stream.Send(&proto.InferResponse{
 		RequestId: requestID,
 		Status:    proto.InferResponse_ACK.Enum(),
 	})
@@ -67,7 +67,7 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 		}
 	}
 
-	stream.Send(&proto.InferResponse{
+	_ = stream.Send(&proto.InferResponse{
 		RequestId: requestID,
 		Status:    proto.InferResponse_FINISH.Enum(),
 	})

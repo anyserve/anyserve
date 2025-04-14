@@ -52,7 +52,7 @@ func initFunc(ctx context.Context, cmd *cli.Command) error {
 
 	m, err := meta.NewMeta(metaURI)
 	if err != nil {
-		return fmt.Errorf("Meta client: %w", err)
+		return fmt.Errorf("meta client: %w", err)
 	}
 
 	format, err := m.Load()
@@ -67,10 +67,10 @@ func initFunc(ctx context.Context, cmd *cli.Command) error {
 		}
 	} else {
 		logger.Error("Load meta", zap.Error(err))
-		return fmt.Errorf("Load meta: %w", err)
+		return fmt.Errorf("load meta: %w", err)
 	}
 
-	m.Init(format, cmd.Bool("force"))
+	_ = m.Init(format, cmd.Bool("force"))
 
 	return nil
 }

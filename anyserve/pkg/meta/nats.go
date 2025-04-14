@@ -1,14 +1,11 @@
 package meta
 
 import (
-	"sync"
-
 	"github.com/nats-io/nats.go"
 )
 
 type NATSStorage struct {
 	nc *nats.Conn
-	mu sync.Mutex
 }
 
 func NewNATSStorage(url string) *NATSStorage {

@@ -16,9 +16,8 @@ var loggers = make(map[string]*logHandle)
 
 type logHandle struct {
 	*zap.Logger
-	sugar *zap.SugaredLogger
-	name  string
-	pid   int
+	name string
+	pid  int
 }
 
 func GetLogger(name string) *logHandle {
@@ -56,7 +55,6 @@ func newLogger(name string) *logHandle {
 	logger, _ := logConfig.Build()
 
 	l := &logHandle{Logger: logger, name: name, pid: pid}
-	l.sugar = l.Logger.Sugar()
 	return l
 }
 

@@ -17,6 +17,9 @@ func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendRe
 		if err != nil {
 			return err
 		}
-		s.meta.QueueSendResponseStream(stream.Context(), sendResponseRequest)
+		err = s.meta.QueueSendResponseStream(stream.Context(), sendResponseRequest)
+		if err != nil {
+			return err
+		}
 	}
 }
