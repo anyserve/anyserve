@@ -47,7 +47,7 @@ upgrade:
 	go get -u ./... && go mod tidy
 
 dev: build
-	$(BINARY_PATH)
+	$(BINARY_PATH) serve redis://localhost -v
 
 help:
 	@echo "Available commands:"
