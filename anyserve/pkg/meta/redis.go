@@ -96,7 +96,7 @@ func (m *redisMeta) doPopRequestQueue(ctx context.Context, metadata map[string]s
 	searchResult, err := m.rdb.FTSearchWithArgs(ctx, "tsIndex", "*", &redis.FTSearchOptions{
 		SortBy: []redis.FTSearchSortBy{
 			{
-				FieldName: "@timestamp",
+				FieldName: "_timestamp",
 				Asc:       true,
 			},
 		},
