@@ -42,7 +42,7 @@ type Meta interface {
 	// QueueInferRequestStream(ctx context.Context, inferRequestChan <-chan *proto.InferRequest, requestId string) <-chan error
 
 	QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error
-	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.ResponseCore, error)
+	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferCore, error)
 }
 
 func NewMeta(metaURI string) (Meta, error) {

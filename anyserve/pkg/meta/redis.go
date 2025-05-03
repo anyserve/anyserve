@@ -135,7 +135,7 @@ func (m *redisMeta) doGetRequest(ctx context.Context, requestId string) ([]byte,
 	return m.rdb.Get(ctx, m.key(requestId)).Bytes()
 }
 
-func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, response *proto.ResponseCore) error {
+func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, response *proto.InferCore) error {
 	data, err := protobufproto.Marshal(response)
 	if err != nil {
 		return err
@@ -143,12 +143,12 @@ func (m *redisMeta) doPushResponseQueue(ctx context.Context, requestId string, r
 	return m.rdb.RPush(ctx, m.key("response:"+requestId), data).Err()
 }
 
-func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (*proto.ResponseCore, error) {
+func (m *redisMeta) doPopResponseQueue(ctx context.Context, requestId string) (*proto.InferCore, error) {
 	result, err := m.rdb.LPop(ctx, m.key("response:"+requestId)).Result()
 	if err != nil {
 		return nil, err
 	}
-	var response proto.ResponseCore
+	var response proto.InferCore
 	err = protobufproto.Unmarshal([]byte(result), &response)
 	if err != nil {
 		return nil, err

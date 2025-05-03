@@ -38,8 +38,7 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 	}
 
 	// send ACK to client
-	ack := &proto.ResponseCore{
-		Output: []byte(""),
+	ack := &proto.InferCore{
 		Metadata: map[string]string{
 			config.RESPONSE_METADATA_TYPE: config.RESPONSE_METADATA_TYPE_VALUE_ACK,
 		},
@@ -53,29 +52,29 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 		return err
 	}
 
-	responseCoreChan, err := s.meta.PopInferResponse(ctx, requestID)
+	responseChan, err := s.meta.PopInferResponse(ctx, requestID)
 	if err != nil {
 		_logger.Error("Failed to pop inference response", zap.Error(err))
 		return err
 	}
 
-	for responseCore := range responseCoreChan {
-		switch responseCore.Metadata[config.RESPONSE_METADATA_TYPE] {
+	for response := range responseChan {
+		switch response.Metadata[config.RESPONSE_METADATA_TYPE] {
 		case config.RESPONSE_METADATA_TYPE_VALUE_FINISH:
 			return nil
 		case config.RESPONSE_METADATA_TYPE_VALUE_FAILED:
-			_logger.Error("Inference response error", zap.String("error", string(responseCore.Output)))
+			_logger.Error("Inference response error", zap.String("error", string(response.Content)))
 			return errors.New("inference response error")
 		case config.RESPONSE_METADATA_TYPE_VALUE_PROCESSING:
 			if err := stream.Send(&proto.InferResponse{
 				RequestId: requestID,
-				Response:  responseCore,
+				Response:  response,
 			}); err != nil {
 				_logger.Error("Failed to send inference response", zap.Error(err))
 				return err
 			}
 		default:
-			_logger.Error("Unknown inference response type", zap.String("type", responseCore.Metadata[config.RESPONSE_METADATA_TYPE]))
+			_logger.Error("Unknown inference response type", zap.String("type", response.Metadata[config.RESPONSE_METADATA_TYPE]))
 			return errors.New("unknown inference response type")
 		}
 	}

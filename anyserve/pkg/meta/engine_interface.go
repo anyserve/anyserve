@@ -17,8 +17,8 @@ type engine interface {
 	doPopRequestQueue(ctx context.Context, metadata map[string]string) ([]string, error)
 	doGetRequest(ctx context.Context, requestId string) ([]byte, error)
 
-	doPushResponseQueue(ctx context.Context, requestId string, response *proto.ResponseCore) error
-	doPopResponseQueue(ctx context.Context, requestId string) (*proto.ResponseCore, error)
+	doPushResponseQueue(ctx context.Context, requestId string, response *proto.InferCore) error
+	doPopResponseQueue(ctx context.Context, requestId string) (*proto.InferCore, error)
 
 	doResponseQueueExists(ctx context.Context, requestId string) (bool, error)
 }

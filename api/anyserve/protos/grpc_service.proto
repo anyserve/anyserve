@@ -8,38 +8,14 @@ import "google/protobuf/any.proto";
 option go_package = "github.com/anyserve/anyserve/pkg/proto";
 
 service GRPCInferenceService {
-    // Check liveness of the anyserve server
-    rpc ServerLive(ServerLiveRequest) returns (ServerLiveResponse) {}
-
-    // Request anyserve server to infer
     rpc Infer(InferRequest) returns (stream InferResponse) {}
-
-    // Request anyserve server to infer with stream
     rpc InferStream(stream InferRequest) returns (stream InferResponse) {}
-
-    // Client fetch infer request from anyserve server
     rpc FetchInfer(FetchInferRequest) returns (stream FetchInferResponse) {}
-
-    // Client send infer result to anyserve server
     rpc SendResponse(stream SendResponseRequest) returns (google.protobuf.Empty) {}
 }
 
-message ServerLiveResponse {
-    bool live = 1;
-    string version = 2;
-    string hostname = 3;
-}
-
-message ServerLiveRequest {
-}
-
 message InferCore {
-    bytes input = 1;
-    map<string, string> metadata = 2;
-}
-
-message ResponseCore {
-    bytes output = 1;
+    bytes content = 1;
     map<string, string> metadata = 2;
 }
 
@@ -51,7 +27,7 @@ message InferRequest {
 
 message InferResponse {
     string request_id = 1;
-    optional ResponseCore response = 2;
+    optional InferCore response = 2;
 }
 
 message FetchInferRequest
@@ -61,12 +37,11 @@ message FetchInferRequest
 
 message FetchInferResponse {
     string request_id = 1;
-    InferCore infer = 2;
+    optional InferCore infer = 2;
 }
 
 message SendResponseRequest {
     string request_id = 1;
-    string type = 2;
-    optional ResponseCore response = 3;
-    map<string, string> metrics = 4;
+    optional InferCore response = 2;
+    map<string, string> metrics = 3;
 }
