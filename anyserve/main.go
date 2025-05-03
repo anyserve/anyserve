@@ -13,6 +13,6 @@ var logger = utils.GetLogger("cmd")
 func main() {
 	err := cmd.Main(os.Args)
 	if err != nil {
-		logger.Fatal("failed to run command", zap.Error(err))
+		logger.Fatal("Failed to run command", zap.Error(err))
 	}
 }
