@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/anyserve/anyserve/pkg/config"
 	"github.com/anyserve/anyserve/pkg/proto"
 	"github.com/redis/go-redis/v9"
 	protobufproto "google.golang.org/protobuf/proto"
 )
 
-// FT.CREATE tsIndex ON HASH PREFIX 1 "meta:" SCHEMA _timestamp NUMERIC SORTABLE
-// FT.SEARCH tsIndex "*" SORTBY _timestamp ASC LIMIT 0 1
+// FT.CREATE tsIndex ON HASH PREFIX 1 "meta:" SCHEMA @timestamp NUMERIC SORTABLE
+// FT.SEARCH tsIndex "*" SORTBY @timestamp ASC LIMIT 0 1
 
 type redisMeta struct {
 	*baseMeta
@@ -96,7 +97,7 @@ func (m *redisMeta) doPopRequestQueue(ctx context.Context, metadata map[string]s
 	searchResult, err := m.rdb.FTSearchWithArgs(ctx, "tsIndex", "*", &redis.FTSearchOptions{
 		SortBy: []redis.FTSearchSortBy{
 			{
-				FieldName: "_timestamp",
+				FieldName: config.INFER_METADATA_TIMESTAMP,
 				Asc:       true,
 			},
 		},

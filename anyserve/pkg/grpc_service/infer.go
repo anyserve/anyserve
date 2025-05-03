@@ -62,6 +62,13 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 		switch response.Metadata[config.RESPONSE_METADATA_TYPE] {
 		case config.RESPONSE_METADATA_TYPE_VALUE_FINISH:
 			_logger.Debug(fmt.Sprintf("Infer response finished: %v", response))
+			if err := stream.Send(&proto.InferResponse{
+				RequestId: requestID,
+				Response:  response,
+			}); err != nil {
+				_logger.Error("Failed to send infer response", zap.Error(err))
+				return err
+			}
 			return nil
 		case config.RESPONSE_METADATA_TYPE_VALUE_FAILED:
 			_logger.Error("Infer response error", zap.String("error", string(response.Content)))
