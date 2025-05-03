@@ -20,7 +20,6 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	GRPCInferenceService_ServerLive_FullMethodName   = "/inference.GRPCInferenceService/ServerLive"
 	GRPCInferenceService_Infer_FullMethodName        = "/inference.GRPCInferenceService/Infer"
 	GRPCInferenceService_InferStream_FullMethodName  = "/inference.GRPCInferenceService/InferStream"
 	GRPCInferenceService_FetchInfer_FullMethodName   = "/inference.GRPCInferenceService/FetchInfer"
@@ -31,15 +30,9 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type GRPCInferenceServiceClient interface {
-	// Check liveness of the anyserve server
-	ServerLive(ctx context.Context, in *ServerLiveRequest, opts ...grpc.CallOption) (*ServerLiveResponse, error)
-	// Request anyserve server to infer
 	Infer(ctx context.Context, in *InferRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[InferResponse], error)
-	// Request anyserve server to infer with stream
 	InferStream(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[InferRequest, InferResponse], error)
-	// Client fetch infer request from anyserve server
 	FetchInfer(ctx context.Context, in *FetchInferRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchInferResponse], error)
-	// Client send infer result to anyserve server
 	SendResponse(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[SendResponseRequest, emptypb.Empty], error)
 }
 
@@ -49,16 +42,6 @@ type gRPCInferenceServiceClient struct {
 
 func NewGRPCInferenceServiceClient(cc grpc.ClientConnInterface) GRPCInferenceServiceClient {
 	return &gRPCInferenceServiceClient{cc}
-}
-
-func (c *gRPCInferenceServiceClient) ServerLive(ctx context.Context, in *ServerLiveRequest, opts ...grpc.CallOption) (*ServerLiveResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ServerLiveResponse)
-	err := c.cc.Invoke(ctx, GRPCInferenceService_ServerLive_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 func (c *gRPCInferenceServiceClient) Infer(ctx context.Context, in *InferRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[InferResponse], error) {
@@ -129,15 +112,9 @@ type GRPCInferenceService_SendResponseClient = grpc.ClientStreamingClient[SendRe
 // All implementations should embed UnimplementedGRPCInferenceServiceServer
 // for forward compatibility.
 type GRPCInferenceServiceServer interface {
-	// Check liveness of the anyserve server
-	ServerLive(context.Context, *ServerLiveRequest) (*ServerLiveResponse, error)
-	// Request anyserve server to infer
 	Infer(*InferRequest, grpc.ServerStreamingServer[InferResponse]) error
-	// Request anyserve server to infer with stream
 	InferStream(grpc.BidiStreamingServer[InferRequest, InferResponse]) error
-	// Client fetch infer request from anyserve server
 	FetchInfer(*FetchInferRequest, grpc.ServerStreamingServer[FetchInferResponse]) error
-	// Client send infer result to anyserve server
 	SendResponse(grpc.ClientStreamingServer[SendResponseRequest, emptypb.Empty]) error
 }
 
@@ -148,9 +125,6 @@ type GRPCInferenceServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedGRPCInferenceServiceServer struct{}
 
-func (UnimplementedGRPCInferenceServiceServer) ServerLive(context.Context, *ServerLiveRequest) (*ServerLiveResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method ServerLive not implemented")
-}
 func (UnimplementedGRPCInferenceServiceServer) Infer(*InferRequest, grpc.ServerStreamingServer[InferResponse]) error {
 	return status.Errorf(codes.Unimplemented, "method Infer not implemented")
 }
@@ -181,24 +155,6 @@ func RegisterGRPCInferenceServiceServer(s grpc.ServiceRegistrar, srv GRPCInferen
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&GRPCInferenceService_ServiceDesc, srv)
-}
-
-func _GRPCInferenceService_ServerLive_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ServerLiveRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(GRPCInferenceServiceServer).ServerLive(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: GRPCInferenceService_ServerLive_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(GRPCInferenceServiceServer).ServerLive(ctx, req.(*ServerLiveRequest))
-	}
-	return interceptor(ctx, in, info, handler)
 }
 
 func _GRPCInferenceService_Infer_Handler(srv interface{}, stream grpc.ServerStream) error {
@@ -243,12 +199,7 @@ type GRPCInferenceService_SendResponseServer = grpc.ClientStreamingServer[SendRe
 var GRPCInferenceService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "inference.GRPCInferenceService",
 	HandlerType: (*GRPCInferenceServiceServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "ServerLive",
-			Handler:    _GRPCInferenceService_ServerLive_Handler,
-		},
-	},
+	Methods:     []grpc.MethodDesc{},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "Infer",

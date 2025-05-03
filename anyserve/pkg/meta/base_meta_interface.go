@@ -56,7 +56,7 @@ func (m *baseMeta) Load() (*Format, error) {
 func (m *baseMeta) QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error {
 	logger := zap.L().With(zap.String("request_id", requestId))
 	var err error
-	err = m.e.doSetRequest(ctx, requestId, proto.Infer.Input)
+	err = m.e.doSetRequest(ctx, requestId, proto.Infer.Content)
 	if err != nil {
 		logger.Error("SetRequest", zap.Error(err))
 		return err
@@ -88,7 +88,7 @@ func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]stri
 			logger.Sugar().Debugf("PopInferRequest request: %v", request)
 			inferRequestChan <- &proto.FetchInferResponse{
 				RequestId: requestId,
-				Infer:     &proto.InferCore{Input: request, Metadata: metadata},
+				Infer:     &proto.InferCore{Content: request, Metadata: metadata},
 			}
 		}
 	}()
@@ -104,8 +104,8 @@ func (m *baseMeta) QueueSendResponseStream(ctx context.Context, sendResponseRequ
 	return nil
 }
 
-func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.ResponseCore, error) {
-	inferResponseChan := make(chan *proto.ResponseCore)
+func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferCore, error) {
+	inferResponseChan := make(chan *proto.InferCore)
 	go func() {
 		defer close(inferResponseChan)
 		for {

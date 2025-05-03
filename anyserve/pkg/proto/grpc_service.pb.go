@@ -23,105 +23,9 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-type ServerLiveResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Live          bool                   `protobuf:"varint,1,opt,name=live,proto3" json:"live,omitempty"`
-	Version       string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	Hostname      string                 `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ServerLiveResponse) Reset() {
-	*x = ServerLiveResponse{}
-	mi := &file_grpc_service_proto_msgTypes[0]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ServerLiveResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ServerLiveResponse) ProtoMessage() {}
-
-func (x *ServerLiveResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[0]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ServerLiveResponse.ProtoReflect.Descriptor instead.
-func (*ServerLiveResponse) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{0}
-}
-
-func (x *ServerLiveResponse) GetLive() bool {
-	if x != nil {
-		return x.Live
-	}
-	return false
-}
-
-func (x *ServerLiveResponse) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *ServerLiveResponse) GetHostname() string {
-	if x != nil {
-		return x.Hostname
-	}
-	return ""
-}
-
-type ServerLiveRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ServerLiveRequest) Reset() {
-	*x = ServerLiveRequest{}
-	mi := &file_grpc_service_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ServerLiveRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ServerLiveRequest) ProtoMessage() {}
-
-func (x *ServerLiveRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ServerLiveRequest.ProtoReflect.Descriptor instead.
-func (*ServerLiveRequest) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{1}
-}
-
 type InferCore struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Input         []byte                 `protobuf:"bytes,1,opt,name=input,proto3" json:"input,omitempty"`
+	Content       []byte                 `protobuf:"bytes,1,opt,name=content,proto3" json:"content,omitempty"`
 	Metadata      map[string]string      `protobuf:"bytes,2,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -129,7 +33,7 @@ type InferCore struct {
 
 func (x *InferCore) Reset() {
 	*x = InferCore{}
-	mi := &file_grpc_service_proto_msgTypes[2]
+	mi := &file_grpc_service_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -141,7 +45,7 @@ func (x *InferCore) String() string {
 func (*InferCore) ProtoMessage() {}
 
 func (x *InferCore) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[2]
+	mi := &file_grpc_service_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -154,69 +58,17 @@ func (x *InferCore) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InferCore.ProtoReflect.Descriptor instead.
 func (*InferCore) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{2}
+	return file_grpc_service_proto_rawDescGZIP(), []int{0}
 }
 
-func (x *InferCore) GetInput() []byte {
+func (x *InferCore) GetContent() []byte {
 	if x != nil {
-		return x.Input
+		return x.Content
 	}
 	return nil
 }
 
 func (x *InferCore) GetMetadata() map[string]string {
-	if x != nil {
-		return x.Metadata
-	}
-	return nil
-}
-
-type ResponseCore struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Output        []byte                 `protobuf:"bytes,1,opt,name=output,proto3" json:"output,omitempty"`
-	Metadata      map[string]string      `protobuf:"bytes,2,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ResponseCore) Reset() {
-	*x = ResponseCore{}
-	mi := &file_grpc_service_proto_msgTypes[3]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ResponseCore) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ResponseCore) ProtoMessage() {}
-
-func (x *ResponseCore) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[3]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ResponseCore.ProtoReflect.Descriptor instead.
-func (*ResponseCore) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{3}
-}
-
-func (x *ResponseCore) GetOutput() []byte {
-	if x != nil {
-		return x.Output
-	}
-	return nil
-}
-
-func (x *ResponseCore) GetMetadata() map[string]string {
 	if x != nil {
 		return x.Metadata
 	}
@@ -232,7 +84,7 @@ type InferRequest struct {
 
 func (x *InferRequest) Reset() {
 	*x = InferRequest{}
-	mi := &file_grpc_service_proto_msgTypes[4]
+	mi := &file_grpc_service_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -244,7 +96,7 @@ func (x *InferRequest) String() string {
 func (*InferRequest) ProtoMessage() {}
 
 func (x *InferRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[4]
+	mi := &file_grpc_service_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -257,7 +109,7 @@ func (x *InferRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InferRequest.ProtoReflect.Descriptor instead.
 func (*InferRequest) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{4}
+	return file_grpc_service_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *InferRequest) GetInfer() *InferCore {
@@ -270,14 +122,14 @@ func (x *InferRequest) GetInfer() *InferCore {
 type InferResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Response      *ResponseCore          `protobuf:"bytes,2,opt,name=response,proto3,oneof" json:"response,omitempty"`
+	Response      *InferCore             `protobuf:"bytes,2,opt,name=response,proto3,oneof" json:"response,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *InferResponse) Reset() {
 	*x = InferResponse{}
-	mi := &file_grpc_service_proto_msgTypes[5]
+	mi := &file_grpc_service_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -289,7 +141,7 @@ func (x *InferResponse) String() string {
 func (*InferResponse) ProtoMessage() {}
 
 func (x *InferResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[5]
+	mi := &file_grpc_service_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -302,7 +154,7 @@ func (x *InferResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InferResponse.ProtoReflect.Descriptor instead.
 func (*InferResponse) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{5}
+	return file_grpc_service_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *InferResponse) GetRequestId() string {
@@ -312,7 +164,7 @@ func (x *InferResponse) GetRequestId() string {
 	return ""
 }
 
-func (x *InferResponse) GetResponse() *ResponseCore {
+func (x *InferResponse) GetResponse() *InferCore {
 	if x != nil {
 		return x.Response
 	}
@@ -328,7 +180,7 @@ type FetchInferRequest struct {
 
 func (x *FetchInferRequest) Reset() {
 	*x = FetchInferRequest{}
-	mi := &file_grpc_service_proto_msgTypes[6]
+	mi := &file_grpc_service_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -340,7 +192,7 @@ func (x *FetchInferRequest) String() string {
 func (*FetchInferRequest) ProtoMessage() {}
 
 func (x *FetchInferRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[6]
+	mi := &file_grpc_service_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -353,7 +205,7 @@ func (x *FetchInferRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchInferRequest.ProtoReflect.Descriptor instead.
 func (*FetchInferRequest) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{6}
+	return file_grpc_service_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *FetchInferRequest) GetMetadata() map[string]string {
@@ -366,14 +218,14 @@ func (x *FetchInferRequest) GetMetadata() map[string]string {
 type FetchInferResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Infer         *InferCore             `protobuf:"bytes,2,opt,name=infer,proto3" json:"infer,omitempty"`
+	Infer         *InferCore             `protobuf:"bytes,2,opt,name=infer,proto3,oneof" json:"infer,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *FetchInferResponse) Reset() {
 	*x = FetchInferResponse{}
-	mi := &file_grpc_service_proto_msgTypes[7]
+	mi := &file_grpc_service_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -385,7 +237,7 @@ func (x *FetchInferResponse) String() string {
 func (*FetchInferResponse) ProtoMessage() {}
 
 func (x *FetchInferResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[7]
+	mi := &file_grpc_service_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -398,7 +250,7 @@ func (x *FetchInferResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchInferResponse.ProtoReflect.Descriptor instead.
 func (*FetchInferResponse) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{7}
+	return file_grpc_service_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *FetchInferResponse) GetRequestId() string {
@@ -418,16 +270,15 @@ func (x *FetchInferResponse) GetInfer() *InferCore {
 type SendResponseRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Type          string                 `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
-	Response      *ResponseCore          `protobuf:"bytes,3,opt,name=response,proto3,oneof" json:"response,omitempty"`
-	Metrics       map[string]string      `protobuf:"bytes,4,rep,name=metrics,proto3" json:"metrics,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Response      *InferCore             `protobuf:"bytes,2,opt,name=response,proto3,oneof" json:"response,omitempty"`
+	Metrics       map[string]string      `protobuf:"bytes,3,rep,name=metrics,proto3" json:"metrics,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SendResponseRequest) Reset() {
 	*x = SendResponseRequest{}
-	mi := &file_grpc_service_proto_msgTypes[8]
+	mi := &file_grpc_service_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -439,7 +290,7 @@ func (x *SendResponseRequest) String() string {
 func (*SendResponseRequest) ProtoMessage() {}
 
 func (x *SendResponseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_grpc_service_proto_msgTypes[8]
+	mi := &file_grpc_service_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -452,7 +303,7 @@ func (x *SendResponseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendResponseRequest.ProtoReflect.Descriptor instead.
 func (*SendResponseRequest) Descriptor() ([]byte, []int) {
-	return file_grpc_service_proto_rawDescGZIP(), []int{8}
+	return file_grpc_service_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *SendResponseRequest) GetRequestId() string {
@@ -462,14 +313,7 @@ func (x *SendResponseRequest) GetRequestId() string {
 	return ""
 }
 
-func (x *SendResponseRequest) GetType() string {
-	if x != nil {
-		return x.Type
-	}
-	return ""
-}
-
-func (x *SendResponseRequest) GetResponse() *ResponseCore {
+func (x *SendResponseRequest) GetResponse() *InferCore {
 	if x != nil {
 		return x.Response
 	}
@@ -487,53 +331,40 @@ var File_grpc_service_proto protoreflect.FileDescriptor
 
 const file_grpc_service_proto_rawDesc = "" +
 	"\n" +
-	"\x12grpc_service.proto\x12\tinference\x1a\x1bgoogle/protobuf/empty.proto\x1a\x19google/protobuf/any.proto\"^\n" +
-	"\x12ServerLiveResponse\x12\x12\n" +
-	"\x04live\x18\x01 \x01(\bR\x04live\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12\x1a\n" +
-	"\bhostname\x18\x03 \x01(\tR\bhostname\"\x13\n" +
-	"\x11ServerLiveRequest\"\x9e\x01\n" +
-	"\tInferCore\x12\x14\n" +
-	"\x05input\x18\x01 \x01(\fR\x05input\x12>\n" +
+	"\x12grpc_service.proto\x12\tinference\x1a\x1bgoogle/protobuf/empty.proto\x1a\x19google/protobuf/any.proto\"\xa2\x01\n" +
+	"\tInferCore\x12\x18\n" +
+	"\acontent\x18\x01 \x01(\fR\acontent\x12>\n" +
 	"\bmetadata\x18\x02 \x03(\v2\".inference.InferCore.MetadataEntryR\bmetadata\x1a;\n" +
-	"\rMetadataEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa6\x01\n" +
-	"\fResponseCore\x12\x16\n" +
-	"\x06output\x18\x01 \x01(\fR\x06output\x12A\n" +
-	"\bmetadata\x18\x02 \x03(\v2%.inference.ResponseCore.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\":\n" +
 	"\fInferRequest\x12*\n" +
-	"\x05infer\x18\x01 \x01(\v2\x14.inference.InferCoreR\x05infer\"u\n" +
+	"\x05infer\x18\x01 \x01(\v2\x14.inference.InferCoreR\x05infer\"r\n" +
 	"\rInferResponse\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\x128\n" +
-	"\bresponse\x18\x02 \x01(\v2\x17.inference.ResponseCoreH\x00R\bresponse\x88\x01\x01B\v\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x125\n" +
+	"\bresponse\x18\x02 \x01(\v2\x14.inference.InferCoreH\x00R\bresponse\x88\x01\x01B\v\n" +
 	"\t_response\"\x98\x01\n" +
 	"\x11FetchInferRequest\x12F\n" +
 	"\bmetadata\x18\x01 \x03(\v2*.inference.FetchInferRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"_\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"n\n" +
 	"\x12FetchInferResponse\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\x12*\n" +
-	"\x05infer\x18\x02 \x01(\v2\x14.inference.InferCoreR\x05infer\"\x92\x02\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12/\n" +
+	"\x05infer\x18\x02 \x01(\v2\x14.inference.InferCoreH\x00R\x05infer\x88\x01\x01B\b\n" +
+	"\x06_infer\"\xfb\x01\n" +
 	"\x13SendResponseRequest\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\x12\x12\n" +
-	"\x04type\x18\x02 \x01(\tR\x04type\x128\n" +
-	"\bresponse\x18\x03 \x01(\v2\x17.inference.ResponseCoreH\x00R\bresponse\x88\x01\x01\x12E\n" +
-	"\ametrics\x18\x04 \x03(\v2+.inference.SendResponseRequest.MetricsEntryR\ametrics\x1a:\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x125\n" +
+	"\bresponse\x18\x02 \x01(\v2\x14.inference.InferCoreH\x00R\bresponse\x88\x01\x01\x12E\n" +
+	"\ametrics\x18\x03 \x03(\v2+.inference.SendResponseRequest.MetricsEntryR\ametrics\x1a:\n" +
 	"\fMetricsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\v\n" +
-	"\t_response2\x86\x03\n" +
-	"\x14GRPCInferenceService\x12K\n" +
-	"\n" +
-	"ServerLive\x12\x1c.inference.ServerLiveRequest\x1a\x1d.inference.ServerLiveResponse\"\x00\x12>\n" +
+	"\t_response2\xb9\x02\n" +
+	"\x14GRPCInferenceService\x12>\n" +
 	"\x05Infer\x12\x17.inference.InferRequest\x1a\x18.inference.InferResponse\"\x000\x01\x12F\n" +
 	"\vInferStream\x12\x17.inference.InferRequest\x1a\x18.inference.InferResponse\"\x00(\x010\x01\x12M\n" +
 	"\n" +
@@ -552,47 +383,40 @@ func file_grpc_service_proto_rawDescGZIP() []byte {
 	return file_grpc_service_proto_rawDescData
 }
 
-var file_grpc_service_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_grpc_service_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_grpc_service_proto_goTypes = []any{
-	(*ServerLiveResponse)(nil),  // 0: inference.ServerLiveResponse
-	(*ServerLiveRequest)(nil),   // 1: inference.ServerLiveRequest
-	(*InferCore)(nil),           // 2: inference.InferCore
-	(*ResponseCore)(nil),        // 3: inference.ResponseCore
-	(*InferRequest)(nil),        // 4: inference.InferRequest
-	(*InferResponse)(nil),       // 5: inference.InferResponse
-	(*FetchInferRequest)(nil),   // 6: inference.FetchInferRequest
-	(*FetchInferResponse)(nil),  // 7: inference.FetchInferResponse
-	(*SendResponseRequest)(nil), // 8: inference.SendResponseRequest
-	nil,                         // 9: inference.InferCore.MetadataEntry
-	nil,                         // 10: inference.ResponseCore.MetadataEntry
-	nil,                         // 11: inference.FetchInferRequest.MetadataEntry
-	nil,                         // 12: inference.SendResponseRequest.MetricsEntry
-	(*emptypb.Empty)(nil),       // 13: google.protobuf.Empty
+	(*InferCore)(nil),           // 0: inference.InferCore
+	(*InferRequest)(nil),        // 1: inference.InferRequest
+	(*InferResponse)(nil),       // 2: inference.InferResponse
+	(*FetchInferRequest)(nil),   // 3: inference.FetchInferRequest
+	(*FetchInferResponse)(nil),  // 4: inference.FetchInferResponse
+	(*SendResponseRequest)(nil), // 5: inference.SendResponseRequest
+	nil,                         // 6: inference.InferCore.MetadataEntry
+	nil,                         // 7: inference.FetchInferRequest.MetadataEntry
+	nil,                         // 8: inference.SendResponseRequest.MetricsEntry
+	(*emptypb.Empty)(nil),       // 9: google.protobuf.Empty
 }
 var file_grpc_service_proto_depIdxs = []int32{
-	9,  // 0: inference.InferCore.metadata:type_name -> inference.InferCore.MetadataEntry
-	10, // 1: inference.ResponseCore.metadata:type_name -> inference.ResponseCore.MetadataEntry
-	2,  // 2: inference.InferRequest.infer:type_name -> inference.InferCore
-	3,  // 3: inference.InferResponse.response:type_name -> inference.ResponseCore
-	11, // 4: inference.FetchInferRequest.metadata:type_name -> inference.FetchInferRequest.MetadataEntry
-	2,  // 5: inference.FetchInferResponse.infer:type_name -> inference.InferCore
-	3,  // 6: inference.SendResponseRequest.response:type_name -> inference.ResponseCore
-	12, // 7: inference.SendResponseRequest.metrics:type_name -> inference.SendResponseRequest.MetricsEntry
-	1,  // 8: inference.GRPCInferenceService.ServerLive:input_type -> inference.ServerLiveRequest
-	4,  // 9: inference.GRPCInferenceService.Infer:input_type -> inference.InferRequest
-	4,  // 10: inference.GRPCInferenceService.InferStream:input_type -> inference.InferRequest
-	6,  // 11: inference.GRPCInferenceService.FetchInfer:input_type -> inference.FetchInferRequest
-	8,  // 12: inference.GRPCInferenceService.SendResponse:input_type -> inference.SendResponseRequest
-	0,  // 13: inference.GRPCInferenceService.ServerLive:output_type -> inference.ServerLiveResponse
-	5,  // 14: inference.GRPCInferenceService.Infer:output_type -> inference.InferResponse
-	5,  // 15: inference.GRPCInferenceService.InferStream:output_type -> inference.InferResponse
-	7,  // 16: inference.GRPCInferenceService.FetchInfer:output_type -> inference.FetchInferResponse
-	13, // 17: inference.GRPCInferenceService.SendResponse:output_type -> google.protobuf.Empty
-	13, // [13:18] is the sub-list for method output_type
-	8,  // [8:13] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	6,  // 0: inference.InferCore.metadata:type_name -> inference.InferCore.MetadataEntry
+	0,  // 1: inference.InferRequest.infer:type_name -> inference.InferCore
+	0,  // 2: inference.InferResponse.response:type_name -> inference.InferCore
+	7,  // 3: inference.FetchInferRequest.metadata:type_name -> inference.FetchInferRequest.MetadataEntry
+	0,  // 4: inference.FetchInferResponse.infer:type_name -> inference.InferCore
+	0,  // 5: inference.SendResponseRequest.response:type_name -> inference.InferCore
+	8,  // 6: inference.SendResponseRequest.metrics:type_name -> inference.SendResponseRequest.MetricsEntry
+	1,  // 7: inference.GRPCInferenceService.Infer:input_type -> inference.InferRequest
+	1,  // 8: inference.GRPCInferenceService.InferStream:input_type -> inference.InferRequest
+	3,  // 9: inference.GRPCInferenceService.FetchInfer:input_type -> inference.FetchInferRequest
+	5,  // 10: inference.GRPCInferenceService.SendResponse:input_type -> inference.SendResponseRequest
+	2,  // 11: inference.GRPCInferenceService.Infer:output_type -> inference.InferResponse
+	2,  // 12: inference.GRPCInferenceService.InferStream:output_type -> inference.InferResponse
+	4,  // 13: inference.GRPCInferenceService.FetchInfer:output_type -> inference.FetchInferResponse
+	9,  // 14: inference.GRPCInferenceService.SendResponse:output_type -> google.protobuf.Empty
+	11, // [11:15] is the sub-list for method output_type
+	7,  // [7:11] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_grpc_service_proto_init() }
@@ -600,15 +424,16 @@ func file_grpc_service_proto_init() {
 	if File_grpc_service_proto != nil {
 		return
 	}
+	file_grpc_service_proto_msgTypes[2].OneofWrappers = []any{}
+	file_grpc_service_proto_msgTypes[4].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[5].OneofWrappers = []any{}
-	file_grpc_service_proto_msgTypes[8].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_grpc_service_proto_rawDesc), len(file_grpc_service_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   13,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
