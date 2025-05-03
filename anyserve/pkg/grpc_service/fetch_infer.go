@@ -12,14 +12,14 @@ func (s *InferenceService) FetchInfer(req *proto.FetchInferRequest, stream proto
 
 	responseChan, err := s.meta.PopInferRequest(ctx, req.Metadata)
 	if err != nil {
-		logger.Error("Failed to Pop Infer Request", zap.Error(err))
+		logger.Error("Failed to pop infer request", zap.Error(err))
 		return err
 	}
 
 	for response := range responseChan {
-		logger.Debug(fmt.Sprintf("Fetch Infer Request: %v", response))
+		logger.Debug(fmt.Sprintf("Fetch infer request: %v", response))
 		if err := stream.Send(response); err != nil {
-			logger.Error("Failed to Send Fetch Infer Request", zap.Error(err))
+			logger.Error("Failed to send fetch infer request", zap.Error(err))
 			return err
 		}
 	}

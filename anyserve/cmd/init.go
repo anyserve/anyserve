@@ -60,7 +60,7 @@ func initFunc(ctx context.Context, cmd *cli.Command) error {
 		logger.Warn("Meta already initialized. Updating now")
 		format.Name = name
 	} else if strings.HasPrefix(err.Error(), "backend is not formatted") {
-		logger.Info("backend is not formatted. Initializing")
+		logger.Info("Backend is not formatted. Initializing")
 		format = &meta.Format{
 			Name: name,
 			UUID: uuid.New().String(),
