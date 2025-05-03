@@ -23,8 +23,6 @@ message InferRequest {
     InferCore infer = 1;
 }
 
-
-
 message InferResponse {
     string request_id = 1;
     optional InferCore response = 2;
