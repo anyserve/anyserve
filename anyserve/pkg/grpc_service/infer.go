@@ -3,6 +3,7 @@ package grpc_service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -22,7 +23,7 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 	if req.Infer.Metadata == nil {
 		req.Infer.Metadata = make(map[string]string)
 	}
-	// inject timestamp to request metadata for basic schedule
+
 	if _, ok := req.Infer.Metadata[config.INFER_METADATA_TIMESTAMP]; !ok {
 		req.Infer.Metadata[config.INFER_METADATA_TIMESTAMP] = strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
@@ -30,23 +31,22 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 	err := s.meta.QueueInferRequest(ctx, req, requestID)
 
 	if err != nil {
-		_logger.Error("Failed to queue inference request", zap.Error(err))
+		_logger.Error("Failed to queue infer request", zap.Error(err))
 		_ = stream.Send(&proto.InferResponse{
 			RequestId: requestID,
 		})
 		return err
 	}
 
-	// send ACK to client
-	ack := &proto.InferCore{
-		Metadata: map[string]string{
-			config.RESPONSE_METADATA_TYPE: config.RESPONSE_METADATA_TYPE_VALUE_ACK,
-		},
-	}
 	err = stream.Send(&proto.InferResponse{
 		RequestId: requestID,
-		Response:  ack,
+		Response: &proto.InferCore{
+			Metadata: map[string]string{
+				config.RESPONSE_METADATA_TYPE: config.RESPONSE_METADATA_TYPE_VALUE_ACK,
+			},
+		},
 	})
+
 	if err != nil {
 		_logger.Error("Failed to send ACK", zap.Error(err))
 		return err
@@ -54,28 +54,29 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 
 	responseChan, err := s.meta.PopInferResponse(ctx, requestID)
 	if err != nil {
-		_logger.Error("Failed to pop inference response", zap.Error(err))
+		_logger.Error("Failed to pop infer response", zap.Error(err))
 		return err
 	}
 
 	for response := range responseChan {
 		switch response.Metadata[config.RESPONSE_METADATA_TYPE] {
 		case config.RESPONSE_METADATA_TYPE_VALUE_FINISH:
+			_logger.Debug(fmt.Sprintf("Infer response finished: %v", response))
 			return nil
 		case config.RESPONSE_METADATA_TYPE_VALUE_FAILED:
-			_logger.Error("Inference response error", zap.String("error", string(response.Content)))
+			_logger.Error("Infer response error", zap.String("error", string(response.Content)))
 			return errors.New("inference response error")
 		case config.RESPONSE_METADATA_TYPE_VALUE_PROCESSING:
 			if err := stream.Send(&proto.InferResponse{
 				RequestId: requestID,
 				Response:  response,
 			}); err != nil {
-				_logger.Error("Failed to send inference response", zap.Error(err))
+				_logger.Error("Failed to send infer response", zap.Error(err))
 				return err
 			}
 		default:
-			_logger.Error("Unknown inference response type", zap.String("type", response.Metadata[config.RESPONSE_METADATA_TYPE]))
-			return errors.New("unknown inference response type")
+			_logger.Error("Unknown infer response type", zap.String("type", response.Metadata[config.RESPONSE_METADATA_TYPE]))
+			return errors.New("unknown infer response type")
 		}
 	}
 	return nil
