@@ -6,10 +6,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-
 
 
 def send_request(stub: pb2_grpc.GRPCInferenceServiceStub):
@@ -93,6 +91,11 @@ if __name__ == "__main__":
     if mode == "produce":
         send_request(stub)
     elif mode == "consume":
-        consume_request(stub)
+        while True:
+            time.sleep(1)
+            try:
+                consume_request(stub)
+            except Exception as e:
+                logger.error(f"Error consuming request: {e}")
     else:
         raise ValueError(f"Invalid mode: {mode}")
