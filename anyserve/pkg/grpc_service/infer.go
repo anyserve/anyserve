@@ -24,10 +24,10 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 		req.Infer.Metadata = make(map[string]string)
 	}
 
-	if _, ok := req.Infer.Metadata[config.INFER_METADATA_TIMESTAMP]; !ok {
-		req.Infer.Metadata[config.INFER_METADATA_TIMESTAMP] = strconv.FormatInt(time.Now().UnixNano(), 10)
-	}
+	req.Infer.Metadata[config.METADATA_TIMESTAMP] = strconv.FormatInt(time.Now().UnixNano(), 10)
+	req.Infer.Metadata[config.INFER_METADATA_STATUS] = config.INFER_METADATA_STATUS_VALUE_QUEUED
 
+	_logger.Debug(fmt.Sprintf("Infer %s queued", requestID))
 	err := s.meta.QueueInferRequest(ctx, req, requestID)
 
 	if err != nil {
@@ -61,7 +61,7 @@ func (s *InferenceService) Infer(req *proto.InferRequest, stream proto.GRPCInfer
 	for response := range responseChan {
 		switch response.Metadata[config.RESPONSE_METADATA_TYPE] {
 		case config.RESPONSE_METADATA_TYPE_VALUE_FINISH:
-			_logger.Debug(fmt.Sprintf("Infer response finished: %v", response))
+			_logger.Debug(fmt.Sprintf("Infer % response finished: %v", response))
 			if err := stream.Send(&proto.InferResponse{
 				RequestId: requestID,
 				Response:  response,
