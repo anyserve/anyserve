@@ -35,6 +35,8 @@ type Meta interface {
 	QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error
 	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferCore, error)
 	DeleteInferRequest(ctx context.Context, requestId string) error
+	SetInferRequest(ctx context.Context, requestId string, metadata map[string]string) error
+	ExistsInferRequest(ctx context.Context, requestId string) (bool, error)
 }
 
 func NewMeta(metaURI string) (Meta, error) {

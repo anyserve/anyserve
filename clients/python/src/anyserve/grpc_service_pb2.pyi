@@ -24,10 +24,12 @@ class InferCore(_message.Message):
     def __init__(self, content: _Optional[bytes] = ..., metadata: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class InferRequest(_message.Message):
-    __slots__ = ("infer",)
+    __slots__ = ("infer", "request_id")
     INFER_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     infer: InferCore
-    def __init__(self, infer: _Optional[_Union[InferCore, _Mapping]] = ...) -> None: ...
+    request_id: str
+    def __init__(self, infer: _Optional[_Union[InferCore, _Mapping]] = ..., request_id: _Optional[str] = ...) -> None: ...
 
 class InferResponse(_message.Message):
     __slots__ = ("request_id", "response")

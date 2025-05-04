@@ -54,7 +54,6 @@ func (m *baseMeta) Load() (*Format, error) {
 }
 
 func (m *baseMeta) QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error {
-	logger := zap.L().With(zap.String("request_id", requestId))
 	var err error
 	err = m.e.doSetRequest(ctx, requestId, proto.Infer.Content)
 	if err != nil {
@@ -85,7 +84,7 @@ func (m *baseMeta) PopInferRequest(ctx context.Context, metadata map[string]stri
 				logger.Error("GetRequest", zap.Error(err))
 				return
 			}
-			logger.Sugar().Debugf("PopInferRequest request: %v", request)
+			logger.Debug(fmt.Sprintf("Pop infer request: %s", requestId))
 			inferRequestChan <- &proto.FetchInferResponse{
 				RequestId: requestId,
 				Infer:     &proto.InferCore{Content: request, Metadata: metadata},
@@ -126,4 +125,16 @@ func (m *baseMeta) PopInferResponse(ctx context.Context, requestId string) (<-ch
 		}
 	}()
 	return inferResponseChan, nil
+}
+
+func (m *baseMeta) DeleteInferRequest(ctx context.Context, requestId string) error {
+	return m.e.doDeleteRequest(ctx, requestId)
+}
+
+func (m *baseMeta) SetInferRequest(ctx context.Context, requestId string, metadata map[string]string) error {
+	return m.e.doSetInferRequest(ctx, requestId, metadata)
+}
+
+func (m *baseMeta) ExistsInferRequest(ctx context.Context, requestId string) (bool, error) {
+	return m.e.doExistsInferRequest(ctx, requestId)
 }
