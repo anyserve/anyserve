@@ -26,23 +26,15 @@ func Register(name string, register Backend) {
 }
 
 type Meta interface {
-
-	// Init the meta data to backend
 	Init(format *Format, force bool) error
-
-	// GetFormat returns current format
 	GetFormat() Format
-
-	// Load the meta data from the backend
 	Load() (*Format, error)
 
 	QueueInferRequest(ctx context.Context, proto *proto.InferRequest, requestId string) error
 	PopInferRequest(ctx context.Context, metadata map[string]string) (<-chan *proto.FetchInferResponse, error)
-	// TODO: Implement
-	// QueueInferRequestStream(ctx context.Context, inferRequestChan <-chan *proto.InferRequest, requestId string) <-chan error
-
 	QueueSendResponseStream(ctx context.Context, sendResponseRequest *proto.SendResponseRequest) error
 	PopInferResponse(ctx context.Context, requestId string) (<-chan *proto.InferCore, error)
+	DeleteInferRequest(ctx context.Context, requestId string) error
 }
 
 func NewMeta(metaURI string) (Meta, error) {
