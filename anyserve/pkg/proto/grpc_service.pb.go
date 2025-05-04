@@ -77,7 +77,8 @@ func (x *InferCore) GetMetadata() map[string]string {
 
 type InferRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Infer         *InferCore             `protobuf:"bytes,1,opt,name=infer,proto3" json:"infer,omitempty"`
+	Infer         *InferCore             `protobuf:"bytes,1,opt,name=infer,proto3,oneof" json:"infer,omitempty"`
+	RequestId     *string                `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3,oneof" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -117,6 +118,13 @@ func (x *InferRequest) GetInfer() *InferCore {
 		return x.Infer
 	}
 	return nil
+}
+
+func (x *InferRequest) GetRequestId() string {
+	if x != nil && x.RequestId != nil {
+		return *x.RequestId
+	}
+	return ""
 }
 
 type InferResponse struct {
@@ -337,9 +345,13 @@ const file_grpc_service_proto_rawDesc = "" +
 	"\bmetadata\x18\x02 \x03(\v2\".inference.InferCore.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\":\n" +
-	"\fInferRequest\x12*\n" +
-	"\x05infer\x18\x01 \x01(\v2\x14.inference.InferCoreR\x05infer\"r\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"|\n" +
+	"\fInferRequest\x12/\n" +
+	"\x05infer\x18\x01 \x01(\v2\x14.inference.InferCoreH\x00R\x05infer\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"request_id\x18\x02 \x01(\tH\x01R\trequestId\x88\x01\x01B\b\n" +
+	"\x06_inferB\r\n" +
+	"\v_request_id\"r\n" +
 	"\rInferResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x125\n" +
@@ -424,6 +436,7 @@ func file_grpc_service_proto_init() {
 	if File_grpc_service_proto != nil {
 		return
 	}
+	file_grpc_service_proto_msgTypes[1].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[2].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[4].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[5].OneofWrappers = []any{}

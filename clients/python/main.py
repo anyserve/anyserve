@@ -2,6 +2,14 @@ import time
 import grpc
 import anyserve.grpc_service_pb2 as pb2
 import anyserve.grpc_service_pb2_grpc as pb2_grpc
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
 
 
 def send_request(stub: pb2_grpc.GRPCInferenceServiceStub):
@@ -10,42 +18,52 @@ def send_request(stub: pb2_grpc.GRPCInferenceServiceStub):
     request = pb2.InferRequest(infer=infer_core)
 
     for response in stub.Infer(request):
-        print(f"Request ID: {response.request_id}")
-        print(f"Response: {response}")
+        logger.info(f"Request ID: {response.request_id}")
+        logger.info(f"Response: {response}")
 
 
 def consume_request(stub: pb2_grpc.GRPCInferenceServiceStub):
     request = pb2.FetchInferRequest(metadata={"model_name": "test"})
-
-    content = b"1 2 3"
     request_id = None
 
     for response in stub.FetchInfer(request):
         request_id = response.request_id
-        print(f"Request ID: {response.request_id}")
-        print(f"Response: {response}")
-        if response.HasField("infer"):
-            content = response.infer.content
-            content = content[::-1]
+        logger.info(f"Request ID: {response.request_id}")
+        logger.info(f"Response: {response}")
 
     if request_id is not None:
 
         def response_generator():
-            time.sleep(1)
+            logger.info("send response.created")
+            yield pb2.SendResponseRequest(
+                request_id=request_id,
+                response=pb2.InferCore(metadata={"@type": "response.created"}),
+            )
+            logger.info("send response.processing")
             yield pb2.SendResponseRequest(
                 request_id=request_id,
                 response=pb2.InferCore(
-                    content=content, metadata={"@type": "response.processing"}
+                    content=b"first response", metadata={"@type": "response.processing"}
+                ),
+            )
+            time.sleep(1)
+            logger.info("send response.processing")
+            yield pb2.SendResponseRequest(
+                request_id=request_id,
+                response=pb2.InferCore(
+                    content=b"second response",
+                    metadata={"@type": "response.processing"},
                 ),
             )
             time.sleep(1)
             yield pb2.SendResponseRequest(
                 request_id=request_id,
                 response=pb2.InferCore(
-                    content=content, metadata={"@type": "response.processing"}
+                    content=b"third response", metadata={"@type": "response.processing"}
                 ),
             )
             time.sleep(1)
+            logger.info("send response.finished")
             yield pb2.SendResponseRequest(
                 request_id=request_id,
                 response=pb2.InferCore(metadata={"@type": "response.finished"}),

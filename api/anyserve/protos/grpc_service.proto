@@ -20,7 +20,7 @@ message InferCore {
 }
 
 message InferRequest {
-    InferCore infer = 1;
+    optional InferCore infer = 1;
     optional string request_id = 2;
 }
 
