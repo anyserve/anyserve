@@ -138,3 +138,54 @@ func (m *baseMeta) SetInferRequest(ctx context.Context, requestId string, metada
 func (m *baseMeta) ExistsInferRequest(ctx context.Context, requestId string) (bool, error) {
 	return m.e.doExistsInferRequest(ctx, requestId)
 }
+
+func (m *baseMeta) ListQueues(ctx context.Context) ([]Queue, error) {
+	return m.e.doListQueues(ctx)
+}
+
+func (m *baseMeta) CreateQueue(ctx context.Context, queue Queue) error {
+	exists, err := m.e.doQueueExists(ctx, queue.Name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return fmt.Errorf("queue '%s' already exists", queue.Name)
+	}
+	err = m.e.doCreateQueue(ctx, queue)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Created queue: %s", queue.Name))
+	err = m.e.doCreateQueueIndex(ctx, queue)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Created queue index: %s", queue.Index))
+	return nil
+}
+
+func (m *baseMeta) DeleteQueue(ctx context.Context, queueName string) error {
+	exists, err := m.e.doQueueExists(ctx, queueName)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("queue '%s' does not exist", queueName)
+	}
+	err = m.e.doDeleteQueueIndex(ctx, queueName)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Deleted queue index: %s", queueName))
+	err = m.e.doDeleteQueueData(ctx, queueName)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Deleted queue data: %s", queueName))
+	err = m.e.doDeleteQueue(ctx, queueName)
+	if err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("Deleted queue: %s", queueName))
+	return nil
+}

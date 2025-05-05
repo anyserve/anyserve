@@ -15,6 +15,10 @@ import (
 // FT.CREATE tsIndex ON HASH PREFIX 1 "meta:" SCHEMA @timestamp NUMERIC SORTABLE @status TAG SORTABLE
 // FT.SEARCH tsIndex '@\@status:{queued}' SORTBY @timestamp
 // FT.DROPINDEX tsIndex
+const (
+	SETTING = "setting"
+	QUEUES  = "queues"
+)
 
 type redisMeta struct {
 	*baseMeta
@@ -79,19 +83,19 @@ func (m *redisMeta) unkey(key string) string {
 }
 
 func (m *redisMeta) metaKey(requestId string) string {
-	return m.key("meta:" + requestId)
+	return m.key("m:" + requestId)
 }
 
 // Return requestId from metaKey
 // meta:4d480a48-5ac1-4e61-9275-2dea44697ce3 -> 4d480a48-5ac1-4e61-9275-2dea44697ce3
 func (m *redisMeta) unmetaKey(key string) string {
 	metaKey := m.unkey(key)
-	requestId := metaKey[len("meta:"):]
+	requestId := metaKey[len("m:"):]
 	return requestId
 }
 
 func (m *redisMeta) responseKey(requestId string) string {
-	return m.key("response:" + requestId)
+	return m.key("r:" + requestId)
 }
 
 func (m *redisMeta) doInit(format *Format, force bool) error {
@@ -102,31 +106,10 @@ func (m *redisMeta) doInit(format *Format, force bool) error {
 		return fmt.Errorf("json: %s", err)
 	}
 
-	if err = m.rdb.Set(ctx, m.key("setting"), data, 0).Err(); err != nil {
+	if err = m.rdb.Set(ctx, m.key(SETTING), data, 0).Err(); err != nil {
 		return err
 	}
 
-	infoCmd := redis.NewCmd(ctx, "FT.INFO", "tsIndex")
-	err = m.rdb.Process(ctx, infoCmd)
-	if err == nil {
-		logger.Info("Redis search index 'tsIndex' already exists")
-		return nil
-	}
-
-	if !strings.Contains(err.Error(), "Unknown index name") {
-		return fmt.Errorf("failed to check search index: %w", err)
-	}
-
-	indexCmd := redis.NewCmd(ctx, "FT.CREATE", "tsIndex", "ON", "HASH", "PREFIX", "1", "meta:", "SCHEMA",
-		config.METADATA_TIMESTAMP, "NUMERIC", "SORTABLE",
-		config.INFER_METADATA_STATUS, "TAG", "SORTABLE")
-
-	err = m.rdb.Process(ctx, indexCmd)
-	if err != nil {
-		return fmt.Errorf("failed to create search index: %w", err)
-	}
-
-	logger.Info("Created Redis search index 'tsIndex'")
 	return nil
 }
 
@@ -241,4 +224,159 @@ func (m *redisMeta) doExistsInferRequest(ctx context.Context, requestId string) 
 		return false, err
 	}
 	return metaExists > 0 && requestExists > 0, nil
+}
+
+func (m *redisMeta) doQueueExists(ctx context.Context, queueName string) (bool, error) {
+	exists, err := m.rdb.SIsMember(ctx, m.key(QUEUES), queueName).Result()
+	return exists, err
+}
+
+func (m *redisMeta) doListQueues(ctx context.Context) ([]Queue, error) {
+	var queues []Queue
+	queueNames, err := m.rdb.SMembers(ctx, m.key(QUEUES)).Result()
+	if err != nil {
+		return nil, err
+	}
+	for _, queueName := range queueNames {
+		queue, err := m.rdb.HGetAll(ctx, m.key(queueName)).Result()
+		if err != nil {
+			return nil, err
+		}
+		queues = append(queues, Queue{Name: queueName, Index: queue["index"], Streaming: queue["streaming"], Storage: queue["storage"]})
+	}
+	return queues, nil
+}
+
+func (m *redisMeta) doCreateQueue(ctx context.Context, queue Queue) error {
+	err := m.rdb.SAdd(ctx, m.key(QUEUES), queue.Name).Err()
+	if err != nil {
+		return err
+	}
+	err = m.rdb.HSet(ctx, m.key(queue.Name), "index", queue.Index, "streaming", queue.Streaming, "storage", queue.Storage).Err()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *redisMeta) doCreateQueueIndex(ctx context.Context, queue Queue) error {
+	indexName := fmt.Sprintf("%s:index", queue.Name)
+	queueMetaPrefix := fmt.Sprintf("%s:m", queue.Name)
+
+	infoCmd := redis.NewCmd(ctx, "FT.INFO", indexName)
+	err := m.rdb.Process(ctx, infoCmd)
+	if err == nil {
+		logger.Warn(fmt.Sprintf("Redis search index '%s' exists, will be deleted", indexName))
+		err = m.rdb.FTDropIndex(ctx, indexName).Err()
+		if err != nil {
+			logger.Error(fmt.Sprintf("failed to delete existing Redis search index '%s': %v", indexName, err))
+			return err
+		}
+	}
+
+	// extract index schema from index string
+	// e.g. "@xxx,@yyy" -> ["@xxx","TAG", "SORTABLE", "@yyy","TAG", "SORTABLE"]
+	fields := func(index string) []string {
+		var result []string
+		for field := range strings.SplitSeq(index, ",") {
+			result = append(result, field, "TAG", "SORTABLE")
+		}
+		return result
+	}(queue.Index)
+
+	// add default index schema
+	fields = append(fields, config.METADATA_TIMESTAMP, "NUMERIC", "SORTABLE")
+	fields = append(fields, config.INFER_METADATA_STATUS, "TAG", "SORTABLE")
+
+	args := []interface{}{"FT.CREATE", indexName, "ON", "HASH", "PREFIX", "1", queueMetaPrefix, "SCHEMA"}
+	for _, field := range fields {
+		args = append(args, field)
+	}
+	indexCmd := redis.NewCmd(ctx, args...)
+
+	err = m.rdb.Process(ctx, indexCmd)
+	if err != nil {
+		logger.Error(fmt.Sprintf("failed to create search index: %v", err))
+		return fmt.Errorf("failed to create search index: %w", err)
+	}
+
+	logger.Info(fmt.Sprintf("Created Redis search index '%s'", indexName))
+	return nil
+}
+
+func (m *redisMeta) doDeleteQueue(ctx context.Context, queueName string) error {
+	// Check if queue exists before attempting to delete
+	exists, err := m.rdb.SIsMember(ctx, m.key(QUEUES), queueName).Result()
+	if err != nil {
+		return fmt.Errorf("failed to check if queue exists: %w", err)
+	}
+
+	if !exists {
+		logger.Warn(fmt.Sprintf("Queue '%s' does not exist", queueName))
+		return fmt.Errorf("queue '%s' does not exist", queueName)
+	}
+
+	err = m.rdb.SRem(ctx, m.key(QUEUES), queueName).Err()
+	if err != nil {
+		return err
+	}
+	err = m.rdb.Del(ctx, m.key(queueName)).Err()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *redisMeta) doDeleteQueueIndex(ctx context.Context, queueName string) error {
+	indexName := fmt.Sprintf("%s:index", queueName)
+	err := m.rdb.FTDropIndex(ctx, indexName).Err()
+	if err != nil {
+		// Ignore "Unknown Index name" errors
+		if strings.Contains(err.Error(), "Unknown Index name") {
+			logger.Warn(fmt.Sprintf("Index '%s' does not exist, skipping deletion", indexName))
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (m *redisMeta) doDeleteQueueData(ctx context.Context, queueName string) error {
+	var cursor uint64
+	var keys []string
+
+	for {
+		var scanKeys []string
+		var err error
+		scanKeys, cursor, err = m.rdb.Scan(ctx, cursor, fmt.Sprintf("%s:*", queueName), 100).Result()
+		if err != nil {
+			return err
+		}
+
+		keys = append(keys, scanKeys...)
+		if cursor == 0 {
+			break
+		}
+	}
+
+	if len(keys) > 0 {
+		const batchSize = 1000
+		for i := 0; i < len(keys); i += batchSize {
+			end := i + batchSize
+			if end > len(keys) {
+				end = len(keys)
+			}
+
+			batch := keys[i:end]
+			_, err := m.rdb.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Del(ctx, batch...)
+				return nil
+			})
+
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

@@ -14,7 +14,7 @@ import (
 func cmdInit() *cli.Command {
 	return &cli.Command{
 		Name:      "init",
-		Usage:     "Initialize Anyserve system",
+		Usage:     "Init anyserve",
 		Action:    initFunc,
 		ArgsUsage: "META-URI NAME",
 		Flags:     expandFlags(initFlags()),

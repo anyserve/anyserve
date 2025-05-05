@@ -23,4 +23,12 @@ type engine interface {
 	doPopResponseQueue(ctx context.Context, requestId string) (*proto.InferCore, error)
 
 	doResponseQueueExists(ctx context.Context, requestId string) (bool, error)
+
+	doQueueExists(ctx context.Context, queueName string) (bool, error)
+	doListQueues(ctx context.Context) ([]Queue, error)
+	doCreateQueue(ctx context.Context, queue Queue) error
+	doCreateQueueIndex(ctx context.Context, queue Queue) error
+	doDeleteQueue(ctx context.Context, queueName string) error
+	doDeleteQueueIndex(ctx context.Context, queueName string) error
+	doDeleteQueueData(ctx context.Context, queueName string) error
 }

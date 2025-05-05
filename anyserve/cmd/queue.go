@@ -3,7 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/anyserve/anyserve/pkg/meta"
 	"github.com/urfave/cli/v3"
 )
 
@@ -32,30 +34,23 @@ $ anyserve queue list sqlite:///tmp/anyserve.db
 			{
 				Name:      "create",
 				Usage:     "Create a new queue",
-				ArgsUsage: "META-URI",
+				ArgsUsage: "META-URI NAME",
 				Description: `
 Create a new queue.
 
 Examples:
 # Use Redis
-$ anyserve queue redis://localhost create --name myqueue --index "@model"
-$ anyserve queue redis://localhost create --name priorityqueue --index "@priority,@model"
+$ anyserve queue create redis://localhost myqueue --index "@model"
+$ anyserve queue create redis://localhost priorityqueue --index "@priority,@model"
 
 # Use NATS as Streaming Engine
-$ anyserve queue redis://localhost create --name priorityqueue --index "@priority,@model" --streaming nats://localhost:4222
+$ anyserve queue create redis://localhost priorityqueue --index "@priority,@model" --streaming nats://localhost:4222
 
 # Use S3 as Storage Engine
-$ anyserve queue redis://localhost create --name priorityqueue --index "@priority,@model" --storage s3://mybucket
+$ anyserve queue create redis://localhost priorityqueue --index "@priority,@model" --storage s3://mybucket
 `,
 				Action: queueCreateFunc,
 				Flags:  expandFlags(queueCreateFlags()),
-			},
-			{
-				Name:      "info",
-				Usage:     "Get queue info",
-				ArgsUsage: "META-URI NAME",
-				Action:    queueInfoFunc,
-				Flags:     expandFlags(queueInfoFlags()),
 			},
 			{
 				Name:      "stats",
@@ -70,7 +65,14 @@ $ anyserve queue redis://localhost create --name priorityqueue --index "@priorit
 				ArgsUsage: "META-URI NAME",
 				Action:    queueDeleteFunc,
 				Flags:     expandFlags(queueDeleteFlags()),
-				Aliases:   []string{"rm"},
+				Description: `
+Remove a queue.
+
+Examples:
+$ anyserve queue remove redis://localhost myqueue
+$ anyserve queue remove redis://localhost priorityqueue
+`,
+				Aliases: []string{"rm"},
 			},
 		},
 		Description: `
@@ -87,6 +89,26 @@ func queueListFunc(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("META-URI is required")
 	}
 
+	metaEngine, err := meta.NewMeta(metaURI)
+	if err != nil {
+		return err
+	}
+
+	format, err := metaEngine.Load()
+	if err != nil {
+		return err
+	}
+
+	logger.Info(fmt.Sprintf("name: %s, uuid: %s", format.Name, format.UUID))
+
+	queues, err := metaEngine.ListQueues(ctx)
+	if err != nil {
+		return err
+	}
+
+	for _, queue := range queues {
+		logger.Info(fmt.Sprintf("queue: %s", queue))
+	}
 	return nil
 }
 
@@ -98,30 +120,56 @@ func queueCreateFunc(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("META-URI is required")
 	}
 
-	name := cmd.String("name")
+	name := cmd.Args().Get(1)
 	if name == "" {
 		return fmt.Errorf("queue name is required")
 	}
 
-	// TODO: Implement create queue functionality with indexing, streaming, and storage options
-
-	return nil
-}
-
-func queueInfoFunc(ctx context.Context, cmd *cli.Command) error {
-	setup(cmd)
-
-	metaURI := cmd.Args().Get(0)
-	if metaURI == "" {
-		return fmt.Errorf("META-URI is required")
+	metaEngine, err := meta.NewMeta(metaURI)
+	if err != nil {
+		return err
 	}
 
-	name := cmd.Args().Get(1)
-	if name == "" {
-		return fmt.Errorf("queue NAME is required")
+	format, err := metaEngine.Load()
+	if err != nil {
+		return err
 	}
 
-	// TODO: Implement queue info functionality
+	logger.Info(fmt.Sprintf("name: %s, uuid: %s", format.Name, format.UUID))
+
+	queue := meta.Queue{Name: name}
+
+	if index := cmd.String("index"); index != "" {
+		queue.Index = func(index string) string {
+			var temp []string
+			for field := range strings.SplitSeq(index, ",") {
+				field = strings.TrimSpace(field)
+				if field == "" {
+					continue
+				}
+				// add @ prefix if not present
+				if !strings.HasPrefix(field, "@") {
+					logger.Warn(fmt.Sprintf("index field '%s' does not have @ prefix, auto adding it", field))
+					field = fmt.Sprintf("@%s", field)
+				}
+				temp = append(temp, field)
+			}
+			return strings.Join(temp, ",")
+		}(index)
+	} else {
+		return fmt.Errorf("index is required")
+	}
+	if streaming := cmd.String("streaming"); streaming != "" {
+		queue.Streaming = streaming
+	}
+	if storage := cmd.String("storage"); storage != "" {
+		queue.Storage = storage
+	}
+
+	err = metaEngine.CreateQueue(ctx, queue)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -139,8 +187,19 @@ func queueStatsFunc(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("queue NAME is required")
 	}
 
-	// TODO: Implement queue status functionality
+	metaEngine, err := meta.NewMeta(metaURI)
+	if err != nil {
+		return err
+	}
 
+	format, err := metaEngine.Load()
+	if err != nil {
+		return err
+	}
+
+	logger.Info(fmt.Sprintf("name: %s, uuid: %s", format.Name, format.UUID))
+
+	// TODO: Implement queue stats functionality
 	return nil
 }
 
@@ -157,9 +216,18 @@ func queueDeleteFunc(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("queue NAME is required")
 	}
 
-	// TODO: Implement queue delete functionality
+	metaEngine, err := meta.NewMeta(metaURI)
+	if err != nil {
+		return err
+	}
+	format, err := metaEngine.Load()
+	if err != nil {
+		return err
+	}
 
-	return nil
+	logger.Info(fmt.Sprintf("name: %s, uuid: %s", format.Name, format.UUID))
+
+	return metaEngine.DeleteQueue(ctx, name)
 }
 
 func queueListFlags() []cli.Flag {
@@ -169,12 +237,8 @@ func queueListFlags() []cli.Flag {
 func queueCreateFlags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
-			Name:  "name",
-			Usage: "Queue name",
-		},
-		&cli.StringFlag{
 			Name:  "index",
-			Usage: "Index fields (comma separated)",
+			Usage: "Index fields (comma separated) with '@' prefix, e.g. @model, @priority",
 		},
 		&cli.StringFlag{
 			Name:  "streaming",
@@ -185,10 +249,6 @@ func queueCreateFlags() []cli.Flag {
 			Usage: "Storage Engine URI",
 		},
 	}
-}
-
-func queueInfoFlags() []cli.Flag {
-	return []cli.Flag{}
 }
 
 func queueStatsFlags() []cli.Flag {

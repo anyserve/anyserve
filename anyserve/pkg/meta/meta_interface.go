@@ -17,6 +17,13 @@ type Format struct {
 	UUID string
 }
 
+type Queue struct {
+	Name      string
+	Index     string
+	Streaming string
+	Storage   string
+}
+
 type Backend func(driver, addr string) (Meta, error)
 
 var metaBackends = make(map[string]Backend)
@@ -37,6 +44,10 @@ type Meta interface {
 	DeleteInferRequest(ctx context.Context, requestId string) error
 	SetInferRequest(ctx context.Context, requestId string, metadata map[string]string) error
 	ExistsInferRequest(ctx context.Context, requestId string) (bool, error)
+
+	ListQueues(ctx context.Context) ([]Queue, error)
+	CreateQueue(ctx context.Context, queue Queue) error
+	DeleteQueue(ctx context.Context, queueName string) error
 }
 
 func NewMeta(metaURI string) (Meta, error) {
