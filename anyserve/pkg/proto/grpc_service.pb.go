@@ -77,8 +77,9 @@ func (x *InferCore) GetMetadata() map[string]string {
 
 type InferRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Infer         *InferCore             `protobuf:"bytes,1,opt,name=infer,proto3,oneof" json:"infer,omitempty"`
-	RequestId     *string                `protobuf:"bytes,2,opt,name=request_id,json=requestId,proto3,oneof" json:"request_id,omitempty"`
+	Queue         *string                `protobuf:"bytes,1,opt,name=queue,proto3,oneof" json:"queue,omitempty"`
+	Infer         *InferCore             `protobuf:"bytes,2,opt,name=infer,proto3,oneof" json:"infer,omitempty"`
+	RequestId     *string                `protobuf:"bytes,3,opt,name=request_id,json=requestId,proto3,oneof" json:"request_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -111,6 +112,13 @@ func (x *InferRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use InferRequest.ProtoReflect.Descriptor instead.
 func (*InferRequest) Descriptor() ([]byte, []int) {
 	return file_grpc_service_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *InferRequest) GetQueue() string {
+	if x != nil && x.Queue != nil {
+		return *x.Queue
+	}
+	return ""
 }
 
 func (x *InferRequest) GetInfer() *InferCore {
@@ -181,7 +189,8 @@ func (x *InferResponse) GetResponse() *InferCore {
 
 type FetchInferRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Metadata      map[string]string      `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Queue         *string                `protobuf:"bytes,1,opt,name=queue,proto3,oneof" json:"queue,omitempty"`
+	Metadata      map[string]string      `protobuf:"bytes,2,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -214,6 +223,13 @@ func (x *FetchInferRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use FetchInferRequest.ProtoReflect.Descriptor instead.
 func (*FetchInferRequest) Descriptor() ([]byte, []int) {
 	return file_grpc_service_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *FetchInferRequest) GetQueue() string {
+	if x != nil && x.Queue != nil {
+		return *x.Queue
+	}
+	return ""
 }
 
 func (x *FetchInferRequest) GetMetadata() map[string]string {
@@ -345,23 +361,27 @@ const file_grpc_service_proto_rawDesc = "" +
 	"\bmetadata\x18\x02 \x03(\v2\".inference.InferCore.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"|\n" +
-	"\fInferRequest\x12/\n" +
-	"\x05infer\x18\x01 \x01(\v2\x14.inference.InferCoreH\x00R\x05infer\x88\x01\x01\x12\"\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa1\x01\n" +
+	"\fInferRequest\x12\x19\n" +
+	"\x05queue\x18\x01 \x01(\tH\x00R\x05queue\x88\x01\x01\x12/\n" +
+	"\x05infer\x18\x02 \x01(\v2\x14.inference.InferCoreH\x01R\x05infer\x88\x01\x01\x12\"\n" +
 	"\n" +
-	"request_id\x18\x02 \x01(\tH\x01R\trequestId\x88\x01\x01B\b\n" +
+	"request_id\x18\x03 \x01(\tH\x02R\trequestId\x88\x01\x01B\b\n" +
+	"\x06_queueB\b\n" +
 	"\x06_inferB\r\n" +
 	"\v_request_id\"r\n" +
 	"\rInferResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x125\n" +
 	"\bresponse\x18\x02 \x01(\v2\x14.inference.InferCoreH\x00R\bresponse\x88\x01\x01B\v\n" +
-	"\t_response\"\x98\x01\n" +
-	"\x11FetchInferRequest\x12F\n" +
-	"\bmetadata\x18\x01 \x03(\v2*.inference.FetchInferRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\t_response\"\xbd\x01\n" +
+	"\x11FetchInferRequest\x12\x19\n" +
+	"\x05queue\x18\x01 \x01(\tH\x00R\x05queue\x88\x01\x01\x12F\n" +
+	"\bmetadata\x18\x02 \x03(\v2*.inference.FetchInferRequest.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"n\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\b\n" +
+	"\x06_queue\"n\n" +
 	"\x12FetchInferResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12/\n" +
@@ -438,6 +458,7 @@ func file_grpc_service_proto_init() {
 	}
 	file_grpc_service_proto_msgTypes[1].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[2].OneofWrappers = []any{}
+	file_grpc_service_proto_msgTypes[3].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[4].OneofWrappers = []any{}
 	file_grpc_service_proto_msgTypes[5].OneofWrappers = []any{}
 	type x struct{}

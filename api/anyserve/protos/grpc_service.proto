@@ -20,8 +20,9 @@ message InferCore {
 }
 
 message InferRequest {
-    optional InferCore infer = 1;
-    optional string request_id = 2;
+    optional string queue = 1;
+    optional InferCore infer = 2;
+    optional string request_id = 3;
 }
 
 message InferResponse {
@@ -31,7 +32,8 @@ message InferResponse {
 
 message FetchInferRequest
 {
-    map<string, string> metadata = 1;
+    optional string queue = 1;
+    map<string, string> metadata = 2;
 }
 
 message FetchInferResponse {

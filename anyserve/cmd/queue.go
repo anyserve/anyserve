@@ -12,39 +12,29 @@ func cmdQueue() *cli.Command {
 		Name:      "queue",
 		Usage:     "Queue operations",
 		ArgsUsage: "META-URI",
-		Flags:     expandFlags(queueFlags()),
+		Flags:     []cli.Flag{},
 		Commands: []*cli.Command{
 			{
 				Name:      "list",
-				Usage:     "List all queues",
+				Usage:     "List all queue",
 				ArgsUsage: "META-URI",
-				Action:    queueListFunc,
-				Flags:     expandFlags(queueFlags()),
+				Description: `
+List all queue.
+
+Examples:
+$ anyserve queue list redis://localhost
+$ anyserve queue list sqlite:///tmp/anyserve.db
+`,
+				Action:  queueListFunc,
+				Flags:   expandFlags(queueListFlags()),
+				Aliases: []string{"ps"},
 			},
 			{
 				Name:      "create",
 				Usage:     "Create a new queue",
 				ArgsUsage: "META-URI",
-				Action:    queueCreateFunc,
-				Flags:     expandFlags(queueCreateFlags()),
-			},
-			{
-				Name:      "status",
-				Usage:     "Get queue status",
-				ArgsUsage: "META-URI NAME",
-				Action:    queueStatusFunc,
-				Flags:     expandFlags(queueFlags()),
-			},
-			{
-				Name:      "delete",
-				Usage:     "Delete a queue",
-				ArgsUsage: "META-URI NAME",
-				Action:    queueDeleteFunc,
-				Flags:     expandFlags(queueFlags()),
-			},
-		},
-		Description: `
-Queue operations.
+				Description: `
+Create a new queue.
 
 Examples:
 # Use Redis
@@ -57,6 +47,35 @@ $ anyserve queue redis://localhost create --name priorityqueue --index "@priorit
 # Use S3 as Storage Engine
 $ anyserve queue redis://localhost create --name priorityqueue --index "@priority,@model" --storage s3://mybucket
 `,
+				Action: queueCreateFunc,
+				Flags:  expandFlags(queueCreateFlags()),
+			},
+			{
+				Name:      "info",
+				Usage:     "Get queue info",
+				ArgsUsage: "META-URI NAME",
+				Action:    queueInfoFunc,
+				Flags:     expandFlags(queueInfoFlags()),
+			},
+			{
+				Name:      "stats",
+				Usage:     "Get queue stats",
+				ArgsUsage: "META-URI NAME",
+				Action:    queueStatsFunc,
+				Flags:     expandFlags(queueStatsFlags()),
+			},
+			{
+				Name:      "remove",
+				Usage:     "Remove a queue",
+				ArgsUsage: "META-URI NAME",
+				Action:    queueDeleteFunc,
+				Flags:     expandFlags(queueDeleteFlags()),
+				Aliases:   []string{"rm"},
+			},
+		},
+		Description: `
+Queue operations.
+`,
 	}
 }
 
@@ -67,9 +86,6 @@ func queueListFunc(ctx context.Context, cmd *cli.Command) error {
 	if metaURI == "" {
 		return fmt.Errorf("META-URI is required")
 	}
-
-	logger.Sugar().Infof("Listing queues for %s", metaURI)
-	// TODO: Implement list queues functionality
 
 	return nil
 }
@@ -92,7 +108,25 @@ func queueCreateFunc(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-func queueStatusFunc(ctx context.Context, cmd *cli.Command) error {
+func queueInfoFunc(ctx context.Context, cmd *cli.Command) error {
+	setup(cmd)
+
+	metaURI := cmd.Args().Get(0)
+	if metaURI == "" {
+		return fmt.Errorf("META-URI is required")
+	}
+
+	name := cmd.Args().Get(1)
+	if name == "" {
+		return fmt.Errorf("queue NAME is required")
+	}
+
+	// TODO: Implement queue info functionality
+
+	return nil
+}
+
+func queueStatsFunc(ctx context.Context, cmd *cli.Command) error {
 	setup(cmd)
 
 	metaURI := cmd.Args().Get(0)
@@ -128,18 +162,12 @@ func queueDeleteFunc(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-func queueFlags() []cli.Flag {
-	return []cli.Flag{
-		&cli.BoolFlag{
-			Name:  "force",
-			Usage: "Force initialization",
-			Value: false,
-		},
-	}
+func queueListFlags() []cli.Flag {
+	return []cli.Flag{}
 }
 
 func queueCreateFlags() []cli.Flag {
-	return append(queueFlags(),
+	return []cli.Flag{
 		&cli.StringFlag{
 			Name:  "name",
 			Usage: "Queue name",
@@ -150,11 +178,23 @@ func queueCreateFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "streaming",
-			Usage: "Streaming engine URI",
+			Usage: "Streaming Engine URI",
 		},
 		&cli.StringFlag{
 			Name:  "storage",
-			Usage: "Storage engine URI",
+			Usage: "Storage Engine URI",
 		},
-	)
+	}
+}
+
+func queueInfoFlags() []cli.Flag {
+	return []cli.Flag{}
+}
+
+func queueStatsFlags() []cli.Flag {
+	return []cli.Flag{}
+}
+
+func queueDeleteFlags() []cli.Flag {
+	return []cli.Flag{}
 }
