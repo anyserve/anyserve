@@ -33,7 +33,7 @@ func Main(args []string) error {
 		Flags:           globalFlags(),
 		Commands: []*cli.Command{
 			cmdInit(),
-			cmdQueueGroup(),
+			cmdQueue(),
 			cmdServe(),
 		},
 	}
