@@ -21,7 +21,7 @@ func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendRe
 
 		if err == io.EOF {
 			logger.Debug(fmt.Sprintf("Received send response request: EOF %s", sendResponseRequest.RequestId))
-			s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_COMPLETED)
+			_ = s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_COMPLETED)
 			return stream.SendAndClose(&emptypb.Empty{})
 		}
 		if err != nil {
@@ -33,14 +33,14 @@ func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendRe
 
 		case config.RESPONSE_METADATA_TYPE_VALUE_ACK:
 			logger.Debug(fmt.Sprintf("%s response.ack", requestId))
-			s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_SCHEDULED)
+			_ = s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_SCHEDULED)
 			if err := s.meta.QueueSendResponseStream(stream.Context(), sendResponseRequest); err != nil {
 				logger.Error(fmt.Sprintf("Failed to queue send response request: %s", err))
 				return err
 			}
 		case config.RESPONSE_METADATA_TYPE_VALUE_FINISH:
 			logger.Debug(fmt.Sprintf("%s response.finished", requestId))
-			s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_COMPLETED)
+			_ = s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_COMPLETED)
 			if err := s.meta.QueueSendResponseStream(stream.Context(), sendResponseRequest); err != nil {
 				logger.Error(fmt.Sprintf("Failed to queue send response request: %s", err))
 				return err
@@ -49,7 +49,7 @@ func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendRe
 
 		case config.RESPONSE_METADATA_TYPE_VALUE_FAILED:
 			logger.Error(fmt.Sprintf("%s response.failed", requestId))
-			s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_FAILED)
+			_ = s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_FAILED)
 			if err := s.meta.QueueSendResponseStream(stream.Context(), sendResponseRequest); err != nil {
 				logger.Error(fmt.Sprintf("Failed to queue send response request: %s", err))
 				return err
@@ -58,7 +58,7 @@ func (s *InferenceService) SendResponse(stream proto.GRPCInferenceService_SendRe
 
 		case config.RESPONSE_METADATA_TYPE_VALUE_PROCESSING:
 			logger.Debug(fmt.Sprintf("%s response.processing", requestId))
-			s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_PROCESSING)
+			_ = s.setInferRequestStatus(ctx, requestId, config.INFER_METADATA_STATUS_VALUE_PROCESSING)
 			if err := s.meta.QueueSendResponseStream(stream.Context(), sendResponseRequest); err != nil {
 				logger.Error(fmt.Sprintf("Failed to queue send response request: %s", err))
 				return err
