@@ -11,36 +11,37 @@ import (
 	"go.uber.org/zap"
 )
 
-func cmdInit() *cli.Command {
+func cmdQueueGroup() *cli.Command {
 	return &cli.Command{
-		Name:      "init",
-		Usage:     "Initialize Anyserve system",
-		Action:    initFunc,
+		Name:      "queuegroup",
+		Usage:     "Queue group operations",
+		Action:    queueGroupFunc,
 		ArgsUsage: "META-URI NAME",
-		Flags:     expandFlags(initFlags()),
+		Flags:     expandFlags(queueGroupFlags()),
 		Description: `
-Create a new Anyserve system. 
-META-URI is used to set up the metadata engine (embedded NATS, sqlite, redis, NATS, etc.) ,
-NAME is the name of the system.
+Queue Group operations.
 
 Examples:
-# Use SQLite as metadata engine
-$ anyserve init sqlite://myjfs.db myserve
+# Use Redis
+$ anyserve queuegroup redis://localhost create --name mymodels --index "@model"
+$ anyserve queuegroup redis://localhost create --name priority --index "@priority,@model"
 
-# Use Redis as metadata engine
-$ anyserve init redis://localhost myserve
+# Use NATS as Streaming Engine
+$ anyserve queuegroup redis://localhost create --name priority --index "@priority,@model" --streaming nats://localhost:4222
+
+# Use S3 as Storage Engine
+$ anyserve queuegroup redis://localhost create --name priority --index "@priority,@model" --storage s3://mybucket
 `,
 	}
 }
 
-func initFunc(ctx context.Context, cmd *cli.Command) error {
+func queueGroupFunc(ctx context.Context, cmd *cli.Command) error {
 	setup(cmd)
 
 	metaURI := cmd.Args().Get(0)
-	name := cmd.Args().Get(1)
 
-	if metaURI == "" || name == "" {
-		return fmt.Errorf("META-URI and NAME are required")
+	if metaURI == "" {
+		return fmt.Errorf("META-URI is required")
 	}
 
 	m, err := meta.NewMeta(metaURI)
@@ -68,7 +69,7 @@ func initFunc(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-func initFlags() []cli.Flag {
+func queueGroupFlags() []cli.Flag {
 
 	return []cli.Flag{
 		&cli.BoolFlag{
