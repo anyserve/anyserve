@@ -24,12 +24,14 @@ class InferCore(_message.Message):
     def __init__(self, content: _Optional[bytes] = ..., metadata: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class InferRequest(_message.Message):
-    __slots__ = ("infer", "request_id")
+    __slots__ = ("queue", "infer", "request_id")
+    QUEUE_FIELD_NUMBER: _ClassVar[int]
     INFER_FIELD_NUMBER: _ClassVar[int]
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
+    queue: str
     infer: InferCore
     request_id: str
-    def __init__(self, infer: _Optional[_Union[InferCore, _Mapping]] = ..., request_id: _Optional[str] = ...) -> None: ...
+    def __init__(self, queue: _Optional[str] = ..., infer: _Optional[_Union[InferCore, _Mapping]] = ..., request_id: _Optional[str] = ...) -> None: ...
 
 class InferResponse(_message.Message):
     __slots__ = ("request_id", "response")
@@ -40,7 +42,7 @@ class InferResponse(_message.Message):
     def __init__(self, request_id: _Optional[str] = ..., response: _Optional[_Union[InferCore, _Mapping]] = ...) -> None: ...
 
 class FetchInferRequest(_message.Message):
-    __slots__ = ("metadata",)
+    __slots__ = ("queue", "metadata")
     class MetadataEntry(_message.Message):
         __slots__ = ("key", "value")
         KEY_FIELD_NUMBER: _ClassVar[int]
@@ -48,9 +50,11 @@ class FetchInferRequest(_message.Message):
         key: str
         value: str
         def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    QUEUE_FIELD_NUMBER: _ClassVar[int]
     METADATA_FIELD_NUMBER: _ClassVar[int]
+    queue: str
     metadata: _containers.ScalarMap[str, str]
-    def __init__(self, metadata: _Optional[_Mapping[str, str]] = ...) -> None: ...
+    def __init__(self, queue: _Optional[str] = ..., metadata: _Optional[_Mapping[str, str]] = ...) -> None: ...
 
 class FetchInferResponse(_message.Message):
     __slots__ = ("request_id", "infer")

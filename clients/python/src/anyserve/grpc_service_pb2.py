@@ -26,7 +26,7 @@ from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 from google.protobuf import any_pb2 as google_dot_protobuf_dot_any__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12grpc_service.proto\x12\tinference\x1a\x1bgoogle/protobuf/empty.proto\x1a\x19google/protobuf/any.proto\"\xa2\x01\n\tInferCore\x12\x18\n\x07\x63ontent\x18\x01 \x01(\x0cR\x07\x63ontent\x12>\n\x08metadata\x18\x02 \x03(\x0b\x32\".inference.InferCore.MetadataEntryR\x08metadata\x1a;\n\rMetadataEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\"|\n\x0cInferRequest\x12/\n\x05infer\x18\x01 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x05infer\x88\x01\x01\x12\"\n\nrequest_id\x18\x02 \x01(\tH\x01R\trequestId\x88\x01\x01\x42\x08\n\x06_inferB\r\n\x0b_request_id\"r\n\rInferResponse\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12\x35\n\x08response\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x08response\x88\x01\x01\x42\x0b\n\t_response\"\x98\x01\n\x11\x46\x65tchInferRequest\x12\x46\n\x08metadata\x18\x01 \x03(\x0b\x32*.inference.FetchInferRequest.MetadataEntryR\x08metadata\x1a;\n\rMetadataEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\"n\n\x12\x46\x65tchInferResponse\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12/\n\x05infer\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x05infer\x88\x01\x01\x42\x08\n\x06_infer\"\xfb\x01\n\x13SendResponseRequest\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12\x35\n\x08response\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x08response\x88\x01\x01\x12\x45\n\x07metrics\x18\x03 \x03(\x0b\x32+.inference.SendResponseRequest.MetricsEntryR\x07metrics\x1a:\n\x0cMetricsEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\x42\x0b\n\t_response2\xb9\x02\n\x14GRPCInferenceService\x12>\n\x05Infer\x12\x17.inference.InferRequest\x1a\x18.inference.InferResponse\"\x00\x30\x01\x12\x46\n\x0bInferStream\x12\x17.inference.InferRequest\x1a\x18.inference.InferResponse\"\x00(\x01\x30\x01\x12M\n\nFetchInfer\x12\x1c.inference.FetchInferRequest\x1a\x1d.inference.FetchInferResponse\"\x00\x30\x01\x12J\n\x0cSendResponse\x12\x1e.inference.SendResponseRequest\x1a\x16.google.protobuf.Empty\"\x00(\x01\x42(Z&github.com/anyserve/anyserve/pkg/protob\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12grpc_service.proto\x12\tinference\x1a\x1bgoogle/protobuf/empty.proto\x1a\x19google/protobuf/any.proto\"\xa2\x01\n\tInferCore\x12\x18\n\x07\x63ontent\x18\x01 \x01(\x0cR\x07\x63ontent\x12>\n\x08metadata\x18\x02 \x03(\x0b\x32\".inference.InferCore.MetadataEntryR\x08metadata\x1a;\n\rMetadataEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\"\xa1\x01\n\x0cInferRequest\x12\x19\n\x05queue\x18\x01 \x01(\tH\x00R\x05queue\x88\x01\x01\x12/\n\x05infer\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x01R\x05infer\x88\x01\x01\x12\"\n\nrequest_id\x18\x03 \x01(\tH\x02R\trequestId\x88\x01\x01\x42\x08\n\x06_queueB\x08\n\x06_inferB\r\n\x0b_request_id\"r\n\rInferResponse\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12\x35\n\x08response\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x08response\x88\x01\x01\x42\x0b\n\t_response\"\xbd\x01\n\x11\x46\x65tchInferRequest\x12\x19\n\x05queue\x18\x01 \x01(\tH\x00R\x05queue\x88\x01\x01\x12\x46\n\x08metadata\x18\x02 \x03(\x0b\x32*.inference.FetchInferRequest.MetadataEntryR\x08metadata\x1a;\n\rMetadataEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\x42\x08\n\x06_queue\"n\n\x12\x46\x65tchInferResponse\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12/\n\x05infer\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x05infer\x88\x01\x01\x42\x08\n\x06_infer\"\xfb\x01\n\x13SendResponseRequest\x12\x1d\n\nrequest_id\x18\x01 \x01(\tR\trequestId\x12\x35\n\x08response\x18\x02 \x01(\x0b\x32\x14.inference.InferCoreH\x00R\x08response\x88\x01\x01\x12\x45\n\x07metrics\x18\x03 \x03(\x0b\x32+.inference.SendResponseRequest.MetricsEntryR\x07metrics\x1a:\n\x0cMetricsEntry\x12\x10\n\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n\x05value\x18\x02 \x01(\tR\x05value:\x02\x38\x01\x42\x0b\n\t_response2\xb9\x02\n\x14GRPCInferenceService\x12>\n\x05Infer\x12\x17.inference.InferRequest\x1a\x18.inference.InferResponse\"\x00\x30\x01\x12\x46\n\x0bInferStream\x12\x17.inference.InferRequest\x1a\x18.inference.InferResponse\"\x00(\x01\x30\x01\x12M\n\nFetchInfer\x12\x1c.inference.FetchInferRequest\x1a\x1d.inference.FetchInferResponse\"\x00\x30\x01\x12J\n\x0cSendResponse\x12\x1e.inference.SendResponseRequest\x1a\x16.google.protobuf.Empty\"\x00(\x01\x42(Z&github.com/anyserve/anyserve/pkg/protob\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -44,20 +44,20 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_INFERCORE']._serialized_end=252
   _globals['_INFERCORE_METADATAENTRY']._serialized_start=193
   _globals['_INFERCORE_METADATAENTRY']._serialized_end=252
-  _globals['_INFERREQUEST']._serialized_start=254
-  _globals['_INFERREQUEST']._serialized_end=378
-  _globals['_INFERRESPONSE']._serialized_start=380
-  _globals['_INFERRESPONSE']._serialized_end=494
-  _globals['_FETCHINFERREQUEST']._serialized_start=497
-  _globals['_FETCHINFERREQUEST']._serialized_end=649
+  _globals['_INFERREQUEST']._serialized_start=255
+  _globals['_INFERREQUEST']._serialized_end=416
+  _globals['_INFERRESPONSE']._serialized_start=418
+  _globals['_INFERRESPONSE']._serialized_end=532
+  _globals['_FETCHINFERREQUEST']._serialized_start=535
+  _globals['_FETCHINFERREQUEST']._serialized_end=724
   _globals['_FETCHINFERREQUEST_METADATAENTRY']._serialized_start=193
   _globals['_FETCHINFERREQUEST_METADATAENTRY']._serialized_end=252
-  _globals['_FETCHINFERRESPONSE']._serialized_start=651
-  _globals['_FETCHINFERRESPONSE']._serialized_end=761
-  _globals['_SENDRESPONSEREQUEST']._serialized_start=764
-  _globals['_SENDRESPONSEREQUEST']._serialized_end=1015
-  _globals['_SENDRESPONSEREQUEST_METRICSENTRY']._serialized_start=944
-  _globals['_SENDRESPONSEREQUEST_METRICSENTRY']._serialized_end=1002
-  _globals['_GRPCINFERENCESERVICE']._serialized_start=1018
-  _globals['_GRPCINFERENCESERVICE']._serialized_end=1331
+  _globals['_FETCHINFERRESPONSE']._serialized_start=726
+  _globals['_FETCHINFERRESPONSE']._serialized_end=836
+  _globals['_SENDRESPONSEREQUEST']._serialized_start=839
+  _globals['_SENDRESPONSEREQUEST']._serialized_end=1090
+  _globals['_SENDRESPONSEREQUEST_METRICSENTRY']._serialized_start=1019
+  _globals['_SENDRESPONSEREQUEST_METRICSENTRY']._serialized_end=1077
+  _globals['_GRPCINFERENCESERVICE']._serialized_start=1093
+  _globals['_GRPCINFERENCESERVICE']._serialized_end=1406
 # @@protoc_insertion_point(module_scope)
