@@ -6,12 +6,14 @@ on:
     paths:
       - "anyserve/**"
       - "api/**"
+      - "Makefile"
       - ".github/workflows/anyserve-ci.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "anyserve/**"
       - "api/**"
+      - "Makefile"
       - ".github/workflows/anyserve-ci.yml"
 
 
