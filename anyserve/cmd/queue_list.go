@@ -23,7 +23,7 @@ $ anyserve queue list sqlite:///tmp/anyserve.db
 `,
 		Action:  queueListFunc,
 		Flags:   expandFlags(queueListFlags()),
-		Aliases: []string{"ps"},
+		Aliases: []string{"ps", "ls"},
 	}
 }
 func queueListFunc(ctx context.Context, cmd *cli.Command) error {
