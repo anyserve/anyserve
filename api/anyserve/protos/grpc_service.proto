@@ -46,3 +46,4 @@ message SendResponseRequest {
     optional InferCore response = 2;
     map<string, string> metrics = 3;
 }
+
