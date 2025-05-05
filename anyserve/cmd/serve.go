@@ -55,7 +55,7 @@ func serveFunc(ctx context.Context, cmd *cli.Command) error {
 
 	grpcConfig := &config.GRPCConfig{
 		Host:       cmd.String("grpc.host"),
-		Port:       cmd.Int("grpc.port"),
+		Port:       int64(cmd.Int("grpc.port")),
 		TLSEnabled: cmd.Bool("grpc.tls_enabled"),
 		CertFile:   cmd.String("grpc.cert_file"),
 		KeyFile:    cmd.String("grpc.key_file"),
@@ -63,7 +63,7 @@ func serveFunc(ctx context.Context, cmd *cli.Command) error {
 
 	httpConfig := &config.HTTPConfig{
 		Host: cmd.String("http.host"),
-		Port: cmd.Int("http.port"),
+		Port: int64(cmd.Int("http.port")),
 	}
 
 	meta, err := meta.NewMeta(metaURI)

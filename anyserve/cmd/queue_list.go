@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/anyserve/anyserve/pkg/meta"
+	"github.com/pterm/pterm"
 	"github.com/urfave/cli/v3"
 )
 
@@ -50,9 +51,13 @@ func queueListFunc(ctx context.Context, cmd *cli.Command) error {
 		return err
 	}
 
-	for _, queue := range queues {
-		logger.Info(fmt.Sprintf("queue: %s", queue))
+	table := pterm.TableData{
+		{"#", "Name", "Index", "Streaming", "Storage"},
 	}
+	for i, queue := range queues {
+		table = append(table, []string{fmt.Sprintf("%d", i), queue.Name, queue.Index, queue.Streaming, queue.Storage})
+	}
+	pterm.DefaultTable.WithHasHeader().WithData(table).Render()
 	return nil
 }
 
