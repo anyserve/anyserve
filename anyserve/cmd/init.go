@@ -43,12 +43,12 @@ func initFunc(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("META-URI and NAME are required")
 	}
 
-	m, err := meta.NewMeta(metaURI)
+	metaEngine, err := meta.NewMeta(metaURI)
 	if err != nil {
 		return fmt.Errorf("meta client: %w", err)
 	}
 
-	format, err := m.Load()
+	format, err := metaEngine.Load()
 	if err == nil {
 		logger.Warn("Meta already initialized. Updating now")
 		format.Name = name
@@ -63,7 +63,23 @@ func initFunc(ctx context.Context, cmd *cli.Command) error {
 		return fmt.Errorf("load meta: %w", err)
 	}
 
-	_ = m.Init(format, cmd.Bool("force"))
+	err = metaEngine.Init(format, cmd.Bool("force"))
+	if err != nil {
+		return fmt.Errorf("init meta: %w", err)
+	}
+
+	logger.Info("Init meta", zap.Any("format", format))
+
+	queue := meta.Queue{
+		Name:  "default",
+		Index: "",
+	}
+	err = metaEngine.CreateQueue(ctx, queue)
+	if err != nil {
+		return fmt.Errorf("create queue: %w", err)
+	}
+
+	logger.Info("Create queue", zap.Any("queue", queue))
 
 	return nil
 }

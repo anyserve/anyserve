@@ -277,6 +277,9 @@ func (m *redisMeta) doCreateQueueIndex(ctx context.Context, queue Queue) error {
 	// extract index schema from index string
 	// e.g. "@xxx,@yyy" -> ["@xxx","TAG", "SORTABLE", "@yyy","TAG", "SORTABLE"]
 	fields := func(index string) []string {
+		if index == "" {
+			return []string{}
+		}
 		var result []string
 		for field := range strings.SplitSeq(index, ",") {
 			result = append(result, field, "TAG", "SORTABLE")
