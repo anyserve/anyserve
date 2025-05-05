@@ -10,10 +10,12 @@ logging.basicConfig(
 )
 
 
-def send_request(stub: pb2_grpc.GRPCInferenceServiceStub):
+def send_request(
+    stub: pb2_grpc.GRPCInferenceServiceStub, request_id: str | None = None
+):
     infer_core = pb2.InferCore(content=b"1 2 3", metadata={"model_name": "test"})
 
-    request = pb2.InferRequest(infer=infer_core)
+    request = pb2.InferRequest(infer=infer_core, request_id=request_id)
 
     for response in stub.Infer(request):
         logger.info(f"Request ID: {response.request_id}")
@@ -82,6 +84,13 @@ if __name__ == "__main__":
         default="consume",
         help="Mode of operation (produce, consume)",
     )
+    parser.add_argument(
+        "--request-id",
+        type=str,
+        default=None,
+        help="Request ID to consume",
+    )
+
     args = parser.parse_args()
 
     mode = args.mode
@@ -89,7 +98,10 @@ if __name__ == "__main__":
     channel = grpc.insecure_channel("localhost:50052")
     stub = pb2_grpc.GRPCInferenceServiceStub(channel)
     if mode == "produce":
-        send_request(stub)
+        if args.request_id is not None:
+            send_request(stub, args.request_id)
+        else:
+            send_request(stub)
     elif mode == "consume":
         while True:
             time.sleep(1)
