@@ -4,16 +4,24 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "anyserve/**"
+      - "crates/**"
+      - "clients/rust/**"
+      - "docs/**"
       - "api/**"
-      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "mise.toml"
       - ".github/workflows/anyserve-ci.yml"
   pull_request:
     branches: ["main"]
     paths:
-      - "anyserve/**"
+      - "crates/**"
+      - "clients/rust/**"
+      - "docs/**"
       - "api/**"
-      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "mise.toml"
       - ".github/workflows/anyserve-ci.yml"
 
 
@@ -23,32 +31,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          go-version: "1.24"
-          cache: true
+          python-version: "3.12"
 
-      - name: Install Buf
-        uses: bufbuild/buf-setup-action@v1.50.0
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
-      - name: Generate gRPC files
-        run: make buf
+      - name: Install mise
+        run: curl https://mise.run | sh
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v7
-        with:
-          version: latest
-          working-directory: anyserve
+      - name: Add tool paths
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Build
-        run: make -C anyserve build
+      - name: Install Rust toolchain
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise trust --all
+          mise install
+
+      - name: Install maturin
+        run: python -m pip install maturin
+
+      - name: Format
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          cargo fmt --all --check
+
+      - name: Check
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run check
 
       - name: Test
-        run: make -C anyserve test COVERAGE=1
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run test
 
-      - name: Upload coverage
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./anyserve/coverage.txt
-          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Build Python wheel
+        run: python -m maturin build --manifest-path clients/python/Cargo.toml --interpreter python

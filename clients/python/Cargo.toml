@@ -1,0 +1,18 @@
+[package]
+name = "anyserve-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+anyserve-proto = { path = "../../crates/anyserve-proto" }
+pyo3.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true

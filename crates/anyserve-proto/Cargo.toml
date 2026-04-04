@@ -1,0 +1,15 @@
+[package]
+name = "anyserve-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+tonic-build.workspace = true

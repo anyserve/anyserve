@@ -1,0 +1,50 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "mise: install",
+      "type": "shell",
+      "command": "mise install",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "mise: check",
+      "type": "shell",
+      "command": "mise run check",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "mise: test",
+      "type": "shell",
+      "command": "mise run test",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "mise: python-sdk",
+      "type": "shell",
+      "command": "mise run python-sdk",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    },
+    {
+      "label": "cargo: serve",
+      "type": "shell",
+      "command": "cargo run -p anyserve -- serve redis://127.0.0.1:6379",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": "$rustc"
+    }
+  ]
+}

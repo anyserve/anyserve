@@ -1,2 +1,11 @@
 # ignore local redis dump file
 dump.rdb
+
+/target
+/.mise
+/.direnv
+/docs/book
+**/*.rs.bk
+/clients/python/.maturin
+/clients/python/dist
+/clients/python/.venv

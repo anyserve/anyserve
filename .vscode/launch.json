@@ -1,20 +1,105 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Debug anyserve (make dev)",
-            "type": "go",
-            "request": "launch",
-            "mode": "auto",
-            "program": "${workspaceFolder}/anyserve/main.go",
-            "args": ["serve", "redis://localhost", "-v"],
-            "env": {},
-            "cwd": "${workspaceFolder}/anyserve",
-            "buildFlags": "",
-            "showLog": true
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug anyserve server",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "anyserve",
+          "--bin",
+          "anyserve"
+        ],
+        "filter": {
+          "name": "anyserve",
+          "kind": "bin"
         }
-    ]
+      },
+      "args": [
+        "serve",
+        "redis://127.0.0.1:6379"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "debug"
+      }
+    },
+    {
+      "name": "Debug anyserve init",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "anyserve",
+          "--bin",
+          "anyserve"
+        ],
+        "filter": {
+          "name": "anyserve",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "init",
+        "redis://127.0.0.1:6379",
+        "myserve",
+        "--force"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "RUST_LOG": "info"
+      }
+    },
+    {
+      "name": "Debug anyserve client (produce)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "anyserve-client",
+          "--bin",
+          "anyserve-client"
+        ],
+        "filter": {
+          "name": "anyserve-client",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "--mode",
+        "produce"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Debug anyserve client (consume)",
+      "type": "lldb",
+      "request": "launch",
+      "cargo": {
+        "args": [
+          "build",
+          "--package",
+          "anyserve-client",
+          "--bin",
+          "anyserve-client"
+        ],
+        "filter": {
+          "name": "anyserve-client",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "--mode",
+        "consume"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
 }

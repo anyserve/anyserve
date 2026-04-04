@@ -1,0 +1,17 @@
+[package]
+name = "anyserve-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+anyserve-proto = { path = "../../crates/anyserve-proto" }
+async-stream.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

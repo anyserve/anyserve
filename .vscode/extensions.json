@@ -1,0 +1,12 @@
+{
+  "recommendations": [
+    "rust-lang.rust-analyzer",
+    "vadimcn.vscode-lldb",
+    "tamasfe.even-better-toml",
+    "ms-python.python"
+  ],
+  "unwantedRecommendations": [
+    "golang.go",
+    "astro-build.astro-vscode"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.cargo.features": "all",
+  "rust-analyzer.linkedProjects": [
+    "${workspaceFolder}/Cargo.toml",
+    "${workspaceFolder}/clients/python/Cargo.toml"
+  ],
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "files.exclude": {
+    "**/target": true
+  }
+}
