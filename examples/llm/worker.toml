@@ -1,0 +1,11 @@
+base_url = "http://127.0.0.1:11434/v1"
+provider = "ollama"
+interfaces = ["llm.chat.v1", "llm.embed.v1"]
+poll_interval_secs = 1
+heartbeat_interval_secs = 5
+
+[attributes]
+region = "local"
+
+[capacity]
+slot = 1

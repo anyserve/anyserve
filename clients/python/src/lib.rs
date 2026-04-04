@@ -164,14 +164,14 @@ impl AnyserveClient {
         after_sequence: u64,
     ) -> PyResult<JobEventIterator> {
         let runtime = self.runtime.clone();
-        let stream_runtime = runtime.clone();
         let client = self.client.clone();
         py.allow_threads(move || {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.watch_job(job_id, after_sequence))
             })?;
+            let iterator_runtime = Arc::new(Mutex::new(build_runtime()?));
             Ok(JobEventIterator {
-                runtime: stream_runtime,
+                runtime: iterator_runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
             })
         })
@@ -558,14 +558,14 @@ impl AnyserveClient {
         follow: bool,
     ) -> PyResult<FrameIterator> {
         let runtime = self.runtime.clone();
-        let stream_runtime = runtime.clone();
         let client = self.client.clone();
         py.allow_threads(move || {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))
             })?;
+            let iterator_runtime = Arc::new(Mutex::new(build_runtime()?));
             Ok(FrameIterator {
-                runtime: stream_runtime,
+                runtime: iterator_runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
             })
         })

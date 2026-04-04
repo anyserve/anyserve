@@ -81,7 +81,7 @@ Static docs can be deployed from this repository to GitHub Pages. The current md
 
 - `mise`
 - `protoc`
-- Python 3.9+ for the Python bindings
+- Python 3.12+ for the Python bindings
 
 ## Install
 
@@ -132,9 +132,35 @@ Start the control plane:
 mise exec -- cargo run -p anyserve -- serve
 ```
 
-The runtime exposes only gRPC. Liveness and readiness use the standard gRPC health service on the same port.
+Start the built-in OpenAI-compatible example stack from the checked-in config:
+
+```bash
+mise exec -- cargo run -p anyserve -- serve --config examples/llm/anyserve.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+```
+
+That example starts:
+
+- gRPC on `127.0.0.1:50052`
+- the built-in OpenAI-compatible gateway on `127.0.0.1:8080`
+
+The built-in gateway exposes:
+
+- `GET /healthz`
+- `GET /readyz`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/embeddings`
 
 Examples use endpoint strings like `http://127.0.0.1:50052`. That is a gRPC channel URI used by `tonic`, not a REST or JSON HTTP API.
+
+Treat the checked-in example docs as the canonical walkthrough:
+
+- [examples/llm/README.md](examples/llm/README.md): built-in OpenAI gateway + built-in LLM worker
+- [docs/src/ollama.md](docs/src/ollama.md): Ollama-specific notes for the same example
+- [docs/src/testing.md](docs/src/testing.md): how the example fits into the test layers
+
+The worker expects an OpenAI-compatible upstream at the configured `base_url`, for example Ollama, SGLang, or vLLM.
 
 Start a demo worker:
 
@@ -151,9 +177,20 @@ mise exec -- cargo run -p anyserve-demo -- --mode submit
 Or use the Python examples after installing the bindings:
 
 ```bash
-mise run python-sdk-dev
-mise exec -- python examples/python/worker.py
-mise exec -- python examples/python/submit.py
+# clean venv from local source
+python -m venv .venv
+. .venv/bin/activate
+pip install ./clients/python
+
+# or use the active mise Python
+# mise run python-sdk-dev
+
+python examples/python/worker.py
+python examples/python/submit.py
+
+# with the active mise Python instead
+# mise exec -- python examples/python/worker.py
+# mise exec -- python examples/python/submit.py
 ```
 
 The demo path now uses both control-plane and data-plane APIs:

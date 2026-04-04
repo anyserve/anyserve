@@ -2,7 +2,17 @@
 
 These examples exercise the installed `anyserve` Python package.
 
-Before running them locally, install the bindings into your active `mise` Python:
+Before running them locally, install the bindings into a Python environment.
+
+From local source in a clean virtual environment:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install ./clients/python
+```
+
+Or install them into the active `mise` Python:
 
 ```bash
 mise run python-sdk-dev
@@ -17,12 +27,19 @@ mise exec -- cargo run -p anyserve -- serve
 Start the example worker:
 
 ```bash
-mise exec -- python examples/python/worker.py
+python examples/python/worker.py
 ```
 
 Submit an example job:
 
 ```bash
+python examples/python/submit.py
+```
+
+If you are using the active `mise` Python instead of a virtual environment, run:
+
+```bash
+mise exec -- python examples/python/worker.py
 mise exec -- python examples/python/submit.py
 ```
 

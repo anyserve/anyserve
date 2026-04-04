@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .client import AnyserveClient, SubmitterClient, WorkerClient
 from .highlevel import HandlerSpec, WorkerHandler, get_handler_spec, serve, worker
 

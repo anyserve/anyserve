@@ -417,6 +417,176 @@ async fn grpc_streaming_e2e_round_trip() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn grpc_follow_streams_wake_on_new_events_and_frames() -> Result<()> {
+    let (endpoint, shutdown_tx, handle) = spawn_server().await?;
+    let mut client = ControlPlaneServiceClient::connect(endpoint.clone())
+        .await
+        .context("connect submit client")?;
+    let mut worker = ControlPlaneServiceClient::connect(endpoint)
+        .await
+        .context("connect worker client")?;
+
+    let worker_id = worker
+        .register_worker(Request::new(RegisterWorkerRequest {
+            worker_id: "worker-follow".to_string(),
+            spec: Some(WorkerSpec {
+                interfaces: vec!["demo.echo.v1".to_string()],
+                attributes: HashMap::from([("runtime".to_string(), "demo".to_string())]),
+                total_capacity: vec![ResourceQuantity {
+                    name: "slot".to_string(),
+                    value: 1,
+                }],
+                max_active_leases: 1,
+                metadata: HashMap::new(),
+            }),
+        }))
+        .await
+        .context("register worker")?
+        .into_inner()
+        .worker
+        .context("missing worker in register response")?
+        .worker_id;
+
+    let job = client
+        .submit_job(Request::new(SubmitJobRequest {
+            job_id: "job-follow".to_string(),
+            spec: Some(JobSpec {
+                interface_name: "demo.echo.v1".to_string(),
+                inputs: Vec::new(),
+                params: Vec::new(),
+                demand: Some(Demand {
+                    required_attributes: HashMap::from([(
+                        "runtime".to_string(),
+                        "demo".to_string(),
+                    )]),
+                    preferred_attributes: HashMap::new(),
+                    required_capacity: vec![ResourceQuantity {
+                        name: "slot".to_string(),
+                        value: 1,
+                    }],
+                }),
+                policy: Some(ExecutionPolicy {
+                    profile: "basic".to_string(),
+                    priority: 0,
+                    lease_ttl_secs: 15,
+                }),
+                metadata: HashMap::new(),
+            }),
+        }))
+        .await
+        .context("submit job")?
+        .into_inner()
+        .job
+        .context("missing job in submit response")?;
+
+    let assignment = worker
+        .poll_lease(Request::new(PollLeaseRequest {
+            worker_id: worker_id.clone(),
+        }))
+        .await
+        .context("poll lease for follow job")?
+        .into_inner();
+    let lease = assignment.lease.context("missing lease in poll response")?;
+    let attempt = assignment
+        .attempt
+        .context("missing attempt in poll response")?;
+
+    let mut events = client
+        .watch_job(Request::new(WatchJobRequest {
+            job_id: job.job_id.clone(),
+            after_sequence: 2,
+        }))
+        .await
+        .context("watch follow job")?
+        .into_inner();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    worker
+        .report_event(Request::new(ReportEventRequest {
+            worker_id: worker_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            kind: EventKind::Started as i32,
+            payload: Vec::new(),
+            metadata: HashMap::new(),
+        }))
+        .await
+        .context("report started for follow job")?;
+
+    let event = tokio::time::timeout(Duration::from_millis(90), events.next())
+        .await
+        .context("timed out waiting for follow job event")?
+        .context("follow job event stream ended early")?
+        .context("receive follow job event")?;
+    assert_eq!(event.kind(), EventKind::Started);
+
+    let output_stream = worker
+        .open_stream(Request::new(OpenStreamRequest {
+            job_id: job.job_id.clone(),
+            attempt_id: attempt.attempt_id.clone(),
+            worker_id: worker_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            stream_name: "output.default".to_string(),
+            scope: StreamScope::Lease as i32,
+            direction: StreamDirection::WorkerToClient as i32,
+            metadata: HashMap::new(),
+        }))
+        .await
+        .context("open follow output stream")?
+        .into_inner()
+        .stream
+        .context("missing follow output stream in open response")?;
+
+    let mut frames = client
+        .pull_frames(Request::new(PullFramesRequest {
+            stream_id: output_stream.stream_id.clone(),
+            after_sequence: 0,
+            follow: true,
+        }))
+        .await
+        .context("pull follow output frames")?
+        .into_inner();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    worker
+        .push_frames(Request::new(tokio_stream::iter(vec![PushFramesRequest {
+            stream_id: output_stream.stream_id.clone(),
+            worker_id: worker_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            kind: FrameKind::Data as i32,
+            payload: b"stream reply".to_vec(),
+            metadata: HashMap::new(),
+        }])))
+        .await
+        .context("push follow output frame")?;
+
+    let frame = tokio::time::timeout(Duration::from_millis(90), frames.next())
+        .await
+        .context("timed out waiting for follow output frame")?
+        .context("follow frame stream ended early")?
+        .context("receive follow output frame")?;
+    assert_eq!(frame.kind(), FrameKind::Data);
+    assert_eq!(frame.payload, b"stream reply".to_vec());
+
+    worker
+        .complete_lease(Request::new(CompleteLeaseRequest {
+            worker_id: worker_id.clone(),
+            lease_id: lease.lease_id.clone(),
+            outputs: Vec::new(),
+            metadata: HashMap::new(),
+        }))
+        .await
+        .context("complete follow lease")?;
+
+    drop(events);
+    drop(frames);
+    drop(client);
+    drop(worker);
+    let _ = shutdown_tx.send(());
+    handle.await.context("join grpc server task")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn grpc_can_list_and_cancel_jobs() -> Result<()> {
     let (endpoint, shutdown_tx, handle) = spawn_server().await?;
     let mut client = ControlPlaneServiceClient::connect(endpoint)

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,14 @@ use serde::Serialize;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+mod serve_config;
+mod serve_openai;
+mod serve_openai_worker;
+
+use serve_config::{ResolvedServeConfig, ServeOverrides};
+use serve_openai::run_server as run_serve_openai;
+use serve_openai_worker::ServeOpenAIWorkerArgs;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50052";
 
@@ -43,6 +52,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Serve(ServeArgs),
+    Worker(ServeOpenAIWorkerArgs),
     Job {
         #[command(subcommand)]
         command: JobCommands,
@@ -111,20 +121,26 @@ struct JobCancelArgs {
 
 #[derive(Args, Debug)]
 struct ServeArgs {
-    #[arg(long = "grpc-host", default_value = "0.0.0.0")]
-    grpc_host: String,
-    #[arg(long = "grpc-port", default_value_t = 50_052)]
-    grpc_port: u16,
-    #[arg(long = "grpc-tls-enabled")]
-    grpc_tls_enabled: bool,
+    #[arg(long = "config", value_name = "PATH")]
+    config: Option<PathBuf>,
+    #[arg(long = "grpc-host")]
+    grpc_host: Option<String>,
+    #[arg(long = "grpc-port")]
+    grpc_port: Option<u16>,
+    #[arg(
+        long = "grpc-tls-enabled",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    grpc_tls_enabled: Option<bool>,
     #[arg(long = "grpc-cert-file")]
     grpc_cert_file: Option<String>,
     #[arg(long = "grpc-key-file")]
     grpc_key_file: Option<String>,
-    #[arg(long = "heartbeat-ttl-secs", default_value_t = 30)]
-    heartbeat_ttl_secs: u64,
-    #[arg(long = "default-lease-ttl-secs", default_value_t = 30)]
-    default_lease_ttl_secs: u64,
+    #[arg(long = "heartbeat-ttl-secs")]
+    heartbeat_ttl_secs: Option<u64>,
+    #[arg(long = "default-lease-ttl-secs")]
+    default_lease_ttl_secs: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -222,6 +238,7 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Serve(args) => serve(args).await,
+        Commands::Worker(args) => serve_openai_worker::run(&endpoint, args).await,
         Commands::Job { command } => run_job_command(&endpoint, command).await,
     }
 }
@@ -440,29 +457,66 @@ async fn run_job_cancel(
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
-    let grpc_config = GrpcConfig {
-        host: args.grpc_host,
-        port: args.grpc_port,
-        tls_enabled: args.grpc_tls_enabled,
-        cert_file: args.grpc_cert_file,
-        key_file: args.grpc_key_file,
-    };
+    let config = ResolvedServeConfig::load(ServeOverrides {
+        config: args.config,
+        grpc_host: args.grpc_host,
+        grpc_port: args.grpc_port,
+        grpc_tls_enabled: args.grpc_tls_enabled,
+        grpc_cert_file: args.grpc_cert_file,
+        grpc_key_file: args.grpc_key_file,
+        heartbeat_ttl_secs: args.heartbeat_ttl_secs,
+        default_lease_ttl_secs: args.default_lease_ttl_secs,
+    })?;
+    let grpc_config = config.grpc.clone();
 
     let kernel = Arc::new(Kernel::new(
         Arc::new(MemoryStateStore::new()),
         Arc::new(MemoryStreamStore::new()),
         Arc::new(BasicScheduler),
-        args.heartbeat_ttl_secs,
-        args.default_lease_ttl_secs,
+        config.heartbeat_ttl_secs,
+        config.default_lease_ttl_secs,
     ));
 
     let grpc_addr = socket_addr(&grpc_config.host, grpc_config.port)?;
+    let openai_addr = config
+        .openai
+        .as_ref()
+        .map(|openai| socket_addr_from_bind(&openai.listen))
+        .transpose()?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let grpc_task = tokio::spawn(run_grpc_server(grpc_addr, kernel, grpc_config, shutdown_rx));
+    let grpc_task = tokio::spawn(run_grpc_server(
+        grpc_addr,
+        Arc::clone(&kernel),
+        grpc_config,
+        shutdown_rx,
+    ));
+    let openai_task =
+        if let (Some(openai_config), Some(openai_addr)) = (config.openai.clone(), openai_addr) {
+            Some(tokio::spawn(run_serve_openai(
+                openai_addr,
+                Arc::clone(&kernel),
+                openai_config,
+                shutdown_tx.subscribe(),
+            )))
+        } else {
+            None
+        };
 
-    print_startup_access_points(&grpc_addr, args.grpc_tls_enabled);
-    info!(grpc = %grpc_addr, "control plane started");
+    print_startup_access_points(
+        &grpc_addr,
+        config.grpc.tls_enabled,
+        config.config_path.as_deref(),
+        openai_addr.as_ref(),
+    );
+    if let Some(config_path) = config.config_path.as_ref() {
+        info!(grpc = %grpc_addr, config = %config_path.display(), "control plane started");
+    } else {
+        info!(grpc = %grpc_addr, "control plane started");
+    }
+    if let Some(openai_addr) = openai_addr {
+        info!(openai = %openai_addr, "openai gateway started");
+    }
 
     tokio::signal::ctrl_c()
         .await
@@ -470,6 +524,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let _ = shutdown_tx.send(true);
 
     grpc_task.await.context("join grpc task")??;
+    if let Some(openai_task) = openai_task {
+        openai_task.await.context("join openai task")??;
+    }
     Ok(())
 }
 
@@ -519,16 +576,33 @@ async fn run_grpc_server(
         .context("run grpc server")
 }
 
-fn print_startup_access_points(addr: &SocketAddr, tls_enabled: bool) {
+fn print_startup_access_points(
+    addr: &SocketAddr,
+    tls_enabled: bool,
+    config_path: Option<&std::path::Path>,
+    openai_addr: Option<&SocketAddr>,
+) {
     let scheme = if tls_enabled { "https" } else { "http" };
-    let access_points = access_points(addr, scheme);
-
-    print_section("Control Plane Ready");
-    print_key_values(&[
+    let grpc_access_points = access_points(addr, scheme);
+    let mut entries = vec![
         ("grpc", addr.to_string()),
         ("scheme", scheme.to_string()),
-        ("access", access_points.join(", ")),
-    ]);
+        ("access", grpc_access_points.join(", ")),
+    ];
+    if let Some(config_path) = config_path {
+        entries.push(("config", config_path.display().to_string()));
+    }
+    if let Some(openai_addr) = openai_addr {
+        let access = access_points(openai_addr, "http")
+            .into_iter()
+            .map(|value| format!("{value}/v1"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        entries.push(("openai", access));
+    }
+
+    print_section("Control Plane Ready");
+    print_key_values(&entries);
     println!();
 }
 
@@ -553,6 +627,15 @@ fn socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no socket addresses resolved for {host}:{port}"))
+}
+
+fn socket_addr_from_bind(value: &str) -> Result<SocketAddr> {
+    let mut addrs = value
+        .to_socket_addrs()
+        .with_context(|| format!("resolve socket address {value}"))?;
+    addrs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no socket addresses resolved for {value}"))
 }
 
 fn access_points(addr: &SocketAddr, scheme: &str) -> Vec<String> {

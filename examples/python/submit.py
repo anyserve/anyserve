@@ -49,15 +49,20 @@ def main() -> None:
         print(f"job event seq={event['sequence']} kind={event['kind']}")
 
     streams = client.list_streams(job["job_id"])
-    output_stream = next(
-        item for item in streams if item["stream_name"] == "output.default"
-    )
+    try:
+        output_stream = next(
+            item for item in streams if item["stream_name"] == "output.default"
+        )
+    except StopIteration as exc:
+        raise SystemExit("output.default stream was not created") from exc
     output_payload = b"".join(
         frame["payload"]
         for frame in client.pull_frames(output_stream["stream_id"], follow=False)
         if frame["kind"] == "data"
     )
     final_job = client.get_job(job["job_id"])
+    if final_job["state"] != "succeeded":
+        raise SystemExit(f"job did not succeed: {final_job['state']}")
 
     print(f"output payload={output_payload.decode('utf-8', errors='replace')}")
     print(f"final job state={final_job['state']}")

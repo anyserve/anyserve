@@ -4,7 +4,7 @@
 
 - `mise`
 - `protoc`
-- Python 3.9+ if you want the Python bindings
+- Python 3.12+ if you want the Python bindings
 
 ## Bootstrap
 
@@ -14,22 +14,66 @@ mise install
 mise run build
 ```
 
+## Example-First Workflow
+
+The checked-in examples are the main usage docs.
+
+For the built-in OpenAI-compatible gateway and LLM worker, start here:
+
+- [examples/llm/README.md](../../examples/llm/README.md)
+- [Ollama](ollama.md)
+
+The smallest local stack is:
+
+```bash
+mise exec -- cargo run -p anyserve -- serve --config examples/llm/anyserve.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+```
+
+That example exposes:
+
+- `GET /healthz`
+- `GET /readyz`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/embeddings`
+
+Keep the detailed commands, config explanation, and current behavior notes in the example README so they only need to be updated in one place.
+
 ## Start the Control Plane
 
 ```bash
 mise exec -- cargo run -p anyserve -- serve
 ```
 
-gRPC listens on `0.0.0.0:50052`.
+Or use your own config file:
 
-The gRPC health service is available on the same port.
+```bash
+mise exec -- cargo run -p anyserve -- serve --config path/to/anyserve.toml
+```
 
-Examples use endpoint strings like `http://127.0.0.1:50052` because the generated clients use gRPC channel URIs. That is not a REST endpoint.
+CLI flags override the config file if you provide both.
+
+The gRPC health service is available on the same port as gRPC. Example endpoint strings like `http://127.0.0.1:50052` are gRPC channel URIs, not REST endpoints.
 
 ## Run the Demo Worker
 
 ```bash
 mise exec -- cargo run -p anyserve-demo -- --mode worker
+```
+
+## Run the Built-In LLM Worker
+
+```bash
+mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+```
+
+The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in [examples/llm/README.md](../../examples/llm/README.md).
+
+Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
+
+```bash
+curl http://127.0.0.1:8080/v1/models
 ```
 
 ## Submit the Demo Job
@@ -54,9 +98,20 @@ It then:
 You can also run the Python examples after installing the bindings:
 
 ```bash
-mise run python-sdk-dev
-mise exec -- python examples/python/worker.py
-mise exec -- python examples/python/submit.py
+# clean venv from local source
+python -m venv .venv
+. .venv/bin/activate
+pip install ./clients/python
+
+# or use the active mise Python
+# mise run python-sdk-dev
+
+python examples/python/worker.py
+python examples/python/submit.py
+
+# with the active mise Python instead
+# mise exec -- python examples/python/worker.py
+# mise exec -- python examples/python/submit.py
 ```
 
 ## Build the Python Bindings

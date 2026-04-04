@@ -167,6 +167,10 @@ class HighLevelTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             worker(interface="demo.echo.v1")(async_echo)
 
+    def test_worker_rejects_max_active_leases_other_than_one(self):
+        with self.assertRaises(ValueError):
+            worker(interface="demo.echo.v1", max_active_leases=2)
+
     def test_serve_processes_bytes_handler(self):
         @worker(interface="demo.echo.v1", attributes={"runtime": "python"}, capacity={"slot": 1})
         def echo(payload: bytes) -> bytes:
