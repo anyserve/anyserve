@@ -18,6 +18,21 @@ The published distribution name is `anyserve-runtime`, while the import package 
 import anyserve
 ```
 
+From a local wheel:
+
+```bash
+pip install target/wheels/anyserve_runtime-*.whl
+```
+
+From local source:
+
+```bash
+pip install ./clients/python
+```
+
+Source installs build the Rust extension locally, so they require a working Rust toolchain on `PATH`.
+Inside this repository, `mise exec -- ...` provides the expected Python and Rust toolchains.
+
 The top-level `AnyserveClient` exposes the generic control-plane surface and also offers
 role-specific views through `submitter()` and `worker()`.
 
@@ -80,6 +95,14 @@ And high-level worker helpers:
 - `get_handler_spec(...)`
 
 ## Local Development
+
+Build and install from local source into the active environment:
+
+```bash
+pip install ./clients/python
+```
+
+Or install the extension directly into the active environment through `maturin`:
 
 ```bash
 python3 -m pip install --user maturin

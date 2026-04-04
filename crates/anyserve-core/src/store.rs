@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::model::{
     AttemptRecord, Attributes, EventKind, Frame, FrameKind, JobEvent, JobRecord, LeaseRecord,
@@ -25,6 +25,7 @@ pub trait StateStore: Send + Sync {
         now_ms: u64,
     ) -> Result<JobEvent>;
     async fn job_events_after(&self, job_id: &str, after_sequence: u64) -> Result<Vec<JobEvent>>;
+    async fn subscribe_job_events(&self, job_id: &str) -> watch::Receiver<u64>;
 
     async fn create_attempt(&self, attempt: AttemptRecord) -> Result<()>;
     async fn get_attempt(&self, attempt_id: &str) -> Result<Option<AttemptRecord>>;
@@ -57,6 +58,8 @@ pub trait StreamStore: Send + Sync {
         now_ms: u64,
     ) -> Result<Frame>;
     async fn frames_after(&self, stream_id: &str, after_sequence: u64) -> Result<Vec<Frame>>;
+    async fn subscribe_job_streams(&self, job_id: &str) -> watch::Receiver<u64>;
+    async fn subscribe_stream_updates(&self, stream_id: &str) -> watch::Receiver<u64>;
 }
 
 #[derive(Default)]
@@ -69,13 +72,39 @@ struct MemoryState {
 }
 
 #[derive(Default)]
+struct MemoryStateWatchers {
+    job_events: BTreeMap<String, watch::Sender<u64>>,
+}
+
 pub struct MemoryStateStore {
     inner: Mutex<MemoryState>,
+    watchers: Mutex<MemoryStateWatchers>,
 }
 
 impl MemoryStateStore {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Default for MemoryStateStore {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(MemoryState::default()),
+            watchers: Mutex::new(MemoryStateWatchers::default()),
+        }
+    }
+}
+
+impl MemoryStateStore {
+    async fn notify_job_events(&self, job_id: &str) {
+        let mut watchers = self.watchers.lock().await;
+        bump_version(
+            watchers
+                .job_events
+                .entry(job_id.to_string())
+                .or_insert_with(version_sender),
+        );
     }
 }
 
@@ -132,6 +161,8 @@ impl StateStore for MemoryStateStore {
             created_at_ms: now_ms,
         };
         events.push(event.clone());
+        drop(inner);
+        self.notify_job_events(job_id).await;
         Ok(event)
     }
 
@@ -145,6 +176,15 @@ impl StateStore for MemoryStateStore {
             .filter(|event| event.sequence > after_sequence)
             .cloned()
             .collect())
+    }
+
+    async fn subscribe_job_events(&self, job_id: &str) -> watch::Receiver<u64> {
+        let mut watchers = self.watchers.lock().await;
+        watchers
+            .job_events
+            .entry(job_id.to_string())
+            .or_insert_with(version_sender)
+            .subscribe()
     }
 
     async fn create_attempt(&self, attempt: AttemptRecord) -> Result<()> {
@@ -246,13 +286,50 @@ struct MemoryStreams {
 }
 
 #[derive(Default)]
+struct MemoryStreamWatchers {
+    job_streams: BTreeMap<String, watch::Sender<u64>>,
+    stream_updates: BTreeMap<String, watch::Sender<u64>>,
+}
+
 pub struct MemoryStreamStore {
     inner: Mutex<MemoryStreams>,
+    watchers: Mutex<MemoryStreamWatchers>,
 }
 
 impl MemoryStreamStore {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl Default for MemoryStreamStore {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(MemoryStreams::default()),
+            watchers: Mutex::new(MemoryStreamWatchers::default()),
+        }
+    }
+}
+
+impl MemoryStreamStore {
+    async fn notify_job_streams(&self, job_id: &str) {
+        let mut watchers = self.watchers.lock().await;
+        bump_version(
+            watchers
+                .job_streams
+                .entry(job_id.to_string())
+                .or_insert_with(version_sender),
+        );
+    }
+
+    async fn notify_stream_updates(&self, stream_id: &str) {
+        let mut watchers = self.watchers.lock().await;
+        bump_version(
+            watchers
+                .stream_updates
+                .entry(stream_id.to_string())
+                .or_insert_with(version_sender),
+        );
     }
 }
 
@@ -263,7 +340,10 @@ impl StreamStore for MemoryStreamStore {
         if inner.streams.contains_key(&stream.stream_id) {
             bail!("stream '{}' already exists", stream.stream_id);
         }
+        let job_id = stream.job_id.clone();
         inner.streams.insert(stream.stream_id.clone(), stream);
+        drop(inner);
+        self.notify_job_streams(&job_id).await;
         Ok(())
     }
 
@@ -289,7 +369,12 @@ impl StreamStore for MemoryStreamStore {
         if !inner.streams.contains_key(&stream.stream_id) {
             bail!("stream '{}' does not exist", stream.stream_id);
         }
+        let job_id = stream.job_id.clone();
+        let stream_id = stream.stream_id.clone();
         inner.streams.insert(stream.stream_id.clone(), stream);
+        drop(inner);
+        self.notify_job_streams(&job_id).await;
+        self.notify_stream_updates(&stream_id).await;
         Ok(())
     }
 
@@ -302,29 +387,37 @@ impl StreamStore for MemoryStreamStore {
         now_ms: u64,
     ) -> Result<Frame> {
         let mut inner = self.inner.lock().await;
-        let stream = inner
-            .streams
-            .get_mut(stream_id)
-            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))?;
-        if stream.state.is_terminal() {
-            bail!("stream '{}' is already closed", stream_id);
-        }
+        let (frame, job_id) = {
+            let stream = inner
+                .streams
+                .get_mut(stream_id)
+                .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))?;
+            if stream.state.is_terminal() {
+                bail!("stream '{}' is already closed", stream_id);
+            }
 
-        let sequence = stream.last_sequence + 1;
-        let frame = Frame {
-            stream_id: stream_id.to_string(),
-            sequence,
-            kind,
-            payload,
-            metadata,
-            created_at_ms: now_ms,
+            let sequence = stream.last_sequence + 1;
+            stream.last_sequence = sequence;
+            (
+                Frame {
+                    stream_id: stream_id.to_string(),
+                    sequence,
+                    kind,
+                    payload,
+                    metadata,
+                    created_at_ms: now_ms,
+                },
+                stream.job_id.clone(),
+            )
         };
-        stream.last_sequence = sequence;
         inner
             .frames
             .entry(stream_id.to_string())
             .or_default()
             .push(frame.clone());
+        drop(inner);
+        self.notify_job_streams(&job_id).await;
+        self.notify_stream_updates(stream_id).await;
         Ok(frame)
     }
 
@@ -342,12 +435,73 @@ impl StreamStore for MemoryStreamStore {
             .cloned()
             .collect())
     }
+
+    async fn subscribe_job_streams(&self, job_id: &str) -> watch::Receiver<u64> {
+        let mut watchers = self.watchers.lock().await;
+        watchers
+            .job_streams
+            .entry(job_id.to_string())
+            .or_insert_with(version_sender)
+            .subscribe()
+    }
+
+    async fn subscribe_stream_updates(&self, stream_id: &str) -> watch::Receiver<u64> {
+        let mut watchers = self.watchers.lock().await;
+        watchers
+            .stream_updates
+            .entry(stream_id.to_string())
+            .or_insert_with(version_sender)
+            .subscribe()
+    }
+}
+
+fn version_sender() -> watch::Sender<u64> {
+    let (sender, _) = watch::channel(0);
+    sender
+}
+
+fn bump_version(sender: &watch::Sender<u64>) {
+    let next = sender.borrow().saturating_add(1);
+    sender.send_replace(next);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MemoryStreamStore, StreamStore};
-    use crate::model::{Attributes, FrameKind, StreamDirection, StreamRecord, StreamScope};
+    use std::time::Duration;
+
+    use super::{MemoryStateStore, MemoryStreamStore, StateStore, StreamStore};
+    use crate::model::{
+        Attributes, EventKind, FrameKind, JobRecord, StreamDirection, StreamRecord, StreamScope,
+    };
+
+    #[tokio::test]
+    async fn appending_job_event_notifies_subscribers() {
+        let store = MemoryStateStore::new();
+        store
+            .create_job(JobRecord {
+                job_id: "job-1".to_string(),
+                ..JobRecord::default()
+            })
+            .await
+            .unwrap();
+        let mut updates = store.subscribe_job_events("job-1").await;
+
+        store
+            .append_job_event(
+                "job-1",
+                EventKind::Accepted,
+                Vec::new(),
+                Attributes::new(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(50), updates.changed())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn appends_and_reads_frames_in_order() {
@@ -392,5 +546,38 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].payload, b"hello".to_vec());
         assert_eq!(frames[1].payload, b"world".to_vec());
+    }
+
+    #[tokio::test]
+    async fn appending_frame_notifies_stream_subscribers() {
+        let store = MemoryStreamStore::new();
+        store
+            .create_stream(StreamRecord {
+                stream_id: "stream-1".to_string(),
+                job_id: "job-1".to_string(),
+                stream_name: "input.default".to_string(),
+                scope: StreamScope::Job,
+                direction: StreamDirection::ClientToWorker,
+                ..StreamRecord::default()
+            })
+            .await
+            .unwrap();
+        let mut updates = store.subscribe_stream_updates("stream-1").await;
+
+        store
+            .append_frame(
+                "stream-1",
+                FrameKind::Data,
+                b"hello".to_vec(),
+                Attributes::new(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_millis(50), updates.changed())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

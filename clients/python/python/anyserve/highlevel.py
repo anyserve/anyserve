@@ -301,8 +301,8 @@ def _build_handler_spec(
         raise ValueError("input_stream must be non-empty")
     if not output_stream:
         raise ValueError("output_stream must be non-empty")
-    if max_active_leases < 1:
-        raise ValueError("max_active_leases must be at least 1")
+    if max_active_leases != 1:
+        raise ValueError("serve(...) currently only supports max_active_leases=1")
 
     return HandlerSpec(
         interface=interface,

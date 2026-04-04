@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Error, Result, bail};
 use anyserve_proto::controlplane::{
@@ -72,6 +71,7 @@ impl ControlPlaneService for ControlPlaneGrpcService {
         let job_id = request.job_id;
         let stream = try_stream! {
             let mut cursor = request.after_sequence;
+            let mut updates = kernel.subscribe_job_events(&job_id).await.map_err(to_status)?;
 
             loop {
                 let events = kernel.watch_job(&job_id, cursor).await.map_err(to_status)?;
@@ -92,7 +92,9 @@ impl ControlPlaneService for ControlPlaneGrpcService {
                     break;
                 }
 
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                if updates.changed().await.is_err() {
+                    break;
+                }
             }
         };
 
@@ -501,6 +503,10 @@ impl ControlPlaneService for ControlPlaneGrpcService {
         let follow = request.follow;
         let stream = try_stream! {
             let mut cursor = request.after_sequence;
+            let mut updates = kernel
+                .subscribe_stream_updates(&stream_id)
+                .await
+                .map_err(to_status)?;
 
             loop {
                 let frames = kernel.pull_frames(&stream_id, cursor).await.map_err(to_status)?;
@@ -521,7 +527,9 @@ impl ControlPlaneService for ControlPlaneGrpcService {
                     break;
                 }
 
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                if updates.changed().await.is_err() {
+                    break;
+                }
             }
         };
 

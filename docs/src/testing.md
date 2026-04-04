@@ -20,7 +20,22 @@ Current core tests cover:
 
 ## 2. Local End-to-End
 
-Start the control plane:
+The checked-in examples are the easiest local smoke tests.
+
+For the built-in OpenAI-compatible gateway and LLM worker, use:
+
+- [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md)
+- [Ollama](ollama.md)
+
+That path covers:
+
+- `anyserve serve --config examples/llm/anyserve.toml`
+- `anyserve worker --config examples/llm/worker.toml`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/embeddings`
+
+If you only want the generic control plane and demo worker, start the control plane directly:
 
 ```bash
 mise exec -- cargo run -p anyserve -- serve --grpc-port 50062

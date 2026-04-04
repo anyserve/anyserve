@@ -6,10 +6,10 @@ use anyserve_client::controlplane::{
     ExecutionPolicy, JobSpec, ResourceQuantity, WorkerSpec, WorkerStatus,
 };
 use anyserve_client::{
-    AnyserveClient as RustAnyserveClient, AttemptRecord, AttemptState, EventKind, Frame,
-    FrameKind, FrameWrite, JobEvent, JobRecord, JobState, JobSubmission, LeaseGrant, LeaseRecord,
-    ObjectRef, PushSummary as RustPushSummary, StreamDirection, StreamOpen, StreamRecord,
-    StreamScope, StreamState, WorkerRecord, WorkerRegistration, object_ref,
+    AnyserveClient as RustAnyserveClient, AttemptRecord, AttemptState, EventKind, Frame, FrameKind,
+    FrameWrite, JobEvent, JobRecord, JobState, JobSubmission, LeaseGrant, LeaseRecord, ObjectRef,
+    PushSummary as RustPushSummary, StreamDirection, StreamOpen, StreamRecord, StreamScope,
+    StreamState, WorkerRecord, WorkerRegistration, object_ref,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -164,14 +164,14 @@ impl AnyserveClient {
         after_sequence: u64,
     ) -> PyResult<JobEventIterator> {
         let runtime = self.runtime.clone();
-        let stream_runtime = runtime.clone();
         let client = self.client.clone();
         py.allow_threads(move || {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.watch_job(job_id, after_sequence))
             })?;
+            let iterator_runtime = Arc::new(Mutex::new(build_runtime()?));
             Ok(JobEventIterator {
-                runtime: stream_runtime,
+                runtime: iterator_runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
             })
         })
@@ -558,14 +558,14 @@ impl AnyserveClient {
         follow: bool,
     ) -> PyResult<FrameIterator> {
         let runtime = self.runtime.clone();
-        let stream_runtime = runtime.clone();
         let client = self.client.clone();
         py.allow_threads(move || {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))
             })?;
+            let iterator_runtime = Arc::new(Mutex::new(build_runtime()?));
             Ok(FrameIterator {
-                runtime: stream_runtime,
+                runtime: iterator_runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
             })
         })
@@ -979,10 +979,7 @@ fn worker_status_to_py(py: Python<'_>, status: Option<WorkerStatus>) -> PyResult
     Ok(dict.unbind())
 }
 
-fn execution_policy_to_py(
-    py: Python<'_>,
-    policy: Option<ExecutionPolicy>,
-) -> PyResult<Py<PyDict>> {
+fn execution_policy_to_py(py: Python<'_>, policy: Option<ExecutionPolicy>) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     if let Some(policy) = policy {
         dict.set_item("profile", policy.profile)?;
@@ -1105,19 +1102,11 @@ fn event_kind_name(kind: EventKind) -> &'static str {
 }
 
 fn empty_to_none_py(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn zero_to_none_py(value: u64) -> Option<u64> {
-    if value == 0 {
-        None
-    } else {
-        Some(value)
-    }
+    if value == 0 { None } else { Some(value) }
 }
 
 fn to_py_err(error: anyhow::Error) -> PyErr {

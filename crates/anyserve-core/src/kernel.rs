@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::model::{
@@ -102,6 +102,11 @@ impl Kernel {
             .await
     }
 
+    pub async fn subscribe_job_events(&self, job_id: &str) -> Result<watch::Receiver<u64>> {
+        self.get_job(job_id).await?;
+        Ok(self.state_store.subscribe_job_events(job_id).await)
+    }
+
     pub async fn get_job(&self, job_id: &str) -> Result<JobRecord> {
         self.state_store
             .get_job(job_id)
@@ -119,6 +124,19 @@ impl Kernel {
                 .then_with(|| left.job_id.cmp(&right.job_id))
         });
         Ok(jobs)
+    }
+
+    pub async fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
+        let mut workers = self.state_store.list_workers().await?;
+        workers.sort_by(|left, right| {
+            right
+                .status
+                .last_seen_at_ms
+                .cmp(&left.status.last_seen_at_ms)
+                .then_with(|| right.registered_at_ms.cmp(&left.registered_at_ms))
+                .then_with(|| left.worker_id.cmp(&right.worker_id))
+        });
+        Ok(workers)
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobRecord> {
@@ -549,6 +567,11 @@ impl Kernel {
         self.stream_store.list_streams_for_job(job_id).await
     }
 
+    pub async fn subscribe_job_streams(&self, job_id: &str) -> Result<watch::Receiver<u64>> {
+        self.get_job(job_id).await?;
+        Ok(self.stream_store.subscribe_job_streams(job_id).await)
+    }
+
     pub async fn close_stream(
         &self,
         stream_id: &str,
@@ -612,6 +635,11 @@ impl Kernel {
         self.stream_store
             .frames_after(stream_id, after_sequence)
             .await
+    }
+
+    pub async fn subscribe_stream_updates(&self, stream_id: &str) -> Result<watch::Receiver<u64>> {
+        self.get_stream(stream_id).await?;
+        Ok(self.stream_store.subscribe_stream_updates(stream_id).await)
     }
 
     async fn require_lease(&self, worker_id: &str, lease_id: &str) -> Result<LeaseRecord> {
@@ -976,7 +1004,9 @@ mod tests {
 
         let jobs = kernel.list_jobs().await.unwrap();
         assert_eq!(
-            jobs.iter().map(|job| job.job_id.as_str()).collect::<Vec<_>>(),
+            jobs.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
             vec![second.job_id.as_str(), first.job_id.as_str()]
         );
     }
@@ -1013,11 +1043,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let assignment = kernel
-            .poll_lease(&worker.worker_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let assignment = kernel.poll_lease(&worker.worker_id).await.unwrap().unwrap();
         let stream = kernel
             .open_stream(super::OpenStreamCommand {
                 job_id: job.job_id.clone(),

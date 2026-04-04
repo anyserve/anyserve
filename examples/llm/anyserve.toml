@@ -1,0 +1,22 @@
+[server]
+grpc_host = "0.0.0.0"
+grpc_port = 50052
+heartbeat_ttl_secs = 30
+default_lease_ttl_secs = 30
+
+[server.tls]
+enabled = false
+# cert_file = "/path/to/server.pem"
+# key_file = "/path/to/server.key"
+
+[openai]
+enabled = true
+listen = "0.0.0.0:8080"
+models = ["qwen3:0.6b-fp16"]
+chat_interface = "llm.chat.v1"
+embeddings_interface = "llm.embed.v1"
+request_timeout_secs = 60
+
+[openai.demand.required_attributes]
+family = "llm"
+protocol = "openai-compatible"
