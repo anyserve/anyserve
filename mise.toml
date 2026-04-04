@@ -34,25 +34,107 @@ description = "Run cargo check"
 run = "cargo check --workspace"
 
 [tasks.python-sdk]
-description = "Build the Rust-exported Python wheel"
+description = "Build the Rust-exported Python bindings wheel"
 run = "python -m pip install --quiet maturin && python -m maturin build --manifest-path clients/python/Cargo.toml --interpreter python"
 
+[tasks.python-dist]
+description = "Build the Python source and wheel distributions"
+run = "rm -rf clients/python/dist && python -m pip install --quiet build maturin && python -m build clients/python"
+
 [tasks.python-sdk-dev]
-description = "Install the Rust-exported Python SDK into the active Python environment"
+description = "Install the Rust-exported Python bindings into the active Python environment"
 run = "python -m pip install --quiet maturin && python -m maturin develop --manifest-path clients/python/Cargo.toml"
 
-[tasks.python-sdk-smoke]
-description = "Install the built Python wheel and verify the import surface"
+[tasks.python-sdk-test]
+description = "Run Python unit tests for the high-level bindings API"
 run = """
-python -m pip install --force-reinstall "$(ls -t target/wheels/anyserve-*.whl | head -n 1)"
-python - <<'PY'
-from anyserve import AnyserveClient, FRAME_DATA, inline_object, uri_object
+python -m pip install --quiet maturin
+python -m maturin build --manifest-path clients/python/Cargo.toml --interpreter python
+WHEEL="$(python - <<'PY'
+from pathlib import Path
 
-client = AnyserveClient("http://127.0.0.1:50052")
+candidates = []
+for base in (Path("clients/python/dist"), Path("target/wheels")):
+    candidates.extend(base.glob("anyserve_runtime-*.whl"))
+
+if not candidates:
+    raise SystemExit("no anyserve_runtime wheel found in clients/python/dist or target/wheels")
+
+print(max(candidates, key=lambda path: path.stat().st_mtime))
+PY
+)"
+python -m pip install --force-reinstall "$WHEEL"
+python -m unittest discover -s clients/python/tests -p 'test_*.py'
+"""
+
+[tasks.python-sdk-smoke]
+description = "Install the built Python bindings wheel and verify the import surface"
+run = """
+python - <<'PY'
+from pathlib import Path
+
+candidates = []
+for base in (Path("clients/python/dist"), Path("target/wheels")):
+    candidates.extend(base.glob("anyserve_runtime-*.whl"))
+
+if not candidates:
+    raise SystemExit("no anyserve_runtime wheel found in clients/python/dist or target/wheels")
+
+wheel = max(candidates, key=lambda path: path.stat().st_mtime)
+print(wheel)
+PY
+WHEEL="$(python - <<'PY'
+from pathlib import Path
+
+candidates = []
+for base in (Path("clients/python/dist"), Path("target/wheels")):
+    candidates.extend(base.glob("anyserve_runtime-*.whl"))
+
+if not candidates:
+    raise SystemExit("no anyserve_runtime wheel found in clients/python/dist or target/wheels")
+
+print(max(candidates, key=lambda path: path.stat().st_mtime))
+PY
+)"
+python -m pip install --force-reinstall "$WHEEL"
+python - <<'PY'
+from anyserve import (
+    AnyserveClient,
+    HandlerSpec,
+    SubmitterClient,
+    WorkerClient,
+    FRAME_DATA,
+    get_handler_spec,
+    inline_object,
+    serve,
+    uri_object,
+    worker,
+)
+
+class _FakeNative:
+    def list_jobs(self):
+        return []
+
+submitter = SubmitterClient(_FakeNative(), "http://127.0.0.1:50052")
+worker_client = WorkerClient(_FakeNative(), "http://127.0.0.1:50052")
+
+@worker(interface="demo.echo.v1", codec="bytes")
+def echo(payload: bytes) -> bytes:
+    return payload
+
+spec = get_handler_spec(echo)
+
+assert AnyserveClient.__name__ == "AnyserveClient"
+assert isinstance(submitter, SubmitterClient)
+assert isinstance(worker_client, WorkerClient)
+assert isinstance(spec, HandlerSpec)
 assert FRAME_DATA == "data"
 assert inline_object(b"hello")["inline"] == b"hello"
 assert uri_object("file:///tmp/example")["uri"] == "file:///tmp/example"
-print(client)
+assert callable(submitter.list_jobs)
+assert callable(worker_client.pull_frames)
+assert callable(serve)
+print(AnyserveClient)
 PY
 """
 

@@ -29,7 +29,7 @@ mise exec -- cargo run -p anyserve -- serve --grpc-port 50062
 Start a demo worker:
 
 ```bash
-mise exec -- cargo run -p anyserve-client -- --mode worker --endpoint http://127.0.0.1:50062
+mise exec -- cargo run -p anyserve-demo -- --mode worker --endpoint http://127.0.0.1:50062
 ```
 
 The `http://` prefix here is a gRPC channel URI used by the generated clients, not a REST endpoint.
@@ -37,7 +37,7 @@ The `http://` prefix here is a gRPC channel URI used by the generated clients, n
 Submit a demo job:
 
 ```bash
-mise exec -- cargo run -p anyserve-client -- --mode submit --endpoint http://127.0.0.1:50062
+mise exec -- cargo run -p anyserve-demo -- --mode submit --endpoint http://127.0.0.1:50062
 ```
 
 Expected event flow:
@@ -51,7 +51,7 @@ Expected event flow:
 
 The submit client should also print one `output frame` line after the job completes.
 
-## 3. Python SDK Smoke Test
+## 3. Python Bindings Smoke Test
 
 Build the wheel:
 
@@ -65,14 +65,28 @@ Install it into the active `mise` Python and verify the import surface:
 mise run python-sdk-smoke
 ```
 
+Run the Python unit tests for the high-level worker API:
+
+```bash
+mise run python-sdk-test
+```
+
 This smoke test intentionally does not require a running control plane. It verifies:
 
 - wheel installation
 - Python import surface
-- SDK constants
+- role-specific client helpers such as `list_jobs`
+- bindings constants
 - convenience object constructors
 
-If you also want to exercise the Python SDK against a live server, start the control plane and demo worker first, then run:
+The Python unit tests additionally verify:
+
+- low-level facade forwarding for `list_jobs`, `watch_job`, and `pull_frames`
+- `@worker(...)` metadata capture
+- `serve(...)` success paths for `bytes` and `json`
+- failure handling for malformed JSON input
+
+If you also want to exercise the Python bindings against a live server, start the control plane and demo worker first, then run:
 
 ```bash
 mise exec -- python - <<'PY'

@@ -1,4 +1,4 @@
-from typing import Dict, List, Literal, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, TypedDict
 
 EventKind = Literal[
     "accepted",
@@ -21,6 +21,7 @@ StreamDirection = Literal[
     "internal",
 ]
 FrameKind = Literal["open", "data", "close", "error", "checkpoint", "control"]
+HandlerCodec = Literal["bytes", "json"]
 
 EVENT_ACCEPTED: str
 EVENT_LEASE_GRANTED: str
@@ -155,8 +156,32 @@ class PushSummary(TypedDict):
     last_sequence: int
     written_frames: int
 
-class AnyserveClient:
-    def __init__(self, endpoint: str) -> None: ...
+class HandlerSpec:
+    interface: str
+    attributes: Dict[str, str]
+    capacity: Dict[str, int]
+    metadata: Dict[str, str]
+    codec: HandlerCodec | str
+    input_stream: str
+    output_stream: str
+    max_active_leases: int
+    def __init__(
+        self,
+        interface: str,
+        attributes: Optional[Dict[str, str]] = ...,
+        capacity: Optional[Dict[str, int]] = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+        codec: HandlerCodec | str = ...,
+        input_stream: str = ...,
+        output_stream: str = ...,
+        max_active_leases: int = ...,
+    ) -> None: ...
+
+class WorkerHandler:
+    spec: HandlerSpec
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+class SubmitterClient:
     def submit_job(
         self,
         interface_name: str,
@@ -171,7 +196,142 @@ class AnyserveClient:
         lease_ttl_secs: Optional[int] = ...,
         job_id: Optional[str] = ...,
     ) -> JobRecord: ...
-    def watch_job(self, job_id: str, after_sequence: int = ...) -> List[JobEvent]: ...
+    def watch_job(self, job_id: str, after_sequence: int = ...) -> Iterator[JobEvent]: ...
+    def list_jobs(self) -> List[JobRecord]: ...
+    def get_job(self, job_id: str) -> JobRecord: ...
+    def cancel_job(self, job_id: str) -> JobRecord: ...
+    def get_attempt(self, attempt_id: str) -> AttemptRecord: ...
+    def list_attempts(self, job_id: str) -> List[AttemptRecord]: ...
+    def open_stream(
+        self,
+        job_id: str,
+        stream_name: str,
+        scope: StreamScope | str = ...,
+        direction: StreamDirection | str = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+        attempt_id: Optional[str] = ...,
+        worker_id: Optional[str] = ...,
+        lease_id: Optional[str] = ...,
+    ) -> StreamRecord: ...
+    def get_stream(self, stream_id: str) -> StreamRecord: ...
+    def list_streams(self, job_id: str) -> List[StreamRecord]: ...
+    def close_stream(
+        self,
+        stream_id: str,
+        worker_id: Optional[str] = ...,
+        lease_id: Optional[str] = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+    ) -> StreamRecord: ...
+    def push_frames(
+        self,
+        stream_id: str,
+        frames: List[Tuple[FrameKind | str, bytes, Dict[str, str]]],
+        worker_id: Optional[str] = ...,
+        lease_id: Optional[str] = ...,
+    ) -> PushSummary: ...
+    def pull_frames(
+        self,
+        stream_id: str,
+        after_sequence: int = ...,
+        follow: bool = ...,
+    ) -> Iterator[Frame]: ...
+
+class WorkerClient:
+    def register_worker(
+        self,
+        interfaces: List[str],
+        attributes: Optional[Dict[str, str]] = ...,
+        total_capacity: Optional[Dict[str, int]] = ...,
+        max_active_leases: int = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+        worker_id: Optional[str] = ...,
+    ) -> WorkerRecord: ...
+    def heartbeat_worker(
+        self,
+        worker_id: str,
+        available_capacity: Optional[Dict[str, int]] = ...,
+        active_leases: int = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+    ) -> WorkerRecord: ...
+    def poll_lease(self, worker_id: str) -> Optional[LeaseGrant]: ...
+    def renew_lease(self, worker_id: str, lease_id: str) -> LeaseRecord: ...
+    def report_event(
+        self,
+        worker_id: str,
+        lease_id: str,
+        kind: EventKind | str,
+        payload: Optional[bytes] = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+    ) -> None: ...
+    def complete_lease(
+        self,
+        worker_id: str,
+        lease_id: str,
+        outputs: Optional[List[ObjectRef]] = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+    ) -> None: ...
+    def fail_lease(
+        self,
+        worker_id: str,
+        lease_id: str,
+        reason: str,
+        retryable: bool = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+    ) -> None: ...
+    def open_stream(
+        self,
+        job_id: str,
+        stream_name: str,
+        scope: StreamScope | str = ...,
+        direction: StreamDirection | str = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+        attempt_id: Optional[str] = ...,
+        worker_id: Optional[str] = ...,
+        lease_id: Optional[str] = ...,
+    ) -> StreamRecord: ...
+    def get_stream(self, stream_id: str) -> StreamRecord: ...
+    def list_streams(self, job_id: str) -> List[StreamRecord]: ...
+    def close_stream(
+        self,
+        stream_id: str,
+        worker_id: Optional[str] = ...,
+        lease_id: Optional[str] = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+    ) -> StreamRecord: ...
+    def push_frames(
+        self,
+        stream_id: str,
+        frames: List[Tuple[FrameKind | str, bytes, Dict[str, str]]],
+        worker_id: Optional[str] = ...,
+        lease_id: Optional[str] = ...,
+    ) -> PushSummary: ...
+    def pull_frames(
+        self,
+        stream_id: str,
+        after_sequence: int = ...,
+        follow: bool = ...,
+    ) -> Iterator[Frame]: ...
+
+class AnyserveClient:
+    def __init__(self, endpoint: str) -> None: ...
+    def submitter(self) -> SubmitterClient: ...
+    def worker(self) -> WorkerClient: ...
+    def submit_job(
+        self,
+        interface_name: str,
+        inputs: Optional[List[ObjectRef]] = ...,
+        params: Optional[bytes] = ...,
+        required_attributes: Optional[Dict[str, str]] = ...,
+        preferred_attributes: Optional[Dict[str, str]] = ...,
+        required_capacity: Optional[Dict[str, int]] = ...,
+        metadata: Optional[Dict[str, str]] = ...,
+        profile: Optional[str] = ...,
+        priority: int = ...,
+        lease_ttl_secs: Optional[int] = ...,
+        job_id: Optional[str] = ...,
+    ) -> JobRecord: ...
+    def watch_job(self, job_id: str, after_sequence: int = ...) -> Iterator[JobEvent]: ...
+    def list_jobs(self) -> List[JobRecord]: ...
     def get_job(self, job_id: str) -> JobRecord: ...
     def cancel_job(self, job_id: str) -> JobRecord: ...
     def get_attempt(self, attempt_id: str) -> AttemptRecord: ...
@@ -249,7 +409,28 @@ class AnyserveClient:
         stream_id: str,
         after_sequence: int = ...,
         follow: bool = ...,
-    ) -> List[Frame]: ...
+    ) -> Iterator[Frame]: ...
 
+def worker(
+    *,
+    interface: str,
+    attributes: Optional[Dict[str, str]] = ...,
+    capacity: Optional[Dict[str, int]] = ...,
+    metadata: Optional[Dict[str, str]] = ...,
+    codec: HandlerCodec | str = ...,
+    input_stream: str = ...,
+    output_stream: str = ...,
+    max_active_leases: int = ...,
+) -> Callable[[Callable[[Any], Any]], WorkerHandler]: ...
+def get_handler_spec(handler: Callable[[Any], Any]) -> HandlerSpec: ...
+def serve(
+    handler: Callable[[Any], Any],
+    endpoint: Optional[str] = ...,
+    *,
+    worker_id: Optional[str] = ...,
+    heartbeat_interval_secs: float = ...,
+    poll_interval_secs: float = ...,
+    client: Any = ...,
+) -> None: ...
 def inline_object(content: bytes, metadata: Optional[Dict[str, str]] = ...) -> ObjectRef: ...
 def uri_object(uri: str, metadata: Optional[Dict[str, str]] = ...) -> ObjectRef: ...

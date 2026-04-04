@@ -109,6 +109,18 @@ impl Kernel {
             .ok_or_else(|| anyhow!("job '{}' does not exist", job_id))
     }
 
+    pub async fn list_jobs(&self) -> Result<Vec<JobRecord>> {
+        let mut jobs = self.state_store.list_jobs().await?;
+        jobs.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        Ok(jobs)
+    }
+
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobRecord> {
         let _guard = self.dispatch_lock.lock().await;
         let mut job = self.get_job(job_id).await?;
@@ -861,6 +873,7 @@ fn now_ms() -> u64 {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::Kernel;
     use crate::model::{
@@ -927,6 +940,109 @@ mod tests {
 
         assert_eq!(job.state, JobState::Pending);
         assert!(events.iter().any(|event| event.kind == EventKind::Requeued));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_returns_most_recently_updated_first() {
+        let kernel = Kernel::new(
+            Arc::new(MemoryStateStore::new()),
+            Arc::new(MemoryStreamStore::new()),
+            Arc::new(BasicScheduler),
+            30,
+            30,
+        );
+
+        let first = kernel
+            .submit_job(
+                Some("job-1".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let second = kernel
+            .submit_job(
+                Some("job-2".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let jobs = kernel.list_jobs().await.unwrap();
+        assert_eq!(
+            jobs.iter().map(|job| job.job_id.as_str()).collect::<Vec<_>>(),
+            vec![second.job_id.as_str(), first.job_id.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_leased_job_cancels_attempt_and_closes_streams() {
+        let kernel = Kernel::new(
+            Arc::new(MemoryStateStore::new()),
+            Arc::new(MemoryStreamStore::new()),
+            Arc::new(BasicScheduler),
+            30,
+            30,
+        );
+
+        let job = kernel
+            .submit_job(
+                Some("job-cancel".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        let worker = kernel
+            .register_worker(
+                Some("worker-1".to_string()),
+                WorkerSpec {
+                    interfaces: BTreeSet::from(["demo.execute.v1".to_string()]),
+                    total_capacity: BTreeMap::from([("slot".to_string(), 1)]),
+                    max_active_leases: 1,
+                    ..WorkerSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        let assignment = kernel
+            .poll_lease(&worker.worker_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let stream = kernel
+            .open_stream(super::OpenStreamCommand {
+                job_id: job.job_id.clone(),
+                attempt_id: Some(assignment.attempt.attempt_id.clone()),
+                worker_id: Some(worker.worker_id.clone()),
+                lease_id: Some(assignment.lease.lease_id.clone()),
+                stream_name: "output.default".to_string(),
+                scope: StreamScope::Lease,
+                direction: StreamDirection::WorkerToClient,
+                metadata: Attributes::new(),
+            })
+            .await
+            .unwrap();
+
+        let job = kernel.cancel_job(&job.job_id).await.unwrap();
+        let attempt = kernel
+            .get_attempt(&assignment.attempt.attempt_id)
+            .await
+            .unwrap();
+        let stream = kernel.get_stream(&stream.stream_id).await.unwrap();
+
+        assert_eq!(job.state, JobState::Cancelled);
+        assert!(job.lease_id.is_none());
+        assert_eq!(attempt.state, crate::model::AttemptState::Cancelled);
+        assert!(stream.state.is_terminal());
     }
 
     #[tokio::test]

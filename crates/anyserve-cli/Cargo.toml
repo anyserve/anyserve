@@ -7,9 +7,12 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+anyserve-client = { path = "../anyserve-client" }
 anyserve-core = { path = "../anyserve-core" }
 anyserve-proto = { path = "../anyserve-proto" }
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true

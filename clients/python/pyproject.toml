@@ -1,13 +1,32 @@
 [project]
-name = "anyserve"
-version = "0.1.0"
-description = "Rust-backed Python SDK for Anyserve"
+name = "anyserve-runtime"
+version = "0.2.0"
+description = "Rust-backed Python package for AnyServe"
 readme = "README.md"
 authors = [
     { name = "arcosx", email = "arcosx@outlook.com" }
 ]
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/anyserve/anyserve"
+Repository = "https://github.com/anyserve/anyserve"
+Documentation = "https://github.com/anyserve/anyserve/tree/main/docs"
+Issues = "https://github.com/anyserve/anyserve/issues"
 
 [build-system]
 requires = ["maturin>=1.7,<2"]

@@ -9,12 +9,14 @@ use anyserve_core::store::{MemoryStateStore, MemoryStreamStore};
 use anyserve_proto::controlplane::control_plane_service_client::ControlPlaneServiceClient;
 use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
 use anyserve_proto::controlplane::{
-    CompleteLeaseRequest, Demand, EventKind, ExecutionPolicy, FrameKind, GetJobRequest, JobSpec,
-    JobState, ListAttemptsRequest, ListStreamsRequest, OpenStreamRequest, PollLeaseRequest,
-    PullFramesRequest, PushFramesRequest, RegisterWorkerRequest, ReportEventRequest,
-    ResourceQuantity, StreamDirection, StreamScope, SubmitJobRequest, WatchJobRequest, WorkerSpec,
+    CancelJobRequest, CompleteLeaseRequest, Demand, EventKind, ExecutionPolicy, FrameKind,
+    GetJobRequest, JobSpec, JobState, ListAttemptsRequest, ListJobsRequest, ListStreamsRequest,
+    OpenStreamRequest, PollLeaseRequest, PullFramesRequest, PushFramesRequest,
+    RegisterWorkerRequest, ReportEventRequest, ResourceQuantity, StreamDirection, StreamScope,
+    SubmitJobRequest, WatchJobRequest, WorkerSpec,
 };
 use tokio::sync::oneshot;
+use tokio::time::Duration;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Request;
@@ -409,6 +411,75 @@ async fn grpc_streaming_e2e_round_trip() -> Result<()> {
 
     drop(client);
     drop(worker);
+    let _ = shutdown_tx.send(());
+    handle.await.context("join grpc server task")??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_can_list_and_cancel_jobs() -> Result<()> {
+    let (endpoint, shutdown_tx, handle) = spawn_server().await?;
+    let mut client = ControlPlaneServiceClient::connect(endpoint)
+        .await
+        .context("connect client")?;
+
+    for job_id in ["job-list-1", "job-list-2"] {
+        client
+            .submit_job(Request::new(SubmitJobRequest {
+                job_id: job_id.to_string(),
+                spec: Some(JobSpec {
+                    interface_name: "demo.echo.v1".to_string(),
+                    inputs: Vec::new(),
+                    params: Vec::new(),
+                    demand: Some(Demand {
+                        required_attributes: HashMap::new(),
+                        preferred_attributes: HashMap::new(),
+                        required_capacity: Vec::new(),
+                    }),
+                    policy: Some(ExecutionPolicy {
+                        profile: "basic".to_string(),
+                        priority: 0,
+                        lease_ttl_secs: 15,
+                    }),
+                    metadata: HashMap::new(),
+                }),
+            }))
+            .await
+            .with_context(|| format!("submit job {job_id}"))?;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    let jobs = client
+        .list_jobs(Request::new(ListJobsRequest {}))
+        .await
+        .context("list jobs before cancel")?
+        .into_inner()
+        .jobs;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].job_id, "job-list-2");
+    assert_eq!(jobs[1].job_id, "job-list-1");
+
+    let cancelled = client
+        .cancel_job(Request::new(CancelJobRequest {
+            job_id: "job-list-1".to_string(),
+        }))
+        .await
+        .context("cancel job")?
+        .into_inner();
+    assert_eq!(cancelled.state(), JobState::Cancelled);
+
+    let jobs = client
+        .list_jobs(Request::new(ListJobsRequest {}))
+        .await
+        .context("list jobs after cancel")?
+        .into_inner()
+        .jobs;
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].job_id, "job-list-1");
+    assert_eq!(jobs[0].state(), JobState::Cancelled);
+    assert_eq!(jobs[1].job_id, "job-list-2");
+
+    drop(client);
     let _ = shutdown_tx.send(());
     handle.await.context("join grpc server task")??;
     Ok(())

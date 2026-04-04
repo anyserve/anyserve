@@ -62,15 +62,16 @@ Workers advertise supply through the same generic model, and the control plane i
 - attempt tracking per lease assignment
 - event streaming per job
 - generic stream/frame data plane for client and worker IO
-- Rust demo client and Rust-backed Python SDK
+- first-class Rust client crate, Rust demo apps, and Rust-backed Python bindings
 
 ## Workspace
 
+- `crates/anyserve-client`: first-class Rust client for the control-plane gRPC API
 - `crates/anyserve-proto`: protobuf and tonic bindings
 - `crates/anyserve-core`: domain model, in-memory state store, scheduler, kernel, and gRPC service
 - `crates/anyserve-cli`: the `anyserve` binary
-- `clients/rust`: demo submitter / worker client
-- `clients/python`: Rust-exported Python SDK via `PyO3` and `maturin`
+- `examples/rust`: demo submitter / worker apps that exercise the Rust client crate
+- `clients/python`: Rust-exported Python bindings via `PyO3` and `maturin`
 - `docs`: mdBook documentation
 
 Static docs can be deployed from this repository to GitHub Pages. The current mdBook config assumes the project-page base path `/anyserve/`.
@@ -79,7 +80,40 @@ Static docs can be deployed from this repository to GitHub Pages. The current md
 
 - `mise`
 - `protoc`
-- Python 3.9+ for the Python SDK
+- Python 3.9+ for the Python bindings
+
+## Install
+
+Install the latest prebuilt binary from GitHub Releases:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.sh | sh
+```
+
+Install on Windows with PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1 | iex
+```
+
+Install a specific version or choose a custom install directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.sh | sh -s -- --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.sh | sh -s -- --dir /usr/local/bin
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1))) -Version v0.2.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1))) -InstallDir "$env:LOCALAPPDATA\Programs\AnyServe\bin"
+```
+
+Prebuilt binaries are currently published for:
+
+- macOS `arm64`
+- macOS `x86_64`
+- Linux `x86_64`
+- Windows `x86_64`
 
 ## Setup
 
@@ -104,13 +138,13 @@ Examples use endpoint strings like `http://127.0.0.1:50052`. That is a gRPC chan
 Start a demo worker:
 
 ```bash
-mise exec -- cargo run -p anyserve-client -- --mode worker
+mise exec -- cargo run -p anyserve-demo -- --mode worker
 ```
 
 Submit a demo job and watch its events:
 
 ```bash
-mise exec -- cargo run -p anyserve-client -- --mode submit
+mise exec -- cargo run -p anyserve-demo -- --mode submit
 ```
 
 The demo path now uses both control-plane and data-plane APIs:
@@ -137,7 +171,7 @@ Run linting:
 mise run clippy
 ```
 
-## Python SDK
+## Python Bindings
 
 Build the wheel:
 
@@ -145,16 +179,36 @@ Build the wheel:
 mise run python-sdk
 ```
 
-Then use the SDK:
+You can build function-style workers on top of the low-level bindings:
+
+```python
+from anyserve import serve, worker
+
+
+@worker(
+    interface="demo.echo.v1",
+    attributes={"runtime": "python"},
+    capacity={"slot": 1},
+    codec="bytes",
+)
+def echo(payload: bytes) -> bytes:
+    return payload
+
+
+serve(echo, endpoint="http://127.0.0.1:50052")
+```
+
+Then use the bindings:
 
 ```python
 from anyserve import AnyserveClient, FRAME_DATA
 
 client = AnyserveClient("http://127.0.0.1:50052")
-# gRPC channel URI for the SDK transport, not a REST endpoint.
+# gRPC channel URI for the bindings transport, not a REST endpoint.
+# The Python facade is backed by the Rust anyserve-client transport layer.
 
 # This assumes a compatible worker is already running,
-# for example: `mise exec -- cargo run -p anyserve-client -- --mode worker`
+# for example: `mise exec -- cargo run -p anyserve-demo -- --mode worker`
 
 job = client.submit_job(
     interface_name="demo.echo.v1",
@@ -169,7 +223,8 @@ client.push_frames(
 )
 client.close_stream(stream["stream_id"])
 
-events = client.watch_job(job["job_id"])
+for event in client.watch_job(job["job_id"]):
+    print(event["kind"], event["metadata"])
 ```
 
 ## Mise Tasks

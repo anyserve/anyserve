@@ -1,10 +1,11 @@
 [workspace]
 members = [
   "clients/python",
+  "crates/anyserve-client",
   "crates/anyserve-cli",
   "crates/anyserve-core",
   "crates/anyserve-proto",
-  "clients/rust",
+  "examples/rust",
 ]
 resolver = "2"
 
@@ -12,7 +13,7 @@ resolver = "2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/anyserve/anyserve"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
 anyhow = "1.0.98"

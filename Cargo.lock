@@ -69,12 +69,15 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "anyserve"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "anyserve-client",
  "anyserve-core",
  "anyserve-proto",
  "clap",
+ "serde",
+ "serde_json",
  "tokio",
  "tonic",
  "tonic-health",
@@ -84,22 +87,17 @@ dependencies = [
 
 [[package]]
 name = "anyserve-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "anyserve-proto",
- "async-stream",
- "clap",
- "tokio",
  "tokio-stream",
  "tonic",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
 name = "anyserve-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "anyserve-proto",
@@ -114,8 +112,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyserve-demo"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "anyserve-client",
+ "clap",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "anyserve-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -125,13 +136,12 @@ dependencies = [
 
 [[package]]
 name = "anyserve-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
- "anyserve-proto",
+ "anyserve-client",
  "pyo3",
  "tokio",
- "tokio-stream",
  "tonic",
 ]
 

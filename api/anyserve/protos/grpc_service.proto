@@ -7,6 +7,7 @@ import "google/protobuf/empty.proto";
 service ControlPlaneService {
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse) {}
   rpc WatchJob(WatchJobRequest) returns (stream JobEvent) {}
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse) {}
   rpc GetJob(GetJobRequest) returns (JobRecord) {}
   rpc CancelJob(CancelJobRequest) returns (JobRecord) {}
   rpc GetAttempt(GetAttemptRequest) returns (AttemptRecord) {}
@@ -232,6 +233,12 @@ message SubmitJobResponse {
 message WatchJobRequest {
   string job_id = 1;
   uint64 after_sequence = 2;
+}
+
+message ListJobsRequest {}
+
+message ListJobsResponse {
+  repeated JobRecord jobs = 1;
 }
 
 message GetJobRequest {

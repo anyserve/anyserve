@@ -6,33 +6,114 @@ on:
     paths:
       - "crates/**"
       - "clients/python/**"
-      - "clients/rust/**"
-      - "docs/**"
       - "api/**"
+      - "examples/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "README.md"
       - "Makefile"
       - "mise.toml"
+      - "scripts/**"
       - ".github/workflows/anyserve-ci.yml"
+      - ".github/workflows/python-publish.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "crates/**"
       - "clients/python/**"
-      - "clients/rust/**"
-      - "docs/**"
       - "api/**"
+      - "examples/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "README.md"
       - "Makefile"
       - "mise.toml"
+      - "scripts/**"
       - ".github/workflows/anyserve-ci.yml"
+      - ".github/workflows/python-publish.yml"
+      - ".github/workflows/release.yml"
 
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      python: ${{ steps.filter.outputs.python }}
+      distribution: ${{ steps.filter.outputs.distribution }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changed areas
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            rust:
+              - "crates/**"
+              - "api/**"
+              - "examples/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "Makefile"
+              - "mise.toml"
+              - ".github/workflows/anyserve-ci.yml"
+            python:
+              - "clients/python/**"
+              - "crates/anyserve-proto/**"
+              - "api/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "mise.toml"
+              - ".github/workflows/anyserve-ci.yml"
+              - ".github/workflows/python-publish.yml"
+            distribution:
+              - "scripts/**"
+              - ".github/workflows/release.yml"
+              - ".github/workflows/anyserve-ci.yml"
+
+  distribution:
+    needs: changes
+    if: needs.changes.outputs.distribution == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate install script syntax
+        run: sh -n scripts/install.sh
+
+      - name: Validate packaging script syntax
+        run: bash -n scripts/package-release.sh
+
+      - name: Validate release workflow syntax
+        run: ruby -e 'require "yaml"; YAML.load_file(".github/workflows/release.yml")'
+
+  distribution-windows:
+    needs: changes
+    if: needs.changes.outputs.distribution == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Windows install script syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,8 +141,8 @@ jobs:
           mise trust --all
           mise install
 
-      - name: Install maturin
-        run: python -m pip install maturin
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: |
@@ -81,26 +162,54 @@ jobs:
           . "$HOME/.cargo/env"
           mise run test
 
-      - name: End-to-end test
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: clients/python/pyproject.toml
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install mise
+        run: curl https://mise.run | sh
+
+      - name: Add tool paths
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
         run: |
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           . "$HOME/.cargo/env"
-          mise run e2e
+          mise trust --all
+          mise install
 
-      - name: Build Python wheel
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Python distributions
         run: |
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           . "$HOME/.cargo/env"
-          mise run python-sdk
+          mise run python-dist
 
-      - name: Python wheel smoke test
+      - name: Validate Python distribution metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check clients/python/dist/*
+
+      - name: Python bindings smoke test
         run: |
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           . "$HOME/.cargo/env"
           mise run python-sdk-smoke
-
-      - name: Build docs
-        run: |
-          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-          . "$HOME/.cargo/env"
-          mise run docs-build

@@ -4,7 +4,7 @@
 
 - `mise`
 - `protoc`
-- Python 3.9+ if you want the Python SDK
+- Python 3.9+ if you want the Python bindings
 
 ## Bootstrap
 
@@ -29,13 +29,13 @@ Examples use endpoint strings like `http://127.0.0.1:50052` because the generate
 ## Run the Demo Worker
 
 ```bash
-mise exec -- cargo run -p anyserve-client -- --mode worker
+mise exec -- cargo run -p anyserve-demo -- --mode worker
 ```
 
 ## Submit the Demo Job
 
 ```bash
-mise exec -- cargo run -p anyserve-client -- --mode submit
+mise exec -- cargo run -p anyserve-demo -- --mode submit
 ```
 
 The demo client submits a job with:
@@ -51,11 +51,30 @@ It then:
 - waits for job events
 - pulls `output.default` after completion
 
-## Build the Python SDK
+## Build the Python Bindings
 
 ```bash
 mise run python-sdk
 mise run python-sdk-dev
+```
+
+## Python Worker Decorator
+
+```python
+from anyserve import serve, worker
+
+
+@worker(
+    interface="demo.echo.v1",
+    attributes={"runtime": "python"},
+    capacity={"slot": 1},
+    codec="bytes",
+)
+def echo(payload: bytes) -> bytes:
+    return payload
+
+
+serve(echo, endpoint="http://127.0.0.1:50052")
 ```
 
 ## Python Example
@@ -64,7 +83,7 @@ mise run python-sdk-dev
 from anyserve import AnyserveClient, FRAME_DATA
 
 client = AnyserveClient("http://127.0.0.1:50052")
-# gRPC channel URI used by the generated SDK client.
+# gRPC channel URI used by the Rust-backed bindings client.
 # Assumes the control plane and a compatible worker are already running.
 
 job = client.submit_job(
@@ -80,8 +99,7 @@ client.push_frames(
 )
 client.close_stream(stream["stream_id"])
 
-events = client.watch_job(job["job_id"])
-for event in events:
+for event in client.watch_job(job["job_id"]):
     print(event["kind"], event["metadata"])
 ```
 

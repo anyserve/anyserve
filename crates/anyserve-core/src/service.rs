@@ -99,6 +99,16 @@ impl ControlPlaneService for ControlPlaneGrpcService {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn list_jobs(
+        &self,
+        _request: Request<proto::ListJobsRequest>,
+    ) -> Result<Response<proto::ListJobsResponse>, Status> {
+        let jobs = self.kernel.list_jobs().await.map_err(to_status)?;
+        Ok(Response::new(proto::ListJobsResponse {
+            jobs: jobs.into_iter().map(job_record_to_proto).collect(),
+        }))
+    }
+
     async fn get_job(
         &self,
         request: Request<proto::GetJobRequest>,

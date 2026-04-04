@@ -11,8 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow.workspace = true
-anyserve-proto = { path = "../../crates/anyserve-proto" }
+anyserve-client = { path = "../../crates/anyserve-client" }
 pyo3.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
 tonic.workspace = true

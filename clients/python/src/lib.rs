@@ -1,23 +1,26 @@
 use std::collections::HashMap;
-use std::future::Future;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use anyhow::{Context, Result, bail};
-use anyserve_proto::controlplane::control_plane_service_client::ControlPlaneServiceClient;
-use anyserve_proto::controlplane::{
-    AttemptRecord, CloseStreamRequest, CompleteLeaseRequest, Demand, EventKind, ExecutionPolicy,
-    FailLeaseRequest, Frame, FrameKind, GetAttemptRequest, GetJobRequest, GetStreamRequest,
-    HeartbeatWorkerRequest, JobEvent, JobRecord, JobSpec, ListAttemptsRequest, ListStreamsRequest,
-    ObjectRef, OpenStreamRequest, PollLeaseRequest, PullFramesRequest, PushFramesRequest,
-    RegisterWorkerRequest, RenewLeaseRequest, ReportEventRequest, ResourceQuantity,
-    StreamDirection, StreamRecord, StreamScope, SubmitJobRequest, WatchJobRequest, WorkerRecord,
-    WorkerSpec, WorkerStatus, object_ref,
+use anyhow::{Context, Result, anyhow, bail};
+use anyserve_client::controlplane::{
+    ExecutionPolicy, JobSpec, ResourceQuantity, WorkerSpec, WorkerStatus,
+};
+use anyserve_client::{
+    AnyserveClient as RustAnyserveClient, AttemptRecord, AttemptState, EventKind, Frame,
+    FrameKind, FrameWrite, JobEvent, JobRecord, JobState, JobSubmission, LeaseGrant, LeaseRecord,
+    ObjectRef, PushSummary as RustPushSummary, StreamDirection, StreamOpen, StreamRecord,
+    StreamScope, StreamState, WorkerRecord, WorkerRegistration, object_ref,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use tokio::runtime::Builder;
-use tokio_stream::StreamExt;
-use tonic::Request;
+use tokio::runtime::{Builder, Runtime};
+use tonic::Streaming;
+
+type SharedRuntime = Arc<Mutex<Runtime>>;
+type SharedClient = Arc<Mutex<RustAnyserveClient>>;
+type SharedJobEventStream = Arc<Mutex<Option<Streaming<JobEvent>>>>;
+type SharedFrameStream = Arc<Mutex<Option<Streaming<Frame>>>>;
 
 #[derive(FromPyObject)]
 struct PyObjectRef {
@@ -27,12 +30,6 @@ struct PyObjectRef {
     uri: Option<String>,
     #[pyo3(item("metadata"))]
     metadata: Option<HashMap<String, String>>,
-}
-
-#[pyclass]
-#[derive(Clone)]
-struct AnyserveClient {
-    endpoint: String,
 }
 
 struct SubmitJobCall {
@@ -69,11 +66,39 @@ struct OpenStreamCall {
     lease_id: Option<String>,
 }
 
+#[pyclass]
+#[derive(Clone)]
+struct AnyserveClient {
+    endpoint: String,
+    runtime: SharedRuntime,
+    client: SharedClient,
+}
+
+#[pyclass]
+struct JobEventIterator {
+    runtime: SharedRuntime,
+    stream: SharedJobEventStream,
+}
+
+#[pyclass]
+struct FrameIterator {
+    runtime: SharedRuntime,
+    stream: SharedFrameStream,
+}
+
 #[pymethods]
 impl AnyserveClient {
     #[new]
-    fn new(endpoint: String) -> Self {
-        Self { endpoint }
+    fn new(endpoint: String) -> PyResult<Self> {
+        let runtime = build_runtime().map_err(to_py_err)?;
+        let client = runtime
+            .block_on(RustAnyserveClient::connect(endpoint.clone()))
+            .map_err(to_py_err)?;
+        Ok(Self {
+            endpoint,
+            runtime: Arc::new(Mutex::new(runtime)),
+            client: Arc::new(Mutex::new(client)),
+        })
     }
 
     #[pyo3(signature = (
@@ -105,25 +130,27 @@ impl AnyserveClient {
         lease_ttl_secs: Option<u32>,
         job_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
+        let request = SubmitJobCall {
+            interface_name,
+            inputs: inputs.unwrap_or_default(),
+            params: params.unwrap_or_default(),
+            required_attributes: required_attributes.unwrap_or_default(),
+            preferred_attributes: preferred_attributes.unwrap_or_default(),
+            required_capacity: required_capacity.unwrap_or_default(),
+            metadata: metadata.unwrap_or_default(),
+            profile: profile.unwrap_or_else(|| "basic".to_string()),
+            priority,
+            lease_ttl_secs: lease_ttl_secs.unwrap_or(30),
+            job_id,
+        };
         let job = py
             .allow_threads(move || {
-                submit_job_impl(
-                    endpoint,
-                    SubmitJobCall {
-                        interface_name,
-                        inputs: inputs.unwrap_or_default(),
-                        params: params.unwrap_or_default(),
-                        required_attributes: required_attributes.unwrap_or_default(),
-                        preferred_attributes: preferred_attributes.unwrap_or_default(),
-                        required_capacity: required_capacity.unwrap_or_default(),
-                        metadata: metadata.unwrap_or_default(),
-                        profile: profile.unwrap_or_else(|| "basic".to_string()),
-                        priority,
-                        lease_ttl_secs: lease_ttl_secs.unwrap_or(30),
-                        job_id,
-                    },
-                )
+                let request = submit_job_from_py(request)?;
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.submit_job(request))
+                })
             })
             .map_err(to_py_err)?;
         job_record_to_py(py, job)
@@ -135,45 +162,85 @@ impl AnyserveClient {
         py: Python<'_>,
         job_id: String,
         after_sequence: u64,
-    ) -> PyResult<Vec<Py<PyDict>>> {
-        let endpoint = self.endpoint.clone();
-        let events = py
-            .allow_threads(move || watch_job_impl(endpoint, job_id, after_sequence))
+    ) -> PyResult<JobEventIterator> {
+        let runtime = self.runtime.clone();
+        let stream_runtime = runtime.clone();
+        let client = self.client.clone();
+        py.allow_threads(move || {
+            let stream = with_client(&runtime, &client, move |runtime, client| {
+                runtime.block_on(client.watch_job(job_id, after_sequence))
+            })?;
+            Ok(JobEventIterator {
+                runtime: stream_runtime,
+                stream: Arc::new(Mutex::new(Some(stream))),
+            })
+        })
+        .map_err(to_py_err)
+    }
+
+    fn list_jobs(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
+        let jobs = py
+            .allow_threads(move || {
+                with_client(&runtime, &client, |runtime, client| {
+                    runtime.block_on(client.list_jobs())
+                })
+            })
             .map_err(to_py_err)?;
-        events
-            .into_iter()
-            .map(|event| job_event_to_py(py, event))
+        jobs.into_iter()
+            .map(|job| job_record_to_py(py, job))
             .collect()
     }
 
     fn get_job(&self, py: Python<'_>, job_id: String) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let job = py
-            .allow_threads(move || get_job_impl(endpoint, job_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.get_job(job_id))
+                })
+            })
             .map_err(to_py_err)?;
         job_record_to_py(py, job)
     }
 
     fn cancel_job(&self, py: Python<'_>, job_id: String) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let job = py
-            .allow_threads(move || cancel_job_impl(endpoint, job_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.cancel_job(job_id))
+                })
+            })
             .map_err(to_py_err)?;
         job_record_to_py(py, job)
     }
 
     fn get_attempt(&self, py: Python<'_>, attempt_id: String) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let attempt = py
-            .allow_threads(move || get_attempt_impl(endpoint, attempt_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.get_attempt(attempt_id))
+                })
+            })
             .map_err(to_py_err)?;
         attempt_record_to_py(py, attempt)
     }
 
     fn list_attempts(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<Py<PyDict>>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let attempts = py
-            .allow_threads(move || list_attempts_impl(endpoint, job_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.list_attempts(job_id))
+                })
+            })
             .map_err(to_py_err)?;
         attempts
             .into_iter()
@@ -200,20 +267,22 @@ impl AnyserveClient {
         metadata: Option<HashMap<String, String>>,
         worker_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
+        let request = RegisterWorkerCall {
+            interfaces,
+            attributes: attributes.unwrap_or_default(),
+            total_capacity: total_capacity.unwrap_or_default(),
+            max_active_leases,
+            metadata: metadata.unwrap_or_default(),
+            worker_id,
+        };
         let worker = py
             .allow_threads(move || {
-                register_worker_impl(
-                    endpoint,
-                    RegisterWorkerCall {
-                        interfaces,
-                        attributes: attributes.unwrap_or_default(),
-                        total_capacity: total_capacity.unwrap_or_default(),
-                        max_active_leases,
-                        metadata: metadata.unwrap_or_default(),
-                        worker_id,
-                    },
-                )
+                let request = register_worker_from_py(request);
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.register_worker(request))
+                })
             })
             .map_err(to_py_err)?;
         worker_record_to_py(py, worker)
@@ -228,29 +297,34 @@ impl AnyserveClient {
         active_leases: u32,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let worker = py
             .allow_threads(move || {
-                heartbeat_worker_impl(
-                    endpoint,
-                    worker_id,
-                    available_capacity.unwrap_or_default(),
-                    active_leases,
-                    metadata.unwrap_or_default(),
-                )
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.heartbeat_worker(
+                        worker_id,
+                        available_capacity.unwrap_or_default(),
+                        active_leases,
+                        metadata.unwrap_or_default(),
+                    ))
+                })
             })
             .map_err(to_py_err)?;
         worker_record_to_py(py, worker)
     }
 
     fn poll_lease(&self, py: Python<'_>, worker_id: String) -> PyResult<Option<Py<PyDict>>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let lease = py
-            .allow_threads(move || poll_lease_impl(endpoint, worker_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.poll_lease(worker_id))
+                })
+            })
             .map_err(to_py_err)?;
-        lease
-            .map(|(lease, attempt, job)| lease_grant_to_py(py, lease, attempt, job))
-            .transpose()
+        lease.map(|grant| lease_grant_to_py(py, grant)).transpose()
     }
 
     fn renew_lease(
@@ -259,9 +333,14 @@ impl AnyserveClient {
         worker_id: String,
         lease_id: String,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let lease = py
-            .allow_threads(move || renew_lease_impl(endpoint, worker_id, lease_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.renew_lease(worker_id, lease_id))
+                })
+            })
             .map_err(to_py_err)?;
         lease_record_to_py(py, lease)
     }
@@ -276,16 +355,19 @@ impl AnyserveClient {
         payload: Option<Vec<u8>>,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         py.allow_threads(move || {
-            report_event_impl(
-                endpoint,
-                worker_id,
-                lease_id,
-                parse_event_kind(&kind)?,
-                payload.unwrap_or_default(),
-                metadata.unwrap_or_default(),
-            )
+            let kind = parse_event_kind(&kind)?;
+            with_client(&runtime, &client, move |runtime, client| {
+                runtime.block_on(client.report_event(
+                    worker_id,
+                    lease_id,
+                    kind,
+                    payload.unwrap_or_default(),
+                    metadata.unwrap_or_default(),
+                ))
+            })
         })
         .map_err(to_py_err)?;
         Ok(())
@@ -300,15 +382,18 @@ impl AnyserveClient {
         outputs: Option<Vec<PyObjectRef>>,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         py.allow_threads(move || {
-            complete_lease_impl(
-                endpoint,
-                worker_id,
-                lease_id,
-                outputs.unwrap_or_default(),
-                metadata.unwrap_or_default(),
-            )
+            let outputs = py_objects_to_proto(outputs.unwrap_or_default())?;
+            with_client(&runtime, &client, move |runtime, client| {
+                runtime.block_on(client.complete_lease(
+                    worker_id,
+                    lease_id,
+                    outputs,
+                    metadata.unwrap_or_default(),
+                ))
+            })
         })
         .map_err(to_py_err)?;
         Ok(())
@@ -324,16 +409,18 @@ impl AnyserveClient {
         retryable: bool,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         py.allow_threads(move || {
-            fail_lease_impl(
-                endpoint,
-                worker_id,
-                lease_id,
-                reason,
-                retryable,
-                metadata.unwrap_or_default(),
-            )
+            with_client(&runtime, &client, move |runtime, client| {
+                runtime.block_on(client.fail_lease(
+                    worker_id,
+                    lease_id,
+                    reason,
+                    retryable,
+                    metadata.unwrap_or_default(),
+                ))
+            })
         })
         .map_err(to_py_err)?;
         Ok(())
@@ -362,39 +449,51 @@ impl AnyserveClient {
         worker_id: Option<String>,
         lease_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
+        let request = OpenStreamCall {
+            job_id,
+            stream_name,
+            scope: parse_stream_scope(&scope).map_err(to_py_err)?,
+            direction: parse_stream_direction(&direction).map_err(to_py_err)?,
+            metadata: metadata.unwrap_or_default(),
+            attempt_id,
+            worker_id,
+            lease_id,
+        };
         let stream = py
             .allow_threads(move || {
-                open_stream_impl(
-                    endpoint,
-                    OpenStreamCall {
-                        job_id,
-                        stream_name,
-                        scope: parse_stream_scope(&scope)?,
-                        direction: parse_stream_direction(&direction)?,
-                        metadata: metadata.unwrap_or_default(),
-                        attempt_id,
-                        worker_id,
-                        lease_id,
-                    },
-                )
+                let request = open_stream_from_py(request);
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.open_stream(request))
+                })
             })
             .map_err(to_py_err)?;
         stream_record_to_py(py, stream)
     }
 
     fn get_stream(&self, py: Python<'_>, stream_id: String) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let stream = py
-            .allow_threads(move || get_stream_impl(endpoint, stream_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.get_stream(stream_id))
+                })
+            })
             .map_err(to_py_err)?;
         stream_record_to_py(py, stream)
     }
 
     fn list_streams(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<Py<PyDict>>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let streams = py
-            .allow_threads(move || list_streams_impl(endpoint, job_id))
+            .allow_threads(move || {
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.list_streams(job_id))
+                })
+            })
             .map_err(to_py_err)?;
         streams
             .into_iter()
@@ -411,16 +510,18 @@ impl AnyserveClient {
         lease_id: Option<String>,
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let stream = py
             .allow_threads(move || {
-                close_stream_impl(
-                    endpoint,
-                    stream_id,
-                    worker_id,
-                    lease_id,
-                    metadata.unwrap_or_default(),
-                )
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.close_stream(
+                        stream_id,
+                        worker_id,
+                        lease_id,
+                        metadata.unwrap_or_default(),
+                    ))
+                })
             })
             .map_err(to_py_err)?;
         stream_record_to_py(py, stream)
@@ -435,10 +536,14 @@ impl AnyserveClient {
         worker_id: Option<String>,
         lease_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
-        let endpoint = self.endpoint.clone();
+        let runtime = self.runtime.clone();
+        let client = self.client.clone();
         let summary = py
             .allow_threads(move || {
-                push_frames_impl(endpoint, stream_id, frames, worker_id, lease_id)
+                let frames = frame_writes_from_py(frames)?;
+                with_client(&runtime, &client, move |runtime, client| {
+                    runtime.block_on(client.push_frames(stream_id, frames, worker_id, lease_id))
+                })
             })
             .map_err(to_py_err)?;
         push_summary_to_py(py, summary)
@@ -451,15 +556,20 @@ impl AnyserveClient {
         stream_id: String,
         after_sequence: u64,
         follow: bool,
-    ) -> PyResult<Vec<Py<PyDict>>> {
-        let endpoint = self.endpoint.clone();
-        let frames = py
-            .allow_threads(move || pull_frames_impl(endpoint, stream_id, after_sequence, follow))
-            .map_err(to_py_err)?;
-        frames
-            .into_iter()
-            .map(|frame| frame_to_py(py, frame))
-            .collect()
+    ) -> PyResult<FrameIterator> {
+        let runtime = self.runtime.clone();
+        let stream_runtime = runtime.clone();
+        let client = self.client.clone();
+        py.allow_threads(move || {
+            let stream = with_client(&runtime, &client, move |runtime, client| {
+                runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))
+            })?;
+            Ok(FrameIterator {
+                runtime: stream_runtime,
+                stream: Arc::new(Mutex::new(Some(stream))),
+            })
+        })
+        .map_err(to_py_err)
     }
 
     fn __repr__(&self) -> String {
@@ -467,488 +577,159 @@ impl AnyserveClient {
     }
 }
 
+#[pymethods]
+impl JobEventIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let runtime = self.runtime.clone();
+        let stream = self.stream.clone();
+        let next = py
+            .allow_threads(move || next_job_event(&runtime, &stream))
+            .map_err(to_py_err)?;
+        next.map(|event| job_event_to_py(py, event)).transpose()
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "JobEventIterator()"
+    }
+}
+
+#[pymethods]
+impl FrameIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let runtime = self.runtime.clone();
+        let stream = self.stream.clone();
+        let next = py
+            .allow_threads(move || next_frame(&runtime, &stream))
+            .map_err(to_py_err)?;
+        next.map(|frame| frame_to_py(py, frame)).transpose()
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "FrameIterator()"
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AnyserveClient>()?;
+    m.add_class::<JobEventIterator>()?;
+    m.add_class::<FrameIterator>()?;
     Ok(())
 }
 
-fn submit_job_impl(endpoint: String, request: SubmitJobCall) -> Result<JobRecord> {
-    let SubmitJobCall {
-        interface_name,
-        inputs,
-        params,
-        required_attributes,
-        preferred_attributes,
-        required_capacity,
-        metadata,
-        profile,
-        priority,
-        lease_ttl_secs,
-        job_id,
-    } = request;
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
+fn build_runtime() -> Result<Runtime> {
+    Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .context("create tokio runtime")
+}
 
-        let response = client
-            .submit_job(Request::new(SubmitJobRequest {
-                job_id: job_id.unwrap_or_default(),
-                spec: Some(JobSpec {
-                    interface_name,
-                    inputs: py_objects_to_proto(inputs)?,
-                    params,
-                    demand: Some(Demand {
-                        required_attributes,
-                        preferred_attributes,
-                        required_capacity: capacity_to_proto(required_capacity),
-                    }),
-                    policy: Some(ExecutionPolicy {
-                        profile,
-                        priority,
-                        lease_ttl_secs,
-                    }),
-                    metadata,
-                }),
-            }))
-            .await
-            .context("submit job")?
-            .into_inner();
+fn with_client<F, T>(runtime: &SharedRuntime, client: &SharedClient, op: F) -> Result<T>
+where
+    F: FnOnce(&mut Runtime, &mut RustAnyserveClient) -> Result<T>,
+{
+    let mut runtime = lock_shared(runtime, "anyserve tokio runtime")?;
+    let mut client = lock_shared(client, "anyserve client")?;
+    op(&mut runtime, &mut client)
+}
 
-        response.job.context("missing job in submit response")
+fn lock_shared<'a, T>(shared: &'a Arc<Mutex<T>>, label: &str) -> Result<MutexGuard<'a, T>> {
+    shared.lock().map_err(|_| anyhow!("{label} lock poisoned"))
+}
+
+fn submit_job_from_py(request: SubmitJobCall) -> Result<JobSubmission> {
+    Ok(JobSubmission {
+        job_id: request.job_id,
+        interface_name: request.interface_name,
+        inputs: py_objects_to_proto(request.inputs)?,
+        params: request.params,
+        required_attributes: request.required_attributes,
+        preferred_attributes: request.preferred_attributes,
+        required_capacity: request.required_capacity,
+        metadata: request.metadata,
+        profile: request.profile,
+        priority: request.priority,
+        lease_ttl_secs: request.lease_ttl_secs,
     })
 }
 
-fn watch_job_impl(endpoint: String, job_id: String, after_sequence: u64) -> Result<Vec<JobEvent>> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let mut stream = client
-            .watch_job(Request::new(WatchJobRequest {
-                job_id,
-                after_sequence,
-            }))
-            .await
-            .context("watch job")?
-            .into_inner();
-
-        let mut events = Vec::new();
-        while let Some(item) = stream.next().await {
-            events.push(item.context("receive job event")?);
-        }
-        Ok(events)
-    })
+fn register_worker_from_py(request: RegisterWorkerCall) -> WorkerRegistration {
+    WorkerRegistration {
+        worker_id: request.worker_id,
+        interfaces: request.interfaces,
+        attributes: request.attributes,
+        total_capacity: request.total_capacity,
+        max_active_leases: request.max_active_leases,
+        metadata: request.metadata,
+    }
 }
 
-fn get_job_impl(endpoint: String, job_id: String) -> Result<JobRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .get_job(Request::new(GetJobRequest { job_id }))
-            .await
-            .context("get job")?
-            .into_inner()
-            .pipe(Ok)
-    })
+fn open_stream_from_py(request: OpenStreamCall) -> StreamOpen {
+    StreamOpen {
+        job_id: request.job_id,
+        stream_name: request.stream_name,
+        scope: request.scope,
+        direction: request.direction,
+        metadata: request.metadata,
+        attempt_id: request.attempt_id,
+        worker_id: request.worker_id,
+        lease_id: request.lease_id,
+    }
 }
 
-fn cancel_job_impl(endpoint: String, job_id: String) -> Result<JobRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .cancel_job(Request::new(
-                anyserve_proto::controlplane::CancelJobRequest { job_id },
-            ))
-            .await
-            .context("cancel job")?
-            .into_inner()
-            .pipe(Ok)
-    })
-}
-
-fn get_attempt_impl(endpoint: String, attempt_id: String) -> Result<AttemptRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .get_attempt(Request::new(GetAttemptRequest { attempt_id }))
-            .await
-            .context("get attempt")?
-            .into_inner()
-            .pipe(Ok)
-    })
-}
-
-fn list_attempts_impl(endpoint: String, job_id: String) -> Result<Vec<AttemptRecord>> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        Ok(client
-            .list_attempts(Request::new(ListAttemptsRequest { job_id }))
-            .await
-            .context("list attempts")?
-            .into_inner()
-            .attempts)
-    })
-}
-
-fn register_worker_impl(endpoint: String, request: RegisterWorkerCall) -> Result<WorkerRecord> {
-    let RegisterWorkerCall {
-        interfaces,
-        attributes,
-        total_capacity,
-        max_active_leases,
-        metadata,
-        worker_id,
-    } = request;
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let response = client
-            .register_worker(Request::new(RegisterWorkerRequest {
-                worker_id: worker_id.unwrap_or_default(),
-                spec: Some(WorkerSpec {
-                    interfaces,
-                    attributes,
-                    total_capacity: capacity_to_proto(total_capacity),
-                    max_active_leases,
-                    metadata,
-                }),
-            }))
-            .await
-            .context("register worker")?
-            .into_inner();
-
-        response
-            .worker
-            .context("missing worker in register response")
-    })
-}
-
-fn heartbeat_worker_impl(
-    endpoint: String,
-    worker_id: String,
-    available_capacity: HashMap<String, i64>,
-    active_leases: u32,
-    metadata: HashMap<String, String>,
-) -> Result<WorkerRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let response = client
-            .heartbeat_worker(Request::new(HeartbeatWorkerRequest {
-                worker_id,
-                available_capacity: capacity_to_proto(available_capacity),
-                active_leases,
-                metadata,
-            }))
-            .await
-            .context("heartbeat worker")?
-            .into_inner();
-
-        response
-            .worker
-            .context("missing worker in heartbeat response")
-    })
-}
-
-fn poll_lease_impl(
-    endpoint: String,
-    worker_id: String,
-) -> Result<
-    Option<(
-        anyserve_proto::controlplane::LeaseRecord,
-        AttemptRecord,
-        JobRecord,
-    )>,
-> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let response = client
-            .poll_lease(Request::new(PollLeaseRequest { worker_id }))
-            .await
-            .context("poll lease")?
-            .into_inner();
-
-        match (response.lease, response.attempt, response.job) {
-            (Some(lease), Some(attempt), Some(job)) => Ok(Some((lease, attempt, job))),
-            (None, None, None) => Ok(None),
-            _ => bail!("lease grant response was incomplete"),
-        }
-    })
-}
-
-fn renew_lease_impl(
-    endpoint: String,
-    worker_id: String,
-    lease_id: String,
-) -> Result<anyserve_proto::controlplane::LeaseRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let response = client
-            .renew_lease(Request::new(RenewLeaseRequest {
-                worker_id,
-                lease_id,
-            }))
-            .await
-            .context("renew lease")?
-            .into_inner();
-
-        response.lease.context("missing lease in renew response")
-    })
-}
-
-fn report_event_impl(
-    endpoint: String,
-    worker_id: String,
-    lease_id: String,
-    kind: EventKind,
-    payload: Vec<u8>,
-    metadata: HashMap<String, String>,
-) -> Result<()> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .report_event(Request::new(ReportEventRequest {
-                worker_id,
-                lease_id,
-                kind: kind as i32,
+fn frame_writes_from_py(
+    frames: Vec<(String, Vec<u8>, HashMap<String, String>)>,
+) -> Result<Vec<FrameWrite>> {
+    frames
+        .into_iter()
+        .map(|(kind, payload, metadata)| {
+            Ok(FrameWrite {
+                kind: parse_frame_kind(&kind)?,
                 payload,
                 metadata,
-            }))
-            .await
-            .context("report event")?;
-        Ok(())
-    })
-}
-
-fn complete_lease_impl(
-    endpoint: String,
-    worker_id: String,
-    lease_id: String,
-    outputs: Vec<PyObjectRef>,
-    metadata: HashMap<String, String>,
-) -> Result<()> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .complete_lease(Request::new(CompleteLeaseRequest {
-                worker_id,
-                lease_id,
-                outputs: py_objects_to_proto(outputs)?,
-                metadata,
-            }))
-            .await
-            .context("complete lease")?;
-        Ok(())
-    })
-}
-
-fn fail_lease_impl(
-    endpoint: String,
-    worker_id: String,
-    lease_id: String,
-    reason: String,
-    retryable: bool,
-    metadata: HashMap<String, String>,
-) -> Result<()> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .fail_lease(Request::new(FailLeaseRequest {
-                worker_id,
-                lease_id,
-                reason,
-                retryable,
-                metadata,
-            }))
-            .await
-            .context("fail lease")?;
-        Ok(())
-    })
-}
-
-fn open_stream_impl(endpoint: String, request: OpenStreamCall) -> Result<StreamRecord> {
-    let OpenStreamCall {
-        job_id,
-        stream_name,
-        scope,
-        direction,
-        metadata,
-        attempt_id,
-        worker_id,
-        lease_id,
-    } = request;
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let response = client
-            .open_stream(Request::new(OpenStreamRequest {
-                job_id,
-                attempt_id: attempt_id.unwrap_or_default(),
-                worker_id: worker_id.unwrap_or_default(),
-                lease_id: lease_id.unwrap_or_default(),
-                stream_name,
-                scope: scope as i32,
-                direction: direction as i32,
-                metadata,
-            }))
-            .await
-            .context("open stream")?
-            .into_inner();
-
-        response.stream.context("missing stream in open response")
-    })
-}
-
-fn get_stream_impl(endpoint: String, stream_id: String) -> Result<StreamRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .get_stream(Request::new(GetStreamRequest { stream_id }))
-            .await
-            .context("get stream")?
-            .into_inner()
-            .pipe(Ok)
-    })
-}
-
-fn list_streams_impl(endpoint: String, job_id: String) -> Result<Vec<StreamRecord>> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        Ok(client
-            .list_streams(Request::new(ListStreamsRequest { job_id }))
-            .await
-            .context("list streams")?
-            .into_inner()
-            .streams)
-    })
-}
-
-fn close_stream_impl(
-    endpoint: String,
-    stream_id: String,
-    worker_id: Option<String>,
-    lease_id: Option<String>,
-    metadata: HashMap<String, String>,
-) -> Result<StreamRecord> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        client
-            .close_stream(Request::new(CloseStreamRequest {
-                stream_id,
-                worker_id: worker_id.unwrap_or_default(),
-                lease_id: lease_id.unwrap_or_default(),
-                metadata,
-            }))
-            .await
-            .context("close stream")?
-            .into_inner()
-            .pipe(Ok)
-    })
-}
-
-struct PushSummary {
-    stream: Option<StreamRecord>,
-    last_sequence: u64,
-    written_frames: u64,
-}
-
-fn push_frames_impl(
-    endpoint: String,
-    stream_id: String,
-    frames: Vec<(String, Vec<u8>, HashMap<String, String>)>,
-    worker_id: Option<String>,
-    lease_id: Option<String>,
-) -> Result<PushSummary> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let worker_id = worker_id.unwrap_or_default();
-        let lease_id = lease_id.unwrap_or_default();
-        let requests = frames
-            .into_iter()
-            .map(|(kind, payload, metadata)| {
-                let frame_kind = parse_frame_kind(&kind)?;
-                Ok(PushFramesRequest {
-                    stream_id: stream_id.clone(),
-                    worker_id: worker_id.clone(),
-                    lease_id: lease_id.clone(),
-                    kind: frame_kind as i32,
-                    payload,
-                    metadata,
-                })
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        let response = client
-            .push_frames(Request::new(tokio_stream::iter(requests)))
-            .await
-            .context("push frames")?
-            .into_inner();
-
-        Ok(PushSummary {
-            stream: response.stream,
-            last_sequence: response.last_sequence,
-            written_frames: response.written_frames,
         })
-    })
+        .collect()
 }
 
-fn pull_frames_impl(
-    endpoint: String,
-    stream_id: String,
-    after_sequence: u64,
-    follow: bool,
-) -> Result<Vec<Frame>> {
-    run_async(async move {
-        let mut client = ControlPlaneServiceClient::connect(endpoint)
-            .await
-            .context("connect anyserve gRPC endpoint")?;
-        let mut stream = client
-            .pull_frames(Request::new(PullFramesRequest {
-                stream_id,
-                after_sequence,
-                follow,
-            }))
-            .await
-            .context("pull frames")?
-            .into_inner();
+fn next_job_event(
+    runtime: &SharedRuntime,
+    stream: &SharedJobEventStream,
+) -> Result<Option<JobEvent>> {
+    let runtime = lock_shared(runtime, "anyserve tokio runtime")?;
+    let mut stream = lock_shared(stream, "job event stream")?;
+    let Some(inner) = stream.as_mut() else {
+        return Ok(None);
+    };
+    let next = runtime
+        .block_on(inner.message())
+        .context("receive job event")?;
+    if next.is_none() {
+        *stream = None;
+    }
+    Ok(next)
+}
 
-        let mut frames = Vec::new();
-        while let Some(item) = stream.next().await {
-            frames.push(item.context("receive frame")?);
-        }
-        Ok(frames)
-    })
+fn next_frame(runtime: &SharedRuntime, stream: &SharedFrameStream) -> Result<Option<Frame>> {
+    let runtime = lock_shared(runtime, "anyserve tokio runtime")?;
+    let mut stream = lock_shared(stream, "frame stream")?;
+    let Some(inner) = stream.as_mut() else {
+        return Ok(None);
+    };
+    let next = runtime.block_on(inner.message()).context("receive frame")?;
+    if next.is_none() {
+        *stream = None;
+    }
+    Ok(next)
 }
 
 fn py_objects_to_proto(objects: Vec<PyObjectRef>) -> Result<Vec<ObjectRef>> {
@@ -969,13 +750,6 @@ fn py_object_to_proto(object: PyObjectRef) -> Result<ObjectRef> {
         (Some(_), Some(_)) => bail!("object cannot contain both inline and uri"),
         (None, None) => bail!("object must contain inline or uri"),
     }
-}
-
-fn capacity_to_proto(capacity: HashMap<String, i64>) -> Vec<ResourceQuantity> {
-    capacity
-        .into_iter()
-        .map(|(name, value)| ResourceQuantity { name, value })
-        .collect()
 }
 
 fn parse_event_kind(kind: &str) -> Result<EventKind> {
@@ -1026,10 +800,10 @@ fn parse_frame_kind(kind: &str) -> Result<FrameKind> {
 }
 
 fn job_record_to_py(py: Python<'_>, job: JobRecord) -> PyResult<Py<PyDict>> {
-    let state = job.state();
+    let state = job_state_name(job.state());
     let dict = PyDict::new(py);
     dict.set_item("job_id", job.job_id)?;
-    dict.set_item("state", job_state_name(state))?;
+    dict.set_item("state", state)?;
     dict.set_item("spec", job_spec_to_py(py, job.spec)?)?;
     dict.set_item("outputs", object_list_to_py(py, job.outputs)?)?;
     dict.set_item("lease_id", empty_to_none_py(job.lease_id))?;
@@ -1045,13 +819,13 @@ fn job_record_to_py(py: Python<'_>, job: JobRecord) -> PyResult<Py<PyDict>> {
 }
 
 fn attempt_record_to_py(py: Python<'_>, attempt: AttemptRecord) -> PyResult<Py<PyDict>> {
-    let state = attempt.state();
+    let state = attempt_state_name(attempt.state());
     let dict = PyDict::new(py);
     dict.set_item("attempt_id", attempt.attempt_id)?;
     dict.set_item("job_id", attempt.job_id)?;
     dict.set_item("worker_id", attempt.worker_id)?;
     dict.set_item("lease_id", attempt.lease_id)?;
-    dict.set_item("state", attempt_state_name(state))?;
+    dict.set_item("state", state)?;
     dict.set_item("created_at_ms", attempt.created_at_ms)?;
     dict.set_item("started_at_ms", zero_to_none_py(attempt.started_at_ms))?;
     dict.set_item("finished_at_ms", zero_to_none_py(attempt.finished_at_ms))?;
@@ -1070,23 +844,15 @@ fn worker_record_to_py(py: Python<'_>, worker: WorkerRecord) -> PyResult<Py<PyDi
     Ok(dict.unbind())
 }
 
-fn lease_grant_to_py(
-    py: Python<'_>,
-    lease: anyserve_proto::controlplane::LeaseRecord,
-    attempt: AttemptRecord,
-    job: JobRecord,
-) -> PyResult<Py<PyDict>> {
+fn lease_grant_to_py(py: Python<'_>, grant: LeaseGrant) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item("lease", lease_record_to_py(py, lease)?)?;
-    dict.set_item("attempt", attempt_record_to_py(py, attempt)?)?;
-    dict.set_item("job", job_record_to_py(py, job)?)?;
+    dict.set_item("lease", lease_record_to_py(py, grant.lease)?)?;
+    dict.set_item("attempt", attempt_record_to_py(py, grant.attempt)?)?;
+    dict.set_item("job", job_record_to_py(py, grant.job)?)?;
     Ok(dict.unbind())
 }
 
-fn lease_record_to_py(
-    py: Python<'_>,
-    lease: anyserve_proto::controlplane::LeaseRecord,
-) -> PyResult<Py<PyDict>> {
+fn lease_record_to_py(py: Python<'_>, lease: LeaseRecord) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("lease_id", lease.lease_id)?;
     dict.set_item("job_id", lease.job_id)?;
@@ -1097,18 +863,18 @@ fn lease_record_to_py(
 }
 
 fn stream_record_to_py(py: Python<'_>, stream: StreamRecord) -> PyResult<Py<PyDict>> {
-    let scope = stream.scope();
-    let direction = stream.direction();
-    let state = stream.state();
+    let scope = stream_scope_name(stream.scope());
+    let direction = stream_direction_name(stream.direction());
+    let state = stream_state_name(stream.state());
     let dict = PyDict::new(py);
     dict.set_item("stream_id", stream.stream_id)?;
     dict.set_item("job_id", stream.job_id)?;
     dict.set_item("attempt_id", empty_to_none_py(stream.attempt_id))?;
     dict.set_item("lease_id", empty_to_none_py(stream.lease_id))?;
     dict.set_item("stream_name", stream.stream_name)?;
-    dict.set_item("scope", stream_scope_name(scope))?;
-    dict.set_item("direction", stream_direction_name(direction))?;
-    dict.set_item("state", stream_state_name(state))?;
+    dict.set_item("scope", scope)?;
+    dict.set_item("direction", direction)?;
+    dict.set_item("state", state)?;
     dict.set_item("metadata", stream.metadata)?;
     dict.set_item("created_at_ms", stream.created_at_ms)?;
     dict.set_item("closed_at_ms", zero_to_none_py(stream.closed_at_ms))?;
@@ -1117,18 +883,18 @@ fn stream_record_to_py(py: Python<'_>, stream: StreamRecord) -> PyResult<Py<PyDi
 }
 
 fn frame_to_py(py: Python<'_>, frame: Frame) -> PyResult<Py<PyDict>> {
-    let kind = frame.kind();
+    let kind = frame_kind_name(frame.kind());
     let dict = PyDict::new(py);
     dict.set_item("stream_id", frame.stream_id)?;
     dict.set_item("sequence", frame.sequence)?;
-    dict.set_item("kind", frame_kind_name(kind))?;
+    dict.set_item("kind", kind)?;
     dict.set_item("payload", PyBytes::new(py, &frame.payload))?;
     dict.set_item("metadata", frame.metadata)?;
     dict.set_item("created_at_ms", frame.created_at_ms)?;
     Ok(dict.unbind())
 }
 
-fn push_summary_to_py(py: Python<'_>, summary: PushSummary) -> PyResult<Py<PyDict>> {
+fn push_summary_to_py(py: Python<'_>, summary: RustPushSummary) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     if let Some(stream) = summary.stream {
         dict.set_item("stream", stream_record_to_py(py, stream)?)?;
@@ -1141,11 +907,11 @@ fn push_summary_to_py(py: Python<'_>, summary: PushSummary) -> PyResult<Py<PyDic
 }
 
 fn job_event_to_py(py: Python<'_>, event: JobEvent) -> PyResult<Py<PyDict>> {
-    let kind = event.kind();
+    let kind = event_kind_name(event.kind());
     let dict = PyDict::new(py);
     dict.set_item("job_id", event.job_id)?;
     dict.set_item("sequence", event.sequence)?;
-    dict.set_item("kind", event_kind_name(kind))?;
+    dict.set_item("kind", kind)?;
     dict.set_item("payload", PyBytes::new(py, &event.payload))?;
     dict.set_item("metadata", event.metadata)?;
     dict.set_item("created_at_ms", event.created_at_ms)?;
@@ -1213,7 +979,10 @@ fn worker_status_to_py(py: Python<'_>, status: Option<WorkerStatus>) -> PyResult
     Ok(dict.unbind())
 }
 
-fn execution_policy_to_py(py: Python<'_>, policy: Option<ExecutionPolicy>) -> PyResult<Py<PyDict>> {
+fn execution_policy_to_py(
+    py: Python<'_>,
+    policy: Option<ExecutionPolicy>,
+) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     if let Some(policy) = policy {
         dict.set_item("profile", policy.profile)?;
@@ -1253,69 +1022,69 @@ fn capacity_to_py(capacity: Vec<ResourceQuantity>) -> HashMap<String, i64> {
         .collect()
 }
 
-fn job_state_name(state: anyserve_proto::controlplane::JobState) -> &'static str {
+fn job_state_name(state: JobState) -> &'static str {
     match state {
-        anyserve_proto::controlplane::JobState::Pending => "pending",
-        anyserve_proto::controlplane::JobState::Leased => "leased",
-        anyserve_proto::controlplane::JobState::Running => "running",
-        anyserve_proto::controlplane::JobState::Succeeded => "succeeded",
-        anyserve_proto::controlplane::JobState::Failed => "failed",
-        anyserve_proto::controlplane::JobState::Cancelled => "cancelled",
-        anyserve_proto::controlplane::JobState::Unspecified => "unspecified",
+        JobState::Pending => "pending",
+        JobState::Leased => "leased",
+        JobState::Running => "running",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+        JobState::Unspecified => "unspecified",
     }
 }
 
-fn attempt_state_name(state: anyserve_proto::controlplane::AttemptState) -> &'static str {
+fn attempt_state_name(state: AttemptState) -> &'static str {
     match state {
-        anyserve_proto::controlplane::AttemptState::Created => "created",
-        anyserve_proto::controlplane::AttemptState::Leased => "leased",
-        anyserve_proto::controlplane::AttemptState::Running => "running",
-        anyserve_proto::controlplane::AttemptState::Succeeded => "succeeded",
-        anyserve_proto::controlplane::AttemptState::Failed => "failed",
-        anyserve_proto::controlplane::AttemptState::Expired => "expired",
-        anyserve_proto::controlplane::AttemptState::Cancelled => "cancelled",
-        anyserve_proto::controlplane::AttemptState::Unspecified => "unspecified",
+        AttemptState::Created => "created",
+        AttemptState::Leased => "leased",
+        AttemptState::Running => "running",
+        AttemptState::Succeeded => "succeeded",
+        AttemptState::Failed => "failed",
+        AttemptState::Expired => "expired",
+        AttemptState::Cancelled => "cancelled",
+        AttemptState::Unspecified => "unspecified",
     }
 }
 
-fn stream_scope_name(scope: anyserve_proto::controlplane::StreamScope) -> &'static str {
+fn stream_scope_name(scope: StreamScope) -> &'static str {
     match scope {
-        anyserve_proto::controlplane::StreamScope::Job => "job",
-        anyserve_proto::controlplane::StreamScope::Attempt => "attempt",
-        anyserve_proto::controlplane::StreamScope::Lease => "lease",
-        anyserve_proto::controlplane::StreamScope::Unspecified => "unspecified",
+        StreamScope::Job => "job",
+        StreamScope::Attempt => "attempt",
+        StreamScope::Lease => "lease",
+        StreamScope::Unspecified => "unspecified",
     }
 }
 
-fn stream_direction_name(direction: anyserve_proto::controlplane::StreamDirection) -> &'static str {
+fn stream_direction_name(direction: StreamDirection) -> &'static str {
     match direction {
-        anyserve_proto::controlplane::StreamDirection::ClientToWorker => "client_to_worker",
-        anyserve_proto::controlplane::StreamDirection::WorkerToClient => "worker_to_client",
-        anyserve_proto::controlplane::StreamDirection::Bidirectional => "bidirectional",
-        anyserve_proto::controlplane::StreamDirection::Internal => "internal",
-        anyserve_proto::controlplane::StreamDirection::Unspecified => "unspecified",
+        StreamDirection::ClientToWorker => "client_to_worker",
+        StreamDirection::WorkerToClient => "worker_to_client",
+        StreamDirection::Bidirectional => "bidirectional",
+        StreamDirection::Internal => "internal",
+        StreamDirection::Unspecified => "unspecified",
     }
 }
 
-fn stream_state_name(state: anyserve_proto::controlplane::StreamState) -> &'static str {
+fn stream_state_name(state: StreamState) -> &'static str {
     match state {
-        anyserve_proto::controlplane::StreamState::Open => "open",
-        anyserve_proto::controlplane::StreamState::Closing => "closing",
-        anyserve_proto::controlplane::StreamState::Closed => "closed",
-        anyserve_proto::controlplane::StreamState::Error => "error",
-        anyserve_proto::controlplane::StreamState::Unspecified => "unspecified",
+        StreamState::Open => "open",
+        StreamState::Closing => "closing",
+        StreamState::Closed => "closed",
+        StreamState::Error => "error",
+        StreamState::Unspecified => "unspecified",
     }
 }
 
-fn frame_kind_name(kind: anyserve_proto::controlplane::FrameKind) -> &'static str {
+fn frame_kind_name(kind: FrameKind) -> &'static str {
     match kind {
-        anyserve_proto::controlplane::FrameKind::Open => "open",
-        anyserve_proto::controlplane::FrameKind::Data => "data",
-        anyserve_proto::controlplane::FrameKind::Close => "close",
-        anyserve_proto::controlplane::FrameKind::Error => "error",
-        anyserve_proto::controlplane::FrameKind::Checkpoint => "checkpoint",
-        anyserve_proto::controlplane::FrameKind::Control => "control",
-        anyserve_proto::controlplane::FrameKind::Unspecified => "unspecified",
+        FrameKind::Open => "open",
+        FrameKind::Data => "data",
+        FrameKind::Close => "close",
+        FrameKind::Error => "error",
+        FrameKind::Checkpoint => "checkpoint",
+        FrameKind::Control => "control",
+        FrameKind::Unspecified => "unspecified",
     }
 }
 
@@ -1336,22 +1105,19 @@ fn event_kind_name(kind: EventKind) -> &'static str {
 }
 
 fn empty_to_none_py(value: String) -> Option<String> {
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn zero_to_none_py(value: u64) -> Option<u64> {
-    if value == 0 { None } else { Some(value) }
-}
-
-fn run_async<F, T>(future: F) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
-    Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("create tokio runtime")?
-        .block_on(future)
+    if value == 0 {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn to_py_err(error: anyhow::Error) -> PyErr {
@@ -1360,17 +1126,12 @@ fn to_py_err(error: anyhow::Error) -> PyErr {
         || message.starts_with("unknown stream scope:")
         || message.starts_with("unknown stream direction:")
         || message.starts_with("unknown frame kind:")
+        || message.starts_with("object cannot contain both inline and uri")
+        || message.starts_with("object must contain inline or uri")
+        || message.starts_with("unsupported codec:")
     {
         PyValueError::new_err(message)
     } else {
         PyRuntimeError::new_err(message)
     }
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, op: impl FnOnce(Self) -> T) -> T {
-        op(self)
-    }
-}
-
-impl<T> Pipe for T {}

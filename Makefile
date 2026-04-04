@@ -27,6 +27,9 @@ python-sdk:
 python-sdk-smoke:
 	@$(BASE_ENV) && $(MISE) run python-sdk-smoke
 
+python-sdk-test:
+	@$(BASE_ENV) && $(MISE) run python-sdk-test
+
 docs-build:
 	@$(BASE_ENV) && $(MISE) run docs-build
 
@@ -41,9 +44,10 @@ help:
 	@echo "  test   - run workspace tests"
 	@echo "  e2e    - run the gRPC end-to-end test"
 	@echo "  clippy - lint the workspace"
-	@echo "  python-sdk - build the Rust-exported Python wheel"
-	@echo "  python-sdk-smoke - install the built wheel and verify imports"
+	@echo "  python-sdk - build the Rust-exported Python bindings wheel"
+	@echo "  python-sdk-smoke - install the built wheel and verify bindings imports"
+	@echo "  python-sdk-test - run Python unit tests for the high-level bindings API"
 	@echo "  docs-build - build the mdBook documentation"
 	@echo "  fmt    - format the workspace"
 
-.PHONY: setup build check test e2e clippy python-sdk python-sdk-smoke docs-build fmt help
+.PHONY: setup build check test e2e clippy python-sdk python-sdk-smoke python-sdk-test docs-build fmt help
