@@ -82,6 +82,7 @@ jobs:
     needs: build
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - name: Download packaged archives
@@ -97,8 +98,8 @@ jobs:
 
       - name: Create or update GitHub release
         run: |
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          if gh release view "${RELEASE_TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --repo "${GH_REPO}" --clobber
           else
-            gh release create "${RELEASE_TAG}" dist/* --title "${RELEASE_TAG}" --generate-notes
+            gh release create "${RELEASE_TAG}" dist/* --repo "${GH_REPO}" --title "${RELEASE_TAG}" --generate-notes
           fi

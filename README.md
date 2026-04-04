@@ -71,6 +71,7 @@ Workers advertise supply through the same generic model, and the control plane i
 - `crates/anyserve-core`: domain model, in-memory state store, scheduler, kernel, and gRPC service
 - `crates/anyserve-cli`: the `anyserve` binary
 - `examples/rust`: demo submitter / worker apps that exercise the Rust client crate
+- `examples/python`: demo submitter / worker scripts that exercise the Python SDK
 - `clients/python`: Rust-exported Python bindings via `PyO3` and `maturin`
 - `docs`: mdBook documentation
 
@@ -145,6 +146,14 @@ Submit a demo job and watch its events:
 
 ```bash
 mise exec -- cargo run -p anyserve-demo -- --mode submit
+```
+
+Or use the Python examples after installing the bindings:
+
+```bash
+mise run python-sdk-dev
+mise exec -- python examples/python/worker.py
+mise exec -- python examples/python/submit.py
 ```
 
 The demo path now uses both control-plane and data-plane APIs:

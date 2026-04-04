@@ -51,6 +51,14 @@ It then:
 - waits for job events
 - pulls `output.default` after completion
 
+You can also run the Python examples after installing the bindings:
+
+```bash
+mise run python-sdk-dev
+mise exec -- python examples/python/worker.py
+mise exec -- python examples/python/submit.py
+```
+
 ## Build the Python Bindings
 
 ```bash
