@@ -14,7 +14,7 @@ Usage:
   install.sh [--version <tag>] [--dir <path>] [--repo <owner/name>]
 
 Options:
-  --version <tag>  Install a specific tag such as v0.2.0. Defaults to latest.
+  --version <tag>  Install a specific tag such as v0.3.0. Defaults to latest.
   --dir <path>     Install directory. Defaults to ~/.local/bin.
   --repo <repo>    GitHub repository to download from. Defaults to anyserve/anyserve.
   -h, --help       Show this help.
