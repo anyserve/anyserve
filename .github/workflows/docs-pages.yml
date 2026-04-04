@@ -5,12 +5,14 @@ on:
     branches: ["main"]
     paths:
       - "docs/**"
+      - "examples/llm/**"
       - "README.md"
       - ".github/workflows/docs-pages.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "docs/**"
+      - "examples/llm/**"
       - "README.md"
       - ".github/workflows/docs-pages.yml"
   workflow_dispatch:

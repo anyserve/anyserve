@@ -10,3 +10,5 @@ dump.rdb
 /clients/python/dist
 /clients/python/.venv
 .playwright-cli/
+__pycache__/
+*.py[cod]

@@ -20,7 +20,7 @@ The checked-in examples are the main usage docs.
 
 For the built-in OpenAI-compatible gateway and LLM worker, start here:
 
-- [examples/llm/README.md](../../examples/llm/README.md)
+- [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md)
 - [Ollama](ollama.md)
 
 The smallest local stack is:
@@ -68,7 +68,7 @@ mise exec -- cargo run -p anyserve-demo -- --mode worker
 mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
 ```
 
-The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in [examples/llm/README.md](../../examples/llm/README.md).
+The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in the [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md).
 
 Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
 

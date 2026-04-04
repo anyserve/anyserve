@@ -2,7 +2,7 @@
 
 This page maps the checked-in LLM example onto a local Ollama instance.
 
-Keep the detailed walkthrough in [examples/llm/README.md](../../examples/llm/README.md). This page stays short and Ollama-specific.
+Keep the detailed walkthrough in the [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md). This page stays short and Ollama-specific.
 
 ## Install Ollama
 

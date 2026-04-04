@@ -24,7 +24,7 @@ The checked-in examples are the easiest local smoke tests.
 
 For the built-in OpenAI-compatible gateway and LLM worker, use:
 
-- [examples/llm/README.md](../../examples/llm/README.md)
+- [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md)
 - [Ollama](ollama.md)
 
 That path covers:
