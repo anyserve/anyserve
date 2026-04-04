@@ -1,11 +1,11 @@
 [book]
 authors = ["Anyserve"]
 language = "en"
-multilingual = false
 src = "src"
 title = "Anyserve"
 
 [output.html]
 default-theme = "rust"
+site-url = "/anyserve/"
 git-repository-url = "https://github.com/anyserve/anyserve"
 edit-url-template = "https://github.com/anyserve/anyserve/edit/main/{path}"

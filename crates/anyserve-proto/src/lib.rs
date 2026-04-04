@@ -1,3 +1,3 @@
-pub mod inference {
-    tonic::include_proto!("inference");
+pub mod controlplane {
+    tonic::include_proto!("controlplane");
 }

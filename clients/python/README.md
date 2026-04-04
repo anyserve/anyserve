@@ -2,13 +2,38 @@
 
 This package is a Rust-exported Python SDK built with `PyO3` and `maturin`.
 
-It exposes a small synchronous client surface over the gRPC API:
+It mirrors the generic control plane surface.
 
-- `AnyserveClient.infer(...)`
-- `AnyserveClient.fetch_one(...)`
-- `AnyserveClient.send_responses(...)`
+Examples use endpoint strings like `http://127.0.0.1:50052` because the SDK connects through a gRPC channel URI. This is not a REST base URL.
 
-## Local development
+## API Surface
+
+- `submit_job`
+- `watch_job`
+- `get_job`
+- `cancel_job`
+- `get_attempt`
+- `list_attempts`
+- `register_worker`
+- `heartbeat_worker`
+- `poll_lease`
+- `renew_lease`
+- `report_event`
+- `complete_lease`
+- `fail_lease`
+- `open_stream`
+- `get_stream`
+- `list_streams`
+- `close_stream`
+- `push_frames`
+- `pull_frames`
+
+It also includes two convenience constructors:
+
+- `inline_object(...)`
+- `uri_object(...)`
+
+## Local Development
 
 ```bash
 python3 -m pip install --user maturin
@@ -18,27 +43,25 @@ python3 -m maturin develop --manifest-path clients/python/Cargo.toml
 ## Example
 
 ```python
-from anyserve import AnyserveClient, response_created, response_finished, response_processing
+from anyserve import AnyserveClient, FRAME_DATA
 
 client = AnyserveClient("http://127.0.0.1:50052")
+# Assumes the control plane and a compatible worker are already running.
 
-responses = client.infer(
-    content=b"1 2 3",
-    metadata={"model_name": "test"},
-    queue="default",
+job = client.submit_job(
+    interface_name="demo.echo.v1",
+    required_attributes={"runtime": "demo"},
+    required_capacity={"slot": 1},
 )
 
-for item in responses:
-    print(item["request_id"], item["metadata"], item["content"])
+stream = client.open_stream(job["job_id"], "input.default")
+client.push_frames(
+    stream["stream_id"],
+    [(FRAME_DATA, b"hello from python", {})],
+)
+client.close_stream(stream["stream_id"])
 
-request = client.fetch_one(metadata={"model_name": "test"})
-if request is not None:
-    client.send_responses(
-        request["request_id"],
-        [
-            response_created(),
-            response_processing(b"partial"),
-            response_finished(),
-        ],
-    )
+events = client.watch_job(job["job_id"])
+for event in events:
+    print(event["kind"], event["metadata"])
 ```

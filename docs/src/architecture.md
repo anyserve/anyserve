@@ -1,26 +1,105 @@
 # Architecture
 
-The workspace is split into a few focused crates:
+Anyserve is a control plane kernel with a small fixed core:
 
-- `clients/python`: Python extension module and thin Python package wrapper
-- `crates/anyserve-proto`: protobuf and gRPC bindings generated from `api/anyserve/protos/grpc_service.proto`
-- `crates/anyserve-core`: shared config, Redis metadata store, and gRPC service implementation
-- `crates/anyserve-cli`: the `anyserve` binary with `init`, `serve`, and `queue` commands
-- `clients/rust`: a small Rust client that mirrors the old producer/consumer demo flow
+- `Job`
+- `Worker`
+- `Lease`
+- `Attempt`
+- `Stream`
+- `Frame`
+- `ObjectRef`
+- `JobEvent`
 
-The runtime request path is:
+The kernel does not encode workload types like LLM or image processing. It only matches:
 
-1. A caller sends `Infer`.
-2. The server stores request content and metadata in Redis.
-3. A worker calls `FetchInfer` and receives the oldest queued request that matches its filters.
-4. The worker streams progress and terminal messages through `SendResponse`.
-5. The caller receives those responses from the original `Infer` stream.
+- `interface_name`
+- `required_attributes`
+- `preferred_attributes`
+- `required_capacity`
 
-Redis stores:
+against worker supply.
 
-- system format metadata
-- queue definitions
-- request payloads
-- request metadata
-- streamed response chunks
-- request-to-queue mappings
+## Module Diagram
+
+```text
+                 +-----------------------------+
+                 |       SDK / CLI / API       |
+                 |   Rust / Python / gRPC      |
+                 +-------------+---------------+
+                               |
+                               v
+                 +-----------------------------+
+                 |         Transport           |
+                 |  Client API   Worker API    |
+                 +-------------+---------------+
+                               |
+                               v
+        +--------------------------------------------------+
+        |                    Kernel                        |
+        |--------------------------------------------------|
+        | Job Manager      Worker Registry   Lease Manager |
+        | Attempt Log      Stream Router     Recovery Loop |
+        | Event Stream     State Machine                     |
+        +------------------+-------------------------------+
+                           |
+                           v
+        +--------------------------------------------------+
+        |                     Ports                        |
+        |--------------------------------------------------|
+        | StateStore   StreamStore   Scheduler   ObjectStore |
+        +--------+----------+------------+------------+------+
+                 |          |            |            |
+                 v          v            v            v
+              +------+   +------+    +------+     +--------+
+              |memory|   |memory|    |basic |     |inline  |
+              +------+   +------+    +------+     +--------+
+```
+
+## Core Flow
+
+1. A client calls `SubmitJob`.
+2. The kernel stores the job and appends an `accepted` event.
+3. A worker registers itself and maintains heartbeats.
+4. The worker calls `PollLease`.
+5. The scheduler picks the oldest compatible pending job for that worker.
+6. The kernel issues a lease and emits `lease_granted`.
+7. The client or worker can open generic streams and exchange frames.
+8. The worker reports progress through `ReportEvent`.
+9. The worker finishes with `CompleteLease` or `FailLease`.
+10. If a lease expires, the recovery loop requeues the job.
+
+## Ports
+
+- `StateStore`
+  Default implementation: `MemoryStateStore`
+- `StreamStore`
+  Default implementation: `MemoryStreamStore`
+- `Scheduler`
+  Default implementation: `BasicScheduler`
+- `ObjectStore`
+  Default implementation: inline object references
+
+That is enough to keep v1 small, bootable, and easy to evolve.
+
+## Stable Core vs Future Plugins
+
+Stable core:
+
+- `Job`
+- `Worker`
+- `Lease`
+- `Attempt`
+- `Stream`
+- `Frame`
+- `ObjectRef`
+- `JobEvent`
+- kernel state machine
+- lease lifecycle
+
+Likely future plugin points:
+
+- persistent state stores
+- richer schedulers
+- external object stores
+- provider adapters

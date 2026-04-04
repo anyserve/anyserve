@@ -40,7 +40,7 @@
     {
       "label": "cargo: serve",
       "type": "shell",
-      "command": "cargo run -p anyserve -- serve redis://127.0.0.1:6379",
+      "command": "mise exec -- cargo run -p anyserve -- serve",
       "options": {
         "cwd": "${workspaceFolder}"
       },

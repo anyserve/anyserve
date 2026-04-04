@@ -19,8 +19,7 @@
         }
       },
       "args": [
-        "serve",
-        "redis://127.0.0.1:6379"
+        "serve"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
@@ -28,27 +27,25 @@
       }
     },
     {
-      "name": "Debug anyserve init",
+      "name": "Debug anyserve client (submit)",
       "type": "lldb",
       "request": "launch",
       "cargo": {
         "args": [
           "build",
           "--package",
-          "anyserve",
+          "anyserve-client",
           "--bin",
-          "anyserve"
+          "anyserve-client"
         ],
         "filter": {
-          "name": "anyserve",
+          "name": "anyserve-client",
           "kind": "bin"
         }
       },
       "args": [
-        "init",
-        "redis://127.0.0.1:6379",
-        "myserve",
-        "--force"
+        "--mode",
+        "submit"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
@@ -56,7 +53,7 @@
       }
     },
     {
-      "name": "Debug anyserve client (produce)",
+      "name": "Debug anyserve client (worker)",
       "type": "lldb",
       "request": "launch",
       "cargo": {
@@ -74,30 +71,7 @@
       },
       "args": [
         "--mode",
-        "produce"
-      ],
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "Debug anyserve client (consume)",
-      "type": "lldb",
-      "request": "launch",
-      "cargo": {
-        "args": [
-          "build",
-          "--package",
-          "anyserve-client",
-          "--bin",
-          "anyserve-client"
-        ],
-        "filter": {
-          "name": "anyserve-client",
-          "kind": "bin"
-        }
-      },
-      "args": [
-        "--mode",
-        "consume"
+        "worker"
       ],
       "cwd": "${workspaceFolder}"
     }

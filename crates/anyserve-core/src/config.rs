@@ -1,19 +1,4 @@
 #[derive(Clone, Debug)]
-pub struct HttpConfig {
-    pub host: String,
-    pub port: u16,
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            host: "0.0.0.0".to_string(),
-            port: 8848,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct GrpcConfig {
     pub host: String,
     pub port: u16,

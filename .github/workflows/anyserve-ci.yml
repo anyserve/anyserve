@@ -5,22 +5,28 @@ on:
     branches: ["main"]
     paths:
       - "crates/**"
+      - "clients/python/**"
       - "clients/rust/**"
       - "docs/**"
       - "api/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "README.md"
+      - "Makefile"
       - "mise.toml"
       - ".github/workflows/anyserve-ci.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "crates/**"
+      - "clients/python/**"
       - "clients/rust/**"
       - "docs/**"
       - "api/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "README.md"
+      - "Makefile"
       - "mise.toml"
       - ".github/workflows/anyserve-ci.yml"
 
@@ -75,5 +81,26 @@ jobs:
           . "$HOME/.cargo/env"
           mise run test
 
+      - name: End-to-end test
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run e2e
+
       - name: Build Python wheel
-        run: python -m maturin build --manifest-path clients/python/Cargo.toml --interpreter python
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run python-sdk
+
+      - name: Python wheel smoke test
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run python-sdk-smoke
+
+      - name: Build docs
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run docs-build
