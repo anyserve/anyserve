@@ -86,6 +86,12 @@ python3 -m pip install --user maturin
 python3 -m maturin develop --manifest-path clients/python/Cargo.toml
 ```
 
+Live end-to-end validation:
+
+```bash
+mise run python-sdk-e2e
+```
+
 ## PyPI Publishing
 
 The repository is set up to publish the Python package through PyPI Trusted Publishing.

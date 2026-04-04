@@ -30,6 +30,9 @@ python-sdk-smoke:
 python-sdk-test:
 	@$(BASE_ENV) && $(MISE) run python-sdk-test
 
+python-sdk-e2e:
+	@$(BASE_ENV) && $(MISE) run python-sdk-e2e
+
 docs-build:
 	@$(BASE_ENV) && $(MISE) run docs-build
 
@@ -47,7 +50,8 @@ help:
 	@echo "  python-sdk - build the Rust-exported Python bindings wheel"
 	@echo "  python-sdk-smoke - install the built wheel and verify bindings imports"
 	@echo "  python-sdk-test - run Python unit tests for the high-level bindings API"
+	@echo "  python-sdk-e2e - run Python SDK live end-to-end tests"
 	@echo "  docs-build - build the mdBook documentation"
 	@echo "  fmt    - format the workspace"
 
-.PHONY: setup build check test e2e clippy python-sdk python-sdk-smoke python-sdk-test docs-build fmt help
+.PHONY: setup build check test e2e clippy python-sdk python-sdk-smoke python-sdk-test python-sdk-e2e docs-build fmt help

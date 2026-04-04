@@ -71,6 +71,12 @@ Run the Python unit tests for the high-level worker API:
 mise run python-sdk-test
 ```
 
+Run the live Python SDK end-to-end suite:
+
+```bash
+mise run python-sdk-e2e
+```
+
 This smoke test intentionally does not require a running control plane. It verifies:
 
 - wheel installation
@@ -85,6 +91,12 @@ The Python unit tests additionally verify:
 - `@worker(...)` metadata capture
 - `serve(...)` success paths for `bytes` and `json`
 - failure handling for malformed JSON input
+
+The Python SDK e2e suite additionally verifies:
+
+- Python low-level submitter APIs against the Rust demo worker
+- Python high-level `@worker` / `serve()` against a live control plane
+- streamed event and frame iteration against a real server
 
 If you also want to exercise the Python bindings against a live server, start the control plane and demo worker first, then run:
 

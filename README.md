@@ -162,6 +162,7 @@ Run the workspace tests:
 ```bash
 mise run test
 mise run e2e
+mise run python-sdk-e2e
 mise run docs-build
 ```
 
@@ -239,6 +240,7 @@ mise run e2e
 mise run clippy
 mise run python-sdk
 mise run python-sdk-smoke
+mise run python-sdk-e2e
 mise run docs-build
 mise run python-sdk-dev
 ```
