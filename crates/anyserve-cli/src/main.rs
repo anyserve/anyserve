@@ -240,7 +240,10 @@ async fn run_job_ls(endpoint: &str, client: &mut AnyserveClient, args: JobLsArgs
     let filtered_jobs = filter_jobs_by_state(jobs, &args.states);
 
     if args.output.output == OutputFormat::Json {
-        let payload = filtered_jobs.iter().map(job_json_record).collect::<Vec<_>>();
+        let payload = filtered_jobs
+            .iter()
+            .map(job_json_record)
+            .collect::<Vec<_>>();
         return write_json(&payload);
     }
 
@@ -277,7 +280,14 @@ async fn run_job_ls(endpoint: &str, client: &mut AnyserveClient, args: JobLsArgs
         })
         .collect::<Vec<_>>();
     print_table(
-        &["JOB ID", "STATE", "INTERFACE", "ATTEMPT", "LAST ERROR", "UPDATED"],
+        &[
+            "JOB ID",
+            "STATE",
+            "INTERFACE",
+            "ATTEMPT",
+            "LAST ERROR",
+            "UPDATED",
+        ],
         &rows,
     );
     Ok(())
@@ -307,7 +317,10 @@ async fn run_job_inspect(
         ("job_id", job.job_id.clone()),
         ("state", job_state_name(job.state()).to_string()),
         ("interface", interface_name(&job).to_string()),
-        ("current_attempt", optional_text(&job.current_attempt_id).to_string()),
+        (
+            "current_attempt",
+            optional_text(&job.current_attempt_id).to_string(),
+        ),
         ("lease_id", optional_text(&job.lease_id).to_string()),
         ("created_at", format_timestamp(job.created_at_ms)),
         ("updated_at", format_timestamp(job.updated_at_ms)),
@@ -335,7 +348,14 @@ async fn run_job_inspect(
             })
             .collect::<Vec<_>>();
         print_table(
-            &["ATTEMPT ID", "STATE", "WORKER", "LEASE", "CREATED", "FINISHED"],
+            &[
+                "ATTEMPT ID",
+                "STATE",
+                "WORKER",
+                "LEASE",
+                "CREATED",
+                "FINISHED",
+            ],
             &rows,
         );
     }
@@ -755,7 +775,12 @@ fn write_json_line<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn print_cancel_result_text(result: &CancelJsonResult) {
-    match (&result.ok, &result.state, &result.updated_at_ms, &result.error) {
+    match (
+        &result.ok,
+        &result.state,
+        &result.updated_at_ms,
+        &result.error,
+    ) {
         (true, Some(state), Some(updated_at_ms), _) => {
             println!(
                 "cancelled {} state={} updated_at_ms={}",
@@ -796,7 +821,10 @@ fn print_key_values(entries: &[(&str, String)]) {
 }
 
 fn print_table(headers: &[&str], rows: &[Vec<String>]) {
-    let mut widths = headers.iter().map(|header| header.len()).collect::<Vec<_>>();
+    let mut widths = headers
+        .iter()
+        .map(|header| header.len())
+        .collect::<Vec<_>>();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             if let Some(width) = widths.get_mut(index) {
@@ -862,11 +890,7 @@ fn format_string_map(map: &HashMap<String, String>) -> String {
 }
 
 fn optional_text(value: &str) -> &str {
-    if value.trim().is_empty() {
-        "-"
-    } else {
-        value
-    }
+    if value.trim().is_empty() { "-" } else { value }
 }
 
 fn ellipsize(value: &str, limit: usize) -> String {
@@ -1086,7 +1110,10 @@ mod tests {
         };
 
         let value = serde_json::to_value(result).unwrap();
-        assert_eq!(value, json!({ "job_id": "job-1", "ok": false, "error": "boom" }));
+        assert_eq!(
+            value,
+            json!({ "job_id": "job-1", "ok": false, "error": "boom" })
+        );
     }
 
     #[test]
@@ -1102,10 +1129,8 @@ mod tests {
             ..JobRecord::default()
         };
 
-        let filtered = filter_jobs_by_state(
-            vec![pending.clone(), cancelled],
-            &[JobStateFilter::Pending],
-        );
+        let filtered =
+            filter_jobs_by_state(vec![pending.clone(), cancelled], &[JobStateFilter::Pending]);
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].job_id, pending.job_id);

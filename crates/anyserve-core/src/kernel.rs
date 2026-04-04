@@ -976,7 +976,9 @@ mod tests {
 
         let jobs = kernel.list_jobs().await.unwrap();
         assert_eq!(
-            jobs.iter().map(|job| job.job_id.as_str()).collect::<Vec<_>>(),
+            jobs.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
             vec![second.job_id.as_str(), first.job_id.as_str()]
         );
     }
@@ -1013,11 +1015,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let assignment = kernel
-            .poll_lease(&worker.worker_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let assignment = kernel.poll_lease(&worker.worker_id).await.unwrap().unwrap();
         let stream = kernel
             .open_stream(super::OpenStreamCommand {
                 job_id: job.job_id.clone(),

@@ -6,10 +6,10 @@ use anyserve_client::controlplane::{
     ExecutionPolicy, JobSpec, ResourceQuantity, WorkerSpec, WorkerStatus,
 };
 use anyserve_client::{
-    AnyserveClient as RustAnyserveClient, AttemptRecord, AttemptState, EventKind, Frame,
-    FrameKind, FrameWrite, JobEvent, JobRecord, JobState, JobSubmission, LeaseGrant, LeaseRecord,
-    ObjectRef, PushSummary as RustPushSummary, StreamDirection, StreamOpen, StreamRecord,
-    StreamScope, StreamState, WorkerRecord, WorkerRegistration, object_ref,
+    AnyserveClient as RustAnyserveClient, AttemptRecord, AttemptState, EventKind, Frame, FrameKind,
+    FrameWrite, JobEvent, JobRecord, JobState, JobSubmission, LeaseGrant, LeaseRecord, ObjectRef,
+    PushSummary as RustPushSummary, StreamDirection, StreamOpen, StreamRecord, StreamScope,
+    StreamState, WorkerRecord, WorkerRegistration, object_ref,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -979,10 +979,7 @@ fn worker_status_to_py(py: Python<'_>, status: Option<WorkerStatus>) -> PyResult
     Ok(dict.unbind())
 }
 
-fn execution_policy_to_py(
-    py: Python<'_>,
-    policy: Option<ExecutionPolicy>,
-) -> PyResult<Py<PyDict>> {
+fn execution_policy_to_py(py: Python<'_>, policy: Option<ExecutionPolicy>) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     if let Some(policy) = policy {
         dict.set_item("profile", policy.profile)?;
@@ -1105,19 +1102,11 @@ fn event_kind_name(kind: EventKind) -> &'static str {
 }
 
 fn empty_to_none_py(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn zero_to_none_py(value: u64) -> Option<u64> {
-    if value == 0 {
-        None
-    } else {
-        Some(value)
-    }
+    if value == 0 { None } else { Some(value) }
 }
 
 fn to_py_err(error: anyhow::Error) -> PyErr {
