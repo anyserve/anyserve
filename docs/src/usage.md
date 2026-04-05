@@ -2,17 +2,8 @@
 
 ## Prerequisites
 
-- `mise`
-- `protoc`
+- an `anyserve` binary on `PATH`
 - Python 3.12+ if you want the Python bindings
-
-## Bootstrap
-
-```bash
-mise trust
-mise install
-mise run build
-```
 
 ## Fastest Local Workflow
 
@@ -24,11 +15,11 @@ For the built-in OpenAI-compatible gateway and LLM worker, start here:
 - [Google Colab Qwen Examples](https://github.com/anyserve/anyserve/blob/main/examples/google-colab/README.md)
 - [Ollama](ollama.md)
 
-The smallest local stack is:
+From a repository checkout, the smallest local stack is:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
-mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
+anyserve serve --config examples/ollama/anyserve.toml
+anyserve worker --config examples/ollama/worker.toml
 ```
 
 That example exposes:
@@ -55,29 +46,23 @@ That page defines the recommended first shape:
 ## Start the Control Plane
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve
+anyserve serve
 ```
 
 Or use your own config file:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config path/to/anyserve.toml
+anyserve serve --config path/to/anyserve.toml
 ```
 
 CLI flags override the config file if you provide both.
 
 The gRPC health service is available on the same port as gRPC. Example endpoint strings like `http://127.0.0.1:50052` are gRPC channel URIs, not REST endpoints.
 
-## Run the Sample Worker
-
-```bash
-mise exec -- cargo run -p anyserve-demo -- --mode worker
-```
-
 ## Run the Built-In LLM Worker
 
 ```bash
-mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
+anyserve worker --config examples/ollama/worker.toml
 ```
 
 The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in the [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md).
@@ -88,26 +73,9 @@ Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
 curl http://127.0.0.1:8080/v1/models
 ```
 
-## Submit the Sample Job
+## Python Examples
 
-```bash
-mise exec -- cargo run -p anyserve-demo -- --mode submit
-```
-
-The sample client submits a job with:
-
-- `interface_name = demo.echo.v1`
-- `required_attributes = {"runtime": "demo"}`
-- `required_capacity = {"slot": 1}`
-
-It then:
-
-- opens `input.default`
-- pushes two input frames
-- waits for job events
-- pulls `output.default` after completion
-
-You can also run the Python examples after installing the bindings:
+You can run the Python examples after installing the bindings:
 
 ```bash
 # clean venv from local source
@@ -115,22 +83,14 @@ python -m venv .venv
 . .venv/bin/activate
 pip install ./clients/python
 
-# or use the active mise Python
-# mise run python-sdk-dev
-
 python examples/python/worker.py
 python examples/python/submit.py
-
-# with the active mise Python instead
-# mise exec -- python examples/python/worker.py
-# mise exec -- python examples/python/submit.py
 ```
 
-## Build the Python Bindings
+## Install the Python Bindings from Local Source
 
 ```bash
-mise run python-sdk
-mise run python-sdk-dev
+pip install ./clients/python
 ```
 
 ## Python Worker Decorator
@@ -181,8 +141,6 @@ for event in client.watch_job(job["job_id"]):
 ## Test the Workspace
 
 ```bash
-mise run test
-mise run e2e
-mise run docs-build
-mise run clippy
+source "$HOME/.cargo/env"
+cargo test -p anyserve-core -p anyserve
 ```

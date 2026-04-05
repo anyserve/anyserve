@@ -31,7 +31,6 @@ pip install ./clients/python
 ```
 
 Source installs build the native extension locally, so they require a working Rust toolchain on `PATH`.
-Inside this repository, `mise exec -- ...` provides the expected toolchains.
 
 The top-level `AnyserveClient` exposes the generic control-plane surface and also offers
 role-specific views through `submitter()` and `worker()`.
@@ -112,7 +111,9 @@ python3 -m maturin develop --manifest-path clients/python/Cargo.toml
 Live end-to-end validation:
 
 ```bash
-mise run python-sdk-e2e
+source "$HOME/.cargo/env"
+cargo build --workspace
+python clients/python/tests/sdk_e2e.py
 ```
 
 ## PyPI Publishing

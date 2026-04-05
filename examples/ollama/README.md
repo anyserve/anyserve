@@ -61,7 +61,7 @@ Those model names are returned by `GET /v1/models`. Right now they are not alias
 ## 3. Start AnyServe
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
+anyserve serve --config examples/ollama/anyserve.toml
 ```
 
 This starts:
@@ -72,7 +72,7 @@ This starts:
 ## 4. Start the Built-In LLM Worker
 
 ```bash
-mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
+anyserve worker --config examples/ollama/worker.toml
 ```
 
 The worker pulls jobs from AnyServe and forwards them to Ollama.

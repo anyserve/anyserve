@@ -12,11 +12,18 @@ The core model is intentionally workload-neutral:
 - workers expose `Supply` through interfaces, attributes, and available capacity
 - the kernel issues leases, collects events, and requeues expired work
 
-The default runtime is zero-dependency:
+The smallest runtime is zero-dependency:
 
-- in-memory state store
+- in-memory control-plane metadata
+- in-memory frames
 - basic scheduler
 - inline object payloads
+
+Anyserve also supports:
+
+- `sqlite + memory` for single-machine durable metadata
+- `postgres + memory` for single-machine PostgreSQL-backed metadata
+- `postgres + redis` for multi-instance deployments
 
 Higher-level workload semantics can live above this core instead of being hard-coded into it.
 

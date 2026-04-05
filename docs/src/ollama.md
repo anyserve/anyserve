@@ -38,10 +38,10 @@ ollama list
 
 ## Start AnyServe with the Built-In OpenAI Gateway
 
-Use the example config from the same checked-in example directory:
+From a repository checkout, use the example config from the same checked-in example directory:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
+anyserve serve --config examples/ollama/anyserve.toml
 ```
 
 That starts:
@@ -54,7 +54,7 @@ That starts:
 Use the worker config in the same directory:
 
 ```bash
-mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
+anyserve worker --config examples/ollama/worker.toml
 ```
 
 That worker points to:

@@ -7,7 +7,8 @@ Anyserve currently has four practical testing layers.
 Run the workspace tests:
 
 ```bash
-mise run test
+source "$HOME/.cargo/env"
+cargo test -p anyserve-core -p anyserve
 ```
 
 Current core tests cover:
@@ -35,64 +36,31 @@ That path covers:
 - `POST /v1/chat/completions`
 - `POST /v1/embeddings`
 
-If you only want the generic control plane and demo worker, start the control plane directly:
-
-```bash
-mise exec -- cargo run -p anyserve -- serve --grpc-port 50062
-```
-
-Start a demo worker:
-
-```bash
-mise exec -- cargo run -p anyserve-demo -- --mode worker --endpoint http://127.0.0.1:50062
-```
-
-The `http://` prefix here is a gRPC channel URI used by the generated clients, not a REST endpoint.
-
-Submit a demo job:
-
-```bash
-mise exec -- cargo run -p anyserve-demo -- --mode submit --endpoint http://127.0.0.1:50062
-```
-
-Expected event flow:
-
-- `accepted`
-- `lease_granted`
-- `started`
-- `progress`
-- `output_ready`
-- `succeeded`
-
-The submit client should also print one `output frame` line after the job completes.
+This is the user-facing path worth validating first because it exercises the built-in gateway and worker with the same shape you would use in practice.
 
 ## 3. Python Bindings Smoke Test
 
-Build the wheel:
+Install the package from local source into an active environment:
 
 ```bash
-mise run python-sdk
+python -m pip install ./clients/python
 ```
 
-Install it into the active `mise` Python and verify the import surface:
+Run the Python unit tests. These do not require a running control plane:
 
 ```bash
-mise run python-sdk-smoke
+python -m unittest discover -s clients/python/tests -p 'test_*.py'
 ```
 
-Run the Python unit tests for the high-level worker API:
+Build the local binaries once, then run the live Python SDK end-to-end suite:
 
 ```bash
-mise run python-sdk-test
+source "$HOME/.cargo/env"
+cargo build --workspace
+python clients/python/tests/sdk_e2e.py
 ```
 
-Run the live Python SDK end-to-end suite:
-
-```bash
-mise run python-sdk-e2e
-```
-
-This smoke test intentionally does not require a running control plane. It verifies:
+The install and unit-test path verifies:
 
 - wheel installation
 - Python import surface
@@ -113,10 +81,10 @@ The Python SDK e2e suite additionally verifies:
 - Python high-level `@worker` / `serve()` against a live control plane
 - streamed event and frame iteration against a real server
 
-If you also want to exercise the Python bindings against a live server, start the control plane and demo worker first, then run:
+If you also want to exercise the Python bindings against a live server manually, start the control plane and a compatible worker first, then run:
 
 ```bash
-mise exec -- python - <<'PY'
+python - <<'PY'
 from anyserve import AnyserveClient, FRAME_DATA, inline_object, uri_object
 
 client = AnyserveClient("http://127.0.0.1:50062")
@@ -139,7 +107,19 @@ PY
 Run the dedicated gRPC end-to-end test:
 
 ```bash
-mise run e2e
+source "$HOME/.cargo/env"
+cargo test -p anyserve-core --test grpc_e2e -- --nocapture
+```
+
+For Docker-backed persistence checks, run the ignored integration tests explicitly:
+
+```bash
+ANYSERVE_TEST_POSTGRES_DSN='postgres://postgres:postgres@127.0.0.1:55432/anyserve_test' \
+cargo test -p anyserve-core --test postgres_memory_persistence -- --ignored --nocapture
+
+ANYSERVE_TEST_POSTGRES_DSN='postgres://postgres:postgres@127.0.0.1:55432/anyserve_test' \
+ANYSERVE_TEST_REDIS_URL='redis://127.0.0.1:56379' \
+cargo test -p anyserve-core --test postgres_redis_integration -- --ignored --nocapture
 ```
 
 This test boots an in-process gRPC server, registers a worker, submits a job, pushes input frames, completes the lease, then verifies:

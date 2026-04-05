@@ -60,33 +60,36 @@ Workers advertise supply through the same generic model, and the control plane i
         +--------------------------------------------------+
         |                     Ports                        |
         |--------------------------------------------------|
-        | StateStore   StreamStore   Scheduler   ObjectStore |
+        | StateStore   FramePlane   Scheduler   ObjectStore |
         +--------+----------+------------+------------+------+
                  |          |            |            |
                  v          v            v            v
-              +------+   +------+    +------+     +--------+
-              |memory|   |memory|    |basic |     |inline  |
-              +------+   +------+    +------+     +--------+
+           +--------+  +--------+   +------+    +--------+
+           |memory /|  |memory /|   |basic |    |inline  |
+           |sqlite /|  |redis   |   +------+    +--------+
+           |postgres|  +--------+
+           +--------+
 ```
 
 ## Current Capabilities
 
 - pure gRPC runtime with gRPC health on the same port
-- in-memory state store
-- in-memory stream store
+- durable control-plane metadata in memory, SQLite, or PostgreSQL
+- high-throughput frame transport in memory or Redis
 - basic demand/supply scheduler
 - worker registration and heartbeats
 - lease issuance, renewal, completion, and failure
 - attempt tracking per lease assignment
 - event streaming per job
 - generic stream/frame data plane for client and worker IO
+- built-in OpenAI-compatible gateway and LLM worker
 - first-class native client transport, sample apps, and Python bindings
 
 ## Repository Layout
 
 - `crates/anyserve-client`: native client transport for the control-plane gRPC API
 - `crates/anyserve-proto`: protobuf and tonic bindings
-- `crates/anyserve-core`: domain model, in-memory state store, scheduler, kernel, and gRPC service
+- `crates/anyserve-core`: domain model, stores, frame planes, scheduler, kernel, and gRPC service
 - `crates/anyserve-cli`: the `anyserve` binary
 - `examples/rust`: sample submitter / worker apps that exercise the native client transport
 - `examples/python`: sample submitter / worker scripts that exercise the Python SDK
@@ -94,12 +97,6 @@ Workers advertise supply through the same generic model, and the control plane i
 - `docs`: mdBook documentation
 
 Static docs can be deployed from this repository to GitHub Pages. The current mdBook config assumes the project-page base path `/anyserve/`.
-
-## Prerequisites
-
-- `mise`
-- `protoc`
-- Python 3.12+ for the Python bindings
 
 ## Install
 
@@ -134,27 +131,27 @@ Prebuilt binaries are currently published for:
 - Linux `x86_64`
 - Windows `x86_64`
 
-## Setup
+## Quickstart
+
+The checked-in Ollama example is the fastest real end-to-end path.
+
+Prerequisites:
+
+- an `anyserve` binary on `PATH`
+- a local Ollama server if you want the built-in LLM example
+
+If you want to use the checked-in example configs, work from a repository checkout:
 
 ```bash
-mise trust
-mise install
-mise run build
-```
-
-## Local Run
-
-Start the control plane:
-
-```bash
-mise exec -- cargo run -p anyserve -- serve
+git clone https://github.com/anyserve/anyserve.git
+cd anyserve
 ```
 
 Start the built-in OpenAI-compatible example stack from the checked-in config:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
-mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
+anyserve serve --config examples/ollama/anyserve.toml
+anyserve worker --config examples/ollama/worker.toml
 ```
 
 That example starts:
@@ -181,16 +178,19 @@ Treat the checked-in example docs as the canonical walkthrough:
 
 The worker expects an OpenAI-compatible upstream at the configured `base_url`, for example Ollama, SGLang, or vLLM.
 
-Start the sample worker:
+Smoke-test the gateway:
 
 ```bash
-mise exec -- cargo run -p anyserve-demo -- --mode worker
+curl http://127.0.0.1:8080/v1/models
 ```
 
-Submit a sample job and watch its events:
-
 ```bash
-mise exec -- cargo run -p anyserve-demo -- --mode submit
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "qwen3:0.6b-fp16",
+    "messages": [{"role": "user", "content": "Say hello in one short sentence."}]
+  }'
 ```
 
 Or use the Python examples after installing the bindings:
@@ -201,15 +201,8 @@ python -m venv .venv
 . .venv/bin/activate
 pip install ./clients/python
 
-# or use the active mise Python
-# mise run python-sdk-dev
-
 python examples/python/worker.py
 python examples/python/submit.py
-
-# with the active mise Python instead
-# mise exec -- python examples/python/worker.py
-# mise exec -- python examples/python/submit.py
 ```
 
 The sample path now uses both control-plane and data-plane APIs:
@@ -220,29 +213,30 @@ The sample path now uses both control-plane and data-plane APIs:
 - waits for worker events
 - pulls `output.default` frames after completion
 
+## Supported Runtime Modes
+
+- `memory + memory`
+  Single-process development mode. Control-plane state and frames are both ephemeral.
+- `sqlite + memory`
+  Single-machine mode. Durable control-plane metadata in SQLite, high-throughput frames stay in memory and do not survive restart.
+- `postgres + memory`
+  Single-machine mode. PostgreSQL stores metadata, request input, and final output; frames stay in memory and do not survive restart.
+- `postgres + redis`
+  Multi-instance mode. Postgres is the durable control-plane source of truth, Redis carries shared frame traffic.
+
 ## Testing
 
-Run the workspace tests:
+Use the checked-in walkthroughs for user-level validation:
 
-```bash
-mise run test
-mise run e2e
-mise run python-sdk-e2e
-mise run docs-build
-```
-
-Run linting:
-
-```bash
-mise run clippy
-```
+- [examples/ollama/README.md](examples/ollama/README.md)
+- [docs/src/testing.md](docs/src/testing.md)
 
 ## Python Bindings
 
-Build the wheel:
+Install from local source:
 
 ```bash
-mise run python-sdk
+pip install ./clients/python
 ```
 
 You can build function-style workers on top of the low-level bindings:
@@ -273,8 +267,7 @@ client = AnyserveClient("http://127.0.0.1:50052")
 # gRPC channel URI for the bindings transport, not a REST endpoint.
 # The Python facade uses the same high-performance client transport.
 
-# This assumes a compatible worker is already running,
-# for example: `mise exec -- cargo run -p anyserve-demo -- --mode worker`
+# This assumes the control plane and a compatible worker are already running.
 
 job = client.submit_job(
     interface_name="demo.echo.v1",
@@ -291,21 +284,4 @@ client.close_stream(stream["stream_id"])
 
 for event in client.watch_job(job["job_id"]):
     print(event["kind"], event["metadata"])
-```
-
-## Mise Tasks
-
-```bash
-mise run setup
-mise run fmt
-mise run build
-mise run check
-mise run test
-mise run e2e
-mise run clippy
-mise run python-sdk
-mise run python-sdk-smoke
-mise run python-sdk-e2e
-mise run docs-build
-mise run python-sdk-dev
 ```

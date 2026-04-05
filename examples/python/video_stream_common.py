@@ -65,8 +65,7 @@ def connect_anyserve_client(
         if time.monotonic() >= deadline:
             message = (
                 f"timed out connecting {role} to Anyserve at {endpoint}. "
-                "Start the control plane first with "
-                "`mise exec -- cargo run -p anyserve -- serve`."
+                "Start the control plane first with `anyserve serve`."
             )
             raise RuntimeError(message) from last_error
         time.sleep(0.25)
