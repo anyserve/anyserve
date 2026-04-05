@@ -81,7 +81,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "anyserve"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-client",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-bench"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-client",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-proto",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-proto",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-demo"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-client",
@@ -163,7 +163,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-python"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-client",

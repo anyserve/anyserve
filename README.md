@@ -118,12 +118,12 @@ irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1
 Install a specific version or choose a custom install directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.sh | sh -s -- --version v0.3.0
+curl -fsSL https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.sh | sh -s -- --version v0.4.0
 curl -fsSL https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.sh | sh -s -- --dir /usr/local/bin
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1))) -Version v0.3.0
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1))) -Version v0.4.0
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/anyserve/anyserve/main/scripts/install.ps1))) -InstallDir "$env:LOCALAPPDATA\Programs\AnyServe\bin"
 ```
 
