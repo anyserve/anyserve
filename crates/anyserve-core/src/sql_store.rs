@@ -18,7 +18,9 @@ use crate::model::{
     LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
     StreamState, WorkerRecord,
 };
-use crate::store::{LeaseDispatchMode, StateStore, StateTransition};
+use crate::store::{
+    JobListSummary, JobStateCounts, JobSummaryPage, LeaseDispatchMode, StateStore, StateTransition,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlDialect {
@@ -951,6 +953,102 @@ impl StateStore for SqlStateStore {
             .await
             .context("list jobs")?;
         rows.into_iter().map(job_from_row).collect()
+    }
+
+    async fn job_state_counts(&self) -> Result<JobStateCounts> {
+        let statement = self.sql(
+            "SELECT state, COUNT(*) AS total
+             FROM jobs
+             GROUP BY state",
+        );
+        let rows = sqlx::query(statement.as_ref())
+            .fetch_all(&self.pool)
+            .await
+            .context("count jobs by state")?;
+        let mut counts = JobStateCounts::default();
+        for row in rows {
+            match enum_value::<JobState>(&row.try_get::<String, _>("state")?)? {
+                JobState::Pending => counts.pending = from_i64(row.try_get("total")?)? as usize,
+                JobState::Leased => counts.leased = from_i64(row.try_get("total")?)? as usize,
+                JobState::Running => counts.running = from_i64(row.try_get("total")?)? as usize,
+                JobState::Succeeded => counts.succeeded = from_i64(row.try_get("total")?)? as usize,
+                JobState::Failed => counts.failed = from_i64(row.try_get("total")?)? as usize,
+                JobState::Cancelled => counts.cancelled = from_i64(row.try_get("total")?)? as usize,
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn list_job_summary_page(
+        &self,
+        states: &[JobState],
+        limit: usize,
+        offset: usize,
+    ) -> Result<JobSummaryPage> {
+        let mut filter = String::new();
+        if !states.is_empty() {
+            let placeholders = vec!["?"; states.len()].join(", ");
+            filter = format!(" WHERE j.state IN ({placeholders})");
+        }
+
+        let count_statement = format!("SELECT COUNT(*) AS total FROM jobs j{filter}");
+        let count_sql = self.sql(&count_statement);
+        let mut count_query = sqlx::query_scalar::<_, i64>(count_sql.as_ref());
+        for state in states {
+            count_query = count_query.bind(enum_text(state)?);
+        }
+        let total = from_i64(
+            count_query
+                .fetch_one(&self.pool)
+                .await
+                .context("count job summary page")?,
+        )? as usize;
+
+        let page_statement = format!(
+            "SELECT
+                 j.job_id,
+                 j.state,
+                 j.spec_json,
+                 j.created_at_ms,
+                 j.updated_at_ms,
+                 j.last_error,
+                 j.current_attempt_id,
+                 (
+                    SELECT COUNT(*)
+                    FROM attempts a
+                    WHERE a.job_id = j.job_id
+                 ) AS attempt_count,
+                 (
+                    SELECT a.worker_id
+                    FROM attempts a
+                    WHERE a.job_id = j.job_id
+                    ORDER BY a.created_at_ms DESC, a.attempt_id DESC
+                    LIMIT 1
+                 ) AS latest_worker_id
+             FROM jobs j
+             {filter}
+             ORDER BY j.updated_at_ms DESC, j.created_at_ms DESC, j.job_id ASC
+             LIMIT ? OFFSET ?"
+        );
+        let page_sql = self.sql(&page_statement);
+        let mut page_query = sqlx::query(page_sql.as_ref());
+        for state in states {
+            page_query = page_query.bind(enum_text(state)?);
+        }
+        let rows = page_query
+            .bind(to_i64(limit as u64)?)
+            .bind(to_i64(offset as u64)?)
+            .fetch_all(&self.pool)
+            .await
+            .context("list job summary page")?;
+
+        Ok(JobSummaryPage {
+            jobs: rows
+                .into_iter()
+                .map(job_list_summary_from_row)
+                .collect::<Result<Vec<_>>>()?,
+            total,
+        })
     }
 
     async fn list_pending_jobs(&self) -> Result<Vec<JobRecord>> {
@@ -2018,6 +2116,24 @@ fn stored_job_inputs(spec: &JobSpec) -> Vec<ObjectRef> {
         content: spec.params.clone(),
         metadata: Attributes::new(),
     }]
+}
+
+fn job_list_summary_from_row(row: sqlx::any::AnyRow) -> Result<JobListSummary> {
+    let spec_json: String = row.try_get("spec_json")?;
+    let spec: JobSpec = json_value(&spec_json)?;
+    Ok(JobListSummary {
+        job_id: row.try_get("job_id")?,
+        state: enum_value::<JobState>(&row.try_get::<String, _>("state")?)?,
+        interface_name: spec.interface_name,
+        source: spec.metadata.get("source").cloned(),
+        created_at_ms: from_i64(row.try_get("created_at_ms")?)?,
+        updated_at_ms: from_i64(row.try_get("updated_at_ms")?)?,
+        current_attempt_id: row.try_get("current_attempt_id")?,
+        latest_worker_id: row.try_get("latest_worker_id")?,
+        attempt_count: from_i64(row.try_get("attempt_count")?)? as usize,
+        last_error: row.try_get("last_error")?,
+        metadata: spec.metadata,
+    })
 }
 
 fn job_from_row(row: sqlx::any::AnyRow) -> Result<JobRecord> {

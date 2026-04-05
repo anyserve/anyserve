@@ -6,3 +6,4 @@
 - [Create Gateway](create-gateway.md)
 - [Ollama](ollama.md)
 - [Testing](testing.md)
+- [Current Performance Evaluation](performance-evaluation.md)

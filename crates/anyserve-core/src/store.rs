@@ -49,6 +49,37 @@ impl<T> StateTransition<T> {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobStateCounts {
+    pub pending: usize,
+    pub leased: usize,
+    pub running: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobListSummary {
+    pub job_id: String,
+    pub state: JobState,
+    pub interface_name: String,
+    pub source: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub current_attempt_id: Option<String>,
+    pub latest_worker_id: Option<String>,
+    pub attempt_count: usize,
+    pub last_error: Option<String>,
+    pub metadata: Attributes,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobSummaryPage {
+    pub jobs: Vec<JobListSummary>,
+    pub total: usize,
+}
+
 #[async_trait]
 pub trait StateStore: Send + Sync {
     fn lease_dispatch_mode(&self) -> LeaseDispatchMode {
@@ -58,6 +89,13 @@ pub trait StateStore: Send + Sync {
     async fn create_job(&self, job: JobRecord) -> Result<()>;
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>>;
     async fn list_jobs(&self) -> Result<Vec<JobRecord>>;
+    async fn job_state_counts(&self) -> Result<JobStateCounts>;
+    async fn list_job_summary_page(
+        &self,
+        states: &[JobState],
+        limit: usize,
+        offset: usize,
+    ) -> Result<JobSummaryPage>;
     async fn list_pending_jobs(&self) -> Result<Vec<JobRecord>>;
     async fn update_job(&self, job: JobRecord) -> Result<()>;
     async fn persist_job_inputs(
@@ -300,6 +338,82 @@ impl StateStore for MemoryStateStore {
     async fn list_jobs(&self) -> Result<Vec<JobRecord>> {
         let inner = self.inner.lock().await;
         Ok(inner.jobs.values().cloned().collect())
+    }
+
+    async fn job_state_counts(&self) -> Result<JobStateCounts> {
+        let inner = self.inner.lock().await;
+        let mut counts = JobStateCounts::default();
+        for job in inner.jobs.values() {
+            match job.state {
+                JobState::Pending => counts.pending += 1,
+                JobState::Leased => counts.leased += 1,
+                JobState::Running => counts.running += 1,
+                JobState::Succeeded => counts.succeeded += 1,
+                JobState::Failed => counts.failed += 1,
+                JobState::Cancelled => counts.cancelled += 1,
+            }
+        }
+        Ok(counts)
+    }
+
+    async fn list_job_summary_page(
+        &self,
+        states: &[JobState],
+        limit: usize,
+        offset: usize,
+    ) -> Result<JobSummaryPage> {
+        let inner = self.inner.lock().await;
+        let mut jobs = inner.jobs.values().cloned().collect::<Vec<_>>();
+        jobs.sort_by(|left, right| {
+            right
+                .updated_at_ms
+                .cmp(&left.updated_at_ms)
+                .then_with(|| right.created_at_ms.cmp(&left.created_at_ms))
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        if !states.is_empty() {
+            jobs.retain(|job| states.contains(&job.state));
+        }
+        let total = jobs.len();
+        let mut summaries = Vec::with_capacity(jobs.len().min(limit));
+        for job in jobs.into_iter().skip(offset).take(limit) {
+            let mut latest_attempt = None::<(u64, String, String)>;
+            let mut attempt_count = 0usize;
+            for attempt in inner
+                .attempts
+                .values()
+                .filter(|attempt| attempt.job_id == job.job_id)
+            {
+                attempt_count += 1;
+                let candidate = (
+                    attempt.created_at_ms,
+                    attempt.attempt_id.clone(),
+                    attempt.worker_id.clone(),
+                );
+                if latest_attempt.as_ref().map(|current| candidate > *current) != Some(false) {
+                    latest_attempt = Some(candidate);
+                }
+            }
+            summaries.push(JobListSummary {
+                job_id: job.job_id.clone(),
+                state: job.state,
+                interface_name: job.spec.interface_name.clone(),
+                source: job.spec.metadata.get("source").cloned(),
+                created_at_ms: job.created_at_ms,
+                updated_at_ms: job.updated_at_ms,
+                current_attempt_id: job.current_attempt_id.clone(),
+                latest_worker_id: latest_attempt.and_then(|(_, _, worker_id)| {
+                    (!worker_id.trim().is_empty()).then_some(worker_id)
+                }),
+                attempt_count,
+                last_error: job.last_error.clone(),
+                metadata: job.spec.metadata.clone(),
+            });
+        }
+        Ok(JobSummaryPage {
+            jobs: summaries,
+            total,
+        })
     }
 
     async fn list_pending_jobs(&self) -> Result<Vec<JobRecord>> {

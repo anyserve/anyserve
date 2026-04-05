@@ -10,7 +10,6 @@ use anyserve_client::{
     AnyserveClient, AttemptRecord, AttemptState, JobRecord, JobState, StreamDirection,
     StreamRecord, StreamScope, StreamState,
 };
-use anyserve_core::config::GrpcConfig;
 use anyserve_core::frame::{FramePlane, MemoryFramePlane, RedisFramePlane};
 use anyserve_core::kernel::Kernel;
 use anyserve_core::notify::{ClusterNotifier, NoopClusterNotifier, RedisClusterNotifier};
@@ -27,10 +26,12 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod serve_config;
+mod serve_console;
 mod serve_openai;
 mod serve_openai_worker;
 
-use serve_config::{FrameBackend, ResolvedServeConfig, ServeOverrides, StorageBackend};
+use serve_config::{FrameBackend, GrpcConfig, ResolvedServeConfig, ServeOverrides, StorageBackend};
+use serve_console::run_server as run_console_server;
 use serve_openai::run_server as run_serve_openai;
 use serve_openai_worker::ServeOpenAIWorkerArgs;
 
@@ -544,6 +545,11 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .as_ref()
         .map(|openai| socket_addr_from_bind(&openai.listen))
         .transpose()?;
+    let console_addr = config
+        .console
+        .as_ref()
+        .map(|console| socket_addr_from_bind(&console.listen))
+        .transpose()?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let grpc_task = tokio::spawn(run_grpc_server(
@@ -563,12 +569,26 @@ async fn serve(args: ServeArgs) -> Result<()> {
         } else {
             None
         };
+    let console_task = if let (Some(console_config), Some(console_addr)) =
+        (config.console.clone(), console_addr)
+    {
+        Some(tokio::spawn(run_console_server(
+            console_addr,
+            Arc::clone(&kernel),
+            console_config,
+            config.runtime_mode(),
+            shutdown_tx.subscribe(),
+        )))
+    } else {
+        None
+    };
 
     print_startup_access_points(
         &grpc_addr,
         config.grpc.tls_enabled,
         config.config_path.as_deref(),
         openai_addr.as_ref(),
+        console_addr.as_ref(),
     );
     if let Some(config_path) = config.config_path.as_ref() {
         let config_path = config_path.display().to_string();
@@ -579,6 +599,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if let Some(openai_addr) = openai_addr {
         info!(openai = %openai_addr, "openai gateway started");
     }
+    if let Some(console_addr) = console_addr {
+        info!(console = %console_addr, "console api started");
+    }
 
     tokio::signal::ctrl_c()
         .await
@@ -588,6 +611,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
     grpc_task.await.context("join grpc task")??;
     if let Some(openai_task) = openai_task {
         openai_task.await.context("join openai task")??;
+    }
+    if let Some(console_task) = console_task {
+        console_task.await.context("join console task")??;
     }
     Ok(())
 }
@@ -661,6 +687,7 @@ fn print_startup_access_points(
     tls_enabled: bool,
     config_path: Option<&std::path::Path>,
     openai_addr: Option<&SocketAddr>,
+    console_addr: Option<&SocketAddr>,
 ) {
     let scheme = if tls_enabled { "https" } else { "http" };
     let grpc_access_points = access_points(addr, scheme);
@@ -679,6 +706,9 @@ fn print_startup_access_points(
             .collect::<Vec<_>>()
             .join(", ");
         entries.push(("openai", access));
+    }
+    if let Some(console_addr) = console_addr {
+        entries.push(("console", access_points(console_addr, "http").join(", ")));
     }
 
     print_section("Control Plane Ready");

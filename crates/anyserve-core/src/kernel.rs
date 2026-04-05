@@ -8,13 +8,15 @@ use uuid::Uuid;
 
 use crate::frame::FramePlane;
 use crate::model::{
-    AttemptRecord, Attributes, EventKind, Frame, FrameKind, JobRecord, JobSpec, JobState,
+    AttemptRecord, Attributes, EventKind, Frame, FrameKind, JobEvent, JobRecord, JobSpec, JobState,
     LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
     StreamState, WorkerRecord, WorkerSpec, WorkerStatus,
 };
 use crate::notify::{ClusterNotifier, ClusterSubscription};
 use crate::scheduler::Scheduler;
-use crate::store::{LeaseDispatchMode, StateStore, StateTransition};
+use crate::store::{
+    JobStateCounts, JobSummaryPage, LeaseDispatchMode, StateStore, StateTransition,
+};
 
 pub struct Kernel {
     state_store: Arc<dyn StateStore>,
@@ -158,6 +160,21 @@ impl Kernel {
         Ok(jobs)
     }
 
+    pub async fn job_state_counts(&self) -> Result<JobStateCounts> {
+        self.state_store.job_state_counts().await
+    }
+
+    pub async fn list_job_summary_page(
+        &self,
+        states: &[JobState],
+        limit: usize,
+        offset: usize,
+    ) -> Result<JobSummaryPage> {
+        self.state_store
+            .list_job_summary_page(states, limit, offset)
+            .await
+    }
+
     pub async fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
         let mut workers = self.state_store.list_workers().await?;
         workers.sort_by(|left, right| {
@@ -195,6 +212,11 @@ impl Kernel {
             bail!("job '{}' does not exist", job_id);
         }
         self.state_store.list_attempts_for_job(job_id).await
+    }
+
+    pub async fn list_job_events(&self, job_id: &str) -> Result<Vec<JobEvent>> {
+        self.get_job(job_id).await?;
+        self.state_store.job_events_after(job_id, 0).await
     }
 
     pub async fn register_worker(

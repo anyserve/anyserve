@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use anyserve_client::{
     AnyserveClient, EventKind, FrameKind, FrameWrite, JobRecord, ObjectRef, StreamDirection,
-    StreamOpen, WorkerRegistration, object_ref,
+    StreamOpen, StreamState, WorkerRegistration, object_ref,
 };
 use clap::Args;
 use futures::StreamExt;
@@ -498,27 +498,34 @@ async fn read_request_body(
             .into_iter()
             .find(|stream| stream.stream_name == DEFAULT_INPUT_STREAM)
         {
-            let mut frames = client.pull_frames(input_stream.stream_id, 0, false).await?;
-            let mut body = Vec::new();
-            while let Some(frame) = frames.next().await {
-                let frame = frame.context("read input frame")?;
-                if frame.kind() == FrameKind::Data {
-                    body.extend(frame.payload);
+            if matches!(
+                input_stream.state(),
+                StreamState::Closed | StreamState::Error
+            ) {
+                let mut frames = client.pull_frames(input_stream.stream_id, 0, false).await?;
+                let mut body = Vec::new();
+                while let Some(frame) = frames.next().await {
+                    let frame = frame.context("read input frame")?;
+                    if frame.kind() == FrameKind::Data {
+                        body.extend(frame.payload);
+                    }
                 }
-            }
-            if !body.is_empty() {
+                if body.is_empty() {
+                    bail!("job '{}' input.default closed without body", job.job_id);
+                }
                 return Ok(body);
             }
         }
 
         if Instant::now() >= deadline {
-            break;
+            bail!(
+                "job '{}' timed out waiting for complete input.default stream",
+                job.job_id
+            );
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-
-    Ok(Vec::new())
 }
 
 fn upstream_path(interface_name: &str) -> Result<&'static str> {
@@ -558,9 +565,28 @@ fn persisted_outputs(content_type: &str, payload: Vec<u8>) -> Vec<ObjectRef> {
 
 #[cfg(test)]
 mod tests {
-    use super::{available_capacity, persisted_outputs, truncate, upstream_path};
-    use anyserve_client::object_ref;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::{Context, Result};
+    use anyserve_client::{AnyserveClient, FrameWrite, object_ref};
+    use anyserve_core::frame::MemoryFramePlane;
+    use anyserve_core::kernel::{Kernel, OpenStreamCommand};
+    use anyserve_core::model::{Attributes, JobSpec, StreamDirection, StreamScope};
+    use anyserve_core::notify::NoopClusterNotifier;
+    use anyserve_core::scheduler::BasicScheduler;
+    use anyserve_core::service::ControlPlaneGrpcService;
+    use anyserve_core::store::MemoryStateStore;
+    use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
+    use tokio::sync::oneshot;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+
+    use super::{
+        DEFAULT_INPUT_STREAM, available_capacity, persisted_outputs, read_request_body, truncate,
+        upstream_path,
+    };
 
     #[test]
     fn llm_worker_maps_supported_interfaces() {
@@ -592,5 +618,140 @@ mod tests {
             outputs[0].metadata.get("content_type").map(String::as_str),
             Some("application/json")
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_request_body_waits_for_terminal_input_stream() -> Result<()> {
+        let (endpoint, shutdown_tx, handle, kernel) = spawn_test_server().await?;
+        let job = kernel
+            .submit_job(
+                None,
+                JobSpec {
+                    interface_name: "llm.chat.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await?;
+        let stream = kernel
+            .open_stream(OpenStreamCommand {
+                job_id: job.job_id.clone(),
+                attempt_id: None,
+                worker_id: None,
+                lease_id: None,
+                stream_name: DEFAULT_INPUT_STREAM.to_string(),
+                scope: StreamScope::Job,
+                direction: StreamDirection::ClientToWorker,
+                metadata: Attributes::new(),
+            })
+            .await?;
+
+        let mut writer = AnyserveClient::connect(endpoint.clone()).await?;
+        writer
+            .push_frames(
+                stream.stream_id.clone(),
+                vec![FrameWrite {
+                    kind: super::FrameKind::Data,
+                    payload: b"hello streamed body".to_vec(),
+                    metadata: HashMap::new(),
+                }],
+                None,
+                None,
+            )
+            .await?;
+
+        let mut reader = AnyserveClient::connect(endpoint).await?;
+        let read_job = reader.get_job(job.job_id.clone()).await?;
+        let read_task = tokio::spawn(async move {
+            read_request_body(&mut reader, &read_job, Duration::from_secs(1)).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!read_task.is_finished());
+
+        writer
+            .close_stream(stream.stream_id, None, None, HashMap::new())
+            .await?;
+
+        let body = read_task.await.context("join read_request_body task")??;
+        assert_eq!(body, b"hello streamed body".to_vec());
+
+        let _ = shutdown_tx.send(());
+        handle.await.context("join grpc test server")??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_request_body_rejects_empty_terminal_input_stream() -> Result<()> {
+        let (endpoint, shutdown_tx, handle, kernel) = spawn_test_server().await?;
+        let job = kernel
+            .submit_job(
+                None,
+                JobSpec {
+                    interface_name: "llm.chat.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await?;
+        let stream = kernel
+            .open_stream(OpenStreamCommand {
+                job_id: job.job_id.clone(),
+                attempt_id: None,
+                worker_id: None,
+                lease_id: None,
+                stream_name: DEFAULT_INPUT_STREAM.to_string(),
+                scope: StreamScope::Job,
+                direction: StreamDirection::ClientToWorker,
+                metadata: Attributes::new(),
+            })
+            .await?;
+
+        let mut writer = AnyserveClient::connect(endpoint.clone()).await?;
+        writer
+            .close_stream(stream.stream_id, None, None, HashMap::new())
+            .await?;
+
+        let mut reader = AnyserveClient::connect(endpoint).await?;
+        let read_job = reader.get_job(job.job_id.clone()).await?;
+        let error = read_request_body(&mut reader, &read_job, Duration::from_secs(1))
+            .await
+            .expect_err("empty terminal input stream should fail");
+        assert!(error.to_string().contains("closed without body"));
+
+        let _ = shutdown_tx.send(());
+        handle.await.context("join grpc test server")??;
+        Ok(())
+    }
+
+    async fn spawn_test_server() -> Result<(
+        String,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        Arc<Kernel>,
+    )> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("bind grpc test listener")?;
+        let addr = listener.local_addr().context("resolve grpc test addr")?;
+        let kernel = Arc::new(Kernel::new(
+            Arc::new(MemoryStateStore::new()),
+            Arc::new(MemoryFramePlane::new()),
+            Arc::new(NoopClusterNotifier),
+            Arc::new(BasicScheduler),
+            30,
+            30,
+            250,
+        ));
+        let service = ControlPlaneGrpcService::new(Arc::clone(&kernel));
+        let incoming = TcpListenerStream::new(listener);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(ControlPlaneServiceServer::new(service))
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        Ok((format!("http://{addr}"), shutdown_tx, handle, kernel))
     }
 }

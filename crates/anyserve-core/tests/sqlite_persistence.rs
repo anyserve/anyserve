@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyserve_core::frame::MemoryFramePlane;
 use anyserve_core::kernel::{Kernel, OpenStreamCommand};
 use anyserve_core::model::{
-    Attributes, ExecutionPolicy, FrameKind, JobSpec, ObjectRef, StreamDirection, StreamScope,
-    WorkerSpec,
+    Attributes, ExecutionPolicy, FrameKind, JobSpec, JobState, ObjectRef, StreamDirection,
+    StreamScope, WorkerSpec,
 };
 use anyserve_core::notify::NoopClusterNotifier;
 use anyserve_core::scheduler::BasicScheduler;
@@ -208,4 +208,108 @@ async fn sqlite_rejects_second_control_plane_instance() {
 
     let _ = std::fs::remove_file(db_path);
     let _ = std::fs::remove_file(lock_path);
+}
+
+#[tokio::test]
+async fn sqlite_summary_queries_return_counts_and_attempt_rollups() {
+    let (dsn, db_path) = sqlite_dsn("summary-queries");
+
+    let state_store = Arc::new(SqlStateStore::connect(&dsn).await.unwrap());
+    let kernel = Kernel::new(
+        state_store,
+        Arc::new(MemoryFramePlane::new()),
+        Arc::new(NoopClusterNotifier),
+        Arc::new(BasicScheduler),
+        30,
+        30,
+        25,
+    );
+
+    let worker = kernel
+        .register_worker(
+            Some("worker-sqlite-summary".to_string()),
+            WorkerSpec {
+                interfaces: BTreeSet::from(["demo.summary.v1".to_string()]),
+                total_capacity: BTreeMap::from([("slot".to_string(), 1)]),
+                max_active_leases: 1,
+                ..WorkerSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+    let succeeded = kernel
+        .submit_job(
+            Some("job-succeeded".to_string()),
+            JobSpec {
+                interface_name: "demo.summary.v1".to_string(),
+                metadata: Attributes::from([("source".to_string(), "summary".to_string())]),
+                ..JobSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+    let cancelled = kernel
+        .submit_job(
+            Some("job-cancelled".to_string()),
+            JobSpec {
+                interface_name: "demo.summary.v1".to_string(),
+                ..JobSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pending = kernel
+        .submit_job(
+            Some("job-pending".to_string()),
+            JobSpec {
+                interface_name: "demo.summary.v1".to_string(),
+                ..JobSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let assignment = kernel.poll_lease(&worker.worker_id).await.unwrap().unwrap();
+    assert_eq!(assignment.job.job_id, succeeded.job_id);
+    kernel
+        .complete_lease(
+            &worker.worker_id,
+            &assignment.lease.lease_id,
+            vec![ObjectRef::inline(b"done".to_vec())],
+            Attributes::new(),
+        )
+        .await
+        .unwrap();
+    kernel.cancel_job(&cancelled.job_id).await.unwrap();
+
+    let counts = kernel.job_state_counts().await.unwrap();
+    assert_eq!(counts.pending, 1);
+    assert_eq!(counts.succeeded, 1);
+    assert_eq!(counts.cancelled, 1);
+
+    let page = kernel
+        .list_job_summary_page(&[JobState::Succeeded, JobState::Cancelled], 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2);
+    assert_eq!(page.jobs.len(), 2);
+    let succeeded_summary = page
+        .jobs
+        .iter()
+        .find(|job| job.job_id == succeeded.job_id)
+        .unwrap();
+    assert_eq!(succeeded_summary.attempt_count, 1);
+    assert_eq!(
+        succeeded_summary.latest_worker_id.as_deref(),
+        Some("worker-sqlite-summary")
+    );
+    assert_eq!(succeeded_summary.source.as_deref(), Some("summary"));
+    assert!(
+        page.jobs
+            .iter()
+            .all(|job| { matches!(job.state, JobState::Succeeded | JobState::Cancelled) })
+    );
+    assert!(page.jobs.iter().all(|job| job.job_id != pending.job_id));
+
+    let _ = std::fs::remove_file(db_path);
 }

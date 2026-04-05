@@ -12,3 +12,7 @@ dump.rdb
 .playwright-cli/
 __pycache__/
 *.py[cod]
+/console/node_modules
+/console/dist
+/console/.env.local
+/console/*.tsbuildinfo
