@@ -1,7 +1,7 @@
 # anyserve Python Bindings
 
-This package is a Rust-exported Python binding layer built with `PyO3` and `maturin`.
-Its transport implementation comes from `crates/anyserve-client`; the public Python package adds
+This package provides high-performance Python bindings for AnyServe.
+Its transport implementation comes from `crates/anyserve-client`; the public package adds
 role-specific facades and higher-level worker helpers on top.
 
 ## Install
@@ -30,8 +30,8 @@ From local source:
 pip install ./clients/python
 ```
 
-Source installs build the Rust extension locally, so they require a working Rust toolchain on `PATH`.
-Inside this repository, `mise exec -- ...` provides the expected Python and Rust toolchains.
+Source installs build the native extension locally, so they require a working Rust toolchain on `PATH`.
+Inside this repository, `mise exec -- ...` provides the expected toolchains.
 
 The top-level `AnyserveClient` exposes the generic control-plane surface and also offers
 role-specific views through `submitter()` and `worker()`.

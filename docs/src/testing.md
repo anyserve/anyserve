@@ -109,7 +109,7 @@ The Python unit tests additionally verify:
 
 The Python SDK e2e suite additionally verifies:
 
-- Python low-level submitter APIs against the Rust demo worker
+- Python low-level submitter APIs against the demo worker
 - Python high-level `@worker` / `serve()` against a live control plane
 - streamed event and frame iteration against a real server
 

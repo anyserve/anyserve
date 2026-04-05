@@ -10,7 +10,7 @@ description = "Fetch workspace dependencies"
 run = "cargo fetch"
 
 [tasks.build]
-description = "Build the Rust workspace"
+description = "Build the workspace core"
 run = "cargo build --workspace"
 
 [tasks.test]
@@ -34,7 +34,7 @@ description = "Run cargo check"
 run = "cargo check --workspace"
 
 [tasks.python-sdk]
-description = "Build the Rust-exported Python bindings wheel"
+description = "Build the Python bindings wheel"
 run = "python -m pip install --quiet maturin && python -m maturin build --manifest-path clients/python/Cargo.toml --interpreter python"
 
 [tasks.python-dist]
@@ -42,7 +42,7 @@ description = "Build the Python source and wheel distributions"
 run = "rm -rf clients/python/dist && python -m pip install --quiet build maturin && python -m build clients/python"
 
 [tasks.python-sdk-dev]
-description = "Install the Rust-exported Python bindings into the active Python environment"
+description = "Install the Python bindings into the active Python environment"
 run = "python -m pip install --quiet maturin && python -m maturin develop --manifest-path clients/python/Cargo.toml"
 
 [tasks.python-sdk-test]

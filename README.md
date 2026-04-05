@@ -1,18 +1,26 @@
 # anyserve
 
-Hosted endpoint. Your workers.
+Serve Models Anywhere, Anytime, on Any Platform.
 
-Anyserve gives you a production-grade inference entry point in front of your own workers.
+Anyserve lets you serve models through your own workers, wherever they run.
+Use one production endpoint and one execution model across chat, embeddings,
+vision, speech, and streaming workloads.
+
+The point is simple: stop building separate systems for each inference type.
+Deploy Anyserve once, then reuse the same worker model, scheduling, streams,
+and recovery flow everywhere.
 
 The clearest way to understand it is simple:
 
 - Anyserve owns the public endpoint, auth, and routing layer
 - you own the workers, models, and inference backends
 - requests hit Anyserve first, then get scheduled onto your worker pool
+- new inference workloads plug into the same runtime instead of needing
+  separate infrastructure
 
-Underneath that product surface, Anyserve is a Rust-first, workload-neutral control
-plane for distributed execution. It does not hard-code LLM, image, or any single
-workload category into the core runtime.
+Underneath that product surface, Anyserve is a workload-neutral control plane for
+distributed execution. It does not hard-code LLM, image, or any single workload
+category into the core runtime.
 
 ## Core Model
 
@@ -30,7 +38,7 @@ Workers advertise supply through the same generic model, and the control plane i
 ```text
                  +-----------------------------+
                  |       SDK / CLI / API       |
-                 |   Rust / Python / gRPC      |
+                 |  Native / Python / gRPC     |
                  +-------------+---------------+
                                |
                                v
@@ -72,17 +80,17 @@ Workers advertise supply through the same generic model, and the control plane i
 - attempt tracking per lease assignment
 - event streaming per job
 - generic stream/frame data plane for client and worker IO
-- first-class Rust client crate, Rust sample apps, and Rust-backed Python bindings
+- first-class native client transport, sample apps, and Python bindings
 
 ## Repository Layout
 
-- `crates/anyserve-client`: first-class Rust client for the control-plane gRPC API
+- `crates/anyserve-client`: native client transport for the control-plane gRPC API
 - `crates/anyserve-proto`: protobuf and tonic bindings
 - `crates/anyserve-core`: domain model, in-memory state store, scheduler, kernel, and gRPC service
 - `crates/anyserve-cli`: the `anyserve` binary
-- `examples/rust`: sample submitter / worker apps that exercise the Rust client crate
+- `examples/rust`: sample submitter / worker apps that exercise the native client transport
 - `examples/python`: sample submitter / worker scripts that exercise the Python SDK
-- `clients/python`: Rust-exported Python bindings via `PyO3` and `maturin`
+- `clients/python`: Python bindings built on the native client transport
 - `docs`: mdBook documentation
 
 Static docs can be deployed from this repository to GitHub Pages. The current mdBook config assumes the project-page base path `/anyserve/`.
@@ -262,7 +270,7 @@ from anyserve import AnyserveClient, FRAME_DATA
 
 client = AnyserveClient("http://127.0.0.1:50052")
 # gRPC channel URI for the bindings transport, not a REST endpoint.
-# The Python facade is backed by the Rust anyserve-client transport layer.
+# The Python facade uses the same high-performance client transport.
 
 # This assumes a compatible worker is already running,
 # for example: `mise exec -- cargo run -p anyserve-demo -- --mode worker`

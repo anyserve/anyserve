@@ -1,8 +1,9 @@
 # Anyserve
 
-Hosted endpoint. Your workers.
+Serve Models Anywhere, Anytime, on Any Platform.
 
-Anyserve is a Rust-first, workload-neutral control plane for distributed execution.
+Anyserve is a workload-neutral control plane for serving models across your own
+workers without rebuilding infrastructure for each workload.
 
 The core model is intentionally workload-neutral:
 

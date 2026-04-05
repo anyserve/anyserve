@@ -25,7 +25,7 @@ against worker supply.
 ```text
                  +-----------------------------+
                  |       SDK / CLI / API       |
-                 |   Rust / Python / gRPC      |
+                 |  Native / Python / gRPC     |
                  +-------------+---------------+
                                |
                                v

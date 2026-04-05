@@ -157,7 +157,7 @@ serve(echo, endpoint="http://127.0.0.1:50052")
 from anyserve import AnyserveClient, FRAME_DATA
 
 client = AnyserveClient("http://127.0.0.1:50052")
-# gRPC channel URI used by the Rust-backed bindings client.
+# gRPC channel URI used by the bindings client.
 # Assumes the control plane and a compatible worker are already running.
 
 job = client.submit_job(
