@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .client import AnyserveClient, SubmitterClient, WorkerClient
+from .client import AnyserveClient
 from .highlevel import HandlerSpec, WorkerHandler, get_handler_spec, serve, worker
 
 EVENT_ACCEPTED = "accepted"
@@ -41,8 +41,6 @@ def uri_object(uri: str, metadata: dict[str, str] | None = None) -> dict[str, ob
 
 __all__ = [
     "AnyserveClient",
-    "SubmitterClient",
-    "WorkerClient",
     "HandlerSpec",
     "WorkerHandler",
     "worker",

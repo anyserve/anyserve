@@ -7,30 +7,7 @@
 
 ## Fastest Local Workflow
 
-The checked-in Ollama stack is the fastest way to understand the production gateway shape.
-
-For the built-in OpenAI-compatible gateway and LLM worker, start here:
-
-- [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md)
-- [Google Colab Qwen Examples](https://github.com/anyserve/anyserve/blob/main/examples/google-colab/README.md)
-- [Ollama](ollama.md)
-
-From a repository checkout, the smallest local stack is:
-
-```bash
-anyserve serve --config examples/ollama/anyserve.toml
-anyserve worker --config examples/ollama/worker.toml
-```
-
-That example exposes:
-
-- `GET /healthz`
-- `GET /readyz`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/embeddings`
-
-Keep the detailed commands, config explanation, and current behavior notes in the example README so they only need to be updated in one place.
+For the built-in OpenAI-compatible gateway and worker, follow the canonical walkthrough in [examples/ollama/README.md](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md). That is the single place with the full command sequence, config notes, and smoke tests.
 
 ## Production Direction
 
@@ -65,7 +42,7 @@ The gRPC health service is available on the same port as gRPC. Example endpoint 
 anyserve worker --config examples/ollama/worker.toml
 ```
 
-The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in the [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md).
+The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. For the end-to-end flow, use the canonical Ollama walkthrough above.
 
 Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
 

@@ -14,7 +14,6 @@ class FakeWorkerClient:
         self._grants = list(grants)
         self._streams = dict(streams)
         self._frames = dict(frames)
-        self._endpoint = None
         self.register_calls = []
         self.heartbeat_calls = []
         self.renew_calls = []

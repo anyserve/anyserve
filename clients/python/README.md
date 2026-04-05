@@ -2,7 +2,7 @@
 
 This package provides high-performance Python bindings for AnyServe.
 Its transport implementation comes from `crates/anyserve-client`; the public package adds
-role-specific facades and higher-level worker helpers on top.
+the low-level `AnyserveClient` surface and higher-level worker helpers on top.
 
 ## Install
 
@@ -32,8 +32,7 @@ pip install ./clients/python
 
 Source installs build the native extension locally, so they require a working Rust toolchain on `PATH`.
 
-The top-level `AnyserveClient` exposes the generic control-plane surface and also offers
-role-specific views through `submitter()` and `worker()`.
+The top-level `AnyserveClient` exposes the generic control-plane surface.
 
 It also includes a high-level worker API for function-style handlers:
 
@@ -129,25 +128,6 @@ For the first release, create a pending Trusted Publisher for `anyserve-runtime`
 then run the publish workflow or push a `v*` tag.
 
 ## Example
-
-High-level worker example:
-
-```python
-from anyserve import serve, worker
-
-
-@worker(
-    interface="demo.echo.v1",
-    attributes={"runtime": "python"},
-    capacity={"slot": 1},
-    codec="bytes",
-)
-def echo(payload: bytes) -> bytes:
-    return payload
-
-
-serve(echo, endpoint="http://127.0.0.1:50052")
-```
 
 Low-level submitter example:
 

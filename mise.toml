@@ -124,8 +124,6 @@ python - <<'PY'
 from anyserve import (
     AnyserveClient,
     HandlerSpec,
-    SubmitterClient,
-    WorkerClient,
     FRAME_DATA,
     get_handler_spec,
     inline_object,
@@ -138,8 +136,8 @@ class _FakeNative:
     def list_jobs(self):
         return []
 
-submitter = SubmitterClient(_FakeNative(), "http://127.0.0.1:50052")
-worker_client = WorkerClient(_FakeNative(), "http://127.0.0.1:50052")
+client = AnyserveClient.__new__(AnyserveClient)
+client._native = _FakeNative()
 
 @worker(interface="demo.echo.v1", codec="bytes")
 def echo(payload: bytes) -> bytes:
@@ -148,14 +146,14 @@ def echo(payload: bytes) -> bytes:
 spec = get_handler_spec(echo)
 
 assert AnyserveClient.__name__ == "AnyserveClient"
-assert isinstance(submitter, SubmitterClient)
-assert isinstance(worker_client, WorkerClient)
+assert client.submitter() is client
+assert client.worker() is client
+assert client.list_jobs() == []
 assert isinstance(spec, HandlerSpec)
 assert FRAME_DATA == "data"
 assert inline_object(b"hello")["inline"] == b"hello"
 assert uri_object("file:///tmp/example")["uri"] == "file:///tmp/example"
-assert callable(submitter.list_jobs)
-assert callable(worker_client.pull_frames)
+assert callable(client.list_jobs)
 assert callable(serve)
 print(AnyserveClient)
 PY

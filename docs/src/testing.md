@@ -23,18 +23,7 @@ Current core tests cover:
 
 The checked-in examples are the easiest local smoke tests.
 
-For the built-in OpenAI-compatible gateway and LLM worker, use:
-
-- [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md)
-- [Ollama](ollama.md)
-
-That path covers:
-
-- `anyserve serve --config examples/ollama/anyserve.toml`
-- `anyserve worker --config examples/ollama/worker.toml`
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/embeddings`
+For the built-in OpenAI-compatible gateway and worker, use the canonical walkthrough in [examples/ollama/README.md](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md). That page keeps the full startup sequence and request examples together.
 
 This is the user-facing path worth validating first because it exercises the built-in gateway and worker with the same shape you would use in practice.
 

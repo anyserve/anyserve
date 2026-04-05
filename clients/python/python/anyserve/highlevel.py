@@ -114,7 +114,12 @@ def serve(
 ) -> None:
     spec = get_handler_spec(handler)
     _validate_loop_intervals(heartbeat_interval_secs, poll_interval_secs)
-    worker_client = _resolve_worker_client(endpoint, client)
+    if client is None:
+        if endpoint is None:
+            raise ValueError("endpoint is required when client is not provided")
+        worker_client = AnyserveClient(endpoint)
+    else:
+        worker_client = client
 
     registered = worker_client.register_worker(
         interfaces=[spec.interface],
@@ -128,11 +133,10 @@ def serve(
 
     state = _LeaseState()
     stop_event = threading.Event()
-    heartbeat_client = _resolve_heartbeat_client(endpoint, client, worker_client)
     heartbeat = threading.Thread(
         target=_heartbeat_loop,
         args=(
-            heartbeat_client,
+            worker_client,
             registered_worker_id,
             spec,
             state,
@@ -321,25 +325,6 @@ def _validate_loop_intervals(heartbeat_interval_secs: float, poll_interval_secs:
         raise ValueError("heartbeat_interval_secs must be greater than 0")
     if poll_interval_secs < 0:
         raise ValueError("poll_interval_secs must be non-negative")
-
-
-def _resolve_worker_client(endpoint: Optional[str], client: Any) -> Any:
-    if client is None:
-        if endpoint is None:
-            raise ValueError("endpoint is required when client is not provided")
-        return AnyserveClient(endpoint).worker()
-    if hasattr(client, "worker") and callable(client.worker):
-        return client.worker()
-    return client
-
-
-def _resolve_heartbeat_client(endpoint: Optional[str], client: Any, worker_client: Any) -> Any:
-    resolved_endpoint = endpoint
-    if resolved_endpoint is None:
-        resolved_endpoint = getattr(worker_client, "_endpoint", None)
-    if resolved_endpoint:
-        return AnyserveClient(resolved_endpoint).worker()
-    return worker_client
 
 
 def _available_capacity(capacity: dict[str, int], active_leases: int) -> dict[str, int]:

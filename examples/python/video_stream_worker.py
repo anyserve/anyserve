@@ -173,7 +173,7 @@ def heartbeat_loop(
         endpoint,
         timeout_secs=connect_timeout_secs,
         role="worker heartbeat",
-    ).worker()
+    )
     while not stop_event.wait(interval_secs):
         active_lease_id, active_leases = state.snapshot()
         try:
@@ -474,7 +474,7 @@ def main() -> None:
         args.endpoint,
         timeout_secs=args.connect_timeout_secs,
         role="worker",
-    ).worker()
+    )
     registration = worker_client.register_worker(
         interfaces=[VIDEO_INTERFACE],
         attributes={"runtime": "python", "device": args.device},

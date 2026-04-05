@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyserve_core::frame::MemoryFramePlane;
 use anyserve_core::kernel::{Kernel, OpenStreamCommand};
@@ -248,6 +249,7 @@ async fn sqlite_summary_queries_return_counts_and_attempt_rollups() {
         )
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let cancelled = kernel
         .submit_job(
             Some("job-cancelled".to_string()),
@@ -258,6 +260,7 @@ async fn sqlite_summary_queries_return_counts_and_attempt_rollups() {
         )
         .await
         .unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let pending = kernel
         .submit_job(
             Some("job-pending".to_string()),
