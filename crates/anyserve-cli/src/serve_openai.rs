@@ -19,8 +19,9 @@ use tokio::time::{Instant, sleep_until};
 use anyserve_core::kernel::{Kernel, OpenStreamCommand};
 use anyserve_core::model::{
     Attributes, Capacity, ExecutionPolicy, Frame, FrameKind, JobRecord, JobSpec, JobState,
-    StreamDirection, StreamScope, WorkerRecord,
+    ObjectRef, StreamDirection, StreamScope, WorkerRecord,
 };
+use anyserve_core::notify::ClusterSubscription;
 
 use crate::serve_config::ServeOpenAIConfig;
 
@@ -341,12 +342,20 @@ async fn submit_request(
 fn streaming_response(state: AppState, job_id: String) -> Response {
     let kernel = Arc::clone(&state.kernel);
     let deadline = Instant::now() + Duration::from_secs(state.config.request_timeout_secs);
+    let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
     let stream = stream! {
         let mut cancel_guard = JobCancellationGuard::new(Arc::clone(&kernel), job_id.clone());
         let mut job_stream_updates = match kernel.subscribe_job_streams(&job_id).await {
             Ok(updates) => updates,
             Err(error) => {
                 yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe job streams: {error}")));
+                return;
+            }
+        };
+        let mut cluster_job_stream_updates = match kernel.subscribe_cluster_job_streams(&job_id).await {
+            Ok(updates) => updates,
+            Err(error) => {
+                yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe cluster job streams: {error}")));
                 return;
             }
         };
@@ -357,8 +366,14 @@ fn streaming_response(state: AppState, job_id: String) -> Response {
                 return;
             }
         };
+        let mut cluster_job_event_updates = match kernel.subscribe_cluster_job_events(&job_id).await {
+            Ok(updates) => updates,
+            Err(error) => {
+                yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe cluster job events: {error}")));
+                return;
+            }
+        };
         let mut output_stream_id: Option<String> = None;
-        let mut stream_updates: Option<watch::Receiver<u64>> = None;
         let mut after_sequence = 0u64;
 
         loop {
@@ -387,16 +402,6 @@ fn streaming_response(state: AppState, job_id: String) -> Response {
             }
 
             if let Some(stream_id) = output_stream_id.as_ref() {
-                if stream_updates.is_none() {
-                    stream_updates = Some(match kernel.subscribe_stream_updates(stream_id).await {
-                        Ok(updates) => updates,
-                        Err(error) => {
-                            yield Err(io::Error::other(format!("subscribe stream updates: {error}")));
-                            break;
-                        }
-                    });
-                }
-
                 let frames = match kernel.pull_frames(stream_id, after_sequence).await {
                     Ok(frames) => frames,
                     Err(error) => {
@@ -506,19 +511,26 @@ fn streaming_response(state: AppState, job_id: String) -> Response {
                 }
             }
 
-            let wait_result = if let Some(stream_updates) = stream_updates.as_mut() {
-                wait_for_any_change(
+            let wait_result = if let Some(stream_id) = output_stream_id.as_ref() {
+                wait_for_stream_or_job_change(
+                    kernel.as_ref(),
+                    stream_id,
+                    after_sequence,
                     deadline,
-                    stream_updates,
+                    poll_interval,
                     &mut job_event_updates,
+                    &mut cluster_job_event_updates,
                     "request timed out waiting for worker stream",
                 )
                 .await
             } else {
-                wait_for_any_change(
+                wait_for_job_or_stream_change(
                     deadline,
+                    poll_interval,
                     &mut job_stream_updates,
+                    &mut cluster_job_stream_updates,
                     &mut job_event_updates,
+                    &mut cluster_job_event_updates,
                     "request timed out waiting for worker stream",
                 )
                 .await
@@ -645,10 +657,15 @@ fn now_ms() -> u64 {
 }
 
 async fn collect_output_bytes(kernel: Arc<Kernel>, job_id: String) -> Result<Vec<u8>, OpenAIError> {
-    let mut updates = kernel
+    let mut local_updates = kernel
         .subscribe_job_events(&job_id)
         .await
         .map_err(|error| OpenAIError::internal(format!("subscribe job events: {error}")))?;
+    let mut cluster_updates = kernel
+        .subscribe_cluster_job_events(&job_id)
+        .await
+        .map_err(|error| OpenAIError::internal(format!("subscribe cluster job events: {error}")))?;
+    let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
 
     loop {
         let job = kernel
@@ -657,7 +674,12 @@ async fn collect_output_bytes(kernel: Arc<Kernel>, job_id: String) -> Result<Vec
             .map_err(|error| OpenAIError::internal(format!("get job: {error}")))?;
 
         match job.state {
-            JobState::Succeeded => return read_output_stream(kernel, &job.job_id).await,
+            JobState::Succeeded => {
+                if let Some(output) = read_output_from_job(&job)? {
+                    return Ok(output);
+                }
+                return read_output_stream(kernel, &job.job_id).await;
+            }
             JobState::Failed => {
                 return Err(OpenAIError::bad_gateway(
                     job.last_error
@@ -666,12 +688,29 @@ async fn collect_output_bytes(kernel: Arc<Kernel>, job_id: String) -> Result<Vec
             }
             JobState::Cancelled => return Err(OpenAIError::bad_gateway("job was cancelled")),
             JobState::Pending | JobState::Leased | JobState::Running => {
-                if updates.changed().await.is_err() {
-                    return Err(OpenAIError::internal("job event watcher closed"));
-                }
+                wait_for_job_event_change(poll_interval, &mut local_updates, &mut cluster_updates)
+                    .await;
             }
         }
     }
+}
+
+fn read_output_from_job(job: &JobRecord) -> Result<Option<Vec<u8>>, OpenAIError> {
+    for output in &job.outputs {
+        match output {
+            ObjectRef::Inline { content, .. } if !content.is_empty() => {
+                return Ok(Some(content.clone()));
+            }
+            ObjectRef::Inline { .. } => continue,
+            ObjectRef::Uri { uri, .. } => {
+                return Err(OpenAIError::bad_gateway(format!(
+                    "worker returned unsupported uri output: {uri}"
+                )));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn extract_data_chunks(frames: Vec<Frame>, after_sequence: &mut u64) -> io::Result<Vec<Vec<u8>>> {
@@ -691,16 +730,77 @@ fn extract_data_chunks(frames: Vec<Frame>, after_sequence: &mut u64) -> io::Resu
     Ok(chunks)
 }
 
-async fn wait_for_any_change(
+async fn wait_for_job_or_stream_change(
     deadline: Instant,
-    left: &mut watch::Receiver<u64>,
-    right: &mut watch::Receiver<u64>,
+    poll_interval: Duration,
+    local_job_stream_updates: &mut watch::Receiver<u64>,
+    cluster_job_stream_updates: &mut ClusterSubscription,
+    local_job_event_updates: &mut watch::Receiver<u64>,
+    cluster_job_event_updates: &mut ClusterSubscription,
+    timeout_message: &'static str,
+) -> io::Result<()> {
+    let poll_deadline = (Instant::now() + poll_interval).min(deadline);
+    tokio::select! {
+        _ = sleep_until(deadline) => Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message)),
+        _ = sleep_until(poll_deadline) => Ok(()),
+        result = local_job_stream_updates.changed() => {
+            result.map_err(|_| io::Error::other("job stream watcher closed"))
+        }
+        result = cluster_job_stream_updates.changed() => {
+            result.map_err(|error| io::Error::other(format!("cluster job stream watcher closed: {error}")))
+        }
+        result = local_job_event_updates.changed() => {
+            result.map_err(|_| io::Error::other("job event watcher closed"))
+        }
+        result = cluster_job_event_updates.changed() => {
+            result.map_err(|error| io::Error::other(format!("cluster job event watcher closed: {error}")))
+        }
+    }
+}
+
+async fn wait_for_stream_or_job_change(
+    kernel: &Kernel,
+    stream_id: &str,
+    after_sequence: u64,
+    deadline: Instant,
+    poll_interval: Duration,
+    local_job_event_updates: &mut watch::Receiver<u64>,
+    cluster_job_event_updates: &mut ClusterSubscription,
     timeout_message: &'static str,
 ) -> io::Result<()> {
     tokio::select! {
         _ = sleep_until(deadline) => Err(io::Error::new(io::ErrorKind::TimedOut, timeout_message)),
-        result = left.changed() => result.map_err(|_| io::Error::other("stream watcher closed")),
-        result = right.changed() => result.map_err(|_| io::Error::other("stream watcher closed")),
+        result = kernel.wait_for_frames(stream_id, after_sequence, poll_interval) => {
+            result
+                .map(|_| ())
+                .map_err(|error| io::Error::other(format!("wait for frames: {error}")))
+        }
+        result = local_job_event_updates.changed() => {
+            result.map_err(|_| io::Error::other("job event watcher closed"))
+        }
+        result = cluster_job_event_updates.changed() => {
+            result.map_err(|error| io::Error::other(format!("cluster job event watcher closed: {error}")))
+        }
+    }
+}
+
+async fn wait_for_job_event_change(
+    poll_interval: Duration,
+    local_updates: &mut watch::Receiver<u64>,
+    cluster_updates: &mut ClusterSubscription,
+) {
+    tokio::select! {
+        result = local_updates.changed() => {
+            if result.is_err() {
+                sleep_until(Instant::now() + poll_interval).await;
+            }
+        }
+        result = cluster_updates.changed() => {
+            if result.is_err() {
+                sleep_until(Instant::now() + poll_interval).await;
+            }
+        }
+        _ = sleep_until(Instant::now() + poll_interval) => {}
     }
 }
 
@@ -746,4 +846,28 @@ async fn read_output_stream(kernel: Arc<Kernel>, job_id: &str) -> Result<Vec<u8>
     }
 
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_output_from_job;
+    use anyserve_core::model::{Attributes, JobRecord, JobSpec, ObjectRef};
+
+    #[test]
+    fn read_output_from_job_prefers_inline_output() {
+        let job = JobRecord {
+            spec: JobSpec::default(),
+            outputs: vec![ObjectRef::Inline {
+                content: br#"{"ok":true}"#.to_vec(),
+                metadata: Attributes::from([(
+                    "content_type".to_string(),
+                    "application/json".to_string(),
+                )]),
+            }],
+            ..JobRecord::default()
+        };
+
+        let output = read_output_from_job(&job).expect("inline output should be supported");
+        assert_eq!(output, Some(br#"{"ok":true}"#.to_vec()));
+    }
 }

@@ -11,10 +11,13 @@ use anyserve_client::{
     StreamRecord, StreamScope, StreamState,
 };
 use anyserve_core::config::GrpcConfig;
+use anyserve_core::frame::{FramePlane, MemoryFramePlane, RedisFramePlane};
 use anyserve_core::kernel::Kernel;
+use anyserve_core::notify::{ClusterNotifier, NoopClusterNotifier, RedisClusterNotifier};
 use anyserve_core::scheduler::BasicScheduler;
 use anyserve_core::service::ControlPlaneGrpcService;
-use anyserve_core::store::{MemoryStateStore, MemoryStreamStore};
+use anyserve_core::sql_store::SqlStateStore;
+use anyserve_core::store::{MemoryStateStore, StateStore};
 use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -26,7 +29,7 @@ mod serve_config;
 mod serve_openai;
 mod serve_openai_worker;
 
-use serve_config::{ResolvedServeConfig, ServeOverrides};
+use serve_config::{FrameBackend, ResolvedServeConfig, ServeOverrides, StorageBackend};
 use serve_openai::run_server as run_serve_openai;
 use serve_openai_worker::ServeOpenAIWorkerArgs;
 
@@ -468,13 +471,47 @@ async fn serve(args: ServeArgs) -> Result<()> {
         default_lease_ttl_secs: args.default_lease_ttl_secs,
     })?;
     let grpc_config = config.grpc.clone();
+    let state_store: Arc<dyn StateStore> = match config.storage.backend {
+        StorageBackend::Memory => Arc::new(MemoryStateStore::new()),
+        StorageBackend::Sqlite | StorageBackend::Postgres => {
+            let dsn = config
+                .storage
+                .dsn
+                .as_deref()
+                .context("storage dsn is required")?;
+            Arc::new(SqlStateStore::connect(dsn).await?)
+        }
+    };
+    let frame_plane: Arc<dyn FramePlane> = match config.frames.backend {
+        FrameBackend::Memory => Arc::new(MemoryFramePlane::new()),
+        FrameBackend::Redis => Arc::new(RedisFramePlane::new(
+            config
+                .frames
+                .redis_url
+                .as_deref()
+                .context("frames redis url is required")?,
+            config.frames.closed_retention_secs,
+        )?),
+    };
+    let notifier: Arc<dyn ClusterNotifier> = match config.frames.backend {
+        FrameBackend::Memory => Arc::new(NoopClusterNotifier),
+        FrameBackend::Redis => Arc::new(RedisClusterNotifier::new(
+            config
+                .frames
+                .redis_url
+                .as_deref()
+                .context("frames redis url is required")?,
+        )?),
+    };
 
     let kernel = Arc::new(Kernel::new(
-        Arc::new(MemoryStateStore::new()),
-        Arc::new(MemoryStreamStore::new()),
+        state_store,
+        frame_plane,
+        notifier,
         Arc::new(BasicScheduler),
         config.heartbeat_ttl_secs,
         config.default_lease_ttl_secs,
+        config.frames.watch_poll_interval_ms,
     ));
 
     let grpc_addr = socket_addr(&grpc_config.host, grpc_config.port)?;

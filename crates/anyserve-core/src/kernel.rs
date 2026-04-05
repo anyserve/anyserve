@@ -1,25 +1,29 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::frame::FramePlane;
 use crate::model::{
-    AttemptRecord, AttemptState, Attributes, EventKind, Frame, FrameKind, JobRecord, JobSpec,
-    JobState, LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
+    AttemptRecord, Attributes, EventKind, Frame, FrameKind, JobRecord, JobSpec, JobState,
+    LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
     StreamState, WorkerRecord, WorkerSpec, WorkerStatus,
 };
+use crate::notify::{ClusterNotifier, ClusterSubscription};
 use crate::scheduler::Scheduler;
-use crate::store::{StateStore, StreamStore};
+use crate::store::{LeaseDispatchMode, StateStore, StateTransition};
 
 pub struct Kernel {
     state_store: Arc<dyn StateStore>,
-    stream_store: Arc<dyn StreamStore>,
+    frame_plane: Arc<dyn FramePlane>,
+    notifier: Arc<dyn ClusterNotifier>,
     scheduler: Arc<dyn Scheduler>,
-    dispatch_lock: Mutex<()>,
     heartbeat_ttl_secs: u64,
     default_lease_ttl_secs: u64,
+    watch_poll_interval_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -37,23 +41,30 @@ pub struct OpenStreamCommand {
 impl Kernel {
     pub fn new(
         state_store: Arc<dyn StateStore>,
-        stream_store: Arc<dyn StreamStore>,
+        frame_plane: Arc<dyn FramePlane>,
+        notifier: Arc<dyn ClusterNotifier>,
         scheduler: Arc<dyn Scheduler>,
         heartbeat_ttl_secs: u64,
         default_lease_ttl_secs: u64,
+        watch_poll_interval_ms: u64,
     ) -> Self {
         Self {
             state_store,
-            stream_store,
+            frame_plane,
+            notifier,
             scheduler,
-            dispatch_lock: Mutex::new(()),
             heartbeat_ttl_secs,
             default_lease_ttl_secs,
+            watch_poll_interval_ms,
         }
     }
 
     pub fn heartbeat_ttl_secs(&self) -> u64 {
         self.heartbeat_ttl_secs
+    }
+
+    pub fn watch_poll_interval_ms(&self) -> u64 {
+        self.watch_poll_interval_ms
     }
 
     pub async fn submit_job(
@@ -86,6 +97,7 @@ impl Kernel {
                 now_ms,
             )
             .await?;
+        self.publish_job_events_best_effort(&job.job_id).await;
         Ok(job)
     }
 
@@ -105,6 +117,24 @@ impl Kernel {
     pub async fn subscribe_job_events(&self, job_id: &str) -> Result<watch::Receiver<u64>> {
         self.get_job(job_id).await?;
         Ok(self.state_store.subscribe_job_events(job_id).await)
+    }
+
+    pub async fn subscribe_cluster_job_events(&self, job_id: &str) -> Result<ClusterSubscription> {
+        self.get_job(job_id).await?;
+        Ok(self
+            .notifier
+            .subscribe_job_events(job_id)
+            .await
+            .unwrap_or_else(|_| ClusterSubscription::noop()))
+    }
+
+    pub async fn subscribe_cluster_job_streams(&self, job_id: &str) -> Result<ClusterSubscription> {
+        self.get_job(job_id).await?;
+        Ok(self
+            .notifier
+            .subscribe_job_streams(job_id)
+            .await
+            .unwrap_or_else(|_| ClusterSubscription::noop()))
     }
 
     pub async fn get_job(&self, job_id: &str) -> Result<JobRecord> {
@@ -140,41 +170,15 @@ impl Kernel {
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<JobRecord> {
-        let _guard = self.dispatch_lock.lock().await;
-        let mut job = self.get_job(job_id).await?;
-        if job.state.is_terminal() {
-            return Ok(job);
-        }
-
-        if let Some(lease_id) = job.lease_id.clone() {
-            self.state_store.delete_lease(&lease_id).await?;
-        }
-
-        if let Some(attempt_id) = job.current_attempt_id.clone()
-            && let Some(mut attempt) = self.state_store.get_attempt(&attempt_id).await?
-        {
-            attempt.state = AttemptState::Cancelled;
-            attempt.finished_at_ms = Some(now_ms());
-            self.state_store.update_attempt(attempt).await?;
-        }
-
         let now_ms = now_ms();
-        job.state = JobState::Cancelled;
-        job.lease_id = None;
-        job.updated_at_ms = now_ms;
-        job.version += 1;
-        self.state_store.update_job(job.clone()).await?;
-        self.close_streams_for_job(&job.job_id, now_ms).await?;
-        self.state_store
-            .append_job_event(
-                job_id,
-                EventKind::Cancelled,
-                Vec::new(),
-                Attributes::new(),
-                now_ms,
-            )
+        let transition = self
+            .state_store
+            .cancel_job_transition(job_id, now_ms)
             .await?;
-        Ok(job)
+        self.finalize_terminal_streams(transition.streams_to_finalize.clone())
+            .await?;
+        self.publish_transition_best_effort(&transition).await;
+        Ok(transition.value)
     }
 
     pub async fn get_attempt(&self, attempt_id: &str) -> Result<AttemptRecord> {
@@ -242,89 +246,53 @@ impl Kernel {
     }
 
     pub async fn poll_lease(&self, worker_id: &str) -> Result<Option<LeaseAssignment>> {
-        let _guard = self.dispatch_lock.lock().await;
         let now_ms = now_ms();
-        self.reap_expired_leases(now_ms).await?;
-
-        let worker = self
+        let reaped = self
             .state_store
-            .get_worker(worker_id)
-            .await?
-            .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
-        if worker.expires_at_ms <= now_ms {
-            bail!("worker '{}' heartbeat expired", worker_id);
-        }
+            .reap_expired_leases_transition(now_ms)
+            .await?;
+        self.finalize_terminal_streams(reaped.streams_to_finalize.clone())
+            .await?;
+        self.publish_transition_best_effort(&reaped).await;
 
-        let active_leases = self
+        let ordered_candidates =
+            if self.state_store.lease_dispatch_mode() == LeaseDispatchMode::KernelOrderedCandidates
+            {
+                let worker = self
+                    .state_store
+                    .get_worker(worker_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
+                if worker.expires_at_ms <= now_ms {
+                    bail!("worker '{}' heartbeat expired", worker_id);
+                }
+
+                let jobs = self.state_store.list_pending_jobs().await?;
+                let ordered_candidates = self
+                    .scheduler
+                    .ordered_jobs_for_worker(&worker, jobs.as_slice());
+                if ordered_candidates.is_empty() {
+                    return Ok(None);
+                }
+                ordered_candidates
+            } else {
+                Vec::new()
+            };
+
+        let assignment = self
             .state_store
-            .list_leases()
-            .await?
-            .into_iter()
-            .filter(|lease| lease.worker_id == worker_id)
-            .count() as u32;
-        if active_leases >= worker.spec.max_active_leases {
-            return Ok(None);
-        }
-
-        let jobs = self.state_store.list_jobs().await?;
-        let Some(mut job) = self.scheduler.select_job_for_worker(&worker, &jobs) else {
-            return Ok(None);
-        };
-
-        let lease_id = Uuid::new_v4().to_string();
-        let attempt_id = Uuid::new_v4().to_string();
-        let lease_ttl_secs = if job.spec.policy.lease_ttl_secs == 0 {
-            self.default_lease_ttl_secs
-        } else {
-            job.spec.policy.lease_ttl_secs
-        };
-        let lease = LeaseRecord {
-            lease_id: lease_id.clone(),
-            job_id: job.job_id.clone(),
-            worker_id: worker_id.to_string(),
-            issued_at_ms: now_ms,
-            expires_at_ms: now_ms + lease_ttl_secs * 1000,
-        };
-        let attempt = AttemptRecord {
-            attempt_id: attempt_id.clone(),
-            job_id: job.job_id.clone(),
-            worker_id: worker_id.to_string(),
-            lease_id: lease_id.clone(),
-            state: AttemptState::Leased,
-            created_at_ms: now_ms,
-            started_at_ms: None,
-            finished_at_ms: None,
-            last_error: None,
-            metadata: Attributes::new(),
-        };
-
-        job.state = JobState::Leased;
-        job.lease_id = Some(lease_id.clone());
-        job.current_attempt_id = Some(attempt_id.clone());
-        job.updated_at_ms = now_ms;
-        job.version += 1;
-
-        self.state_store.put_lease(lease.clone()).await?;
-        self.state_store.create_attempt(attempt.clone()).await?;
-        self.state_store.update_job(job.clone()).await?;
-        self.state_store
-            .append_job_event(
-                &job.job_id,
-                EventKind::LeaseGranted,
-                Vec::new(),
-                BTreeMap::from([
-                    ("lease_id".to_string(), lease_id),
-                    ("attempt_id".to_string(), attempt_id),
-                ]),
+            .try_assign_job(
+                worker_id,
+                ordered_candidates.as_slice(),
+                self.default_lease_ttl_secs,
                 now_ms,
             )
             .await?;
-
-        Ok(Some(LeaseAssignment {
-            lease,
-            attempt,
-            job,
-        }))
+        if let Some(assignment) = assignment.as_ref() {
+            self.publish_job_events_best_effort(&assignment.job.job_id)
+                .await;
+        }
+        Ok(assignment)
     }
 
     pub async fn renew_lease(&self, worker_id: &str, lease_id: &str) -> Result<LeaseRecord> {
@@ -336,7 +304,7 @@ impl Kernel {
             job.spec.policy.lease_ttl_secs
         };
         lease.expires_at_ms = now_ms() + ttl_secs * 1000;
-        self.state_store.put_lease(lease.clone()).await?;
+        self.state_store.update_lease(lease.clone()).await?;
         Ok(lease)
     }
 
@@ -349,34 +317,11 @@ impl Kernel {
         metadata: Attributes,
     ) -> Result<()> {
         let lease = self.require_lease(worker_id, lease_id).await?;
-        let mut job = self.get_job(&lease.job_id).await?;
-        let mut attempt = self.require_attempt_for_lease(lease_id).await?;
         let now_ms = now_ms();
-
-        if matches!(
-            kind,
-            EventKind::Started | EventKind::Progress | EventKind::OutputReady
-        ) && job.state == JobState::Leased
-        {
-            job.state = JobState::Running;
-            job.updated_at_ms = now_ms;
-            job.version += 1;
-            self.state_store.update_job(job).await?;
-        }
-
-        if matches!(
-            kind,
-            EventKind::Started | EventKind::Progress | EventKind::OutputReady
-        ) && attempt.state == AttemptState::Leased
-        {
-            attempt.state = AttemptState::Running;
-            attempt.started_at_ms = Some(now_ms);
-            self.state_store.update_attempt(attempt).await?;
-        }
-
         self.state_store
-            .append_job_event(&lease.job_id, kind, payload, metadata, now_ms)
+            .report_event_transition(worker_id, lease_id, kind, payload, metadata, now_ms)
             .await?;
+        self.publish_job_events_best_effort(&lease.job_id).await;
         Ok(())
     }
 
@@ -387,37 +332,15 @@ impl Kernel {
         outputs: Vec<ObjectRef>,
         metadata: Attributes,
     ) -> Result<()> {
-        let _guard = self.dispatch_lock.lock().await;
-        let lease = self.require_lease(worker_id, lease_id).await?;
-        let mut job = self.get_job(&lease.job_id).await?;
-        let mut attempt = self.require_attempt_for_lease(lease_id).await?;
+        self.require_lease(worker_id, lease_id).await?;
         let now_ms = now_ms();
-
-        self.state_store.delete_lease(lease_id).await?;
-        job.state = JobState::Succeeded;
-        job.outputs = outputs;
-        job.lease_id = None;
-        job.updated_at_ms = now_ms;
-        job.version += 1;
-        job.last_error = None;
-        self.state_store.update_job(job.clone()).await?;
-
-        attempt.state = AttemptState::Succeeded;
-        attempt.finished_at_ms = Some(now_ms);
-        attempt.last_error = None;
-        self.state_store.update_attempt(attempt).await?;
-        self.close_streams_for_lease(&job.job_id, lease_id, now_ms)
+        let transition = self
+            .state_store
+            .complete_lease_transition(worker_id, lease_id, outputs, metadata, now_ms)
             .await?;
-
-        self.state_store
-            .append_job_event(
-                &job.job_id,
-                EventKind::Succeeded,
-                Vec::new(),
-                metadata,
-                now_ms,
-            )
+        self.finalize_terminal_streams(transition.streams_to_finalize.clone())
             .await?;
+        self.publish_transition_best_effort(&transition).await;
         Ok(())
     }
 
@@ -427,57 +350,17 @@ impl Kernel {
         lease_id: &str,
         reason: String,
         retryable: bool,
-        mut metadata: Attributes,
+        metadata: Attributes,
     ) -> Result<()> {
-        let _guard = self.dispatch_lock.lock().await;
-        let lease = self.require_lease(worker_id, lease_id).await?;
-        let mut job = self.get_job(&lease.job_id).await?;
-        let mut attempt = self.require_attempt_for_lease(lease_id).await?;
+        self.require_lease(worker_id, lease_id).await?;
         let now_ms = now_ms();
-
-        self.state_store.delete_lease(lease_id).await?;
-        self.close_streams_for_lease(&job.job_id, lease_id, now_ms)
+        let transition = self
+            .state_store
+            .fail_lease_transition(worker_id, lease_id, reason, retryable, metadata, now_ms)
             .await?;
-
-        metadata.insert("reason".to_string(), reason.clone());
-        self.state_store
-            .append_job_event(
-                &job.job_id,
-                EventKind::Failed,
-                reason.as_bytes().to_vec(),
-                metadata.clone(),
-                now_ms,
-            )
+        self.finalize_terminal_streams(transition.streams_to_finalize.clone())
             .await?;
-
-        attempt.state = AttemptState::Failed;
-        attempt.finished_at_ms = Some(now_ms);
-        attempt.last_error = Some(reason.clone());
-        self.state_store.update_attempt(attempt).await?;
-
-        job.last_error = Some(reason);
-        job.updated_at_ms = now_ms;
-        job.version += 1;
-        job.lease_id = None;
-
-        if retryable {
-            job.state = JobState::Pending;
-            job.current_attempt_id = None;
-            self.state_store.update_job(job.clone()).await?;
-            self.state_store
-                .append_job_event(
-                    &job.job_id,
-                    EventKind::Requeued,
-                    Vec::new(),
-                    metadata,
-                    now_ms,
-                )
-                .await?;
-        } else {
-            job.state = JobState::Failed;
-            self.state_store.update_job(job).await?;
-        }
-
+        self.publish_transition_best_effort(&transition).await;
         Ok(())
     }
 
@@ -551,25 +434,39 @@ impl Kernel {
             closed_at_ms: None,
             last_sequence: 0,
         };
-        self.stream_store.create_stream(stream.clone()).await?;
+        self.state_store.create_stream(stream.clone()).await?;
+        self.frame_plane.stream_created(&stream).await?;
+        self.publish_job_streams_best_effort(&stream.job_id).await;
         Ok(stream)
     }
 
     pub async fn get_stream(&self, stream_id: &str) -> Result<StreamRecord> {
-        self.stream_store
-            .get_stream(stream_id)
-            .await?
-            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))
+        let mut stream = self.load_stream_record(stream_id).await?;
+        if let Some(last_sequence) = self.frame_plane.latest_sequence(stream_id).await? {
+            stream.last_sequence = last_sequence;
+        }
+        Ok(stream)
+    }
+
+    pub async fn get_stream_metadata(&self, stream_id: &str) -> Result<StreamRecord> {
+        self.load_stream_record(stream_id).await
     }
 
     pub async fn list_streams(&self, job_id: &str) -> Result<Vec<StreamRecord>> {
         self.get_job(job_id).await?;
-        self.stream_store.list_streams_for_job(job_id).await
+        let mut streams = self.state_store.list_streams_for_job(job_id).await?;
+        for stream in &mut streams {
+            if let Some(last_sequence) = self.frame_plane.latest_sequence(&stream.stream_id).await?
+            {
+                stream.last_sequence = last_sequence;
+            }
+        }
+        Ok(streams)
     }
 
     pub async fn subscribe_job_streams(&self, job_id: &str) -> Result<watch::Receiver<u64>> {
         self.get_job(job_id).await?;
-        Ok(self.stream_store.subscribe_job_streams(job_id).await)
+        Ok(self.state_store.subscribe_job_streams(job_id).await)
     }
 
     pub async fn close_stream(
@@ -579,7 +476,7 @@ impl Kernel {
         lease_id: Option<String>,
         metadata: Attributes,
     ) -> Result<StreamRecord> {
-        let mut stream = self.get_stream(stream_id).await?;
+        let mut stream = self.load_stream_record(stream_id).await?;
         if stream.state.is_terminal() {
             return Ok(stream);
         }
@@ -590,8 +487,15 @@ impl Kernel {
         let now_ms = now_ms();
         stream.state = StreamState::Closed;
         stream.closed_at_ms = Some(now_ms);
+        stream.last_sequence = self
+            .frame_plane
+            .latest_sequence(stream_id)
+            .await?
+            .unwrap_or(stream.last_sequence);
         stream.metadata.extend(metadata);
-        self.stream_store.update_stream(stream.clone()).await?;
+        self.state_store.update_stream(stream.clone()).await?;
+        self.frame_plane.stream_updated(&stream).await?;
+        self.publish_job_streams_best_effort(&stream.job_id).await;
         Ok(stream)
     }
 
@@ -604,25 +508,31 @@ impl Kernel {
         payload: Vec<u8>,
         metadata: Attributes,
     ) -> Result<Frame> {
-        let mut stream = self.get_stream(stream_id).await?;
+        let mut stream = self.load_stream_record(stream_id).await?;
         self.validate_stream_write(&stream, worker_id.as_deref(), lease_id.as_deref())
             .await?;
         let now_ms = now_ms();
         let frame = self
-            .stream_store
-            .append_frame(stream_id, kind, payload, metadata, now_ms)
+            .frame_plane
+            .append_frame(&stream, kind, payload, metadata, now_ms)
             .await?;
 
         match kind {
             FrameKind::Close => {
                 stream.state = StreamState::Closed;
                 stream.closed_at_ms = Some(now_ms);
-                self.stream_store.update_stream(stream).await?;
+                stream.last_sequence = frame.sequence;
+                self.state_store.update_stream(stream.clone()).await?;
+                self.frame_plane.stream_updated(&stream).await?;
+                self.publish_job_streams_best_effort(&stream.job_id).await;
             }
             FrameKind::Error => {
                 stream.state = StreamState::Error;
                 stream.closed_at_ms = Some(now_ms);
-                self.stream_store.update_stream(stream).await?;
+                stream.last_sequence = frame.sequence;
+                self.state_store.update_stream(stream.clone()).await?;
+                self.frame_plane.stream_updated(&stream).await?;
+                self.publish_job_streams_best_effort(&stream.job_id).await;
             }
             _ => {}
         }
@@ -631,15 +541,34 @@ impl Kernel {
     }
 
     pub async fn pull_frames(&self, stream_id: &str, after_sequence: u64) -> Result<Vec<Frame>> {
-        self.get_stream(stream_id).await?;
-        self.stream_store
+        self.load_stream_record(stream_id).await?;
+        self.frame_plane
             .frames_after(stream_id, after_sequence)
             .await
     }
 
+    pub async fn wait_for_frames(
+        &self,
+        stream_id: &str,
+        after_sequence: u64,
+        timeout: Duration,
+    ) -> Result<Vec<Frame>> {
+        self.load_stream_record(stream_id).await?;
+        self.frame_plane
+            .wait_for_frames(stream_id, after_sequence, timeout)
+            .await
+    }
+
     pub async fn subscribe_stream_updates(&self, stream_id: &str) -> Result<watch::Receiver<u64>> {
-        self.get_stream(stream_id).await?;
-        Ok(self.stream_store.subscribe_stream_updates(stream_id).await)
+        self.load_stream_record(stream_id).await?;
+        Ok(self.frame_plane.subscribe_stream_updates(stream_id).await)
+    }
+
+    async fn load_stream_record(&self, stream_id: &str) -> Result<StreamRecord> {
+        self.state_store
+            .get_stream(stream_id)
+            .await?
+            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))
     }
 
     async fn require_lease(&self, worker_id: &str, lease_id: &str) -> Result<LeaseRecord> {
@@ -682,13 +611,6 @@ impl Kernel {
             );
         }
         Ok(lease)
-    }
-
-    async fn require_attempt_for_lease(&self, lease_id: &str) -> Result<AttemptRecord> {
-        self.state_store
-            .get_attempt_for_lease(lease_id)
-            .await?
-            .ok_or_else(|| anyhow!("no attempt found for lease '{}'", lease_id))
     }
 
     async fn require_attempt_for_job(
@@ -786,91 +708,36 @@ impl Kernel {
         Ok(())
     }
 
-    async fn close_streams_for_job(&self, job_id: &str, now_ms: u64) -> Result<()> {
-        for mut stream in self.stream_store.list_streams_for_job(job_id).await? {
-            if stream.state.is_terminal() {
-                continue;
-            }
-            stream.state = StreamState::Closed;
-            stream.closed_at_ms = Some(now_ms);
-            self.stream_store.update_stream(stream).await?;
-        }
-        Ok(())
-    }
-
-    async fn close_streams_for_lease(
-        &self,
-        job_id: &str,
-        lease_id: &str,
-        now_ms: u64,
-    ) -> Result<()> {
-        for mut stream in self.stream_store.list_streams_for_job(job_id).await? {
-            if stream.state.is_terminal() {
-                continue;
-            }
-            if stream.lease_id.as_deref() != Some(lease_id) {
-                continue;
-            }
-            stream.state = StreamState::Closed;
-            stream.closed_at_ms = Some(now_ms);
-            self.stream_store.update_stream(stream).await?;
-        }
-        Ok(())
-    }
-
-    async fn reap_expired_leases(&self, now_ms: u64) -> Result<()> {
-        for lease in self.state_store.list_leases().await? {
-            if lease.expires_at_ms > now_ms {
-                continue;
-            }
-
-            self.state_store.delete_lease(&lease.lease_id).await?;
-            self.close_streams_for_lease(&lease.job_id, &lease.lease_id, now_ms)
-                .await?;
-
-            if let Some(mut attempt) = self
-                .state_store
-                .get_attempt_for_lease(&lease.lease_id)
-                .await?
-                && !attempt.state.is_terminal()
+    async fn finalize_terminal_streams(&self, streams: Vec<StreamRecord>) -> Result<()> {
+        for mut stream in streams {
+            if let Some(last_sequence) = self.frame_plane.latest_sequence(&stream.stream_id).await?
             {
-                attempt.state = AttemptState::Expired;
-                attempt.finished_at_ms = Some(now_ms);
-                self.state_store.update_attempt(attempt).await?;
-            }
-
-            if let Some(mut job) = self.state_store.get_job(&lease.job_id).await? {
-                if job.state.is_terminal() {
-                    continue;
+                if last_sequence > stream.last_sequence {
+                    stream.last_sequence = last_sequence;
+                    self.state_store.update_stream(stream.clone()).await?;
                 }
-
-                job.state = JobState::Pending;
-                job.lease_id = None;
-                job.current_attempt_id = None;
-                job.updated_at_ms = now_ms;
-                job.version += 1;
-                self.state_store.update_job(job.clone()).await?;
-                self.state_store
-                    .append_job_event(
-                        &job.job_id,
-                        EventKind::LeaseExpired,
-                        Vec::new(),
-                        BTreeMap::from([("lease_id".to_string(), lease.lease_id.clone())]),
-                        now_ms,
-                    )
-                    .await?;
-                self.state_store
-                    .append_job_event(
-                        &job.job_id,
-                        EventKind::Requeued,
-                        Vec::new(),
-                        Attributes::new(),
-                        now_ms,
-                    )
-                    .await?;
             }
+            self.frame_plane.stream_updated(&stream).await?;
+            self.publish_job_streams_best_effort(&stream.job_id).await;
         }
         Ok(())
+    }
+
+    async fn publish_job_events_best_effort(&self, job_id: &str) {
+        let _ = self.notifier.publish_job_events(job_id).await;
+    }
+
+    async fn publish_job_streams_best_effort(&self, job_id: &str) {
+        let _ = self.notifier.publish_job_streams(job_id).await;
+    }
+
+    async fn publish_transition_best_effort<T>(&self, transition: &StateTransition<T>) {
+        for job_id in &transition.job_event_updates {
+            self.publish_job_events_best_effort(job_id).await;
+        }
+        for job_id in &transition.job_stream_updates {
+            self.publish_job_streams_best_effort(job_id).await;
+        }
     }
 }
 
@@ -904,21 +771,25 @@ mod tests {
     use std::time::Duration;
 
     use super::Kernel;
+    use crate::frame::MemoryFramePlane;
     use crate::model::{
         Attributes, EventKind, ExecutionPolicy, FrameKind, JobSpec, JobState, StreamDirection,
         StreamScope, WorkerSpec,
     };
+    use crate::notify::NoopClusterNotifier;
     use crate::scheduler::BasicScheduler;
-    use crate::store::{MemoryStateStore, MemoryStreamStore};
+    use crate::store::MemoryStateStore;
 
     #[tokio::test]
     async fn failed_retryable_lease_is_requeued() {
         let kernel = Kernel::new(
             Arc::new(MemoryStateStore::new()),
-            Arc::new(MemoryStreamStore::new()),
+            Arc::new(MemoryFramePlane::new()),
+            Arc::new(NoopClusterNotifier),
             Arc::new(BasicScheduler),
             30,
             30,
+            250,
         );
 
         let job = kernel
@@ -974,10 +845,12 @@ mod tests {
     async fn list_jobs_returns_most_recently_updated_first() {
         let kernel = Kernel::new(
             Arc::new(MemoryStateStore::new()),
-            Arc::new(MemoryStreamStore::new()),
+            Arc::new(MemoryFramePlane::new()),
+            Arc::new(NoopClusterNotifier),
             Arc::new(BasicScheduler),
             30,
             30,
+            250,
         );
 
         let first = kernel
@@ -1015,10 +888,12 @@ mod tests {
     async fn cancelling_leased_job_cancels_attempt_and_closes_streams() {
         let kernel = Kernel::new(
             Arc::new(MemoryStateStore::new()),
-            Arc::new(MemoryStreamStore::new()),
+            Arc::new(MemoryFramePlane::new()),
+            Arc::new(NoopClusterNotifier),
             Arc::new(BasicScheduler),
             30,
             30,
+            250,
         );
 
         let job = kernel
@@ -1075,10 +950,12 @@ mod tests {
     async fn stream_frames_can_be_written_and_read() {
         let kernel = Kernel::new(
             Arc::new(MemoryStateStore::new()),
-            Arc::new(MemoryStreamStore::new()),
+            Arc::new(MemoryFramePlane::new()),
+            Arc::new(NoopClusterNotifier),
             Arc::new(BasicScheduler),
             30,
             30,
+            250,
         );
         kernel
             .submit_job(

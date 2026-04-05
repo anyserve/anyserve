@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use anyserve_client::{
-    AnyserveClient, EventKind, FrameKind, FrameWrite, JobRecord, StreamDirection, StreamOpen,
-    WorkerRegistration,
+    AnyserveClient, EventKind, FrameKind, FrameWrite, JobRecord, ObjectRef, StreamDirection,
+    StreamOpen, WorkerRegistration, object_ref,
 };
 use clap::Args;
 use futures::StreamExt;
@@ -407,6 +407,7 @@ async fn process_grant(
         )
         .await?;
 
+    let mut persisted_output = Vec::new();
     if content_type.contains("text/event-stream") {
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -414,6 +415,7 @@ async fn process_grant(
             if chunk.is_empty() {
                 continue;
             }
+            persisted_output.extend_from_slice(&chunk);
             client
                 .push_frames(
                     output_stream.stream_id.clone(),
@@ -433,6 +435,7 @@ async fn process_grant(
             .bytes()
             .await
             .context("read upstream response body")?;
+        persisted_output = body.to_vec();
         client
             .push_frames(
                 output_stream.stream_id.clone(),
@@ -444,9 +447,11 @@ async fn process_grant(
                 ],
                 Some(worker_id.to_string()),
                 Some(lease_id.clone()),
-            )
-            .await?;
+        )
+        .await?;
     }
+
+    let outputs = persisted_outputs(&content_type, persisted_output);
 
     client
         .close_stream(
@@ -469,7 +474,7 @@ async fn process_grant(
         )
         .await?;
     client
-        .complete_lease(worker_id.to_string(), lease_id, Vec::new(), HashMap::new())
+        .complete_lease(worker_id.to_string(), lease_id, outputs, HashMap::new())
         .await?;
 
     Ok(())
@@ -540,9 +545,21 @@ fn truncate(value: &str, limit: usize) -> String {
     chars.into_iter().take(limit).collect::<String>()
 }
 
+fn persisted_outputs(content_type: &str, payload: Vec<u8>) -> Vec<ObjectRef> {
+    if payload.is_empty() {
+        return Vec::new();
+    }
+
+    vec![ObjectRef {
+        reference: Some(object_ref::Reference::Inline(payload)),
+        metadata: HashMap::from([("content_type".to_string(), content_type.to_string())]),
+    }]
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{available_capacity, truncate, upstream_path};
+    use super::{available_capacity, persisted_outputs, truncate, upstream_path};
+    use anyserve_client::object_ref;
     use std::collections::HashMap;
 
     #[test]
@@ -561,5 +578,19 @@ mod tests {
     #[test]
     fn truncate_keeps_short_values() {
         assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn persisted_outputs_store_inline_payload_and_content_type() {
+        let outputs = persisted_outputs("application/json", br#"{"ok":true}"#.to_vec());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].reference,
+            Some(object_ref::Reference::Inline(br#"{"ok":true}"#.to_vec()))
+        );
+        assert_eq!(
+            outputs[0].metadata.get("content_type").map(String::as_str),
+            Some("application/json")
+        );
     }
 }

@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use anyserve_core::frame::MemoryFramePlane;
 use anyserve_core::kernel::Kernel;
+use anyserve_core::notify::NoopClusterNotifier;
 use anyserve_core::scheduler::BasicScheduler;
 use anyserve_core::service::ControlPlaneGrpcService;
-use anyserve_core::store::{MemoryStateStore, MemoryStreamStore};
+use anyserve_core::store::MemoryStateStore;
 use anyserve_proto::controlplane::control_plane_service_client::ControlPlaneServiceClient;
 use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
 use anyserve_proto::controlplane::{
@@ -36,10 +38,12 @@ async fn spawn_server() -> Result<(
 
     let kernel = Arc::new(Kernel::new(
         Arc::new(MemoryStateStore::new()),
-        Arc::new(MemoryStreamStore::new()),
+        Arc::new(MemoryFramePlane::new()),
+        Arc::new(NoopClusterNotifier),
         Arc::new(BasicScheduler),
         30,
         30,
+        250,
     ));
     let service = ControlPlaneGrpcService::new(kernel);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

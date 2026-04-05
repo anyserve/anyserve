@@ -1,8 +1,18 @@
 # anyserve
 
-Anyserve is a zero-dependency control plane for generic distributed execution.
+Hosted endpoint. Your workers.
 
-It does not assume LLM, image, or any other workload category at the core layer.
+Anyserve gives you a production-grade inference entry point in front of your own workers.
+
+The clearest way to understand it is simple:
+
+- Anyserve owns the public endpoint, auth, and routing layer
+- you own the workers, models, and inference backends
+- requests hit Anyserve first, then get scheduled onto your worker pool
+
+Underneath that product surface, Anyserve is a Rust-first, workload-neutral control
+plane for distributed execution. It does not hard-code LLM, image, or any single
+workload category into the core runtime.
 
 ## Core Model
 
@@ -62,16 +72,16 @@ Workers advertise supply through the same generic model, and the control plane i
 - attempt tracking per lease assignment
 - event streaming per job
 - generic stream/frame data plane for client and worker IO
-- first-class Rust client crate, Rust demo apps, and Rust-backed Python bindings
+- first-class Rust client crate, Rust sample apps, and Rust-backed Python bindings
 
-## Workspace
+## Repository Layout
 
 - `crates/anyserve-client`: first-class Rust client for the control-plane gRPC API
 - `crates/anyserve-proto`: protobuf and tonic bindings
 - `crates/anyserve-core`: domain model, in-memory state store, scheduler, kernel, and gRPC service
 - `crates/anyserve-cli`: the `anyserve` binary
-- `examples/rust`: demo submitter / worker apps that exercise the Rust client crate
-- `examples/python`: demo submitter / worker scripts that exercise the Python SDK
+- `examples/rust`: sample submitter / worker apps that exercise the Rust client crate
+- `examples/python`: sample submitter / worker scripts that exercise the Python SDK
 - `clients/python`: Rust-exported Python bindings via `PyO3` and `maturin`
 - `docs`: mdBook documentation
 
@@ -162,13 +172,13 @@ Treat the checked-in example docs as the canonical walkthrough:
 
 The worker expects an OpenAI-compatible upstream at the configured `base_url`, for example Ollama, SGLang, or vLLM.
 
-Start a demo worker:
+Start the sample worker:
 
 ```bash
 mise exec -- cargo run -p anyserve-demo -- --mode worker
 ```
 
-Submit a demo job and watch its events:
+Submit a sample job and watch its events:
 
 ```bash
 mise exec -- cargo run -p anyserve-demo -- --mode submit
@@ -193,7 +203,7 @@ python examples/python/submit.py
 # mise exec -- python examples/python/submit.py
 ```
 
-The demo path now uses both control-plane and data-plane APIs:
+The sample path now uses both control-plane and data-plane APIs:
 
 - it submits a `Job`
 - opens `input.default`

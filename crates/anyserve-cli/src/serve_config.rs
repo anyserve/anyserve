@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 pub const DEFAULT_HEARTBEAT_TTL_SECS: u64 = 30;
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 30;
+pub const DEFAULT_WATCH_POLL_INTERVAL_MS: u64 = 250;
+pub const DEFAULT_CLOSED_RETENTION_SECS: u64 = 300;
 const DEFAULT_OPENAI_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_CHAT_INTERFACE: &str = "llm.chat.v1";
 const DEFAULT_EMBEDDINGS_INTERFACE: &str = "llm.embed.v1";
@@ -32,7 +34,36 @@ pub struct ResolvedServeConfig {
     pub grpc: GrpcConfig,
     pub heartbeat_ttl_secs: u64,
     pub default_lease_ttl_secs: u64,
+    pub storage: StorageConfig,
+    pub frames: FrameConfig,
     pub openai: Option<ServeOpenAIConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageBackend {
+    Memory,
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StorageConfig {
+    pub backend: StorageBackend,
+    pub dsn: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameBackend {
+    Memory,
+    Redis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameConfig {
+    pub backend: FrameBackend,
+    pub redis_url: Option<String>,
+    pub closed_retention_secs: u64,
+    pub watch_poll_interval_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +90,16 @@ impl ResolvedServeConfig {
             .as_ref()
             .and_then(|config| config.server.as_ref());
         let tls = server.and_then(|server| server.tls.as_ref());
+        let storage = server
+            .and_then(|server| server.storage.as_ref())
+            .cloned()
+            .unwrap_or_default()
+            .resolve()?;
+        let frames = server
+            .and_then(|server| server.frames.as_ref())
+            .cloned()
+            .unwrap_or_default()
+            .resolve(storage.backend)?;
         let grpc = GrpcConfig {
             host: overrides
                 .grpc_host
@@ -91,6 +132,8 @@ impl ResolvedServeConfig {
                 .default_lease_ttl_secs
                 .or_else(|| server.and_then(|server| server.default_lease_ttl_secs))
                 .unwrap_or(DEFAULT_LEASE_TTL_SECS),
+            storage,
+            frames,
             openai: file_config
                 .as_ref()
                 .and_then(|config| config.openai.as_ref())
@@ -128,7 +171,97 @@ struct ServerConfigFile {
     #[serde(default)]
     default_lease_ttl_secs: Option<u64>,
     #[serde(default)]
+    storage: Option<StorageConfigFile>,
+    #[serde(default)]
+    frames: Option<FrameConfigFile>,
+    #[serde(default)]
     tls: Option<TlsConfigFile>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct StorageConfigFile {
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    dsn: Option<String>,
+}
+
+impl StorageConfigFile {
+    fn resolve(self) -> Result<StorageConfig> {
+        let backend = match self.backend.as_deref().unwrap_or("memory") {
+            "memory" => StorageBackend::Memory,
+            "sqlite" => StorageBackend::Sqlite,
+            "postgres" => StorageBackend::Postgres,
+            other => anyhow::bail!("unsupported storage backend '{other}'"),
+        };
+        if matches!(backend, StorageBackend::Sqlite | StorageBackend::Postgres)
+            && self.dsn.is_none()
+        {
+            anyhow::bail!("storage.dsn is required for non-memory backends");
+        }
+        Ok(StorageConfig {
+            backend,
+            dsn: self.dsn,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct FrameConfigFile {
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    redis_url: Option<String>,
+    #[serde(default)]
+    closed_retention_secs: Option<u64>,
+    #[serde(default)]
+    watch_poll_interval_ms: Option<u64>,
+}
+
+impl FrameConfigFile {
+    fn resolve(self, storage_backend: StorageBackend) -> Result<FrameConfig> {
+        let backend = match self.backend.as_deref() {
+            Some("memory") => FrameBackend::Memory,
+            Some("redis") => FrameBackend::Redis,
+            Some(other) => anyhow::bail!("unsupported frames backend '{other}'"),
+            None => {
+                if storage_backend == StorageBackend::Postgres {
+                    FrameBackend::Redis
+                } else {
+                    FrameBackend::Memory
+                }
+            }
+        };
+        if backend == FrameBackend::Redis && self.redis_url.is_none() {
+            anyhow::bail!("frames.redis_url is required when frames.backend = 'redis'");
+        }
+        match (storage_backend, backend) {
+            (StorageBackend::Memory, FrameBackend::Memory)
+            | (StorageBackend::Sqlite, FrameBackend::Memory)
+            | (StorageBackend::Postgres, FrameBackend::Redis) => {}
+            (StorageBackend::Memory, FrameBackend::Redis) => {
+                anyhow::bail!("memory storage only supports frames.backend = 'memory'")
+            }
+            (StorageBackend::Sqlite, FrameBackend::Redis) => {
+                anyhow::bail!("sqlite storage only supports frames.backend = 'memory'")
+            }
+            (StorageBackend::Postgres, FrameBackend::Memory) => {
+                anyhow::bail!("postgres storage requires frames.backend = 'redis'")
+            }
+        }
+        Ok(FrameConfig {
+            backend,
+            redis_url: self.redis_url,
+            closed_retention_secs: self
+                .closed_retention_secs
+                .unwrap_or(DEFAULT_CLOSED_RETENTION_SECS),
+            watch_poll_interval_ms: self
+                .watch_poll_interval_ms
+                .unwrap_or(DEFAULT_WATCH_POLL_INTERVAL_MS),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -226,7 +359,8 @@ impl DemandConfigFile {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_HEARTBEAT_TTL_SECS, DEFAULT_LEASE_TTL_SECS, ResolvedServeConfig, ServeOverrides,
+        DEFAULT_HEARTBEAT_TTL_SECS, DEFAULT_LEASE_TTL_SECS, DEFAULT_WATCH_POLL_INTERVAL_MS,
+        FrameBackend, ResolvedServeConfig, ServeOverrides, StorageBackend,
     };
     use std::fs;
 
@@ -251,6 +385,12 @@ mod tests {
         assert!(resolved.openai.is_none());
         assert_eq!(resolved.heartbeat_ttl_secs, DEFAULT_HEARTBEAT_TTL_SECS);
         assert_eq!(resolved.default_lease_ttl_secs, DEFAULT_LEASE_TTL_SECS);
+        assert_eq!(resolved.storage.backend, StorageBackend::Memory);
+        assert_eq!(resolved.frames.backend, FrameBackend::Memory);
+        assert_eq!(
+            resolved.frames.watch_poll_interval_ms,
+            DEFAULT_WATCH_POLL_INTERVAL_MS
+        );
     }
 
     #[test]
@@ -363,6 +503,129 @@ provider = "ollama"
                 .get("provider")
                 .map(String::as_str),
             Some("ollama")
+        );
+    }
+
+    #[test]
+    fn postgres_storage_defaults_to_redis_frames() {
+        let path = temp_file_path("postgres-redis");
+        fs::write(
+            &path,
+            r#"
+[server.storage]
+backend = "postgres"
+dsn = "postgres://example:anyserve@localhost/anyserve"
+
+[server.frames]
+redis_url = "redis://127.0.0.1:6379"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedServeConfig::load(ServeOverrides {
+            config: Some(path.clone()),
+            ..ServeOverrides::default()
+        })
+        .unwrap();
+
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(resolved.storage.backend, StorageBackend::Postgres);
+        assert_eq!(resolved.frames.backend, FrameBackend::Redis);
+        assert_eq!(
+            resolved.frames.redis_url.as_deref(),
+            Some("redis://127.0.0.1:6379")
+        );
+    }
+
+    #[test]
+    fn memory_storage_rejects_redis_frames() {
+        let path = temp_file_path("memory-redis-invalid");
+        fs::write(
+            &path,
+            r#"
+[server.frames]
+backend = "redis"
+redis_url = "redis://127.0.0.1:6379"
+"#,
+        )
+        .unwrap();
+
+        let error = ResolvedServeConfig::load(ServeOverrides {
+            config: Some(path.clone()),
+            ..ServeOverrides::default()
+        })
+        .unwrap_err();
+
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("memory storage only supports frames.backend = 'memory'")
+        );
+    }
+
+    #[test]
+    fn sqlite_storage_rejects_redis_frames() {
+        let path = temp_file_path("sqlite-redis-invalid");
+        fs::write(
+            &path,
+            r#"
+[server.storage]
+backend = "sqlite"
+dsn = "sqlite:///tmp/anyserve.db"
+
+[server.frames]
+backend = "redis"
+redis_url = "redis://127.0.0.1:6379"
+"#,
+        )
+        .unwrap();
+
+        let error = ResolvedServeConfig::load(ServeOverrides {
+            config: Some(path.clone()),
+            ..ServeOverrides::default()
+        })
+        .unwrap_err();
+
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("sqlite storage only supports frames.backend = 'memory'")
+        );
+    }
+
+    #[test]
+    fn postgres_storage_rejects_memory_frames() {
+        let path = temp_file_path("postgres-memory-invalid");
+        fs::write(
+            &path,
+            r#"
+[server.storage]
+backend = "postgres"
+dsn = "postgres://example:anyserve@localhost/anyserve"
+
+[server.frames]
+backend = "memory"
+"#,
+        )
+        .unwrap();
+
+        let error = ResolvedServeConfig::load(ServeOverrides {
+            config: Some(path.clone()),
+            ..ServeOverrides::default()
+        })
+        .unwrap_err();
+
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            error
+                .to_string()
+                .contains("postgres storage requires frames.backend = 'redis'")
         );
     }
 }

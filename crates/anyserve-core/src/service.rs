@@ -8,6 +8,7 @@ use anyserve_proto::controlplane::{
 };
 use async_stream::try_stream;
 use futures::{Stream, StreamExt};
+use tokio::time::{Duration, sleep};
 use tonic::{Request, Response, Status};
 
 use crate::kernel::{Kernel, OpenStreamCommand};
@@ -71,7 +72,12 @@ impl ControlPlaneService for ControlPlaneGrpcService {
         let job_id = request.job_id;
         let stream = try_stream! {
             let mut cursor = request.after_sequence;
-            let mut updates = kernel.subscribe_job_events(&job_id).await.map_err(to_status)?;
+            let mut local_updates = kernel.subscribe_job_events(&job_id).await.map_err(to_status)?;
+            let mut cluster_updates = kernel
+                .subscribe_cluster_job_events(&job_id)
+                .await
+                .map_err(to_status)?;
+            let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
 
             loop {
                 let events = kernel.watch_job(&job_id, cursor).await.map_err(to_status)?;
@@ -92,8 +98,18 @@ impl ControlPlaneService for ControlPlaneGrpcService {
                     break;
                 }
 
-                if updates.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    result = local_updates.changed() => {
+                        if result.is_err() {
+                            sleep(poll_interval).await;
+                        }
+                    }
+                    result = cluster_updates.changed() => {
+                        if result.is_err() {
+                            sleep(poll_interval).await;
+                        }
+                    }
+                    _ = sleep(poll_interval) => {}
                 }
             }
         };
@@ -503,10 +519,7 @@ impl ControlPlaneService for ControlPlaneGrpcService {
         let follow = request.follow;
         let stream = try_stream! {
             let mut cursor = request.after_sequence;
-            let mut updates = kernel
-                .subscribe_stream_updates(&stream_id)
-                .await
-                .map_err(to_status)?;
+            let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
 
             loop {
                 let frames = kernel.pull_frames(&stream_id, cursor).await.map_err(to_status)?;
@@ -515,7 +528,10 @@ impl ControlPlaneService for ControlPlaneGrpcService {
                     yield frame_to_proto(frame);
                 }
 
-                let stream = kernel.get_stream(&stream_id).await.map_err(to_status)?;
+                let stream = kernel
+                    .get_stream_metadata(&stream_id)
+                    .await
+                    .map_err(to_status)?;
                 if !follow || stream.state.is_terminal() {
                     let remaining = kernel.pull_frames(&stream_id, cursor).await.map_err(to_status)?;
                     if remaining.is_empty() {
@@ -527,8 +543,13 @@ impl ControlPlaneService for ControlPlaneGrpcService {
                     break;
                 }
 
-                if updates.changed().await.is_err() {
-                    break;
+                let waited = kernel
+                    .wait_for_frames(&stream_id, cursor, poll_interval)
+                    .await
+                    .map_err(to_status)?;
+                for frame in waited {
+                    cursor = frame.sequence;
+                    yield frame_to_proto(frame);
                 }
             }
         };

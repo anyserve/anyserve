@@ -3,19 +3,14 @@ use std::cmp::Reverse;
 use crate::model::{Capacity, JobRecord, JobState, WorkerRecord};
 
 pub trait Scheduler: Send + Sync {
-    fn select_job_for_worker(&self, worker: &WorkerRecord, jobs: &[JobRecord])
-    -> Option<JobRecord>;
+    fn ordered_jobs_for_worker(&self, worker: &WorkerRecord, jobs: &[JobRecord]) -> Vec<JobRecord>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct BasicScheduler;
 
 impl Scheduler for BasicScheduler {
-    fn select_job_for_worker(
-        &self,
-        worker: &WorkerRecord,
-        jobs: &[JobRecord],
-    ) -> Option<JobRecord> {
+    fn ordered_jobs_for_worker(&self, worker: &WorkerRecord, jobs: &[JobRecord]) -> Vec<JobRecord> {
         let mut candidates: Vec<JobRecord> = jobs
             .iter()
             .filter(|job| job.state == JobState::Pending)
@@ -40,7 +35,7 @@ impl Scheduler for BasicScheduler {
             )
         });
 
-        candidates.into_iter().next()
+        candidates
     }
 }
 
@@ -125,8 +120,8 @@ mod tests {
             ..JobRecord::default()
         };
 
-        let selected = BasicScheduler.select_job_for_worker(&worker, std::slice::from_ref(&job));
+        let selected = BasicScheduler.ordered_jobs_for_worker(&worker, std::slice::from_ref(&job));
 
-        assert_eq!(selected, Some(job));
+        assert_eq!(selected, vec![job]);
     }
 }

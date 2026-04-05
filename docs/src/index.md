@@ -1,6 +1,8 @@
 # Anyserve
 
-Anyserve is a Rust-first control plane for generic distributed execution.
+Hosted endpoint. Your workers.
+
+Anyserve is a Rust-first, workload-neutral control plane for distributed execution.
 
 The core model is intentionally workload-neutral:
 
@@ -24,3 +26,13 @@ The runtime surface is pure gRPC:
 - gRPC health service
 
 Examples may still use endpoint strings such as `http://127.0.0.1:50052`. In this codebase that is a gRPC channel URI for the client transport, not a REST API base URL.
+
+## Production Surface
+
+The kernel stays generic, but the production surface should feel concrete:
+
+- create a production-grade inference endpoint in front of your own workers
+- start with a single-region quickstart
+- hide the scheduling internals behind an endpoint, API key, worker connect flow, and dashboard
+
+See [Create Gateway](create-gateway.md) for the concrete production surface and dashboard shape.

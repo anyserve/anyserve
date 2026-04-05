@@ -14,9 +14,9 @@ mise install
 mise run build
 ```
 
-## Example-First Workflow
+## Fastest Local Workflow
 
-The checked-in examples are the main usage docs.
+The checked-in LLM stack is the fastest way to understand the production gateway shape.
 
 For the built-in OpenAI-compatible gateway and LLM worker, start here:
 
@@ -40,6 +40,17 @@ That example exposes:
 
 Keep the detailed commands, config explanation, and current behavior notes in the example README so they only need to be updated in one place.
 
+## Production Direction
+
+If you want the clearest production-facing entry point for Anyserve, read [Create Gateway](create-gateway.md).
+
+That page defines the recommended first shape:
+
+- create a hosted endpoint
+- connect your own workers
+- send requests through Anyserve
+- expand to richer routing only after the first request succeeds
+
 ## Start the Control Plane
 
 ```bash
@@ -56,7 +67,7 @@ CLI flags override the config file if you provide both.
 
 The gRPC health service is available on the same port as gRPC. Example endpoint strings like `http://127.0.0.1:50052` are gRPC channel URIs, not REST endpoints.
 
-## Run the Demo Worker
+## Run the Sample Worker
 
 ```bash
 mise exec -- cargo run -p anyserve-demo -- --mode worker
@@ -76,13 +87,13 @@ Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
 curl http://127.0.0.1:8080/v1/models
 ```
 
-## Submit the Demo Job
+## Submit the Sample Job
 
 ```bash
 mise exec -- cargo run -p anyserve-demo -- --mode submit
 ```
 
-The demo client submits a job with:
+The sample client submits a job with:
 
 - `interface_name = demo.echo.v1`
 - `required_attributes = {"runtime": "demo"}`

@@ -47,13 +47,15 @@ against worker supply.
         +--------------------------------------------------+
         |                     Ports                        |
         |--------------------------------------------------|
-        | StateStore   StreamStore   Scheduler   ObjectStore |
+        | StateStore   FramePlane   Scheduler   ObjectStore |
         +--------+----------+------------+------------+------+
                  |          |            |            |
                  v          v            v            v
-              +------+   +------+    +------+     +--------+
-              |memory|   |memory|    |basic |     |inline  |
-              +------+   +------+    +------+     +--------+
+           +--------+  +--------+   +------+    +--------+
+           |memory /|  |memory /|   |basic |    |inline  |
+           |sqlite /|  |redis   |   +------+    +--------+
+           |postgres|  +--------+
+           +--------+
 ```
 
 ## Core Flow
@@ -72,15 +74,24 @@ against worker supply.
 ## Ports
 
 - `StateStore`
-  Default implementation: `MemoryStateStore`
-- `StreamStore`
-  Default implementation: `MemoryStreamStore`
+  Implementations: `MemoryStateStore`, `SqlStateStore`
+- `FramePlane`
+  Implementations: `MemoryFramePlane`, `RedisFramePlane`
 - `Scheduler`
   Default implementation: `BasicScheduler`
 - `ObjectStore`
   Default implementation: inline object references
 
 That is enough to keep v1 small, bootable, and easy to evolve.
+
+## Supported Runtime Modes
+
+- `memory + memory`
+  Single-process development mode. Control-plane state and frames are both ephemeral.
+- `sqlite + memory`
+  Single-machine mode. Durable control-plane state in SQLite, high-throughput frames stay in memory and do not survive restart.
+- `postgres + redis`
+  Multi-instance mode. Postgres is the durable control-plane source of truth, Redis carries shared frame traffic.
 
 ## Stable Core vs Future Plugins
 
