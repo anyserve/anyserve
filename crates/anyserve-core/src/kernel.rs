@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::frame::FramePlane;
@@ -21,6 +21,7 @@ pub struct Kernel {
     frame_plane: Arc<dyn FramePlane>,
     notifier: Arc<dyn ClusterNotifier>,
     scheduler: Arc<dyn Scheduler>,
+    stream_cache: Mutex<BTreeMap<String, StreamRecord>>,
     heartbeat_ttl_secs: u64,
     default_lease_ttl_secs: u64,
     watch_poll_interval_ms: u64,
@@ -53,6 +54,7 @@ impl Kernel {
             frame_plane,
             notifier,
             scheduler,
+            stream_cache: Mutex::new(BTreeMap::new()),
             heartbeat_ttl_secs,
             default_lease_ttl_secs,
             watch_poll_interval_ms,
@@ -255,29 +257,29 @@ impl Kernel {
             .await?;
         self.publish_transition_best_effort(&reaped).await;
 
-        let ordered_candidates =
-            if self.state_store.lease_dispatch_mode() == LeaseDispatchMode::KernelOrderedCandidates
-            {
-                let worker = self
-                    .state_store
-                    .get_worker(worker_id)
-                    .await?
-                    .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
-                if worker.expires_at_ms <= now_ms {
-                    bail!("worker '{}' heartbeat expired", worker_id);
-                }
+        let ordered_candidates = if self.state_store.lease_dispatch_mode()
+            == LeaseDispatchMode::KernelOrderedCandidates
+        {
+            let worker = self
+                .state_store
+                .get_worker(worker_id)
+                .await?
+                .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
+            if worker.expires_at_ms <= now_ms {
+                bail!("worker '{}' heartbeat expired", worker_id);
+            }
 
-                let jobs = self.state_store.list_pending_jobs().await?;
-                let ordered_candidates = self
-                    .scheduler
-                    .ordered_jobs_for_worker(&worker, jobs.as_slice());
-                if ordered_candidates.is_empty() {
-                    return Ok(None);
-                }
-                ordered_candidates
-            } else {
-                Vec::new()
-            };
+            let jobs = self.state_store.list_pending_jobs().await?;
+            let ordered_candidates = self
+                .scheduler
+                .ordered_jobs_for_worker(&worker, jobs.as_slice());
+            if ordered_candidates.is_empty() {
+                return Ok(None);
+            }
+            ordered_candidates
+        } else {
+            Vec::new()
+        };
 
         let assignment = self
             .state_store
@@ -436,6 +438,7 @@ impl Kernel {
         };
         self.state_store.create_stream(stream.clone()).await?;
         self.frame_plane.stream_created(&stream).await?;
+        self.cache_stream(&stream).await;
         self.publish_job_streams_best_effort(&stream.job_id).await;
         Ok(stream)
     }
@@ -461,6 +464,7 @@ impl Kernel {
                 stream.last_sequence = last_sequence;
             }
         }
+        self.cache_streams(&streams).await;
         Ok(streams)
     }
 
@@ -495,6 +499,8 @@ impl Kernel {
         stream.metadata.extend(metadata);
         self.state_store.update_stream(stream.clone()).await?;
         self.frame_plane.stream_updated(&stream).await?;
+        self.cache_stream(&stream).await;
+        self.persist_default_input_stream(&stream).await?;
         self.publish_job_streams_best_effort(&stream.job_id).await;
         Ok(stream)
     }
@@ -524,6 +530,8 @@ impl Kernel {
                 stream.last_sequence = frame.sequence;
                 self.state_store.update_stream(stream.clone()).await?;
                 self.frame_plane.stream_updated(&stream).await?;
+                self.cache_stream(&stream).await;
+                self.persist_default_input_stream(&stream).await?;
                 self.publish_job_streams_best_effort(&stream.job_id).await;
             }
             FrameKind::Error => {
@@ -532,6 +540,7 @@ impl Kernel {
                 stream.last_sequence = frame.sequence;
                 self.state_store.update_stream(stream.clone()).await?;
                 self.frame_plane.stream_updated(&stream).await?;
+                self.cache_stream(&stream).await;
                 self.publish_job_streams_best_effort(&stream.job_id).await;
             }
             _ => {}
@@ -564,11 +573,76 @@ impl Kernel {
         Ok(self.frame_plane.subscribe_stream_updates(stream_id).await)
     }
 
-    async fn load_stream_record(&self, stream_id: &str) -> Result<StreamRecord> {
+    pub async fn persist_job_inputs(&self, job_id: &str, inputs: Vec<ObjectRef>) -> Result<()> {
         self.state_store
+            .persist_job_inputs(job_id, inputs, now_ms())
+            .await
+    }
+
+    async fn load_stream_record(&self, stream_id: &str) -> Result<StreamRecord> {
+        if let Some(stream) = self.stream_cache.lock().await.get(stream_id).cloned() {
+            return Ok(stream);
+        }
+
+        let stream = self
+            .state_store
             .get_stream(stream_id)
             .await?
-            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))
+            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))?;
+        self.cache_stream(&stream).await;
+        Ok(stream)
+    }
+
+    async fn cache_stream(&self, stream: &StreamRecord) {
+        self.stream_cache
+            .lock()
+            .await
+            .insert(stream.stream_id.clone(), stream.clone());
+    }
+
+    async fn cache_streams(&self, streams: &[StreamRecord]) {
+        let mut cache = self.stream_cache.lock().await;
+        for stream in streams {
+            cache.insert(stream.stream_id.clone(), stream.clone());
+        }
+    }
+
+    async fn persist_default_input_stream(&self, stream: &StreamRecord) -> Result<()> {
+        if stream.stream_name != "input.default"
+            || stream.direction != StreamDirection::ClientToWorker
+            || !stream.state.is_terminal()
+        {
+            return Ok(());
+        }
+
+        let frames = self.frame_plane.frames_after(&stream.stream_id, 0).await?;
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        let mut payload = Vec::new();
+        let mut metadata = stream.metadata.clone();
+        for frame in frames {
+            if frame.kind == FrameKind::Data {
+                if metadata.is_empty() && !frame.metadata.is_empty() {
+                    metadata = frame.metadata.clone();
+                }
+                payload.extend(frame.payload);
+            }
+        }
+
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        self.persist_job_inputs(
+            &stream.job_id,
+            vec![ObjectRef::Inline {
+                content: payload,
+                metadata,
+            }],
+        )
+        .await
     }
 
     async fn require_lease(&self, worker_id: &str, lease_id: &str) -> Result<LeaseRecord> {
@@ -718,6 +792,7 @@ impl Kernel {
                 }
             }
             self.frame_plane.stream_updated(&stream).await?;
+            self.cache_stream(&stream).await;
             self.publish_job_streams_best_effort(&stream.job_id).await;
         }
         Ok(())

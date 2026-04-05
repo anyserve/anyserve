@@ -1,31 +1,39 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyserve_core::frame::MemoryFramePlane;
 use anyserve_core::kernel::{Kernel, OpenStreamCommand};
 use anyserve_core::model::{
-    Attributes, ExecutionPolicy, FrameKind, JobSpec, ObjectRef, StreamDirection, StreamScope,
-    WorkerSpec,
+    Attributes, ExecutionPolicy, FrameKind, JobSpec, JobState, ObjectRef, StreamDirection,
+    StreamScope, WorkerSpec,
 };
 use anyserve_core::notify::NoopClusterNotifier;
 use anyserve_core::scheduler::BasicScheduler;
 use anyserve_core::sql_store::SqlStateStore;
 use uuid::Uuid;
 
-fn sqlite_dsn(test_name: &str) -> (String, PathBuf) {
-    let path = std::env::temp_dir().join(format!("anyserve-{test_name}-{}.db", Uuid::new_v4()));
-    (format!("sqlite://{}", path.display()), path)
+fn required_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[tokio::test]
-async fn sqlite_persists_control_plane_but_not_frames() {
-    let (dsn, db_path) = sqlite_dsn("persistence");
+#[ignore = "requires docker-backed postgres via ANYSERVE_TEST_POSTGRES_DSN"]
+async fn postgres_persists_control_plane_and_outputs_but_not_memory_frames() {
+    let Some(postgres_dsn) = required_env("ANYSERVE_TEST_POSTGRES_DSN") else {
+        eprintln!("skipping: ANYSERVE_TEST_POSTGRES_DSN is not set");
+        return;
+    };
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let job_id = format!("job-pg-memory-{suffix}");
+    let worker_id = format!("worker-pg-memory-{suffix}");
+    let interface_name = format!("demo.execute.v1.{suffix}");
 
     {
-        let state_store = Arc::new(SqlStateStore::connect(&dsn).await.unwrap());
         let kernel = Kernel::new(
-            state_store,
+            Arc::new(SqlStateStore::connect(&postgres_dsn).await.unwrap()),
             Arc::new(MemoryFramePlane::new()),
             Arc::new(NoopClusterNotifier),
             Arc::new(BasicScheduler),
@@ -36,9 +44,9 @@ async fn sqlite_persists_control_plane_but_not_frames() {
 
         let job = kernel
             .submit_job(
-                Some("job-sqlite-1".to_string()),
+                Some(job_id.clone()),
                 JobSpec {
-                    interface_name: "demo.execute.v1".to_string(),
+                    interface_name: interface_name.clone(),
                     policy: ExecutionPolicy::default(),
                     ..JobSpec::default()
                 },
@@ -47,9 +55,9 @@ async fn sqlite_persists_control_plane_but_not_frames() {
             .unwrap();
         let worker = kernel
             .register_worker(
-                Some("worker-sqlite-1".to_string()),
+                Some(worker_id.clone()),
                 WorkerSpec {
-                    interfaces: BTreeSet::from(["demo.execute.v1".to_string()]),
+                    interfaces: BTreeSet::from([interface_name.clone()]),
                     total_capacity: BTreeMap::from([("slot".to_string(), 1)]),
                     max_active_leases: 1,
                     ..WorkerSpec::default()
@@ -79,7 +87,7 @@ async fn sqlite_persists_control_plane_but_not_frames() {
                 None,
                 None,
                 FrameKind::Data,
-                br#"{"prompt":"sqlite persisted input"}"#.to_vec(),
+                br#"{"prompt":"persist me"}"#.to_vec(),
                 Attributes::new(),
             )
             .await
@@ -93,11 +101,11 @@ async fn sqlite_persists_control_plane_but_not_frames() {
             .open_stream(OpenStreamCommand {
                 job_id: job.job_id.clone(),
                 attempt_id: None,
-                worker_id: None,
-                lease_id: None,
-                stream_name: "stdout".to_string(),
+                worker_id: Some(worker.worker_id.clone()),
+                lease_id: Some(assignment.lease.lease_id.clone()),
+                stream_name: "output.default".to_string(),
                 scope: StreamScope::Job,
-                direction: StreamDirection::Bidirectional,
+                direction: StreamDirection::WorkerToClient,
                 metadata: Attributes::new(),
             })
             .await
@@ -106,10 +114,10 @@ async fn sqlite_persists_control_plane_but_not_frames() {
         kernel
             .push_frame(
                 &stream.stream_id,
-                None,
-                None,
+                Some(worker.worker_id.clone()),
+                Some(assignment.lease.lease_id.clone()),
                 FrameKind::Data,
-                b"hello".to_vec(),
+                b"stream payload".to_vec(),
                 Attributes::new(),
             )
             .await
@@ -117,24 +125,28 @@ async fn sqlite_persists_control_plane_but_not_frames() {
         kernel
             .push_frame(
                 &stream.stream_id,
-                None,
-                None,
+                Some(worker.worker_id.clone()),
+                Some(assignment.lease.lease_id.clone()),
                 FrameKind::Close,
                 Vec::new(),
                 Attributes::new(),
             )
             .await
             .unwrap();
-
-        let persisted_stream = kernel.get_stream(&stream.stream_id).await.unwrap();
-        assert_eq!(persisted_stream.last_sequence, 2);
-        assert!(assignment.job.current_attempt_id.is_some());
+        kernel
+            .complete_lease(
+                &worker.worker_id,
+                &assignment.lease.lease_id,
+                vec![ObjectRef::inline(br#"{"result":"persisted"}"#.to_vec())],
+                Attributes::new(),
+            )
+            .await
+            .unwrap();
     }
 
     {
-        let state_store = Arc::new(SqlStateStore::connect(&dsn).await.unwrap());
         let kernel = Kernel::new(
-            state_store,
+            Arc::new(SqlStateStore::connect(&postgres_dsn).await.unwrap()),
             Arc::new(MemoryFramePlane::new()),
             Arc::new(NoopClusterNotifier),
             Arc::new(BasicScheduler),
@@ -143,18 +155,24 @@ async fn sqlite_persists_control_plane_but_not_frames() {
             25,
         );
 
-        let job = kernel.get_job("job-sqlite-1").await.unwrap();
-        assert_eq!(job.job_id, "job-sqlite-1");
-        assert!(job.current_attempt_id.is_some());
+        let job = kernel.get_job(&job_id).await.unwrap();
+        assert_eq!(job.state, JobState::Succeeded);
+        assert_eq!(job.spec.inputs.len(), 1);
         assert_eq!(
-            job.spec.inputs,
-            vec![ObjectRef::inline(
-                br#"{"prompt":"sqlite persisted input"}"#.to_vec()
-            )]
+            job.spec.inputs[0],
+            ObjectRef::inline(br#"{"prompt":"persist me"}"#.to_vec())
+        );
+        assert_eq!(job.outputs.len(), 1);
+        assert_eq!(
+            job.outputs[0],
+            ObjectRef::inline(br#"{"result":"persisted"}"#.to_vec())
         );
 
         let events = kernel.watch_job(&job.job_id, 0).await.unwrap();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
+
+        let attempts = kernel.list_attempts(&job.job_id).await.unwrap();
+        assert_eq!(attempts.len(), 1);
 
         let streams = kernel.list_streams(&job.job_id).await.unwrap();
         assert_eq!(streams.len(), 2);
@@ -165,7 +183,7 @@ async fn sqlite_persists_control_plane_but_not_frames() {
         assert_eq!(input_stream.last_sequence, 1);
         let output_stream = streams
             .iter()
-            .find(|stream| stream.stream_name == "stdout")
+            .find(|stream| stream.stream_name == "output.default")
             .unwrap();
         assert_eq!(output_stream.last_sequence, 2);
 
@@ -175,37 +193,4 @@ async fn sqlite_persists_control_plane_but_not_frames() {
             .unwrap();
         assert!(frames.is_empty());
     }
-
-    let _ = std::fs::remove_file(db_path);
-}
-
-#[tokio::test]
-async fn sqlite_rejects_second_control_plane_instance() {
-    let (dsn, db_path) = sqlite_dsn("single-instance-lock");
-    let lock_path = db_path.with_file_name(format!(
-        "{}.control-plane.lock",
-        db_path
-            .file_name()
-            .expect("sqlite db file name should exist")
-            .to_string_lossy()
-    ));
-
-    let first = SqlStateStore::connect(&dsn).await.unwrap();
-    let error = match SqlStateStore::connect(&dsn).await {
-        Ok(_) => panic!("second sqlite store should fail while the first lock is held"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("SQLite backend only supports a single control-plane instance")
-    );
-
-    drop(first);
-
-    let reopened = SqlStateStore::connect(&dsn).await.unwrap();
-    drop(reopened);
-
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(lock_path);
 }

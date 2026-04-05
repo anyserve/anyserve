@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::model::{
-    AttemptRecord, AttemptState, Attributes, EventKind, JobEvent, JobRecord, JobState,
+    AttemptRecord, AttemptState, Attributes, EventKind, JobEvent, JobRecord, JobSpec, JobState,
     LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
     StreamState, WorkerRecord,
 };
@@ -116,6 +116,7 @@ impl SqlStateStore {
                 job_id TEXT PRIMARY KEY,
                 state TEXT NOT NULL,
                 spec_json TEXT NOT NULL,
+                inputs_json TEXT NOT NULL,
                 outputs_json TEXT NOT NULL,
                 lease_id TEXT NULL,
                 version BIGINT NOT NULL,
@@ -206,10 +207,55 @@ impl SqlStateStore {
             .await
             .context("migrate durable state store with postgres dispatch index")?;
         }
+        self.ensure_jobs_inputs_column(&mut tx).await?;
 
         tx.commit()
             .await
             .context("commit durable state migration")?;
+        Ok(())
+    }
+
+    async fn ensure_jobs_inputs_column(&self, tx: &mut Transaction<'_, sqlx::Any>) -> Result<()> {
+        let exists = match self.dialect {
+            SqlDialect::Sqlite => {
+                let rows = sqlx::query("PRAGMA table_info(jobs)")
+                    .fetch_all(&mut **tx)
+                    .await
+                    .context("inspect sqlite jobs columns")?;
+                rows.into_iter().any(|row| {
+                    row.try_get::<String, _>("name")
+                        .map(|name| name == "inputs_json")
+                        .unwrap_or(false)
+                })
+            }
+            SqlDialect::Postgres => {
+                let exists: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1
+                     FROM information_schema.columns
+                     WHERE table_schema = 'public'
+                       AND table_name = 'jobs'
+                       AND column_name = 'inputs_json'
+                     LIMIT 1",
+                )
+                .fetch_optional(&mut **tx)
+                .await
+                .context("inspect postgres jobs columns")?;
+                exists.is_some()
+            }
+        };
+
+        if exists {
+            return Ok(());
+        }
+
+        let statement = self.sql(
+            "ALTER TABLE jobs
+             ADD COLUMN inputs_json TEXT NOT NULL DEFAULT '[]'",
+        );
+        sqlx::query(statement.as_ref())
+            .execute(&mut **tx)
+            .await
+            .with_context(|| format!("add jobs.inputs_json column with {}", statement.as_ref()))?;
         Ok(())
     }
 
@@ -311,7 +357,7 @@ impl SqlStateStore {
             .fetch_optional(&mut **tx)
             .await
             .with_context(|| format!("get job '{job_id}' in transition"))?;
-        row.map(job_from_row).transpose()
+        row.map(job_from_row_without_inputs).transpose()
     }
 
     async fn get_worker_tx(
@@ -396,13 +442,12 @@ impl SqlStateStore {
     ) -> Result<()> {
         let statement = self.sql(
             "UPDATE jobs
-             SET state = ?, spec_json = ?, outputs_json = ?, lease_id = ?, version = ?,
+             SET state = ?, outputs_json = ?, lease_id = ?, version = ?,
                  updated_at_ms = ?, last_error = ?, current_attempt_id = ?
              WHERE job_id = ? AND version = ?",
         );
         let rows = sqlx::query(statement.as_ref())
             .bind(enum_text(&job.state)?)
-            .bind(json_text(&job.spec)?)
             .bind(json_text(&job.outputs)?)
             .bind(job.lease_id.clone())
             .bind(to_i64(job.version)?)
@@ -640,11 +685,12 @@ impl SqlStateStore {
             return Ok(None);
         }
 
-        let active_leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leases WHERE worker_id = $1")
-            .bind(worker_id)
-            .fetch_one(&mut *tx)
-            .await
-            .with_context(|| format!("count active leases for worker '{worker_id}'"))?;
+        let active_leases: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM leases WHERE worker_id = $1")
+                .bind(worker_id)
+                .fetch_one(&mut *tx)
+                .await
+                .with_context(|| format!("count active leases for worker '{worker_id}'"))?;
         if from_i64(active_leases)? >= u64::from(worker.spec.max_active_leases) {
             tx.commit()
                 .await
@@ -674,7 +720,7 @@ impl SqlStateStore {
                 .context("commit empty postgres job assignment tx")?;
             return Ok(None);
         };
-        let current = job_from_row(candidate_row)?;
+        let current = job_from_row_without_inputs(candidate_row)?;
 
         let lease_id = Uuid::new_v4().to_string();
         let attempt_id = Uuid::new_v4().to_string();
@@ -762,7 +808,11 @@ impl SqlStateStore {
             .await
             .context("commit postgres job assignment tx")?;
         self.notify_job_events(&job.job_id).await;
-        Ok(Some(LeaseAssignment { lease, attempt, job }))
+        Ok(Some(LeaseAssignment {
+            lease,
+            attempt,
+            job,
+        }))
     }
 }
 
@@ -854,14 +904,15 @@ impl StateStore for SqlStateStore {
     async fn create_job(&self, job: JobRecord) -> Result<()> {
         let statement = self.sql(
             "INSERT INTO jobs (
-                job_id, state, spec_json, outputs_json, lease_id, version, created_at_ms,
+                job_id, state, spec_json, inputs_json, outputs_json, lease_id, version, created_at_ms,
                 updated_at_ms, last_error, current_attempt_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         );
         sqlx::query(statement.as_ref())
             .bind(&job.job_id)
             .bind(enum_text(&job.state)?)
-            .bind(json_text(&job.spec)?)
+            .bind(json_text(&stored_job_spec(&job.spec))?)
+            .bind(json_text(&stored_job_inputs(&job.spec))?)
             .bind(json_text(&job.outputs)?)
             .bind(job.lease_id.clone())
             .bind(to_i64(job.version)?)
@@ -877,7 +928,7 @@ impl StateStore for SqlStateStore {
 
     async fn get_job(&self, job_id: &str) -> Result<Option<JobRecord>> {
         let statement = self.sql(
-            "SELECT job_id, state, spec_json, outputs_json, lease_id, version, created_at_ms,
+            "SELECT job_id, state, spec_json, inputs_json, outputs_json, lease_id, version, created_at_ms,
                     updated_at_ms, last_error, current_attempt_id
              FROM jobs WHERE job_id = ?",
         );
@@ -891,7 +942,7 @@ impl StateStore for SqlStateStore {
 
     async fn list_jobs(&self) -> Result<Vec<JobRecord>> {
         let statement = self.sql(
-            "SELECT job_id, state, spec_json, outputs_json, lease_id, version, created_at_ms,
+            "SELECT job_id, state, spec_json, inputs_json, outputs_json, lease_id, version, created_at_ms,
                     updated_at_ms, last_error, current_attempt_id
              FROM jobs",
         );
@@ -915,7 +966,7 @@ impl StateStore for SqlStateStore {
             .fetch_all(&self.pool)
             .await
             .context("list pending jobs")?;
-        rows.into_iter().map(job_from_row).collect()
+        rows.into_iter().map(job_from_row_without_inputs).collect()
     }
 
     async fn update_job(&self, job: JobRecord) -> Result<()> {
@@ -925,13 +976,14 @@ impl StateStore for SqlStateStore {
             .ok_or_else(|| anyhow!("job '{}' version underflow", job.job_id))?;
         let statement = self.sql(
             "UPDATE jobs
-             SET state = ?, spec_json = ?, outputs_json = ?, lease_id = ?, version = ?,
+             SET state = ?, spec_json = ?, inputs_json = ?, outputs_json = ?, lease_id = ?, version = ?,
                  updated_at_ms = ?, last_error = ?, current_attempt_id = ?
              WHERE job_id = ? AND version = ?",
         );
         let rows = sqlx::query(statement.as_ref())
             .bind(enum_text(&job.state)?)
-            .bind(json_text(&job.spec)?)
+            .bind(json_text(&stored_job_spec(&job.spec))?)
+            .bind(json_text(&stored_job_inputs(&job.spec))?)
             .bind(json_text(&job.outputs)?)
             .bind(job.lease_id.clone())
             .bind(to_i64(job.version)?)
@@ -945,6 +997,29 @@ impl StateStore for SqlStateStore {
             .with_context(|| format!("update job '{}'", job.job_id))?;
         if rows.rows_affected() == 0 {
             bail!("job '{}' version conflict", job.job_id);
+        }
+        Ok(())
+    }
+
+    async fn persist_job_inputs(
+        &self,
+        job_id: &str,
+        inputs: Vec<ObjectRef>,
+        _now_ms: u64,
+    ) -> Result<()> {
+        let statement = self.sql(
+            "UPDATE jobs
+             SET inputs_json = ?
+             WHERE job_id = ?",
+        );
+        let rows = sqlx::query(statement.as_ref())
+            .bind(json_text(&inputs)?)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("persist inputs for job '{job_id}'"))?;
+        if rows.rows_affected() == 0 {
+            bail!("job '{}' does not exist", job_id);
         }
         Ok(())
     }
@@ -1928,11 +2003,51 @@ fn enum_value<T: DeserializeOwned>(raw: &str) -> Result<T> {
         .with_context(|| format!("deserialize enum payload: {raw}"))
 }
 
+fn stored_job_spec(spec: &JobSpec) -> JobSpec {
+    spec.clone()
+}
+
+fn stored_job_inputs(spec: &JobSpec) -> Vec<ObjectRef> {
+    if !spec.inputs.is_empty() {
+        return spec.inputs.clone();
+    }
+    if spec.params.is_empty() {
+        return Vec::new();
+    }
+    vec![ObjectRef::Inline {
+        content: spec.params.clone(),
+        metadata: Attributes::new(),
+    }]
+}
+
 fn job_from_row(row: sqlx::any::AnyRow) -> Result<JobRecord> {
+    let spec_json: String = row.try_get("spec_json")?;
+    let inputs_json: String = row.try_get("inputs_json")?;
+    let mut spec: JobSpec = json_value(&spec_json)?;
+    let inputs: Vec<ObjectRef> = json_value(&inputs_json)?;
+    if spec.inputs.is_empty() && spec.params.is_empty() && !inputs.is_empty() {
+        spec.inputs = inputs;
+    }
     Ok(JobRecord {
         job_id: row.try_get("job_id")?,
         state: enum_value::<JobState>(&row.try_get::<String, _>("state")?)?,
-        spec: json_value(&row.try_get::<String, _>("spec_json")?)?,
+        spec,
+        outputs: json_value(&row.try_get::<String, _>("outputs_json")?)?,
+        lease_id: row.try_get("lease_id")?,
+        version: from_i64(row.try_get("version")?)?,
+        created_at_ms: from_i64(row.try_get("created_at_ms")?)?,
+        updated_at_ms: from_i64(row.try_get("updated_at_ms")?)?,
+        last_error: row.try_get("last_error")?,
+        current_attempt_id: row.try_get("current_attempt_id")?,
+    })
+}
+
+fn job_from_row_without_inputs(row: sqlx::any::AnyRow) -> Result<JobRecord> {
+    let spec_json: String = row.try_get("spec_json")?;
+    Ok(JobRecord {
+        job_id: row.try_get("job_id")?,
+        state: enum_value::<JobState>(&row.try_get::<String, _>("state")?)?,
+        spec: json_value(&spec_json)?,
         outputs: json_value(&row.try_get::<String, _>("outputs_json")?)?,
         lease_id: row.try_get("lease_id")?,
         version: from_i64(row.try_get("version")?)?,

@@ -21,8 +21,9 @@ use anyserve_core::store::{MemoryStateStore, StateStore};
 use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
+use sqlx::{AnyConnection, Connection};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod serve_config;
@@ -34,6 +35,11 @@ use serve_openai::run_server as run_serve_openai;
 use serve_openai_worker::ServeOpenAIWorkerArgs;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50052";
+const POSTGRES_MEMORY_SINGLETON_LOCK_ID: i64 = 0x4153_5256_5047_4d4d;
+
+struct PostgresMemorySingletonLock {
+    _connection: AnyConnection,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -470,7 +476,25 @@ async fn serve(args: ServeArgs) -> Result<()> {
         heartbeat_ttl_secs: args.heartbeat_ttl_secs,
         default_lease_ttl_secs: args.default_lease_ttl_secs,
     })?;
+    if config.storage.backend == StorageBackend::Postgres
+        && config.frames.backend == FrameBackend::Memory
+    {
+        warn!(
+            "postgres + memory mode is intended for a single control-plane instance; frame data stays in memory and is not shared or persisted"
+        );
+    }
     let grpc_config = config.grpc.clone();
+    let _postgres_memory_lock = match (config.storage.backend, config.frames.backend) {
+        (StorageBackend::Postgres, FrameBackend::Memory) => {
+            let dsn = config
+                .storage
+                .dsn
+                .as_deref()
+                .context("storage dsn is required")?;
+            Some(acquire_postgres_memory_singleton_lock(dsn).await?)
+        }
+        _ => None,
+    };
     let state_store: Arc<dyn StateStore> = match config.storage.backend {
         StorageBackend::Memory => Arc::new(MemoryStateStore::new()),
         StorageBackend::Sqlite | StorageBackend::Postgres => {
@@ -547,7 +571,8 @@ async fn serve(args: ServeArgs) -> Result<()> {
         openai_addr.as_ref(),
     );
     if let Some(config_path) = config.config_path.as_ref() {
-        info!(grpc = %grpc_addr, config = %config_path.display(), "control plane started");
+        let config_path = config_path.display().to_string();
+        info!(grpc = %grpc_addr, config = %config_path, "control plane started");
     } else {
         info!(grpc = %grpc_addr, "control plane started");
     }
@@ -565,6 +590,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
         openai_task.await.context("join openai task")??;
     }
     Ok(())
+}
+
+async fn acquire_postgres_memory_singleton_lock(dsn: &str) -> Result<PostgresMemorySingletonLock> {
+    sqlx::any::install_default_drivers();
+    let mut connection = AnyConnection::connect(dsn)
+        .await
+        .with_context(|| format!("connect postgres singleton lock session {dsn}"))?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(POSTGRES_MEMORY_SINGLETON_LOCK_ID)
+        .fetch_one(&mut connection)
+        .await
+        .context("acquire postgres + memory singleton advisory lock")?;
+    if !acquired {
+        bail!("postgres + memory only supports a single control-plane instance");
+    }
+    Ok(PostgresMemorySingletonLock {
+        _connection: connection,
+    })
 }
 
 async fn run_grpc_server(

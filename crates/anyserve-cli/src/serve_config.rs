@@ -240,15 +240,13 @@ impl FrameConfigFile {
         match (storage_backend, backend) {
             (StorageBackend::Memory, FrameBackend::Memory)
             | (StorageBackend::Sqlite, FrameBackend::Memory)
+            | (StorageBackend::Postgres, FrameBackend::Memory)
             | (StorageBackend::Postgres, FrameBackend::Redis) => {}
             (StorageBackend::Memory, FrameBackend::Redis) => {
                 anyhow::bail!("memory storage only supports frames.backend = 'memory'")
             }
             (StorageBackend::Sqlite, FrameBackend::Redis) => {
                 anyhow::bail!("sqlite storage only supports frames.backend = 'memory'")
-            }
-            (StorageBackend::Postgres, FrameBackend::Memory) => {
-                anyhow::bail!("postgres storage requires frames.backend = 'redis'")
             }
         }
         Ok(FrameConfig {
@@ -539,6 +537,35 @@ redis_url = "redis://127.0.0.1:6379"
     }
 
     #[test]
+    fn postgres_storage_allows_explicit_memory_frames() {
+        let path = temp_file_path("postgres-memory");
+        fs::write(
+            &path,
+            r#"
+[server.storage]
+backend = "postgres"
+dsn = "postgres://example:anyserve@localhost/anyserve"
+
+[server.frames]
+backend = "memory"
+"#,
+        )
+        .unwrap();
+
+        let resolved = ResolvedServeConfig::load(ServeOverrides {
+            config: Some(path.clone()),
+            ..ServeOverrides::default()
+        })
+        .unwrap();
+
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(resolved.storage.backend, StorageBackend::Postgres);
+        assert_eq!(resolved.frames.backend, FrameBackend::Memory);
+        assert!(resolved.frames.redis_url.is_none());
+    }
+
+    #[test]
     fn memory_storage_rejects_redis_frames() {
         let path = temp_file_path("memory-redis-invalid");
         fs::write(
@@ -595,37 +622,6 @@ redis_url = "redis://127.0.0.1:6379"
             error
                 .to_string()
                 .contains("sqlite storage only supports frames.backend = 'memory'")
-        );
-    }
-
-    #[test]
-    fn postgres_storage_rejects_memory_frames() {
-        let path = temp_file_path("postgres-memory-invalid");
-        fs::write(
-            &path,
-            r#"
-[server.storage]
-backend = "postgres"
-dsn = "postgres://example:anyserve@localhost/anyserve"
-
-[server.frames]
-backend = "memory"
-"#,
-        )
-        .unwrap();
-
-        let error = ResolvedServeConfig::load(ServeOverrides {
-            config: Some(path.clone()),
-            ..ServeOverrides::default()
-        })
-        .unwrap_err();
-
-        fs::remove_file(path).unwrap();
-
-        assert!(
-            error
-                .to_string()
-                .contains("postgres storage requires frames.backend = 'redis'")
         );
     }
 }

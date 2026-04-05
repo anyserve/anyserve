@@ -60,6 +60,12 @@ pub trait StateStore: Send + Sync {
     async fn list_jobs(&self) -> Result<Vec<JobRecord>>;
     async fn list_pending_jobs(&self) -> Result<Vec<JobRecord>>;
     async fn update_job(&self, job: JobRecord) -> Result<()>;
+    async fn persist_job_inputs(
+        &self,
+        job_id: &str,
+        inputs: Vec<ObjectRef>,
+        now_ms: u64,
+    ) -> Result<()>;
     async fn try_assign_job(
         &self,
         worker_id: &str,
@@ -312,6 +318,23 @@ impl StateStore for MemoryStateStore {
             bail!("job '{}' does not exist", job.job_id);
         }
         inner.jobs.insert(job.job_id.clone(), job);
+        Ok(())
+    }
+
+    async fn persist_job_inputs(
+        &self,
+        job_id: &str,
+        inputs: Vec<ObjectRef>,
+        now_ms: u64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        let job = inner
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| anyhow!("job '{}' does not exist", job_id))?;
+        job.spec.inputs = inputs;
+        job.updated_at_ms = now_ms;
+        job.version += 1;
         Ok(())
     }
 
