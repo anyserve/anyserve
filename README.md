@@ -153,8 +153,8 @@ mise exec -- cargo run -p anyserve -- serve
 Start the built-in OpenAI-compatible example stack from the checked-in config:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/llm/anyserve.toml
-mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
 ```
 
 That example starts:
@@ -174,7 +174,8 @@ Examples use endpoint strings like `http://127.0.0.1:50052`. That is a gRPC chan
 
 Treat the checked-in example docs as the canonical walkthrough:
 
-- [examples/llm/README.md](examples/llm/README.md): built-in OpenAI gateway + built-in LLM worker
+- [examples/ollama/README.md](examples/ollama/README.md): Ollama-backed built-in OpenAI gateway + built-in LLM worker
+- [examples/google-colab/README.md](examples/google-colab/README.md): Google Colab examples for `Qwen/Qwen3-0.6B`, both all-in-one and remote-worker
 - [docs/src/ollama.md](docs/src/ollama.md): Ollama-specific notes for the same example
 - [docs/src/testing.md](docs/src/testing.md): how the example fits into the test layers
 

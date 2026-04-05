@@ -24,13 +24,13 @@ The checked-in examples are the easiest local smoke tests.
 
 For the built-in OpenAI-compatible gateway and LLM worker, use:
 
-- [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md)
+- [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md)
 - [Ollama](ollama.md)
 
 That path covers:
 
-- `anyserve serve --config examples/llm/anyserve.toml`
-- `anyserve worker --config examples/llm/worker.toml`
+- `anyserve serve --config examples/ollama/anyserve.toml`
+- `anyserve worker --config examples/ollama/worker.toml`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/embeddings`

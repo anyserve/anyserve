@@ -16,18 +16,19 @@ mise run build
 
 ## Fastest Local Workflow
 
-The checked-in LLM stack is the fastest way to understand the production gateway shape.
+The checked-in Ollama stack is the fastest way to understand the production gateway shape.
 
 For the built-in OpenAI-compatible gateway and LLM worker, start here:
 
-- [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md)
+- [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md)
+- [Google Colab Qwen Examples](https://github.com/anyserve/anyserve/blob/main/examples/google-colab/README.md)
 - [Ollama](ollama.md)
 
 The smallest local stack is:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/llm/anyserve.toml
-mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
 ```
 
 That example exposes:
@@ -76,10 +77,10 @@ mise exec -- cargo run -p anyserve-demo -- --mode worker
 ## Run the Built-In LLM Worker
 
 ```bash
-mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
 ```
 
-The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in the [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md).
+The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. The full example walkthrough lives in the [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md).
 
 Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
 

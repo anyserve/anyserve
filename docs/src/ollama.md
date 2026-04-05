@@ -1,8 +1,8 @@
 # Ollama
 
-This page maps the checked-in LLM example onto a local Ollama instance.
+This page maps the checked-in Ollama example onto a local Ollama instance.
 
-Keep the detailed walkthrough in the [LLM Example README](https://github.com/anyserve/anyserve/blob/main/examples/llm/README.md). This page stays short and Ollama-specific.
+Keep the detailed walkthrough in the [Ollama Example README](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md). This page stays short and Ollama-specific.
 
 ## Install Ollama
 
@@ -41,7 +41,7 @@ ollama list
 Use the example config from the same checked-in example directory:
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/llm/anyserve.toml
+mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
 ```
 
 That starts:
@@ -54,7 +54,7 @@ That starts:
 Use the worker config in the same directory:
 
 ```bash
-mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
 ```
 
 That worker points to:

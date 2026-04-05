@@ -545,11 +545,7 @@ async fn postgres_claim_matches_priority_attributes_and_capacity() {
         .await
         .unwrap();
 
-    let first = kernel
-        .poll_lease(&worker.worker_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let first = kernel.poll_lease(&worker.worker_id).await.unwrap().unwrap();
     assert_eq!(first.job.job_id, high_priority_job.job_id);
     kernel
         .complete_lease(
@@ -561,11 +557,7 @@ async fn postgres_claim_matches_priority_attributes_and_capacity() {
         .await
         .unwrap();
 
-    let second = kernel
-        .poll_lease(&worker.worker_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let second = kernel.poll_lease(&worker.worker_id).await.unwrap().unwrap();
     assert_eq!(second.job.job_id, preferred_one_job.job_id);
     kernel
         .complete_lease(
@@ -577,11 +569,7 @@ async fn postgres_claim_matches_priority_attributes_and_capacity() {
         .await
         .unwrap();
 
-    let third = kernel
-        .poll_lease(&worker.worker_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let third = kernel.poll_lease(&worker.worker_id).await.unwrap().unwrap();
     assert_eq!(third.job.job_id, preferred_zero_job.job_id);
 
     let attr_miss = kernel.get_job(&attr_miss_job.job_id).await.unwrap();

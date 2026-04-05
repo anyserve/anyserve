@@ -447,8 +447,8 @@ async fn process_grant(
                 ],
                 Some(worker_id.to_string()),
                 Some(lease_id.clone()),
-        )
-        .await?;
+            )
+            .await?;
     }
 
     let outputs = persisted_outputs(&content_type, persisted_output);

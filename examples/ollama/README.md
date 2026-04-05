@@ -1,6 +1,6 @@
-# Built-In OpenAI Example
+# Ollama Example
 
-This directory is the canonical walkthrough for the built-in OpenAI-compatible gateway and the built-in LLM worker in `anyserve`.
+This directory is the canonical walkthrough for the built-in OpenAI-compatible gateway and the built-in LLM worker in `anyserve` backed by Ollama.
 
 It uses two files in this directory:
 
@@ -8,6 +8,14 @@ It uses two files in this directory:
 - `worker.toml`: starts the built-in LLM worker and points it at an OpenAI-compatible upstream
 
 If you want to point the same worker at SGLang or vLLM instead of Ollama, change `base_url`, `provider`, and the model list in `anyserve.toml`. The rest of the flow stays the same.
+
+## Hosted Notebook Variant
+
+If you want the same gateway shape inside Google Colab instead of a local Ollama process, use the separate example:
+
+- [../google-colab/README.md](../google-colab/README.md)
+
+That example uses a small Hugging Face Qwen model inside the notebook runtime and publishes the AnyServe endpoint through Cloudflare Tunnel.
 
 ## 1. Start Ollama
 
@@ -53,7 +61,7 @@ Those model names are returned by `GET /v1/models`. Right now they are not alias
 ## 3. Start AnyServe
 
 ```bash
-mise exec -- cargo run -p anyserve -- serve --config examples/llm/anyserve.toml
+mise exec -- cargo run -p anyserve -- serve --config examples/ollama/anyserve.toml
 ```
 
 This starts:
@@ -64,7 +72,7 @@ This starts:
 ## 4. Start the Built-In LLM Worker
 
 ```bash
-mise exec -- cargo run -p anyserve -- worker --config examples/llm/worker.toml
+mise exec -- cargo run -p anyserve -- worker --config examples/ollama/worker.toml
 ```
 
 The worker pulls jobs from AnyServe and forwards them to Ollama.
