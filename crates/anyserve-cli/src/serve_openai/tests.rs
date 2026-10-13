@@ -43,9 +43,14 @@ async fn streamed_submit_cancels_job_when_input_upload_fails() {
         inner: MemoryFramePlane::new(),
     }));
 
-    let error = submit_request(&state, "llm.chat.v1", b"hello".to_vec())
-        .await
-        .expect_err("streamed submit should fail");
+    let error = submit_request(
+        &state,
+        &axum::http::HeaderMap::new(),
+        "llm.chat.v1",
+        b"hello".to_vec(),
+    )
+    .await
+    .expect_err("streamed submit should fail");
     assert!(error.message.contains("push input frame"));
 
     let jobs = state.kernel.list_jobs().await.unwrap();
@@ -76,6 +81,7 @@ fn test_state(frame_plane: Arc<dyn FramePlane>) -> AppState {
             request_timeout_secs: 30,
             inline_request_limit_bytes: 1,
             demand: Demand::default(),
+            policy: Default::default(),
         }),
     }
 }

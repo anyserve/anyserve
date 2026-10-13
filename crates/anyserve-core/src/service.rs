@@ -21,6 +21,9 @@ use crate::model::{
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
+/// Long-polls are capped so a stuck client cannot pin server resources forever.
+const MAX_POLL_WAIT_MS: u32 = 60_000;
+
 #[derive(Clone)]
 pub struct ControlPlaneGrpcService {
     kernel: Arc<Kernel>,
@@ -250,11 +253,13 @@ impl ControlPlaneService for ControlPlaneGrpcService {
             return Err(Status::invalid_argument("worker_id is required"));
         }
 
-        let assignment = self
-            .kernel
-            .poll_lease(&request.worker_id)
-            .await
-            .map_err(to_status)?;
+        let wait = Duration::from_millis(u64::from(request.wait_timeout_ms.min(MAX_POLL_WAIT_MS)));
+        let assignment = if wait.is_zero() {
+            self.kernel.poll_lease(&request.worker_id).await
+        } else {
+            self.kernel.poll_lease_wait(&request.worker_id, wait).await
+        }
+        .map_err(to_status)?;
 
         Ok(Response::new(match assignment {
             Some(assignment) => poll_lease_response_to_proto(assignment),
@@ -601,6 +606,8 @@ fn execution_policy_from_proto(policy: proto::ExecutionPolicy) -> ExecutionPolic
         },
         priority: policy.priority,
         lease_ttl_secs: policy.lease_ttl_secs as u64,
+        queue_timeout_ms: policy.queue_timeout_ms,
+        spillover_after_ms: policy.spillover_after_ms,
     }
 }
 
@@ -666,6 +673,8 @@ fn job_spec_to_proto(spec: JobSpec) -> proto::JobSpec {
             profile: spec.policy.profile,
             priority: spec.policy.priority,
             lease_ttl_secs: spec.policy.lease_ttl_secs as u32,
+            queue_timeout_ms: spec.policy.queue_timeout_ms,
+            spillover_after_ms: spec.policy.spillover_after_ms,
         }),
         metadata: spec.metadata.into_iter().collect(),
     }

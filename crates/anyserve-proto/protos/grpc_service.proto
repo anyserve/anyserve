@@ -44,6 +44,11 @@ message ExecutionPolicy {
   string profile = 1;
   int32 priority = 2;
   uint32 lease_ttl_secs = 3;
+  // Fail the job if no worker leases it within this window. 0 disables.
+  uint64 queue_timeout_ms = 4;
+  // Locality hold: workers that do not match every preferred attribute may
+  // only lease the job after it has been pending this long. 0 disables.
+  uint64 spillover_after_ms = 5;
 }
 
 message ObjectRef {
@@ -285,6 +290,9 @@ message HeartbeatWorkerResponse {
 
 message PollLeaseRequest {
   string worker_id = 1;
+  // Long-poll: hold the call open up to this long waiting for an assignable
+  // job. 0 returns immediately.
+  uint32 wait_timeout_ms = 2;
 }
 
 message PollLeaseResponse {

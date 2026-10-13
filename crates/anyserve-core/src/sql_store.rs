@@ -623,6 +623,7 @@ impl SqlStateStore {
             .join(", ");
         let attrs_idx = interface_count + 2;
         let capacity_idx = interface_count + 3;
+        let now_idx = interface_count + 4;
         format!(
             "SELECT job_id, state, spec_json, outputs_json, lease_id, version, created_at_ms,
                     updated_at_ms, last_error, current_attempt_id
@@ -643,6 +644,19 @@ impl SqlStateStore {
                     ) AS cap(key, value)
                     WHERE COALESCE((${capacity_idx}::jsonb ->> cap.key)::bigint, 0)
                         < (cap.value::text)::bigint
+               )
+               AND (
+                    COALESCE((spec_json::jsonb -> 'policy' ->> 'spillover_after_ms')::bigint, 0) = 0
+                    OR created_at_ms
+                        + COALESCE((spec_json::jsonb -> 'policy' ->> 'spillover_after_ms')::bigint, 0)
+                        <= ${now_idx}
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM jsonb_each_text(
+                            COALESCE(spec_json::jsonb -> 'demand' -> 'preferred_attributes', '{{}}'::jsonb)
+                        ) AS hold(key, value)
+                        WHERE (${attrs_idx}::jsonb ->> hold.key) IS DISTINCT FROM hold.value
+                    )
                )
              ORDER BY
                 COALESCE((spec_json::jsonb -> 'policy' ->> 'priority')::integer, 0) DESC,
@@ -712,6 +726,7 @@ impl SqlStateStore {
         let candidate_row = candidate_query
             .bind(worker_attributes)
             .bind(worker_capacity)
+            .bind(to_i64(now_ms)?)
             .fetch_optional(&mut *tx)
             .await
             .with_context(|| format!("select assignable job for worker '{worker_id}'"))?;
@@ -1406,6 +1421,58 @@ impl StateStore for SqlStateStore {
             self.notify_job_streams(&job.job_id).await;
         }
         Ok(StateTransition::new(job.clone(), streams_to_finalize)
+            .with_job_event_updates([job.job_id.clone()])
+            .with_job_stream_updates([job.job_id.clone()]))
+    }
+
+    async fn fail_pending_job_transition(
+        &self,
+        job_id: &str,
+        reason: String,
+        metadata: Attributes,
+        now_ms: u64,
+    ) -> Result<StateTransition<Option<JobRecord>>> {
+        let mut tx = self.begin_transition_tx().await?;
+        let Some(mut job) = self.get_job_tx(&mut tx, job_id).await? else {
+            bail!("job '{}' does not exist", job_id);
+        };
+        if job.state != JobState::Pending {
+            tx.commit()
+                .await
+                .context("commit fail pending no-op transition")?;
+            return Ok(StateTransition::without_streams(None));
+        }
+
+        let previous_job_version = job.version;
+        job.state = JobState::Failed;
+        job.last_error = Some(reason);
+        job.updated_at_ms = now_ms;
+        job.version += 1;
+        self.update_job_tx(&mut tx, &job, previous_job_version)
+            .await?;
+
+        let streams_to_finalize = self
+            .close_job_streams_tx(&mut tx, &job.job_id, now_ms)
+            .await?;
+        Self::append_job_event_tx(
+            self.dialect,
+            &mut tx,
+            &job.job_id,
+            EventKind::Failed,
+            Vec::new(),
+            metadata,
+            now_ms,
+        )
+        .await?;
+
+        tx.commit()
+            .await
+            .context("commit fail pending job transition")?;
+        self.notify_job_events(&job.job_id).await;
+        if !streams_to_finalize.is_empty() {
+            self.notify_job_streams(&job.job_id).await;
+        }
+        Ok(StateTransition::new(Some(job.clone()), streams_to_finalize)
             .with_job_event_updates([job.job_id.clone()])
             .with_job_stream_updates([job.job_id.clone()]))
     }

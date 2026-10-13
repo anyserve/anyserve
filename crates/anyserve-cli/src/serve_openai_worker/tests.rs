@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use anyserve_client::{AnyserveClient, FrameWrite, object_ref};
+use anyserve_client::{AnyserveClient, FrameWrite};
 use anyserve_core::frame::MemoryFramePlane;
 use anyserve_core::kernel::{Kernel, OpenStreamCommand};
 use anyserve_core::model::{Attributes, JobSpec, StreamDirection, StreamScope};
@@ -17,8 +17,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 use super::helpers::{
-    DEFAULT_INPUT_STREAM, available_capacity, persisted_outputs, read_request_body, truncate,
-    upstream_path,
+    DEFAULT_INPUT_STREAM, available_capacity, read_request_body, truncate, upstream_path,
 };
 
 #[test]
@@ -37,20 +36,6 @@ fn llm_worker_reduces_slot_capacity_for_active_lease() {
 #[test]
 fn truncate_keeps_short_values() {
     assert_eq!(truncate("hello", 10), "hello");
-}
-
-#[test]
-fn persisted_outputs_store_inline_payload_and_content_type() {
-    let outputs = persisted_outputs("application/json", br#"{"ok":true}"#.to_vec());
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(
-        outputs[0].reference,
-        Some(object_ref::Reference::Inline(br#"{"ok":true}"#.to_vec()))
-    );
-    assert_eq!(
-        outputs[0].metadata.get("content_type").map(String::as_str),
-        Some("application/json")
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
