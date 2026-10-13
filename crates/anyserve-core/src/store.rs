@@ -143,6 +143,9 @@ pub trait StateStore: Send + Sync {
         now_ms: u64,
     ) -> Result<StateTransition<()>>;
     async fn reap_expired_leases_transition(&self, now_ms: u64) -> Result<StateTransition<()>>;
+    /// Deletes terminal jobs last updated before `before_ms`, with their events,
+    /// attempts, and streams. Returns the removed stream ids.
+    async fn purge_terminal_jobs(&self, before_ms: u64) -> Result<Vec<String>>;
     /// Fail a job that is still pending (e.g. its queue deadline passed).
     /// Returns `None` when the job already left the pending state.
     async fn fail_pending_job_transition(
@@ -190,11 +193,25 @@ pub trait StateStore: Send + Sync {
 #[derive(Default)]
 struct MemoryState {
     jobs: BTreeMap<String, JobRecord>,
+    /// Ids of pending jobs, so dispatch does not scan every retained job.
+    pending: BTreeSet<String>,
     events: BTreeMap<String, Vec<JobEvent>>,
     attempts: BTreeMap<String, AttemptRecord>,
     workers: BTreeMap<String, WorkerRecord>,
     leases: BTreeMap<String, LeaseRecord>,
     streams: BTreeMap<String, StreamRecord>,
+}
+
+impl MemoryState {
+    /// The only way jobs are written, keeping the pending index in sync.
+    fn put_job(&mut self, job: JobRecord) {
+        if job.state == JobState::Pending {
+            self.pending.insert(job.job_id.clone());
+        } else {
+            self.pending.remove(&job.job_id);
+        }
+        self.jobs.insert(job.job_id.clone(), job);
+    }
 }
 
 #[derive(Default)]
@@ -335,7 +352,7 @@ impl StateStore for MemoryStateStore {
         if inner.jobs.contains_key(&job.job_id) {
             bail!("job '{}' already exists", job.job_id);
         }
-        inner.jobs.insert(job.job_id.clone(), job);
+        inner.put_job(job);
         Ok(())
     }
 
@@ -428,9 +445,9 @@ impl StateStore for MemoryStateStore {
     async fn list_pending_jobs(&self) -> Result<Vec<JobRecord>> {
         let inner = self.inner.lock().await;
         Ok(inner
-            .jobs
-            .values()
-            .filter(|job| job.state == JobState::Pending)
+            .pending
+            .iter()
+            .filter_map(|job_id| inner.jobs.get(job_id))
             .cloned()
             .collect())
     }
@@ -440,7 +457,7 @@ impl StateStore for MemoryStateStore {
         if !inner.jobs.contains_key(&job.job_id) {
             bail!("job '{}' does not exist", job.job_id);
         }
-        inner.jobs.insert(job.job_id.clone(), job);
+        inner.put_job(job);
         Ok(())
     }
 
@@ -532,7 +549,7 @@ impl StateStore for MemoryStateStore {
                 job.updated_at_ms = now_ms;
                 job.version += 1;
 
-                inner.jobs.insert(job.job_id.clone(), job.clone());
+                inner.put_job(job.clone());
                 inner.leases.insert(lease_id.clone(), lease.clone());
                 inner.attempts.insert(attempt_id.clone(), attempt.clone());
                 append_job_event_locked(
@@ -655,7 +672,7 @@ impl StateStore for MemoryStateStore {
                 job.lease_id = None;
                 job.updated_at_ms = now_ms;
                 job.version += 1;
-                inner.jobs.insert(job.job_id.clone(), job.clone());
+                inner.put_job(job.clone());
 
                 let streams_to_finalize = close_job_streams_locked(&mut inner, &job.job_id, now_ms);
                 append_job_event_locked(
@@ -682,6 +699,42 @@ impl StateStore for MemoryStateStore {
         Ok(result)
     }
 
+    async fn purge_terminal_jobs(&self, before_ms: u64) -> Result<Vec<String>> {
+        let mut inner = self.inner.lock().await;
+        let expired: BTreeSet<String> = inner
+            .jobs
+            .values()
+            .filter(|job| job.state.is_terminal() && job.updated_at_ms < before_ms)
+            .map(|job| job.job_id.clone())
+            .collect();
+        if expired.is_empty() {
+            return Ok(Vec::new());
+        }
+        inner.jobs.retain(|job_id, _| !expired.contains(job_id));
+        inner.events.retain(|job_id, _| !expired.contains(job_id));
+        inner
+            .attempts
+            .retain(|_, attempt| !expired.contains(&attempt.job_id));
+        let mut removed_streams = Vec::new();
+        inner.streams.retain(|stream_id, stream| {
+            let keep = !expired.contains(&stream.job_id);
+            if !keep {
+                removed_streams.push(stream_id.clone());
+            }
+            keep
+        });
+        drop(inner);
+
+        let mut watchers = self.watchers.lock().await;
+        watchers
+            .job_events
+            .retain(|job_id, _| !expired.contains(job_id));
+        watchers
+            .job_streams
+            .retain(|job_id, _| !expired.contains(job_id));
+        Ok(removed_streams)
+    }
+
     async fn fail_pending_job_transition(
         &self,
         job_id: &str,
@@ -705,7 +758,7 @@ impl StateStore for MemoryStateStore {
                 job.last_error = Some(reason);
                 job.updated_at_ms = now_ms;
                 job.version += 1;
-                inner.jobs.insert(job.job_id.clone(), job.clone());
+                inner.put_job(job.clone());
 
                 let streams_to_finalize = close_job_streams_locked(&mut inner, &job.job_id, now_ms);
                 append_job_event_locked(
@@ -780,7 +833,7 @@ impl StateStore for MemoryStateStore {
             job.updated_at_ms = now_ms;
             job.version += 1;
             job.last_error = None;
-            inner.jobs.insert(job.job_id.clone(), job.clone());
+            inner.put_job(job.clone());
 
             attempt.state = AttemptState::Succeeded;
             attempt.finished_at_ms = Some(now_ms);
@@ -881,7 +934,7 @@ impl StateStore for MemoryStateStore {
             if retryable {
                 job.state = JobState::Pending;
                 job.current_attempt_id = None;
-                inner.jobs.insert(job.job_id.clone(), job.clone());
+                inner.put_job(job.clone());
                 append_job_event_locked(
                     &mut inner,
                     &job.job_id,
@@ -892,7 +945,7 @@ impl StateStore for MemoryStateStore {
                 )?;
             } else {
                 job.state = JobState::Failed;
-                inner.jobs.insert(job.job_id.clone(), job.clone());
+                inner.put_job(job.clone());
             }
 
             notify_job_events.insert(job.job_id.clone());
@@ -955,7 +1008,7 @@ impl StateStore for MemoryStateStore {
                     job.current_attempt_id = None;
                     job.updated_at_ms = now_ms;
                     job.version += 1;
-                    inner.jobs.insert(job.job_id.clone(), job.clone());
+                    inner.put_job(job.clone());
                     append_job_event_locked(
                         &mut inner,
                         &job.job_id,

@@ -1425,6 +1425,45 @@ impl StateStore for SqlStateStore {
             .with_job_stream_updates([job.job_id.clone()]))
     }
 
+    async fn purge_terminal_jobs(&self, before_ms: u64) -> Result<Vec<String>> {
+        let expired = "SELECT job_id FROM jobs WHERE state IN (?, ?, ?) AND updated_at_ms < ?";
+        let terminal = [
+            enum_text(&JobState::Succeeded)?,
+            enum_text(&JobState::Failed)?,
+            enum_text(&JobState::Cancelled)?,
+        ];
+        let before = to_i64(before_ms)?;
+        let mut tx = self.begin_transition_tx().await?;
+
+        let raw = format!("SELECT stream_id FROM streams WHERE job_id IN ({expired})");
+        let statement = self.sql(&raw);
+        let mut query = sqlx::query_scalar::<_, String>(statement.as_ref());
+        for state in &terminal {
+            query = query.bind(state.clone());
+        }
+        let removed_streams = query
+            .bind(before)
+            .fetch_all(&mut *tx)
+            .await
+            .context("select streams of expired jobs")?;
+
+        for table in ["job_events", "attempts", "streams", "jobs"] {
+            let raw = format!("DELETE FROM {table} WHERE job_id IN ({expired})");
+            let statement = self.sql(&raw);
+            let mut query = sqlx::query(statement.as_ref());
+            for state in &terminal {
+                query = query.bind(state.clone());
+            }
+            query
+                .bind(before)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("purge expired rows from {table}"))?;
+        }
+        tx.commit().await.context("commit terminal job purge")?;
+        Ok(removed_streams)
+    }
+
     async fn fail_pending_job_transition(
         &self,
         job_id: &str,

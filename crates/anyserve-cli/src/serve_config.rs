@@ -15,6 +15,8 @@ pub const DEFAULT_HEARTBEAT_TTL_SECS: u64 = 30;
 pub const DEFAULT_LEASE_TTL_SECS: u64 = 30;
 pub const DEFAULT_WATCH_POLL_INTERVAL_MS: u64 = 250;
 pub const DEFAULT_CLOSED_RETENTION_SECS: u64 = 300;
+const DEFAULT_MEMORY_JOB_RETENTION_SECS: u64 = 600;
+const DEFAULT_SQL_JOB_RETENTION_SECS: u64 = 7 * 24 * 3600;
 const DEFAULT_OPENAI_LISTEN: &str = "0.0.0.0:8080";
 const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:3001";
 const DEFAULT_CHAT_INTERFACE: &str = "llm.chat.v1";
@@ -64,6 +66,8 @@ pub struct ResolvedServeConfig {
     pub grpc: GrpcConfig,
     pub heartbeat_ttl_secs: u64,
     pub default_lease_ttl_secs: u64,
+    /// Terminal jobs older than this are purged; 0 keeps them forever.
+    pub job_retention_secs: u64,
     pub storage: StorageConfig,
     pub frames: FrameConfig,
     pub console: Option<ServeConsoleConfig>,
@@ -215,6 +219,12 @@ impl ResolvedServeConfig {
                 .default_lease_ttl_secs
                 .or_else(|| server.and_then(|server| server.default_lease_ttl_secs))
                 .unwrap_or(DEFAULT_LEASE_TTL_SECS),
+            job_retention_secs: server
+                .and_then(|server| server.job_retention_secs)
+                .unwrap_or(match storage.backend {
+                    StorageBackend::Memory => DEFAULT_MEMORY_JOB_RETENTION_SECS,
+                    _ => DEFAULT_SQL_JOB_RETENTION_SECS,
+                }),
             storage,
             frames,
             console,

@@ -31,6 +31,10 @@ pub trait FramePlane: Send + Sync {
     ) -> Result<Vec<Frame>>;
     async fn latest_sequence(&self, stream_id: &str) -> Result<Option<u64>>;
     async fn subscribe_stream_updates(&self, stream_id: &str) -> watch::Receiver<u64>;
+    /// Drops all frames of a stream whose job was purged.
+    async fn forget_stream(&self, _stream_id: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -76,6 +80,15 @@ impl Default for MemoryFramePlane {
 
 #[async_trait]
 impl FramePlane for MemoryFramePlane {
+    async fn forget_stream(&self, stream_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().await;
+        inner.frames.remove(stream_id);
+        inner.last_sequences.remove(stream_id);
+        drop(inner);
+        self.watchers.lock().await.stream_updates.remove(stream_id);
+        Ok(())
+    }
+
     async fn stream_created(&self, stream: &StreamRecord) -> Result<()> {
         let mut inner = self.inner.lock().await;
         inner

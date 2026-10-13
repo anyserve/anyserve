@@ -1,0 +1,13 @@
+kind = "http"
+worker_id = "far-image"
+base_url = "http://image:9100"
+max_active_leases = 4
+health_url = "http://image:9100/healthz"
+token_env = "ANYSERVE_WORKER_TOKEN"
+upstream_timeout_secs = 120
+
+[routes]
+"image.generate.v1" = "/generate"
+
+[attributes]
+region = "far"
