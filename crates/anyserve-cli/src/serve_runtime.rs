@@ -127,6 +127,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         config.default_lease_ttl_secs,
         config.frames.watch_poll_interval_ms,
     ));
+    kernel.set_job_retention(std::time::Duration::from_secs(config.job_retention_secs));
     kernel.start_background().await;
     let auth = Arc::new(config.auth.clone());
     if !auth.is_enabled() {

@@ -22,8 +22,11 @@ def pct(values, q):
     return round(values[min(len(values) - 1, int(q * len(values)))], 2)
 
 
+BODY = None  # --body overrides the random observation payload
+
+
 async def step(session, url, headers, obs_dim, served, sticky=None):
-    body = {"obs": [random.random() for _ in range(obs_dim)]}
+    body = BODY if BODY is not None else {"obs": [random.random() for _ in range(obs_dim)]}
     started = time.perf_counter()
     async with session.post(url, json=body, headers=headers) as response:
         await response.read()
@@ -96,7 +99,10 @@ async def main():
     parser.add_argument("--warmup", type=float, default=2)
     parser.add_argument("--sticky", action="store_true", help="control mode: pin the session to one worker")
     parser.add_argument("--out")
+    parser.add_argument("--body", help="fixed JSON request body (e.g. an image prompt)")
     args = parser.parse_args()
+    global BODY
+    BODY = json.loads(args.body) if args.body else None
 
     headers = dict(h.split(":", 1) for h in args.header)
     if args.token:

@@ -267,6 +267,23 @@ async fn invoke_round_trips_through_a_long_polling_edge_worker() {
         elapsed < Duration::from_millis(500),
         "invoke took {elapsed:?}"
     );
+
+    let metrics = reqwest::Client::new()
+        .get(format!("{}/metrics", cluster.invoke_url))
+        .bearer_auth(CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "anyserve_invoke_duration_ms_count{interface=\"demo.act.v1\",code=\"200\"} 1"
+        )
+    );
+    assert!(metrics.contains("anyserve_live_workers{region=\"ap-south-1\"} 1"));
+    assert!(metrics.contains("anyserve_jobs{state=\"succeeded\"} 1"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

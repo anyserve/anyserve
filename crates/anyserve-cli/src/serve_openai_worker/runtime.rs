@@ -66,38 +66,72 @@ pub(crate) async fn run(control_plane_endpoint: &str, args: ServeOpenAIWorkerArg
     }
     tokio::spawn(heartbeat_loop(context.clone()));
 
+    let (stop_tx, stop_rx) = watch::channel(false);
     let mut lease_loops = JoinSet::new();
     for slot in 0..config.max_active_leases {
         lease_loops.spawn(lease_loop(
             context.clone(),
             client.clone(),
             health_rx.clone(),
+            stop_rx.clone(),
             slot,
         ));
     }
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!(worker_id = %context.worker_id, "worker shutting down");
-        }
+        _ = shutdown_signal() => {}
         Some(joined) = lease_loops.join_next() => {
             if let Err(error) = joined {
                 tracing::error!(error = %error, "worker lease loop exited unexpectedly");
             }
         }
     }
+
+    // Drain: stop taking leases, let in-flight jobs finish, then exit, so a
+    // rolling restart or scale-down never strands a lease until its TTL.
+    let in_flight = context.activity.lock().await.active_lease_ids.len();
+    tracing::info!(worker_id = %context.worker_id, in_flight, "worker draining");
+    let _ = stop_tx.send(true);
+    let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while lease_loops.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(worker_id = %context.worker_id, "drain timed out; leases will expire and requeue");
+    }
     Ok(())
+}
+
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 async fn lease_loop(
     context: WorkerContext,
     mut client: AnyserveClient,
     mut healthy: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
     slot: u32,
 ) {
     let config = &context.config;
     let worker_id = context.worker_id.clone();
     loop {
+        if *stop.borrow() {
+            return;
+        }
         if !*healthy.borrow_and_update() {
             // Upstream is down: stop taking work so other clusters absorb it.
             let _ = healthy.changed().await;
@@ -119,6 +153,7 @@ async fn lease_loop(
         let polled = tokio::select! {
             polled = poll => polled,
             _ = wait_unhealthy(&mut healthy) => continue,
+            _ = stop.changed() => return,
         };
         let grant = match polled {
             Ok(Some(grant)) => grant,

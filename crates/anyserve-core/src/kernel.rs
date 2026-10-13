@@ -34,6 +34,8 @@ pub struct Kernel {
     /// stampeding every waiting loop through the store.
     waiting: std::sync::Mutex<HashMap<String, WaitingWorker>>,
     timer_tx: mpsc::UnboundedSender<TimerEntry>,
+    /// Terminal jobs older than this are purged; 0 keeps them forever.
+    job_retention_ms: std::sync::atomic::AtomicU64,
     timer_rx: Mutex<Option<mpsc::UnboundedReceiver<TimerEntry>>>,
 }
 
@@ -43,6 +45,7 @@ const DISPATCH_RECHECK: Duration = Duration::from_secs(1);
 /// Backstop sweep for queue deadlines owned by a crashed instance and for
 /// expired leases when no worker is polling.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+const PURGE_INTERVAL: Duration = Duration::from_secs(30);
 pub const QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
 /// Retryable failures stop requeueing after this many attempts so a job that
 /// breaks every worker cannot bounce between clusters forever.
@@ -122,8 +125,18 @@ impl Kernel {
             watch_poll_interval_ms,
             waiting: std::sync::Mutex::new(HashMap::new()),
             timer_tx,
+            job_retention_ms: std::sync::atomic::AtomicU64::new(0),
             timer_rx: Mutex::new(Some(timer_rx)),
         }
+    }
+
+    /// Purge terminal jobs (events, attempts, streams, frames) older than
+    /// `retention` during maintenance. Zero disables purging.
+    pub fn set_job_retention(&self, retention: Duration) {
+        self.job_retention_ms.store(
+            retention.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Starts the background tasks that fire spillover/queue-deadline timers,
@@ -178,12 +191,43 @@ impl Kernel {
     async fn run_maintenance(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_purge = Instant::now();
         loop {
             ticker.tick().await;
             if let Err(error) = self.run_maintenance_once().await {
                 tracing::warn!(error = %error, "control plane maintenance pass failed");
             }
+            if last_purge.elapsed() >= PURGE_INTERVAL {
+                last_purge = Instant::now();
+                if let Err(error) = self.purge_expired_jobs().await {
+                    tracing::warn!(error = %error, "terminal job purge failed");
+                }
+            }
         }
+    }
+
+    /// Deletes terminal jobs older than the retention window. Returns how many
+    /// streams were dropped with them.
+    pub async fn purge_expired_jobs(&self) -> Result<usize> {
+        let retention_ms = self
+            .job_retention_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if retention_ms == 0 {
+            return Ok(0);
+        }
+        let removed = self
+            .state_store
+            .purge_terminal_jobs(now_ms().saturating_sub(retention_ms))
+            .await?;
+        let mut cache = self.stream_cache.lock().await;
+        for stream_id in &removed {
+            cache.remove(stream_id);
+        }
+        drop(cache);
+        for stream_id in &removed {
+            self.frame_plane.forget_stream(stream_id).await?;
+        }
+        Ok(removed.len())
     }
 
     /// Reaps expired leases and fails pending jobs whose queue deadline passed.
@@ -279,6 +323,16 @@ impl Kernel {
                 entry.notify.notify_one();
             }
         }
+    }
+
+    /// Poll loops currently parked in a long-poll on this instance.
+    pub fn waiting_poll_loops(&self) -> usize {
+        self.waiting
+            .lock()
+            .expect("waiting registry poisoned")
+            .values()
+            .map(|entry| entry.loops)
+            .sum()
     }
 
     fn register_waiter(&self, worker: WorkerRecord) -> (Arc<Notify>, WaitRegistration<'_>) {
@@ -1607,5 +1661,39 @@ mod tests {
         assert_eq!(job.state, JobState::Failed);
         assert!(job.last_error.unwrap().contains("gave up after"));
         assert!(kernel.poll_lease("worker-1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_expired_terminal_jobs() {
+        let kernel = test_kernel();
+        register(&kernel, "worker-1", "local").await;
+        for job_id in ["job-done", "job-waiting"] {
+            kernel
+                .submit_job(
+                    Some(job_id.to_string()),
+                    JobSpec {
+                        interface_name: "demo.execute.v1".to_string(),
+                        ..JobSpec::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let lease = kernel.poll_lease("worker-1").await.unwrap().unwrap().lease;
+        kernel
+            .complete_lease("worker-1", &lease.lease_id, Vec::new(), Attributes::new())
+            .await
+            .unwrap();
+
+        kernel.set_job_retention(Duration::from_millis(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        kernel.purge_expired_jobs().await.unwrap();
+
+        let remaining = kernel.list_jobs().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].state, JobState::Pending);
+        assert!(kernel.get_job(&lease.job_id).await.is_err());
+        // The pending index still serves dispatch after the purge.
+        assert!(kernel.poll_lease("worker-1").await.unwrap().is_some());
     }
 }

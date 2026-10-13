@@ -34,7 +34,8 @@ services:
 
   edge-near:
     <<: *anyserve
-    command: ["bash", "-c", "for c in /bench/edge-near-llm.toml /bench/edge-near-policy.toml; do anyserve --endpoint http://172.31.11.10:50052 worker --config $$c & done; wait -n"]
+    # One worker process per backend; SIGTERM is forwarded so workers drain.
+    command: ["bash", "-c", "for c in /bench/edge-near-*.toml; do anyserve --endpoint http://172.31.11.10:50052 worker --config $$c & done; trap 'kill -TERM $$(jobs -p); wait' TERM INT; wait -n"]
     environment:
       <<: *tokens
       NETEM_RULES: "172.31.11.:${HALF_RTT_NEAR:-15}"
@@ -43,7 +44,8 @@ services:
 
   edge-far:
     <<: *anyserve
-    command: ["bash", "-c", "for c in /bench/edge-far-llm.toml /bench/edge-far-policy.toml; do anyserve --endpoint http://172.31.12.10:50052 worker --config $$c & done; wait -n"]
+    # One worker process per backend; SIGTERM is forwarded so workers drain.
+    command: ["bash", "-c", "for c in /bench/edge-far-*.toml; do anyserve --endpoint http://172.31.12.10:50052 worker --config $$c & done; trap 'kill -TERM $$(jobs -p); wait' TERM INT; wait -n"]
     environment:
       <<: *tokens
       NETEM_RULES: "172.31.12.:${HALF_RTT_FAR:-35}"
@@ -76,6 +78,20 @@ services:
     networks:
       lan: {ipv4_address: 172.31.20.30}
 
+  # Text-to-image backend; GPU-heavy, so start it only when vLLM is stopped:
+  #   docker compose stop vllm && docker compose --profile image up -d image
+  image:
+    image: vllm/vllm-openai:v0.10.2
+    profiles: ["image"]
+    entrypoint: ["bash", "-c", "pip install -q diffusers==0.35.1 && uvicorn --app-dir /bench image_server:app --host 0.0.0.0 --port 9100"]
+    volumes: ["./:/bench:ro", "hf-cache:/root/.cache/huggingface"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+    networks:
+      lan: {ipv4_address: 172.31.20.40}
+
   # Network namespace for the bench client; tc on its lan leg emulates calling
   # the edge backend directly across the WAN (no middleware) for baselines.
   bench-net:
@@ -89,6 +105,11 @@ services:
     image: vllm/vllm-openai:v0.10.2
     entrypoint: ["sleep", "infinity"]
     network_mode: "service:bench-net"
+    # `vllm bench` needs a visible GPU to start (it only tokenizes).
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
     volumes: ["./:/bench", "hf-cache:/root/.cache/huggingface"]
     depends_on: [bench-net]
 

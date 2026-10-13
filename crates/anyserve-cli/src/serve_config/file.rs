@@ -151,6 +151,8 @@ pub(super) struct ServerConfigFile {
     #[serde(default)]
     pub(super) default_lease_ttl_secs: Option<u64>,
     #[serde(default)]
+    pub(super) job_retention_secs: Option<u64>,
+    #[serde(default)]
     pub(super) storage: Option<StorageConfigFile>,
     #[serde(default)]
     pub(super) frames: Option<FrameConfigFile>,

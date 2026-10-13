@@ -25,12 +25,17 @@ use crate::edge_routing::{
 };
 use crate::serve_config::ServeInvokeConfig;
 
+mod metrics;
+
+use metrics::InvokeMetrics;
+
 pub(crate) const FORWARD_HEADER_PREFIX: &str = "http.header.";
 
 #[derive(Clone)]
 struct InvokeState {
     kernel: Arc<Kernel>,
     config: Arc<ServeInvokeConfig>,
+    metrics: Arc<InvokeMetrics>,
 }
 
 pub async fn run_server(
@@ -56,10 +61,12 @@ fn router(kernel: Arc<Kernel>, config: ServeInvokeConfig, auth: Arc<AuthPolicy>)
     let state = InvokeState {
         kernel,
         config: Arc::new(config),
+        metrics: Arc::new(InvokeMetrics::default()),
     };
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route("/readyz", axum::routing::get(readyz))
+        .route("/metrics", axum::routing::get(metrics_handler))
         .route("/v1/invoke/*interface", axum::routing::post(invoke))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
@@ -96,9 +103,31 @@ async fn readyz(State(state): State<InvokeState>) -> Response {
     }
 }
 
+async fn metrics_handler(State(state): State<InvokeState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(&state.kernel).await,
+    )
+        .into_response()
+}
+
 async fn invoke(
     State(state): State<InvokeState>,
     Path(interface): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = std::time::Instant::now();
+    let response = invoke_job(&state, interface.clone(), headers, body).await;
+    state
+        .metrics
+        .observe(&interface, response.status().as_u16(), started.elapsed());
+    response
+}
+
+async fn invoke_job(
+    state: &InvokeState,
+    interface: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
