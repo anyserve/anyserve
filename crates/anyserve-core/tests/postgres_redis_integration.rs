@@ -577,3 +577,97 @@ async fn postgres_claim_matches_priority_attributes_and_capacity() {
     assert_eq!(attr_miss.state, JobState::Pending);
     assert_eq!(capacity_miss.state, JobState::Pending);
 }
+
+#[tokio::test]
+#[ignore = "requires docker-backed postgres + redis via ANYSERVE_TEST_POSTGRES_DSN and ANYSERVE_TEST_REDIS_URL"]
+async fn postgres_long_poll_wakes_across_instances_and_honors_spillover() {
+    let (Some(postgres_dsn), Some(redis_url)) = (
+        required_env("ANYSERVE_TEST_POSTGRES_DSN"),
+        required_env("ANYSERVE_TEST_REDIS_URL"),
+    ) else {
+        eprintln!("skipping: postgres/redis env not set");
+        return;
+    };
+    let suffix = Uuid::new_v4().simple().to_string();
+    let interface_name = format!("demo.edge.v1.{suffix}");
+    let kernel = |dsn: String, redis: String| async move {
+        let kernel = Arc::new(Kernel::new(
+            Arc::new(SqlStateStore::connect(&dsn).await.unwrap()),
+            Arc::new(RedisFramePlane::new(&redis, 300).unwrap()),
+            Arc::new(RedisClusterNotifier::new(&redis).unwrap()),
+            Arc::new(BasicScheduler),
+            30,
+            30,
+            25,
+        ));
+        kernel.start_background().await;
+        kernel
+    };
+    let kernel_a = kernel(postgres_dsn.clone(), redis_url.clone()).await;
+    let kernel_b = kernel(postgres_dsn, redis_url).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let far_worker = format!("worker-far-{suffix}");
+    kernel_b
+        .register_worker(
+            Some(far_worker.clone()),
+            WorkerSpec {
+                interfaces: BTreeSet::from([interface_name.clone()]),
+                attributes: BTreeMap::from([("region".to_string(), "far".to_string())]),
+                total_capacity: BTreeMap::from([("slot".to_string(), 1)]),
+                max_active_leases: 1,
+                ..WorkerSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let waiter = {
+        let kernel_b = Arc::clone(&kernel_b);
+        let far_worker = far_worker.clone();
+        tokio::spawn(async move {
+            let started = tokio::time::Instant::now();
+            let grant = kernel_b
+                .poll_lease_wait(&far_worker, Duration::from_secs(10))
+                .await
+                .unwrap();
+            (grant, started.elapsed())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Submitted on instance A, preferring a region the waiting worker is not in.
+    let job_id = format!("job-spill-{suffix}");
+    kernel_a
+        .submit_job(
+            Some(job_id.clone()),
+            JobSpec {
+                interface_name,
+                demand: anyserve_core::model::Demand {
+                    preferred_attributes: BTreeMap::from([(
+                        "region".to_string(),
+                        "near".to_string(),
+                    )]),
+                    ..Default::default()
+                },
+                policy: ExecutionPolicy {
+                    spillover_after_ms: 200,
+                    ..ExecutionPolicy::default()
+                },
+                ..JobSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let (grant, elapsed) = waiter.await.unwrap();
+    assert_eq!(grant.unwrap().job.job_id, job_id);
+    assert!(
+        elapsed >= Duration::from_millis(190),
+        "spilled too early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "spilled too late: {elapsed:?}"
+    );
+}

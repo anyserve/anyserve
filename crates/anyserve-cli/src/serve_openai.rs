@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use axum::Router;
 use tokio::sync::watch;
 
+use anyserve_core::auth::AuthPolicy;
 use anyserve_core::kernel::Kernel;
 
 use crate::serve_config::ServeOpenAIConfig;
@@ -24,6 +25,7 @@ pub async fn run_server(
     listen: std::net::SocketAddr,
     kernel: Arc<Kernel>,
     config: ServeOpenAIConfig,
+    auth: Arc<AuthPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let state = AppState {
@@ -39,7 +41,11 @@ pub async fn run_server(
             axum::routing::post(chat_completions),
         )
         .route("/v1/embeddings", axum::routing::post(embeddings))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::edge_routing::require_client_token,
+        ));
 
     let listener = tokio::net::TcpListener::bind(listen)
         .await

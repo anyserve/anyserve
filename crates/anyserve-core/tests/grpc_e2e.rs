@@ -115,6 +115,7 @@ async fn grpc_streaming_e2e_round_trip() -> Result<()> {
                     profile: "basic".to_string(),
                     priority: 0,
                     lease_ttl_secs: 15,
+                    ..Default::default()
                 }),
                 metadata: HashMap::from([("source".to_string(), "grpc-e2e".to_string())]),
             }),
@@ -186,6 +187,7 @@ async fn grpc_streaming_e2e_round_trip() -> Result<()> {
     let assignment = worker
         .poll_lease(Request::new(PollLeaseRequest {
             worker_id: worker_id.clone(),
+            ..Default::default()
         }))
         .await
         .context("poll lease for job")?
@@ -473,6 +475,7 @@ async fn grpc_follow_streams_wake_on_new_events_and_frames() -> Result<()> {
                     profile: "basic".to_string(),
                     priority: 0,
                     lease_ttl_secs: 15,
+                    ..Default::default()
                 }),
                 metadata: HashMap::new(),
             }),
@@ -486,6 +489,7 @@ async fn grpc_follow_streams_wake_on_new_events_and_frames() -> Result<()> {
     let assignment = worker
         .poll_lease(Request::new(PollLeaseRequest {
             worker_id: worker_id.clone(),
+            ..Default::default()
         }))
         .await
         .context("poll lease for follow job")?
@@ -614,6 +618,7 @@ async fn grpc_can_list_and_cancel_jobs() -> Result<()> {
                         profile: "basic".to_string(),
                         priority: 0,
                         lease_ttl_secs: 15,
+                        ..Default::default()
                     }),
                     metadata: HashMap::new(),
                 }),

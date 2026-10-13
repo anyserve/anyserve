@@ -143,6 +143,15 @@ pub trait StateStore: Send + Sync {
         now_ms: u64,
     ) -> Result<StateTransition<()>>;
     async fn reap_expired_leases_transition(&self, now_ms: u64) -> Result<StateTransition<()>>;
+    /// Fail a job that is still pending (e.g. its queue deadline passed).
+    /// Returns `None` when the job already left the pending state.
+    async fn fail_pending_job_transition(
+        &self,
+        job_id: &str,
+        reason: String,
+        metadata: Attributes,
+        now_ms: u64,
+    ) -> Result<StateTransition<Option<JobRecord>>>;
 
     async fn append_job_event(
         &self,
@@ -663,6 +672,56 @@ impl StateStore for MemoryStateStore {
                 }
 
                 StateTransition::new(job.clone(), streams_to_finalize)
+                    .with_job_event_updates([job.job_id.clone()])
+                    .with_job_stream_updates([job.job_id.clone()])
+            }
+        };
+
+        self.notify_job_events(&notify_job_events).await;
+        self.notify_job_streams(&notify_job_streams).await;
+        Ok(result)
+    }
+
+    async fn fail_pending_job_transition(
+        &self,
+        job_id: &str,
+        reason: String,
+        metadata: Attributes,
+        now_ms: u64,
+    ) -> Result<StateTransition<Option<JobRecord>>> {
+        let mut notify_job_events = BTreeSet::new();
+        let mut notify_job_streams = BTreeSet::new();
+        let result = {
+            let mut inner = self.inner.lock().await;
+            let mut job = inner
+                .jobs
+                .get(job_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("job '{}' does not exist", job_id))?;
+            if job.state != JobState::Pending {
+                StateTransition::without_streams(None)
+            } else {
+                job.state = JobState::Failed;
+                job.last_error = Some(reason);
+                job.updated_at_ms = now_ms;
+                job.version += 1;
+                inner.jobs.insert(job.job_id.clone(), job.clone());
+
+                let streams_to_finalize = close_job_streams_locked(&mut inner, &job.job_id, now_ms);
+                append_job_event_locked(
+                    &mut inner,
+                    &job.job_id,
+                    EventKind::Failed,
+                    Vec::new(),
+                    metadata,
+                    now_ms,
+                )?;
+                notify_job_events.insert(job.job_id.clone());
+                if !streams_to_finalize.is_empty() {
+                    notify_job_streams.insert(job.job_id.clone());
+                }
+
+                StateTransition::new(Some(job.clone()), streams_to_finalize)
                     .with_job_event_updates([job.job_id.clone()])
                     .with_job_stream_updates([job.job_id.clone()])
             }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 pub use anyserve_proto::controlplane;
 pub use anyserve_proto::controlplane::{
     AttemptRecord, AttemptState, EventKind, Frame, FrameKind, JobEvent, JobRecord, JobState,
@@ -15,12 +16,78 @@ use anyserve_proto::controlplane::{
     ReportEventRequest, ResourceQuantity, SubmitJobRequest, WatchJobRequest, WorkerSpec,
     control_plane_service_client::ControlPlaneServiceClient,
 };
-use tonic::transport::Channel;
-use tonic::{Request, Streaming};
+use tonic::metadata::AsciiMetadataValue;
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::{Request, Status, Streaming};
 
+/// Environment variable consulted for a bearer token when none is passed explicitly.
+pub const TOKEN_ENV: &str = "ANYSERVE_TOKEN";
+
+pub type ControlPlaneClient = ControlPlaneServiceClient<InterceptedService<Channel, BearerAuth>>;
+
+/// Attaches `authorization: Bearer <token>` to every request when a token is set.
+#[derive(Clone, Debug, Default)]
+pub struct BearerAuth {
+    header: Option<AsciiMetadataValue>,
+}
+
+impl BearerAuth {
+    pub fn new(token: Option<&str>) -> Result<Self> {
+        let header = token
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                format!("Bearer {token}")
+                    .parse::<AsciiMetadataValue>()
+                    .map_err(|_| anyhow!("anyserve token contains invalid characters"))
+            })
+            .transpose()?;
+        Ok(Self { header })
+    }
+}
+
+impl Interceptor for BearerAuth {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(header) = self.header.as_ref() {
+            request
+                .metadata_mut()
+                .insert("authorization", header.clone());
+        }
+        Ok(request)
+    }
+}
+
+#[derive(Clone)]
 pub struct AnyserveClient {
     endpoint: String,
-    inner: ControlPlaneServiceClient<Channel>,
+    inner: ControlPlaneClient,
+}
+
+/// Terminal result of [`AnyserveClient::invoke`].
+#[derive(Clone, Debug)]
+pub struct InvokeOutcome {
+    pub job: JobRecord,
+    /// Worker that ran the final attempt, when known.
+    pub worker_id: Option<String>,
+}
+
+impl InvokeOutcome {
+    pub fn succeeded(&self) -> bool {
+        self.job.state == JobState::Succeeded as i32
+    }
+
+    /// First inline output payload, if the worker returned one.
+    pub fn inline_output(&self) -> Option<&[u8]> {
+        self.job
+            .outputs
+            .iter()
+            .find_map(|output| match output.reference.as_ref() {
+                Some(object_ref::Reference::Inline(content)) => Some(content.as_slice()),
+                _ => None,
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +103,8 @@ pub struct JobSubmission {
     pub profile: String,
     pub priority: i32,
     pub lease_ttl_secs: u32,
+    pub queue_timeout_ms: u64,
+    pub spillover_after_ms: u64,
 }
 
 impl JobSubmission {
@@ -52,7 +121,22 @@ impl JobSubmission {
             profile: "basic".to_string(),
             priority: 0,
             lease_ttl_secs: 30,
+            queue_timeout_ms: 0,
+            spillover_after_ms: 0,
         }
+    }
+
+    /// Single inline input payload, the cheapest way to ship a request body.
+    pub fn with_inline_input(
+        mut self,
+        content: impl Into<Vec<u8>>,
+        metadata: HashMap<String, String>,
+    ) -> Self {
+        self.inputs = vec![ObjectRef {
+            reference: Some(object_ref::Reference::Inline(content.into())),
+            metadata,
+        }];
+        self
     }
 }
 
@@ -176,11 +260,34 @@ pub struct LeaseGrant {
 }
 
 impl AnyserveClient {
+    /// Connects using the token from `ANYSERVE_TOKEN`, if set.
     pub async fn connect(endpoint: impl Into<String>) -> Result<Self> {
+        let token = std::env::var(TOKEN_ENV).ok();
+        Self::connect_with_token(endpoint, token.as_deref()).await
+    }
+
+    pub async fn connect_with_token(
+        endpoint: impl Into<String>,
+        token: Option<&str>,
+    ) -> Result<Self> {
         let endpoint = endpoint.into();
-        let inner = ControlPlaneServiceClient::connect(endpoint.clone())
+        let mut transport = Endpoint::from_shared(endpoint.clone())
+            .context("parse anyserve gRPC endpoint")?
+            .tcp_nodelay(true)
+            .http2_keep_alive_interval(Duration::from_secs(20))
+            .keep_alive_while_idle(true);
+        if endpoint.starts_with("https://") {
+            transport = transport
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .context("configure anyserve gRPC TLS")?;
+        }
+        let channel = transport
+            .connect()
             .await
             .context("connect anyserve gRPC endpoint")?;
+        let inner = ControlPlaneServiceClient::with_interceptor(channel, BearerAuth::new(token)?)
+            .max_decoding_message_size(64 * 1024 * 1024)
+            .max_encoding_message_size(64 * 1024 * 1024);
         Ok(Self { endpoint, inner })
     }
 
@@ -188,12 +295,50 @@ impl AnyserveClient {
         &self.endpoint
     }
 
-    pub fn inner_mut(&mut self) -> &mut ControlPlaneServiceClient<Channel> {
+    pub fn inner_mut(&mut self) -> &mut ControlPlaneClient {
         &mut self.inner
     }
 
-    pub fn into_inner(self) -> ControlPlaneServiceClient<Channel> {
+    pub fn into_inner(self) -> ControlPlaneClient {
         self.inner
+    }
+
+    /// Submits a job and waits for it to reach a terminal state.
+    ///
+    /// On timeout the job is cancelled so it does not run after the caller gave up.
+    pub async fn invoke(
+        &mut self,
+        request: JobSubmission,
+        timeout: Duration,
+    ) -> Result<InvokeOutcome> {
+        let job = self.submit_job(request).await?;
+        let job_id = job.job_id.clone();
+        let mut watcher = self.clone();
+        let wait = async move {
+            let mut events = watcher.watch_job(job_id.clone(), 0).await?;
+            let mut worker_id = None;
+            while let Some(event) = events.message().await.context("read job event")? {
+                if let Some(worker) = event.metadata.get("worker_id") {
+                    worker_id = Some(worker.clone());
+                }
+                let kind = EventKind::try_from(event.kind).unwrap_or(EventKind::Unspecified);
+                if matches!(
+                    kind,
+                    EventKind::Succeeded | EventKind::Failed | EventKind::Cancelled
+                ) {
+                    break;
+                }
+            }
+            let job = watcher.get_job(job_id).await?;
+            Ok::<_, anyhow::Error>(InvokeOutcome { job, worker_id })
+        };
+        match tokio::time::timeout(timeout, wait).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let _ = self.cancel_job(job.job_id.clone()).await;
+                bail!("job '{}' did not finish within {:?}", job.job_id, timeout)
+            }
+        }
     }
 
     pub async fn submit_job(&mut self, request: JobSubmission) -> Result<JobRecord> {
@@ -214,6 +359,8 @@ impl AnyserveClient {
                         profile: request.profile,
                         priority: request.priority,
                         lease_ttl_secs: request.lease_ttl_secs,
+                        queue_timeout_ms: request.queue_timeout_ms,
+                        spillover_after_ms: request.spillover_after_ms,
                     }),
                     metadata: request.metadata,
                 }),
@@ -343,10 +490,21 @@ impl AnyserveClient {
     }
 
     pub async fn poll_lease(&mut self, worker_id: impl Into<String>) -> Result<Option<LeaseGrant>> {
+        self.poll_lease_wait(worker_id, Duration::ZERO).await
+    }
+
+    /// Long-poll for a lease: the server holds the call up to `wait` until a job
+    /// is assignable, so idle workers react to new work without a sleep loop.
+    pub async fn poll_lease_wait(
+        &mut self,
+        worker_id: impl Into<String>,
+        wait: Duration,
+    ) -> Result<Option<LeaseGrant>> {
         let response = self
             .inner
             .poll_lease(Request::new(PollLeaseRequest {
                 worker_id: worker_id.into(),
+                wait_timeout_ms: u32::try_from(wait.as_millis()).unwrap_or(u32::MAX),
             }))
             .await
             .context("poll lease")?
@@ -532,6 +690,45 @@ impl AnyserveClient {
             .push_frames(Request::new(tokio_stream::iter(requests)))
             .await
             .context("push frames")?
+            .into_inner();
+
+        Ok(PushSummary {
+            stream: response.stream,
+            last_sequence: response.last_sequence,
+            written_frames: response.written_frames,
+        })
+    }
+
+    /// Pushes frames from `frames` over a single client-streaming call, so each
+    /// frame is sent as soon as it is produced instead of costing a round trip.
+    pub async fn push_frames_stream<S>(
+        &mut self,
+        stream_id: impl Into<String>,
+        frames: S,
+        worker_id: Option<String>,
+        lease_id: Option<String>,
+    ) -> Result<PushSummary>
+    where
+        S: tokio_stream::Stream<Item = FrameWrite> + Send + 'static,
+    {
+        use tokio_stream::StreamExt;
+
+        let stream_id = stream_id.into();
+        let worker_id = worker_id.unwrap_or_default();
+        let lease_id = lease_id.unwrap_or_default();
+        let requests = frames.map(move |frame| PushFramesRequest {
+            stream_id: stream_id.clone(),
+            worker_id: worker_id.clone(),
+            lease_id: lease_id.clone(),
+            kind: frame.kind as i32,
+            payload: frame.payload,
+            metadata: frame.metadata,
+        });
+        let response = self
+            .inner
+            .push_frames(Request::new(requests))
+            .await
+            .context("push frame stream")?
             .into_inner();
 
         Ok(PushSummary {

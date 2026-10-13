@@ -36,6 +36,13 @@ pub trait ClusterNotifier: Send + Sync {
     async fn publish_job_streams(&self, job_id: &str) -> Result<()>;
     async fn subscribe_job_events(&self, job_id: &str) -> Result<ClusterSubscription>;
     async fn subscribe_job_streams(&self, job_id: &str) -> Result<ClusterSubscription>;
+    /// Signals other control-plane instances that new work may be assignable.
+    async fn publish_dispatch(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn subscribe_dispatch(&self) -> Result<ClusterSubscription> {
+        Ok(ClusterSubscription::Noop)
+    }
 }
 
 pub struct NoopClusterNotifier;
@@ -76,6 +83,8 @@ impl RedisClusterNotifier {
     fn job_events_channel(job_id: &str) -> String {
         format!("anyserve:notify:job-events:{job_id}")
     }
+
+    const DISPATCH_CHANNEL: &'static str = "anyserve:notify:dispatch";
 
     fn job_streams_channel(job_id: &str) -> String {
         format!("anyserve:notify:job-streams:{job_id}")
@@ -133,5 +142,13 @@ impl ClusterNotifier for RedisClusterNotifier {
 
     async fn subscribe_job_streams(&self, job_id: &str) -> Result<ClusterSubscription> {
         self.subscribe(Self::job_streams_channel(job_id)).await
+    }
+
+    async fn publish_dispatch(&self) -> Result<()> {
+        self.publish(Self::DISPATCH_CHANNEL.to_string()).await
+    }
+
+    async fn subscribe_dispatch(&self) -> Result<ClusterSubscription> {
+        self.subscribe(Self::DISPATCH_CHANNEL.to_string()).await
     }
 }

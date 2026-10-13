@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, mpsc, watch};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::frame::FramePlane;
@@ -27,6 +29,33 @@ pub struct Kernel {
     heartbeat_ttl_secs: u64,
     default_lease_ttl_secs: u64,
     watch_poll_interval_ms: u64,
+    /// Bumped whenever work may have become assignable; long-polling workers wait on it.
+    dispatch_tx: watch::Sender<u64>,
+    timer_tx: mpsc::UnboundedSender<TimerEntry>,
+    timer_rx: Mutex<Option<mpsc::UnboundedReceiver<TimerEntry>>>,
+}
+
+/// Upper bound on how long a long-poll sleeps without re-checking the store,
+/// covering missed cross-instance notifications.
+const DISPATCH_RECHECK: Duration = Duration::from_secs(1);
+/// Backstop sweep for queue deadlines owned by a crashed instance and for
+/// expired leases when no worker is polling.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
+pub const QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
+/// Retryable failures stop requeueing after this many attempts so a job that
+/// breaks every worker cannot bounce between clusters forever.
+pub const MAX_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TimerAction {
+    Spillover,
+    QueueDeadline(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TimerEntry {
+    due_at_ms: u64,
+    action: TimerAction,
 }
 
 #[derive(Clone, Debug)]
@@ -51,6 +80,8 @@ impl Kernel {
         default_lease_ttl_secs: u64,
         watch_poll_interval_ms: u64,
     ) -> Self {
+        let (dispatch_tx, _) = watch::channel(0);
+        let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         Self {
             state_store,
             frame_plane,
@@ -60,6 +91,175 @@ impl Kernel {
             heartbeat_ttl_secs,
             default_lease_ttl_secs,
             watch_poll_interval_ms,
+            dispatch_tx,
+            timer_tx,
+            timer_rx: Mutex::new(Some(timer_rx)),
+        }
+    }
+
+    /// Starts the background tasks that fire spillover/queue-deadline timers,
+    /// sweep expired leases, and relay cross-instance dispatch notifications.
+    /// Safe to call more than once; only the first call starts anything.
+    pub async fn start_background(self: &Arc<Self>) {
+        let Some(timer_rx) = self.timer_rx.lock().await.take() else {
+            return;
+        };
+        tokio::spawn(Arc::clone(self).run_timers(timer_rx));
+        tokio::spawn(Arc::clone(self).run_maintenance());
+        tokio::spawn(Arc::clone(self).relay_cluster_dispatch());
+    }
+
+    async fn run_timers(self: Arc<Self>, mut timer_rx: mpsc::UnboundedReceiver<TimerEntry>) {
+        let mut pending: BinaryHeap<Reverse<TimerEntry>> = BinaryHeap::new();
+        loop {
+            let next_due = pending.peek().map(|Reverse(entry)| entry.due_at_ms);
+            let sleep_for = next_due
+                .map(|due| Duration::from_millis(due.saturating_sub(now_ms())))
+                .unwrap_or(Duration::from_secs(3600));
+            tokio::select! {
+                received = timer_rx.recv() => match received {
+                    Some(entry) => pending.push(Reverse(entry)),
+                    None => return,
+                },
+                _ = tokio::time::sleep(sleep_for) => {
+                    let now = now_ms();
+                    while let Some(Reverse(entry)) = pending.peek() {
+                        if entry.due_at_ms > now {
+                            break;
+                        }
+                        let Reverse(entry) = pending.pop().expect("peeked entry");
+                        self.fire_timer(entry.action).await;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn fire_timer(&self, action: TimerAction) {
+        match action {
+            TimerAction::Spillover => self.signal_dispatch().await,
+            TimerAction::QueueDeadline(job_id) => {
+                if let Err(error) = self.expire_pending_job(&job_id).await {
+                    tracing::debug!(job_id = %job_id, error = %error, "queue deadline expiry skipped");
+                }
+            }
+        }
+    }
+
+    async fn run_maintenance(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = self.run_maintenance_once().await {
+                tracing::warn!(error = %error, "control plane maintenance pass failed");
+            }
+        }
+    }
+
+    /// Reaps expired leases and fails pending jobs whose queue deadline passed.
+    pub async fn run_maintenance_once(&self) -> Result<()> {
+        let now = now_ms();
+        let reaped = self.state_store.reap_expired_leases_transition(now).await?;
+        self.finalize_terminal_streams(reaped.streams_to_finalize.clone())
+            .await?;
+        self.publish_transition_best_effort(&reaped).await;
+        if !reaped.job_event_updates.is_empty() {
+            self.signal_dispatch().await;
+        }
+
+        for job in self.state_store.list_pending_jobs().await? {
+            if job
+                .spec
+                .policy
+                .queue_deadline_ms(job.created_at_ms)
+                .is_some_and(|deadline| deadline <= now)
+                && let Err(error) = self.expire_pending_job(&job.job_id).await
+            {
+                tracing::debug!(job_id = %job.job_id, error = %error, "queue deadline sweep skipped");
+            }
+        }
+        Ok(())
+    }
+
+    async fn relay_cluster_dispatch(self: Arc<Self>) {
+        loop {
+            let mut subscription = match self.notifier.subscribe_dispatch().await {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    tracing::warn!(error = %error, "subscribe cluster dispatch failed");
+                    tokio::time::sleep(DISPATCH_RECHECK).await;
+                    continue;
+                }
+            };
+            while subscription.changed().await.is_ok() {
+                self.dispatch_tx
+                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+            }
+            tokio::time::sleep(DISPATCH_RECHECK).await;
+        }
+    }
+
+    async fn expire_pending_job(&self, job_id: &str) -> Result<()> {
+        let job = self.get_job(job_id).await?;
+        let Some(deadline) = job.spec.policy.queue_deadline_ms(job.created_at_ms) else {
+            return Ok(());
+        };
+        if job.state != JobState::Pending || deadline > now_ms() {
+            return Ok(());
+        }
+        let transition = self
+            .state_store
+            .fail_pending_job_transition(
+                job_id,
+                format!(
+                    "no worker leased the job within queue_timeout_ms={}",
+                    job.spec.policy.queue_timeout_ms
+                ),
+                Attributes::from([("reason".to_string(), QUEUE_TIMEOUT_REASON.to_string())]),
+                now_ms(),
+            )
+            .await?;
+        self.finalize_terminal_streams(transition.streams_to_finalize.clone())
+            .await?;
+        self.publish_transition_best_effort(&transition).await;
+        Ok(())
+    }
+
+    fn schedule_timer(&self, due_at_ms: u64, action: TimerAction) {
+        let _ = self.timer_tx.send(TimerEntry { due_at_ms, action });
+    }
+
+    /// Wakes local long-polls and tells peer instances to do the same.
+    async fn signal_dispatch(&self) {
+        self.dispatch_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        let _ = self.notifier.publish_dispatch().await;
+    }
+
+    /// Like [`Kernel::poll_lease`], but holds the call open up to `wait` for an
+    /// assignable job so idle workers pick up new work without polling delay.
+    pub async fn poll_lease_wait(
+        &self,
+        worker_id: &str,
+        wait: Duration,
+    ) -> Result<Option<LeaseAssignment>> {
+        let deadline = Instant::now() + wait;
+        let mut dispatch_rx = self.dispatch_tx.subscribe();
+        loop {
+            dispatch_rx.borrow_and_update();
+            if let Some(assignment) = self.poll_lease(worker_id).await? {
+                return Ok(Some(assignment));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            let recheck = (deadline - now).min(DISPATCH_RECHECK);
+            tokio::select! {
+                _ = dispatch_rx.changed() => {}
+                _ = tokio::time::sleep(recheck) => {}
+            }
         }
     }
 
@@ -102,6 +302,17 @@ impl Kernel {
             )
             .await?;
         self.publish_job_events_best_effort(&job.job_id).await;
+        if let Some(spillover_at_ms) = job
+            .spec
+            .policy
+            .spillover_at_ms(&job.spec.demand, job.created_at_ms)
+        {
+            self.schedule_timer(spillover_at_ms, TimerAction::Spillover);
+        }
+        if let Some(deadline_ms) = job.spec.policy.queue_deadline_ms(job.created_at_ms) {
+            self.schedule_timer(deadline_ms, TimerAction::QueueDeadline(job.job_id.clone()));
+        }
+        self.signal_dispatch().await;
         Ok(job)
     }
 
@@ -278,6 +489,9 @@ impl Kernel {
         self.finalize_terminal_streams(reaped.streams_to_finalize.clone())
             .await?;
         self.publish_transition_best_effort(&reaped).await;
+        if !reaped.job_event_updates.is_empty() {
+            self.signal_dispatch().await;
+        }
 
         let ordered_candidates = if self.state_store.lease_dispatch_mode()
             == LeaseDispatchMode::KernelOrderedCandidates
@@ -292,9 +506,9 @@ impl Kernel {
             }
 
             let jobs = self.state_store.list_pending_jobs().await?;
-            let ordered_candidates = self
-                .scheduler
-                .ordered_jobs_for_worker(&worker, jobs.as_slice());
+            let ordered_candidates =
+                self.scheduler
+                    .ordered_jobs_for_worker(&worker, jobs.as_slice(), now_ms);
             if ordered_candidates.is_empty() {
                 return Ok(None);
             }
@@ -376,7 +590,22 @@ impl Kernel {
         retryable: bool,
         metadata: Attributes,
     ) -> Result<()> {
-        self.require_lease(worker_id, lease_id).await?;
+        let lease = self.require_lease(worker_id, lease_id).await?;
+        let (retryable, reason) = if retryable
+            && self
+                .state_store
+                .list_attempts_for_job(&lease.job_id)
+                .await?
+                .len()
+                >= MAX_ATTEMPTS
+        {
+            (
+                false,
+                format!("{reason} (gave up after {MAX_ATTEMPTS} attempts)"),
+            )
+        } else {
+            (retryable, reason)
+        };
         let now_ms = now_ms();
         let transition = self
             .state_store
@@ -385,6 +614,9 @@ impl Kernel {
         self.finalize_terminal_streams(transition.streams_to_finalize.clone())
             .await?;
         self.publish_transition_best_effort(&transition).await;
+        if retryable {
+            self.signal_dispatch().await;
+        }
         Ok(())
     }
 
@@ -1108,5 +1340,201 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].payload, b"hello".to_vec());
         assert!(closed.state.is_terminal());
+    }
+
+    fn test_kernel() -> Arc<Kernel> {
+        Arc::new(Kernel::new(
+            Arc::new(MemoryStateStore::new()),
+            Arc::new(MemoryFramePlane::new()),
+            Arc::new(NoopClusterNotifier),
+            Arc::new(BasicScheduler),
+            30,
+            30,
+            250,
+        ))
+    }
+
+    async fn register(kernel: &Kernel, worker_id: &str, region: &str) {
+        kernel
+            .register_worker(
+                Some(worker_id.to_string()),
+                WorkerSpec {
+                    interfaces: BTreeSet::from(["demo.execute.v1".to_string()]),
+                    attributes: BTreeMap::from([("region".to_string(), region.to_string())]),
+                    total_capacity: BTreeMap::from([("slot".to_string(), 1)]),
+                    max_active_leases: 1,
+                    ..WorkerSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_poll_wakes_as_soon_as_a_job_is_submitted() {
+        let kernel = test_kernel();
+        kernel.start_background().await;
+        register(&kernel, "worker-1", "local").await;
+
+        let waiter = {
+            let kernel = Arc::clone(&kernel);
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                let grant = kernel
+                    .poll_lease_wait("worker-1", Duration::from_secs(10))
+                    .await
+                    .unwrap();
+                (grant, started.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        kernel
+            .submit_job(
+                Some("job-1".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (grant, elapsed) = waiter.await.unwrap();
+        assert_eq!(grant.unwrap().job.job_id, "job-1");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "long poll took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_poll_returns_none_after_wait_without_work() {
+        let kernel = test_kernel();
+        register(&kernel, "worker-1", "local").await;
+        let grant = kernel
+            .poll_lease_wait("worker-1", Duration::from_millis(30))
+            .await
+            .unwrap();
+        assert!(grant.is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_job_fails_once_queue_timeout_elapses() {
+        let kernel = test_kernel();
+        kernel.start_background().await;
+        kernel
+            .submit_job(
+                Some("job-queued".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    policy: ExecutionPolicy {
+                        queue_timeout_ms: 50,
+                        ..ExecutionPolicy::default()
+                    },
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let job = kernel.get_job("job-queued").await.unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        let events = kernel.list_job_events("job-queued").await.unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.kind, EventKind::Failed);
+        assert_eq!(
+            last.metadata.get("reason").map(String::as_str),
+            Some(super::QUEUE_TIMEOUT_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn spillover_timer_wakes_remote_worker_waiting_on_long_poll() {
+        let kernel = test_kernel();
+        kernel.start_background().await;
+        register(&kernel, "worker-far", "far").await;
+
+        let waiter = {
+            let kernel = Arc::clone(&kernel);
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                let grant = kernel
+                    .poll_lease_wait("worker-far", Duration::from_secs(10))
+                    .await
+                    .unwrap();
+                (grant, started.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        kernel
+            .submit_job(
+                Some("job-near".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    demand: crate::model::Demand {
+                        preferred_attributes: BTreeMap::from([(
+                            "region".to_string(),
+                            "near".to_string(),
+                        )]),
+                        ..Default::default()
+                    },
+                    policy: ExecutionPolicy {
+                        spillover_after_ms: 150,
+                        ..ExecutionPolicy::default()
+                    },
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let (grant, elapsed) = waiter.await.unwrap();
+        assert_eq!(grant.unwrap().job.job_id, "job-near");
+        // Held for the spillover window, then released promptly by the timer
+        // rather than by the 1 s recheck backstop.
+        assert!(
+            elapsed >= Duration::from_millis(140),
+            "released too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "released too late: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_failures_stop_after_max_attempts() {
+        let kernel = test_kernel();
+        register(&kernel, "worker-1", "local").await;
+        kernel
+            .submit_job(
+                Some("job-flaky".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..super::MAX_ATTEMPTS {
+            let lease = kernel.poll_lease("worker-1").await.unwrap().unwrap().lease;
+            kernel
+                .fail_lease(
+                    "worker-1",
+                    &lease.lease_id,
+                    "boom".to_string(),
+                    true,
+                    Attributes::new(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let job = kernel.get_job("job-flaky").await.unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert!(job.last_error.unwrap().contains("gave up after"));
+        assert!(kernel.poll_lease("worker-1").await.unwrap().is_none());
     }
 }

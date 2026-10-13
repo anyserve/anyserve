@@ -3,8 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use anyserve_client::{
-    AnyserveClient, FrameKind, FrameWrite, ObjectRef, StreamDirection, StreamOpen, StreamState,
-    object_ref,
+    AnyserveClient, FrameKind, FrameWrite, StreamDirection, StreamOpen, StreamState,
 };
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -27,13 +26,19 @@ pub(crate) fn build_http_client(
 
     reqwest::Client::builder()
         .default_headers(headers)
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(config.max_active_leases as usize)
         .timeout(config.upstream_timeout)
         .build()
         .context("build HTTP client")
 }
 
-pub(crate) async fn connect_client(control_plane_endpoint: &str) -> Result<AnyserveClient> {
-    AnyserveClient::connect(control_plane_endpoint.to_string()).await
+pub(crate) async fn connect_client(
+    control_plane_endpoint: &str,
+    config: &ResolvedServeOpenAIWorkerConfig,
+) -> Result<AnyserveClient> {
+    AnyserveClient::connect_with_token(control_plane_endpoint.to_string(), config.token.as_deref())
+        .await
 }
 
 pub(crate) async fn read_request_body(
@@ -105,17 +110,6 @@ pub(crate) fn truncate(value: &str, limit: usize) -> String {
         return value.to_string();
     }
     chars.into_iter().take(limit).collect::<String>()
-}
-
-pub(crate) fn persisted_outputs(content_type: &str, payload: Vec<u8>) -> Vec<ObjectRef> {
-    if payload.is_empty() {
-        return Vec::new();
-    }
-
-    vec![ObjectRef {
-        reference: Some(object_ref::Reference::Inline(payload)),
-        metadata: HashMap::from([("content_type".to_string(), content_type.to_string())]),
-    }]
 }
 
 pub(crate) fn open_output_stream(

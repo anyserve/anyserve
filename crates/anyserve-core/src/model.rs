@@ -17,6 +17,13 @@ pub struct ExecutionPolicy {
     pub profile: String,
     pub priority: i32,
     pub lease_ttl_secs: u64,
+    /// Fail the job if it is still pending this long after submission. 0 disables.
+    #[serde(default)]
+    pub queue_timeout_ms: u64,
+    /// Locality hold: workers that do not match every preferred attribute may only
+    /// lease the job once it has been pending this long. 0 disables.
+    #[serde(default)]
+    pub spillover_after_ms: u64,
 }
 
 impl Default for ExecutionPolicy {
@@ -25,6 +32,8 @@ impl Default for ExecutionPolicy {
             profile: "basic".to_string(),
             priority: 0,
             lease_ttl_secs: 30,
+            queue_timeout_ms: 0,
+            spillover_after_ms: 0,
         }
     }
 }
@@ -85,6 +94,21 @@ pub enum JobState {
     Succeeded,
     Failed,
     Cancelled,
+}
+
+impl ExecutionPolicy {
+    /// Earliest time a worker outside the preferred locality may lease a job
+    /// created at `created_at_ms`, or `None` when no hold applies.
+    pub fn spillover_at_ms(&self, demand: &Demand, created_at_ms: u64) -> Option<u64> {
+        if self.spillover_after_ms == 0 || demand.preferred_attributes.is_empty() {
+            return None;
+        }
+        Some(created_at_ms.saturating_add(self.spillover_after_ms))
+    }
+
+    pub fn queue_deadline_ms(&self, created_at_ms: u64) -> Option<u64> {
+        (self.queue_timeout_ms > 0).then(|| created_at_ms.saturating_add(self.queue_timeout_ms))
+    }
 }
 
 impl JobState {

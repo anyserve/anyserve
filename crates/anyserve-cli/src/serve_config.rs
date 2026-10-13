@@ -5,8 +5,10 @@ mod tests;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use anyserve_core::auth::AuthPolicy;
 use anyserve_core::model::Demand;
 
+use crate::edge_routing::RoutingDefaults;
 use file::{AnyserveConfigFile, ServeOpenAIConfigFile};
 
 pub const DEFAULT_HEARTBEAT_TTL_SECS: u64 = 30;
@@ -19,6 +21,9 @@ const DEFAULT_CHAT_INTERFACE: &str = "llm.chat.v1";
 const DEFAULT_EMBEDDINGS_INTERFACE: &str = "llm.embed.v1";
 const DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_OPENAI_INLINE_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
+const DEFAULT_INVOKE_LISTEN: &str = "0.0.0.0:8090";
+const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_INVOKE_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct GrpcConfig {
@@ -63,6 +68,19 @@ pub struct ResolvedServeConfig {
     pub frames: FrameConfig,
     pub console: Option<ServeConsoleConfig>,
     pub openai: Option<ServeOpenAIConfig>,
+    pub invoke: Option<ServeInvokeConfig>,
+    pub auth: AuthPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServeInvokeConfig {
+    pub listen: String,
+    pub default_timeout_ms: u64,
+    pub max_body_bytes: usize,
+    /// Request headers copied to the worker's upstream call.
+    pub forward_headers: Vec<String>,
+    pub demand: Demand,
+    pub(crate) defaults: RoutingDefaults,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +153,7 @@ pub struct ServeOpenAIConfig {
     pub request_timeout_secs: u64,
     pub inline_request_limit_bytes: usize,
     pub demand: Demand,
+    pub(crate) policy: RoutingDefaults,
 }
 
 impl ResolvedServeConfig {
@@ -203,6 +222,15 @@ impl ResolvedServeConfig {
                 .as_ref()
                 .and_then(|config| config.openai.as_ref())
                 .and_then(ServeOpenAIConfigFile::resolve),
+            invoke: file_config
+                .as_ref()
+                .and_then(|config| config.invoke.clone())
+                .and_then(|invoke| invoke.resolve()),
+            auth: file_config
+                .as_ref()
+                .and_then(|config| config.auth.clone())
+                .unwrap_or_default()
+                .resolve()?,
         })
     }
 

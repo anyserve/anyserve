@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use anyserve_core::auth::{AuthLayer, AuthPolicy};
 use anyserve_core::frame::{FramePlane, MemoryFramePlane, RedisFramePlane};
 use anyserve_core::kernel::Kernel;
 use anyserve_core::notify::{ClusterNotifier, NoopClusterNotifier, RedisClusterNotifier};
@@ -21,6 +22,7 @@ use crate::serve_config::{
     FrameBackend, GrpcConfig, ResolvedServeConfig, ServeOverrides, StorageBackend,
 };
 use crate::serve_console::run_server as run_console_server;
+use crate::serve_invoke::run_server as run_serve_invoke;
 use crate::serve_openai::run_server as run_serve_openai;
 
 const POSTGRES_MEMORY_SINGLETON_LOCK_ID: i64 = 0x4153_5256_5047_4d4d;
@@ -125,12 +127,24 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         config.default_lease_ttl_secs,
         config.frames.watch_poll_interval_ms,
     ));
+    kernel.start_background().await;
+    let auth = Arc::new(config.auth.clone());
+    if !auth.is_enabled() {
+        warn!(
+            "auth is disabled; any client can reach the control plane (set [auth] tokens before exposing it beyond a trusted network)"
+        );
+    }
 
     let grpc_addr = socket_addr(&grpc_config.host, grpc_config.port)?;
     let openai_addr = config
         .openai
         .as_ref()
         .map(|openai| socket_addr_from_bind(&openai.listen))
+        .transpose()?;
+    let invoke_addr = config
+        .invoke
+        .as_ref()
+        .map(|invoke| socket_addr_from_bind(&invoke.listen))
         .transpose()?;
     let console_addr = config
         .console
@@ -143,14 +157,28 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         grpc_addr,
         Arc::clone(&kernel),
         grpc_config,
+        AuthPolicy::clone(&auth),
         shutdown_rx,
     ));
+    let invoke_task =
+        if let (Some(invoke_config), Some(invoke_addr)) = (config.invoke.clone(), invoke_addr) {
+            Some(tokio::spawn(run_serve_invoke(
+                invoke_addr,
+                Arc::clone(&kernel),
+                invoke_config,
+                Arc::clone(&auth),
+                shutdown_tx.subscribe(),
+            )))
+        } else {
+            None
+        };
     let openai_task =
         if let (Some(openai_config), Some(openai_addr)) = (config.openai.clone(), openai_addr) {
             Some(tokio::spawn(run_serve_openai(
                 openai_addr,
                 Arc::clone(&kernel),
                 openai_config,
+                Arc::clone(&auth),
                 shutdown_tx.subscribe(),
             )))
         } else {
@@ -186,6 +214,9 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     if let Some(openai_addr) = openai_addr {
         info!(openai = %openai_addr, "openai gateway started");
     }
+    if let Some(invoke_addr) = invoke_addr {
+        info!(invoke = %invoke_addr, auth = auth.is_enabled(), "invoke gateway started");
+    }
     if let Some(console_addr) = console_addr {
         info!(console = %console_addr, "console api started");
     }
@@ -198,6 +229,9 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     grpc_task.await.context("join grpc task")??;
     if let Some(openai_task) = openai_task {
         openai_task.await.context("join openai task")??;
+    }
+    if let Some(invoke_task) = invoke_task {
+        invoke_task.await.context("join invoke task")??;
     }
     if let Some(console_task) = console_task {
         console_task.await.context("join console task")??;
@@ -227,6 +261,7 @@ async fn run_grpc_server(
     addr: SocketAddr,
     kernel: Arc<Kernel>,
     config: GrpcConfig,
+    auth: AuthPolicy,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let service = ControlPlaneGrpcService::new(kernel);
@@ -260,6 +295,9 @@ async fn run_grpc_server(
     }
 
     builder
+        .tcp_nodelay(true)
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .layer(AuthLayer::new(auth))
         .add_service(health_service)
         .add_service(grpc_service)
         .serve_with_shutdown(addr, async move {

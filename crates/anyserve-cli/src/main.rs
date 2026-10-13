@@ -2,9 +2,11 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod edge_routing;
 mod job_commands;
 mod serve_config;
 mod serve_console;
+mod serve_invoke;
 mod serve_openai;
 mod serve_openai_worker;
 mod serve_runtime;
