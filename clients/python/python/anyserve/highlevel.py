@@ -110,6 +110,7 @@ def serve(
     worker_id: Optional[str] = None,
     heartbeat_interval_secs: float = 5,
     poll_interval_secs: float = 1,
+    long_poll_ms: int = 20_000,
     client: Any = None,
 ) -> None:
     spec = get_handler_spec(handler)
@@ -149,9 +150,13 @@ def serve(
 
     try:
         while True:
-            grant = worker_client.poll_lease(registered_worker_id)
+            if long_poll_ms > 0:
+                grant = worker_client.poll_lease(registered_worker_id, long_poll_ms)
+            else:
+                grant = worker_client.poll_lease(registered_worker_id)
             if grant is None:
-                time.sleep(poll_interval_secs)
+                if long_poll_ms <= 0:
+                    time.sleep(poll_interval_secs)
                 continue
             _process_grant(worker_client, registered_worker_id, handler, spec, state, grant)
     finally:

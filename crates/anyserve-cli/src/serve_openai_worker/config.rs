@@ -154,6 +154,15 @@ fn resolve_config(
         .entry("provider".to_string())
         .or_insert_with(|| provider.clone());
 
+    // A stable, client-chosen id doubles as a placement attribute, so callers can
+    // pin a session to one worker with `prefer: worker_id=<id>` (+ spillover).
+    let worker_id = worker_id_override
+        .or(file.worker_id)
+        .unwrap_or_else(default_worker_id);
+    attributes
+        .entry("worker_id".to_string())
+        .or_insert_with(|| worker_id.clone());
+
     let max_active_leases = file.max_active_leases.unwrap_or(1).max(1);
     let mut capacity = file.capacity;
     capacity
@@ -182,7 +191,7 @@ fn resolve_config(
 
     Ok(ResolvedServeOpenAIWorkerConfig {
         kind,
-        worker_id: worker_id_override.or(file.worker_id),
+        worker_id: Some(worker_id),
         provider,
         base_url: file.base_url.trim_end_matches('/').to_string(),
         api_key,
@@ -221,6 +230,11 @@ fn resolve_config(
         capacity,
         metadata: file.metadata,
     })
+}
+
+fn default_worker_id() -> String {
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".to_string());
+    format!("{host}-{}", std::process::id())
 }
 
 fn secret_from(value: Option<String>, env_name: Option<&str>) -> Result<Option<String>> {

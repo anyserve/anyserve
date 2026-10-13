@@ -58,6 +58,14 @@ fn attributes_match(worker: &WorkerRecord, job: &JobRecord) -> bool {
         .all(|(key, expected)| worker.spec.attributes.get(key) == Some(expected))
 }
 
+/// Whether `worker` could lease `job` right now, ignoring capacity (which is
+/// rechecked at assignment). Used to decide which long-polls to wake.
+pub fn worker_can_take(worker: &WorkerRecord, job: &JobRecord, now_ms: u64) -> bool {
+    worker.spec.interfaces.contains(&job.spec.interface_name)
+        && attributes_match(worker, job)
+        && locality_allows(worker, job, now_ms)
+}
+
 /// A job with a spillover window only goes to workers that match every
 /// preferred attribute until the window elapses; then anyone eligible may take it.
 pub fn locality_allows(worker: &WorkerRecord, job: &JobRecord, now_ms: u64) -> bool {

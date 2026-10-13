@@ -1,0 +1,5 @@
+target
+.git
+console/node_modules
+**/__pycache__
+**/.venv

@@ -43,6 +43,8 @@ struct SubmitJobCall {
     profile: String,
     priority: i32,
     lease_ttl_secs: u32,
+    queue_timeout_ms: u64,
+    spillover_after_ms: u64,
     job_id: Option<String>,
 }
 
@@ -112,7 +114,9 @@ impl AnyserveClient {
         profile=None,
         priority=0,
         lease_ttl_secs=None,
-        job_id=None
+        job_id=None,
+        queue_timeout_ms=0,
+        spillover_after_ms=0
     ))]
     #[allow(clippy::too_many_arguments, reason = "Preserve the Python keyword API")]
     fn submit_job(
@@ -129,6 +133,8 @@ impl AnyserveClient {
         priority: i32,
         lease_ttl_secs: Option<u32>,
         job_id: Option<String>,
+        queue_timeout_ms: u64,
+        spillover_after_ms: u64,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
@@ -143,6 +149,8 @@ impl AnyserveClient {
             profile: profile.unwrap_or_else(|| "basic".to_string()),
             priority,
             lease_ttl_secs: lease_ttl_secs.unwrap_or(30),
+            queue_timeout_ms,
+            spillover_after_ms,
             job_id,
         };
         let job = py
@@ -314,13 +322,22 @@ impl AnyserveClient {
         worker_record_to_py(py, worker)
     }
 
-    fn poll_lease(&self, py: Python<'_>, worker_id: String) -> PyResult<Option<Py<PyDict>>> {
+    /// `wait_timeout_ms > 0` long-polls: the server holds the call until a job
+    /// is assignable or the wait elapses.
+    #[pyo3(signature = (worker_id, wait_timeout_ms=0))]
+    fn poll_lease(
+        &self,
+        py: Python<'_>,
+        worker_id: String,
+        wait_timeout_ms: u64,
+    ) -> PyResult<Option<Py<PyDict>>> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
+        let wait = std::time::Duration::from_millis(wait_timeout_ms);
         let lease = py
             .allow_threads(move || {
                 with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.poll_lease(worker_id))
+                    runtime.block_on(client.poll_lease_wait(worker_id, wait))
                 })
             })
             .map_err(to_py_err)?;
@@ -659,6 +676,8 @@ fn submit_job_from_py(request: SubmitJobCall) -> Result<JobSubmission> {
         profile: request.profile,
         priority: request.priority,
         lease_ttl_secs: request.lease_ttl_secs,
+        queue_timeout_ms: request.queue_timeout_ms,
+        spillover_after_ms: request.spillover_after_ms,
     })
 }
 
