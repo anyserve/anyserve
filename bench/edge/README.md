@@ -16,7 +16,8 @@ docker build -t anyserve:edge-dev ../..
 docker volume create anyserve-hf-cache
 docker compose up -d
 ./run-policy.sh   # RL rollout + 30 Hz control loop + failover   -> results/policy.jsonl
-./run-llm.sh      # vllm bench serve, streaming chat              -> results/llm-*.json
+./run-llm.sh      # vllm bench serve, sequential sweep (c1/c16/c64)  -> results/llm-*.json
+./run-llm-latency.sh  # fresh vLLM, arms interleaved x3 (use for A/B)  -> results/llm-lat-*.json
 ./run-image.sh    # text-to-image, stops vLLM                     -> results/image.jsonl
 ```
 
