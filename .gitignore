@@ -16,3 +16,7 @@ __pycache__/
 /console/dist
 /console/.env.local
 /console/*.tsbuildinfo
+
+# local build / benchmark output
+/clients/python/python/anyserve/*.so
+/bench/edge/results/

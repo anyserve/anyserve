@@ -43,7 +43,7 @@ class FakeWorkerClient:
         self.renew_calls.append({"worker_id": worker_id, "lease_id": lease_id})
         return {"lease_id": lease_id}
 
-    def poll_lease(self, worker_id):
+    def poll_lease(self, worker_id, wait_timeout_ms=0):
         if self._grants:
             return self._grants.pop(0)
         raise StopServing()

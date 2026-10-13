@@ -1,0 +1,13 @@
+kind = "http"
+worker_id = "far-policy"
+base_url = "http://policy:9000"
+max_active_leases = 32
+health_url = "http://policy:9000/healthz"
+token_env = "ANYSERVE_WORKER_TOKEN"
+upstream_timeout_secs = 5
+
+[routes]
+"rl.policy.act.v1" = "/act"
+
+[attributes]
+region = "far"

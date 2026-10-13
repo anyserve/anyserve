@@ -1,10 +1,10 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -15,7 +15,7 @@ use crate::model::{
     StreamState, WorkerRecord, WorkerSpec, WorkerStatus,
 };
 use crate::notify::{ClusterNotifier, ClusterSubscription};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Scheduler, worker_can_take};
 use crate::store::{
     JobStateCounts, JobSummaryPage, LeaseDispatchMode, StateStore, StateTransition,
 };
@@ -29,8 +29,10 @@ pub struct Kernel {
     heartbeat_ttl_secs: u64,
     default_lease_ttl_secs: u64,
     watch_poll_interval_ms: u64,
-    /// Bumped whenever work may have become assignable; long-polling workers wait on it.
-    dispatch_tx: watch::Sender<u64>,
+    /// Workers currently parked in a long-poll on this instance. Submissions wake
+    /// only workers that could lease the new job, one poll loop each, instead of
+    /// stampeding every waiting loop through the store.
+    waiting: std::sync::Mutex<HashMap<String, WaitingWorker>>,
     timer_tx: mpsc::UnboundedSender<TimerEntry>,
     timer_rx: Mutex<Option<mpsc::UnboundedReceiver<TimerEntry>>>,
 }
@@ -45,6 +47,34 @@ pub const QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
 /// Retryable failures stop requeueing after this many attempts so a job that
 /// breaks every worker cannot bounce between clusters forever.
 pub const MAX_ATTEMPTS: usize = 3;
+
+struct WaitingWorker {
+    worker: WorkerRecord,
+    notify: Arc<Notify>,
+    loops: usize,
+}
+
+/// Unregisters one long-poll loop when its wait ends (including cancellation).
+struct WaitRegistration<'a> {
+    kernel: &'a Kernel,
+    worker_id: String,
+}
+
+impl Drop for WaitRegistration<'_> {
+    fn drop(&mut self) {
+        let mut waiting = self
+            .kernel
+            .waiting
+            .lock()
+            .expect("waiting registry poisoned");
+        if let Some(entry) = waiting.get_mut(&self.worker_id) {
+            entry.loops -= 1;
+            if entry.loops == 0 {
+                waiting.remove(&self.worker_id);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum TimerAction {
@@ -80,7 +110,6 @@ impl Kernel {
         default_lease_ttl_secs: u64,
         watch_poll_interval_ms: u64,
     ) -> Self {
-        let (dispatch_tx, _) = watch::channel(0);
         let (timer_tx, timer_rx) = mpsc::unbounded_channel();
         Self {
             state_store,
@@ -91,7 +120,7 @@ impl Kernel {
             heartbeat_ttl_secs,
             default_lease_ttl_secs,
             watch_poll_interval_ms,
-            dispatch_tx,
+            waiting: std::sync::Mutex::new(HashMap::new()),
             timer_tx,
             timer_rx: Mutex::new(Some(timer_rx)),
         }
@@ -193,8 +222,7 @@ impl Kernel {
                 }
             };
             while subscription.changed().await.is_ok() {
-                self.dispatch_tx
-                    .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                self.wake_waiting(|_| true);
             }
             tokio::time::sleep(DISPATCH_RECHECK).await;
         }
@@ -230,11 +258,48 @@ impl Kernel {
         let _ = self.timer_tx.send(TimerEntry { due_at_ms, action });
     }
 
-    /// Wakes local long-polls and tells peer instances to do the same.
+    /// Wakes one poll loop of every waiting worker here and on peer instances.
     async fn signal_dispatch(&self) {
-        self.dispatch_tx
-            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        self.wake_waiting(|_| true);
         let _ = self.notifier.publish_dispatch().await;
+    }
+
+    /// Wakes one poll loop of each local waiting worker that could take `job`;
+    /// peers get a broadcast since their waiters are not known here.
+    async fn signal_job_dispatch(&self, job: &JobRecord) {
+        let now = now_ms();
+        self.wake_waiting(|worker| worker_can_take(worker, job, now));
+        let _ = self.notifier.publish_dispatch().await;
+    }
+
+    fn wake_waiting(&self, eligible: impl Fn(&WorkerRecord) -> bool) {
+        let waiting = self.waiting.lock().expect("waiting registry poisoned");
+        for entry in waiting.values() {
+            if eligible(&entry.worker) {
+                entry.notify.notify_one();
+            }
+        }
+    }
+
+    fn register_waiter(&self, worker: WorkerRecord) -> (Arc<Notify>, WaitRegistration<'_>) {
+        let worker_id = worker.worker_id.clone();
+        let mut waiting = self.waiting.lock().expect("waiting registry poisoned");
+        let entry = waiting
+            .entry(worker_id.clone())
+            .or_insert_with(|| WaitingWorker {
+                worker: worker.clone(),
+                notify: Arc::new(Notify::new()),
+                loops: 0,
+            });
+        entry.worker = worker;
+        entry.loops += 1;
+        (
+            Arc::clone(&entry.notify),
+            WaitRegistration {
+                kernel: self,
+                worker_id,
+            },
+        )
     }
 
     /// Like [`Kernel::poll_lease`], but holds the call open up to `wait` for an
@@ -245,9 +310,15 @@ impl Kernel {
         wait: Duration,
     ) -> Result<Option<LeaseAssignment>> {
         let deadline = Instant::now() + wait;
-        let mut dispatch_rx = self.dispatch_tx.subscribe();
+        let worker = self
+            .state_store
+            .get_worker(worker_id)
+            .await?
+            .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
+        // Register before the first poll: a submission racing with it leaves a
+        // Notify permit, so the wake-up is never lost.
+        let (notify, _registration) = self.register_waiter(worker);
         loop {
-            dispatch_rx.borrow_and_update();
             if let Some(assignment) = self.poll_lease(worker_id).await? {
                 return Ok(Some(assignment));
             }
@@ -257,7 +328,7 @@ impl Kernel {
             }
             let recheck = (deadline - now).min(DISPATCH_RECHECK);
             tokio::select! {
-                _ = dispatch_rx.changed() => {}
+                _ = notify.notified() => {}
                 _ = tokio::time::sleep(recheck) => {}
             }
         }
@@ -312,7 +383,7 @@ impl Kernel {
         if let Some(deadline_ms) = job.spec.policy.queue_deadline_ms(job.created_at_ms) {
             self.schedule_timer(deadline_ms, TimerAction::QueueDeadline(job.job_id.clone()));
         }
-        self.signal_dispatch().await;
+        self.signal_job_dispatch(&job).await;
         Ok(job)
     }
 
