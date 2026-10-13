@@ -213,6 +213,15 @@ The sample path now uses both control-plane and data-plane APIs:
 - waits for worker events
 - pulls `output.default` frames after completion
 
+## Edge Inference
+
+One control plane, workers in many clusters: workers long-poll outbound, so
+edge sites need no inbound access. Callers place work with headers
+(`x-anyserve-prefer: region=...`, `x-anyserve-spillover-ms`,
+`x-anyserve-queue-timeout-ms`) through `POST /v1/invoke/{interface}` or the
+OpenAI gateway. See [docs/src/edge.md](docs/src/edge.md) and the container
+testbed in [bench/edge](bench/edge/README.md).
+
 ## Supported Runtime Modes
 
 - `memory + memory`

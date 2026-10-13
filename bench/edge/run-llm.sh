@@ -15,13 +15,13 @@ run() {  # label base-url
   for c in $CONCURRENCY; do
     local prompts=$(( c == 1 ? 16 : c * 8 ))
     docker compose exec -T -e OPENAI_API_KEY="${CLIENT_TOKEN:-bench-client-token}" bench \
-      vllm bench serve --backend openai-chat --endpoint /v1/chat/completions \
+      vllm bench serve --endpoint-type openai-chat --backend openai-chat --endpoint /v1/chat/completions \
         --base-url "$url" --model "$MODEL" --tokenizer "$MODEL" \
         --dataset-name random --random-input-len 256 --random-output-len 128 --ignore-eos \
         --num-prompts "$prompts" --max-concurrency "$c" \
         --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
         --save-result --result-dir /bench/results --result-filename "llm-$label-c$c.json" \
-      | grep -E "Output token throughput|Median TTFT|P99 TTFT|Median TPOT|Median E2EL" | sed "s/^/[$label c$c] /"
+      | grep -E "Successful requests|Failed requests|Output token throughput|Median TTFT|P99 TTFT|Median TPOT|Median E2EL" | sed "s/^/[$label c$c] /"
   done
 }
 
