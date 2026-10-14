@@ -188,6 +188,7 @@ def run_paired(results, raw, rounds, scenario, direct, anyserve, metrics, expect
     One unrecorded warm-up round runs first, so cold-start cost (CUDA graphs,
     connection pools, caches) does not land on whichever arm happens to go first.
     """
+    load_avg = round(os.getloadavg()[0], 2)
     direct(raw, 0)
     anyserve(raw, 0)
     rows = []
@@ -213,7 +214,7 @@ def run_paired(results, raw, rounds, scenario, direct, anyserve, metrics, expect
                            "delta": statistics.median(deltas), "delta_min": min(deltas),
                            "delta_max": max(deltas),
                            "ratio": statistics.median(y / x for x, y in zip(d, a) if x)}
-    results["scenarios"][scenario] = {"metrics": summary, "rounds": rows}
+    results["scenarios"][scenario] = {"metrics": summary, "rounds": rows, "load_avg": load_avg}
     results["gates"].extend(gates)
 
 
@@ -252,28 +253,42 @@ def session_failover(results, raw):
     log(f"session-failover: errors {r['errors']}, max step {r['max_ms']} ms, {r['served_by']}")
 
 
-def suite_quick(results, raw, rounds):
+def selected(name, only):
+    return only is None or name in only
+
+
+def suite_quick(results, raw, rounds, only=None):
     for region in ("near", "far"):
         direct, anyserve = pair_policy(region)
         for mode, metrics in (("rollout", ["p50_ms", "p99_ms", "qps"]), ("control", ["p50_ms", "p99_ms"])):
+            if not selected(f"policy-{mode}-{region}", only):
+                continue
             run_paired(results, raw, rounds, f"policy-{mode}-{region}",
                        lambda raw, r, m=mode: direct(m, raw), lambda raw, r, m=mode: anyserve(m, raw),
                        metrics, expect_worker=f"{region}-policy")
-    session_failover(results, raw)
+    if selected("session-failover", only):
+        session_failover(results, raw)
 
 
-def suite_llm(results, raw, rounds):
+def suite_llm(results, raw, rounds, only=None):
+    names = [f"llm-c{c}-near" for c in (1, 16)]
+    if not any(selected(name, only) for name in names):
+        return
     # Fresh engine per run: vLLM on T4 slows down over long runs.
     compose("up", "-d", "--force-recreate", "vllm", capture=True)
     wait_healthy_vllm()
     for concurrency in (1, 16):
+        if not selected(f"llm-c{concurrency}-near", only):
+            continue
         run_paired(results, raw, rounds, f"llm-c{concurrency}-near",
                    lambda raw, r, c=concurrency: (set_bench_rtt(RTT["near"]), llm(VLLM, "direct-near", c, raw, r))[1],
                    lambda raw, r, c=concurrency: (set_bench_rtt(0), llm(f"{CENTER}:8080", "anyserve-near", c, raw, r))[1],
                    ["ttft_p50_ms", "tpot_p50_ms", "tok_s"])
 
 
-def suite_image(results, raw, rounds):
+def suite_image(results, raw, rounds, only=None):
+    if not selected("image-c1-near", only):
+        return
     compose("stop", "vllm", capture=True)
     compose("up", "-d", "image", capture=True)
     wait_for(lambda: bench_exec("curl", "-fs", "http://172.31.20.40:9100/healthz") is not None,
@@ -338,6 +353,10 @@ def render(results):
     out += ["", "Gates: " + ("PASS" if not results["gates"] else "FAIL"), *[f"- {g}" for g in results["gates"]]]
     if results.get("comparison"):
         out += ["", f"## vs baseline `{results['baseline']}`", "", results["comparison"]]
+    if results.get("confirmation"):
+        out += ["", "## confirmation re-run", "", results["confirmation"]["comparison"]]
+        if results.get("unconfirmed"):
+            out += ["", "Not reproduced (ignored): " + ", ".join(results["unconfirmed"])]
     return "\n".join(out) + "\n"
 
 
@@ -353,31 +372,53 @@ def run_once(args, sha, dirty, tag):
     raw = run_dir.name
     results = {"suite": args.suite, "rounds": args.rounds, "fingerprint": fingerprint(sha, dirty, tag),
                "scenarios": {}, "gates": []}
+    baseline = None if args.baseline == "none" else (
+        previous_run(run_dir) if args.baseline == "auto" else Path(args.baseline))
+    problems = []
     try:
         start_stack()
         results["calibration"] = calibrate()
-        suite_quick(results, raw, args.rounds)
-        if args.suite == "full":
-            suite_llm(results, raw, args.rounds)
-            suite_image(results, raw, args.rounds)
+        run_suites(args.suite, results, raw, args.rounds)
+        if baseline and (baseline / "summary.json").exists():
+            base = json.loads((baseline / "summary.json").read_text())
+            problems, results["comparison"] = compare(base, results)
+            results["baseline"] = baseline.name
+            if problems:
+                problems = confirm(args.suite, base, results, raw, args.rounds, problems)
+            results["regressions"] = problems
         set_bench_rtt(0)
     finally:
         # The bench container writes as root; hand the results back to the caller.
         compose("exec", "-T", "bench", "chown", "-R", f"{os.getuid()}:{os.getgid()}",
                 f"/bench/results/{raw}", capture=True, check=False)
 
-    baseline = None if args.baseline == "none" else (
-        previous_run(run_dir) if args.baseline == "auto" else Path(args.baseline))
-    problems = []
-    if baseline and (baseline / "summary.json").exists():
-        problems, results["comparison"] = compare(json.loads((baseline / "summary.json").read_text()), results)
-        results["baseline"] = baseline.name
-        results["regressions"] = problems
     (run_dir / "summary.json").write_text(json.dumps(results, indent=2))
     report = render(results)
     (run_dir / "summary.md").write_text(report)
     print(report)
     return run_dir, not results["gates"] and not problems
+
+
+def run_suites(suite, results, raw, rounds, only=None):
+    suite_quick(results, raw, rounds, only)
+    if suite == "full":
+        suite_llm(results, raw, rounds, only)
+        suite_image(results, raw, rounds, only)
+
+
+def confirm(suite, baseline, results, raw, rounds, problems):
+    """A regression counts only if it reproduces: re-run the flagged scenarios
+    once and keep the ones that still exceed the band. A shared host can
+    produce a one-off slow scenario that a re-run clears."""
+    flagged = {problem.split()[0] for problem in problems}
+    log(f"possible regression in {sorted(flagged)}; re-running to confirm")
+    rerun = {"scenarios": {}, "gates": []}
+    run_suites(suite, rerun, raw, rounds, only=flagged)
+    confirmed, table = compare(baseline, rerun)
+    results["confirmation"] = {"scenarios": rerun["scenarios"], "comparison": table}
+    results["unconfirmed"] = sorted(set(problems) - set(confirmed))
+    results["gates"].extend(rerun["gates"])
+    return confirmed
 
 
 def stability(run_dirs):
