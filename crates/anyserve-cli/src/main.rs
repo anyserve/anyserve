@@ -8,12 +8,12 @@ mod serve_config;
 mod serve_console;
 mod serve_invoke;
 mod serve_openai;
-mod serve_openai_worker;
 mod serve_runtime;
+mod worker;
 
 use job_commands::{JobCommands, run_job_command};
-use serve_openai_worker::ServeOpenAIWorkerArgs;
 use serve_runtime::{ServeArgs, run as run_serve};
+use worker::WorkerArgs;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50052";
 
@@ -37,7 +37,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Serve(ServeArgs),
-    Worker(ServeOpenAIWorkerArgs),
+    Worker(WorkerArgs),
     Job {
         #[command(subcommand)]
         command: JobCommands,
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Serve(args) => run_serve(args).await,
-        Commands::Worker(args) => serve_openai_worker::run(&endpoint, args).await,
+        Commands::Worker(args) => worker::run(&endpoint, args).await,
         Commands::Job { command } => run_job_command(&endpoint, command).await,
     }
 }

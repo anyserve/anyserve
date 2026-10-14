@@ -9,9 +9,9 @@ use serde::Deserialize;
 use super::{
     DEFAULT_CHAT_INTERFACE, DEFAULT_CLOSED_RETENTION_SECS, DEFAULT_CONSOLE_LISTEN,
     DEFAULT_EMBEDDINGS_INTERFACE, DEFAULT_INVOKE_LISTEN, DEFAULT_INVOKE_MAX_BODY_BYTES,
-    DEFAULT_INVOKE_TIMEOUT_MS, DEFAULT_OPENAI_INLINE_REQUEST_LIMIT_BYTES, DEFAULT_OPENAI_LISTEN,
-    DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS, DEFAULT_WATCH_POLL_INTERVAL_MS, FrameBackend, FrameConfig,
-    ServeConsoleConfig, ServeInvokeConfig, ServeOpenAIConfig, StorageBackend, StorageConfig,
+    DEFAULT_INVOKE_TIMEOUT_MS, DEFAULT_OPENAI_LISTEN, DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS,
+    DEFAULT_WATCH_POLL_INTERVAL_MS, FrameBackend, FrameConfig, ServeConsoleConfig,
+    ServeInvokeConfig, ServeOpenAIConfig, StorageBackend, StorageConfig,
 };
 use crate::edge_routing::RoutingDefaults;
 
@@ -297,8 +297,6 @@ pub(super) struct ServeOpenAIConfigFile {
     #[serde(default)]
     request_timeout_secs: Option<u64>,
     #[serde(default)]
-    inline_request_limit_bytes: Option<usize>,
-    #[serde(default)]
     demand: Option<DemandConfigFile>,
     #[serde(default)]
     policy: Option<RoutingPolicyConfigFile>,
@@ -331,9 +329,6 @@ impl ServeOpenAIConfigFile {
             request_timeout_secs: self
                 .request_timeout_secs
                 .unwrap_or(DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS),
-            inline_request_limit_bytes: self
-                .inline_request_limit_bytes
-                .unwrap_or(DEFAULT_OPENAI_INLINE_REQUEST_LIMIT_BYTES),
             demand: self
                 .demand
                 .clone()

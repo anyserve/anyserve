@@ -161,7 +161,7 @@ async fn get_job(
         .map_err(internal_error("list streams"))?;
     let events = state
         .kernel
-        .list_job_events(&job_id)
+        .watch_job(&job_id, 0)
         .await
         .map_err(internal_error("list events"))?;
 

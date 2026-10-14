@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .client import AnyserveClient
+from ._native import AnyserveClient
 
 _CODEC_BYTES = "bytes"
 _CODEC_JSON = "json"

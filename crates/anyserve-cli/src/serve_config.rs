@@ -22,7 +22,6 @@ const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:3001";
 const DEFAULT_CHAT_INTERFACE: &str = "llm.chat.v1";
 const DEFAULT_EMBEDDINGS_INTERFACE: &str = "llm.embed.v1";
 const DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS: u64 = 60;
-const DEFAULT_OPENAI_INLINE_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
 const DEFAULT_INVOKE_LISTEN: &str = "0.0.0.0:8090";
 const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_INVOKE_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -155,7 +154,6 @@ pub struct ServeOpenAIConfig {
     pub chat_interface: String,
     pub embeddings_interface: String,
     pub request_timeout_secs: u64,
-    pub inline_request_limit_bytes: usize,
     pub demand: Demand,
     pub(crate) policy: RoutingDefaults,
 }

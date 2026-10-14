@@ -189,7 +189,7 @@ async fn invoke_job(
 
     match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
-        wait_for_terminal(&state.kernel, &job.job_id),
+        state.kernel.wait_for_terminal(&job.job_id),
     )
     .await
     {
@@ -209,24 +209,6 @@ async fn invoke_job(
                 ),
                 &job.job_id,
             )
-        }
-    }
-}
-
-async fn wait_for_terminal(kernel: &Kernel, job_id: &str) -> Result<JobRecord> {
-    let mut local_updates = kernel.subscribe_job_events(job_id).await?;
-    let mut cluster_updates = kernel.subscribe_cluster_job_events(job_id).await?;
-    let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
-    loop {
-        local_updates.borrow_and_update();
-        let job = kernel.get_job(job_id).await?;
-        if job.state.is_terminal() {
-            return Ok(job);
-        }
-        tokio::select! {
-            _ = local_updates.changed() => {}
-            _ = cluster_updates.changed() => {}
-            _ = tokio::time::sleep(poll_interval) => {}
         }
     }
 }
@@ -255,7 +237,7 @@ async fn job_response(kernel: &Kernel, job: JobRecord) -> Response {
                 .clone()
                 .unwrap_or_else(|| "worker reported failure".to_string());
             let queue_timeout = kernel
-                .list_job_events(&job_id)
+                .watch_job(&job_id, 0)
                 .await
                 .ok()
                 .and_then(|events| events.last().cloned())

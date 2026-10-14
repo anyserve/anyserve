@@ -7,7 +7,6 @@ use anyserve_core::model::{Frame, FrameKind, JobRecord, JobState};
 
 use super::super::state::{AppState, OpenAIError};
 use super::OUTPUT_STREAM;
-use super::waiters::wait_for_job_event_change;
 
 pub(super) async fn wait_for_output_bytes(
     state: &AppState,
@@ -31,19 +30,6 @@ pub(super) async fn wait_for_output_bytes(
 
 pub(super) async fn cancel_job_best_effort(kernel: Arc<Kernel>, job_id: String) {
     let _ = kernel.cancel_job(&job_id).await;
-}
-
-pub(super) async fn cancel_submitted_job(
-    kernel: Arc<Kernel>,
-    job_id: String,
-    error: String,
-) -> OpenAIError {
-    match kernel.cancel_job(&job_id).await {
-        Ok(_) => OpenAIError::internal(error),
-        Err(cleanup_error) => OpenAIError::internal(format!(
-            "{error}; cleanup cancel job '{job_id}': {cleanup_error}"
-        )),
-    }
 }
 
 pub(super) fn read_output_from_job(job: &JobRecord) -> Result<Option<Vec<u8>>, OpenAIError> {
@@ -85,41 +71,20 @@ pub(super) fn extract_data_chunks(
 }
 
 async fn collect_output_bytes(kernel: Arc<Kernel>, job_id: String) -> Result<Vec<u8>, OpenAIError> {
-    let mut local_updates = kernel
-        .subscribe_job_events(&job_id)
+    let job = kernel
+        .wait_for_terminal(&job_id)
         .await
-        .map_err(|error| OpenAIError::internal(format!("subscribe job events: {error}")))?;
-    let mut cluster_updates = kernel
-        .subscribe_cluster_job_events(&job_id)
-        .await
-        .map_err(|error| OpenAIError::internal(format!("subscribe cluster job events: {error}")))?;
-    let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
-
-    loop {
-        let job = kernel
-            .get_job(&job_id)
-            .await
-            .map_err(|error| OpenAIError::internal(format!("get job: {error}")))?;
-
-        match job.state {
-            JobState::Succeeded => {
-                if let Some(output) = read_output_from_job(&job)? {
-                    return Ok(output);
-                }
-                return read_output_stream(kernel, &job.job_id).await;
-            }
-            JobState::Failed => {
-                return Err(OpenAIError::bad_gateway(
-                    job.last_error
-                        .unwrap_or_else(|| "worker reported failure".to_string()),
-                ));
-            }
-            JobState::Cancelled => return Err(OpenAIError::bad_gateway("job was cancelled")),
-            JobState::Pending | JobState::Leased | JobState::Running => {
-                wait_for_job_event_change(poll_interval, &mut local_updates, &mut cluster_updates)
-                    .await;
-            }
-        }
+        .map_err(|error| OpenAIError::internal(format!("wait for job: {error}")))?;
+    match job.state {
+        JobState::Succeeded => match read_output_from_job(&job)? {
+            Some(output) => Ok(output),
+            None => read_output_stream(kernel, &job.job_id).await,
+        },
+        JobState::Failed => Err(OpenAIError::bad_gateway(
+            job.last_error
+                .unwrap_or_else(|| "worker reported failure".to_string()),
+        )),
+        _ => Err(OpenAIError::bad_gateway("job was cancelled")),
     }
 }
 

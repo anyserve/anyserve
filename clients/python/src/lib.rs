@@ -68,7 +68,7 @@ struct OpenStreamCall {
     lease_id: Option<String>,
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass(skip_from_py_object, module = "anyserve._native")]
 #[derive(Clone)]
 struct AnyserveClient {
     endpoint: String,

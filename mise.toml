@@ -93,19 +93,6 @@ python clients/python/tests/sdk_e2e.py
 [tasks.python-sdk-smoke]
 description = "Install the built Python bindings wheel and verify the import surface"
 run = """
-python - <<'PY'
-from pathlib import Path
-
-candidates = []
-for base in (Path("clients/python/dist"), Path("target/wheels")):
-    candidates.extend(base.glob("anyserve_runtime-*.whl"))
-
-if not candidates:
-    raise SystemExit("no anyserve_runtime wheel found in clients/python/dist or target/wheels")
-
-wheel = max(candidates, key=lambda path: path.stat().st_mtime)
-print(wheel)
-PY
 WHEEL="$(python - <<'PY'
 from pathlib import Path
 
@@ -132,28 +119,17 @@ from anyserve import (
     worker,
 )
 
-class _FakeNative:
-    def list_jobs(self):
-        return []
-
-client = AnyserveClient.__new__(AnyserveClient)
-client._native = _FakeNative()
-
 @worker(interface="demo.echo.v1", codec="bytes")
 def echo(payload: bytes) -> bytes:
     return payload
 
-spec = get_handler_spec(echo)
-
-assert AnyserveClient.__name__ == "AnyserveClient"
-assert client.submitter() is client
-assert client.worker() is client
-assert client.list_jobs() == []
-assert isinstance(spec, HandlerSpec)
+assert AnyserveClient.__module__ == "anyserve._native"
+for method in ("submit_job", "poll_lease", "complete_lease", "push_frames", "list_jobs"):
+    assert callable(getattr(AnyserveClient, method)), method
+assert isinstance(get_handler_spec(echo), HandlerSpec)
 assert FRAME_DATA == "data"
 assert inline_object(b"hello")["inline"] == b"hello"
 assert uri_object("file:///tmp/example")["uri"] == "file:///tmp/example"
-assert callable(client.list_jobs)
 assert callable(serve)
 print(AnyserveClient)
 PY
