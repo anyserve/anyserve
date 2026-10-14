@@ -331,17 +331,22 @@ def previous_run(current):
 def run_once(args, sha, dirty, tag):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = RESULTS / f"{stamp}_{sha}_{args.suite}"
-    (run_dir).mkdir(parents=True)
+    run_dir.mkdir(parents=True)
     raw = run_dir.name
     results = {"suite": args.suite, "rounds": args.rounds, "fingerprint": fingerprint(sha, dirty, tag),
                "scenarios": {}, "gates": []}
-    start_stack()
-    results["calibration"] = calibrate()
-    suite_quick(results, raw, args.rounds)
-    if args.suite == "full":
-        suite_llm(results, raw, args.rounds)
-        suite_image(results, raw, args.rounds)
-    set_bench_rtt(0)
+    try:
+        start_stack()
+        results["calibration"] = calibrate()
+        suite_quick(results, raw, args.rounds)
+        if args.suite == "full":
+            suite_llm(results, raw, args.rounds)
+            suite_image(results, raw, args.rounds)
+        set_bench_rtt(0)
+    finally:
+        # The bench container writes as root; hand the results back to the caller.
+        compose("exec", "-T", "bench", "chown", "-R", f"{os.getuid()}:{os.getgid()}",
+                f"/bench/results/{raw}", capture=True, check=False)
 
     baseline = None if args.baseline == "none" else (
         previous_run(run_dir) if args.baseline == "auto" else Path(args.baseline))
