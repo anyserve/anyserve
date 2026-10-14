@@ -9,7 +9,6 @@ on:
       - "examples/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "Makefile"
       - "mise.toml"
       - "scripts/**"
       - ".github/workflows/anyserve-ci.yml"
@@ -23,7 +22,6 @@ on:
       - "examples/**"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "Makefile"
       - "mise.toml"
       - "scripts/**"
       - ".github/workflows/anyserve-ci.yml"
@@ -58,7 +56,6 @@ jobs:
               - "examples/**"
               - "Cargo.toml"
               - "Cargo.lock"
-              - "Makefile"
               - "mise.toml"
               - ".github/workflows/anyserve-ci.yml"
             python:

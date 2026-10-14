@@ -75,7 +75,6 @@ pub struct JobSubmission {
     pub preferred_attributes: HashMap<String, String>,
     pub required_capacity: HashMap<String, i64>,
     pub metadata: HashMap<String, String>,
-    pub profile: String,
     pub priority: i32,
     pub lease_ttl_secs: u32,
     pub queue_timeout_ms: u64,
@@ -93,7 +92,6 @@ impl JobSubmission {
             preferred_attributes: HashMap::new(),
             required_capacity: HashMap::new(),
             metadata: HashMap::new(),
-            profile: "basic".to_string(),
             priority: 0,
             lease_ttl_secs: 30,
             queue_timeout_ms: 0,
@@ -153,11 +151,6 @@ impl StreamOpen {
             worker_id: None,
             lease_id: None,
         }
-    }
-
-    pub fn with_scope(mut self, scope: StreamScope) -> Self {
-        self.scope = scope;
-        self
     }
 
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
@@ -257,10 +250,6 @@ impl AnyserveClient {
         &self.endpoint
     }
 
-    pub fn inner_mut(&mut self) -> &mut ControlPlaneClient {
-        &mut self.inner
-    }
-
     pub fn into_inner(self) -> ControlPlaneClient {
         self.inner
     }
@@ -280,7 +269,6 @@ impl AnyserveClient {
                         required_capacity: capacity_to_proto(request.required_capacity),
                     }),
                     policy: Some(ExecutionPolicy {
-                        profile: request.profile,
                         priority: request.priority,
                         lease_ttl_secs: request.lease_ttl_secs,
                         queue_timeout_ms: request.queue_timeout_ms,

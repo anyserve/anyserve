@@ -599,11 +599,6 @@ fn demand_from_proto(demand: proto::Demand) -> Demand {
 
 fn execution_policy_from_proto(policy: proto::ExecutionPolicy) -> ExecutionPolicy {
     ExecutionPolicy {
-        profile: if policy.profile.is_empty() {
-            "basic".to_string()
-        } else {
-            policy.profile
-        },
         priority: policy.priority,
         lease_ttl_secs: policy.lease_ttl_secs as u64,
         queue_timeout_ms: policy.queue_timeout_ms,
@@ -670,7 +665,6 @@ fn job_spec_to_proto(spec: JobSpec) -> proto::JobSpec {
             required_capacity: capacity_to_proto(spec.demand.required_capacity),
         }),
         policy: Some(proto::ExecutionPolicy {
-            profile: spec.policy.profile,
             priority: spec.policy.priority,
             lease_ttl_secs: spec.policy.lease_ttl_secs as u32,
             queue_timeout_ms: spec.policy.queue_timeout_ms,

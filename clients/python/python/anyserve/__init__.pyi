@@ -192,7 +192,6 @@ class AnyserveClient:
         preferred_attributes: Optional[Dict[str, str]] = ...,
         required_capacity: Optional[Dict[str, int]] = ...,
         metadata: Optional[Dict[str, str]] = ...,
-        profile: Optional[str] = ...,
         priority: int = ...,
         lease_ttl_secs: Optional[int] = ...,
         job_id: Optional[str] = ...,
