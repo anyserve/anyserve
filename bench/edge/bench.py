@@ -38,9 +38,12 @@ INVOKE = f"{CENTER}:8090/v1/invoke"
 MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 IMAGE_BODY = '{"prompt":"a robot arm stacking poker chips, studio photo","steps":1}'
 
-# Regression thresholds on the paired overhead (anyserve minus direct).
-LATENCY_SLACK_MS = 2.0      # allowed growth of an overhead, absolute ...
-LATENCY_SLACK_REL = 0.20    # ... or relative to the baseline overhead
+# Regression thresholds on the paired overhead (anyserve minus direct):
+# allowed growth = max(absolute ms, relative share of the baseline overhead).
+# Tail metrics get a wider band: across repeated runs their overhead moved
+# by up to 2.3 ms while p50 overheads moved by at most 0.3 ms.
+LATENCY_SLACK = {"p99_ms": (5.0, 0.50)}
+DEFAULT_LATENCY_SLACK = (2.0, 0.20)
 THROUGHPUT_SLACK = 0.05     # allowed drop of the anyserve/direct throughput ratio
 
 
@@ -220,12 +223,20 @@ def session_failover(results, raw):
     proc = subprocess.Popen(
         ["docker", "compose", "exec", "-T", "bench", "python3", "/bench/bench_policy.py", "control",
          "--url", f"{INVOKE}/rl.policy.act.v1", *AUTH, "--header", "x-anyserve-prefer:region=near",
-         "--sticky", "--hz", "30", "--duration", "12", "--label", "session-failover",
+         "--sticky", "--progress", "--hz", "30", "--duration", "12", "--label", "session-failover",
          "--out", f"/bench/results/{raw}/policy.jsonl"],
         cwd=HERE, text=True, stdout=subprocess.PIPE, env={**os.environ})
-    time.sleep(8)
-    compose("stop", "edge-near", capture=True)
-    out, _ = proc.communicate(timeout=120)
+    # Kill the near cluster 3 s into the episode, by step count rather than
+    # wall clock, so container start-up time cannot shift it.
+    lines = []
+    for line in proc.stdout:
+        lines.append(line)
+        if line.strip() == "progress 90":
+            compose("stop", "edge-near", capture=True)
+            break
+    lines.extend(proc.stdout)
+    proc.wait(timeout=120)
+    out = "".join(lines)
     compose("start", "edge-near", capture=True)
     wait_for(lambda: invoke_ok(), "near worker back")
     time.sleep(3)
@@ -296,7 +307,8 @@ def compare(baseline, candidate):
                 continue
             was = base[metric]
             if lower_is_better(metric):
-                limit = was["delta"] + max(LATENCY_SLACK_MS, abs(was["delta"]) * LATENCY_SLACK_REL)
+                absolute, relative = LATENCY_SLACK.get(metric, DEFAULT_LATENCY_SLACK)
+                limit = was["delta"] + max(absolute, abs(was["delta"]) * relative)
                 bad = now["delta"] > limit
                 lines.append(f"| {name} | {metric} overhead | {was['delta']:+.1f} | {now['delta']:+.1f} | {'REGRESSION' if bad else 'ok'} |")
             else:
