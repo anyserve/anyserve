@@ -54,6 +54,12 @@ pub const DRAINING_KEY: &str = "draining";
 /// breaks every worker cannot bounce between clusters forever.
 pub const MAX_ATTEMPTS: usize = 3;
 
+enum LeaseAttempt {
+    Assigned(Box<LeaseAssignment>),
+    Idle,
+    Draining,
+}
+
 struct WaitingWorker {
     worker: WorkerRecord,
     notify: Arc<Notify>,
@@ -383,16 +389,10 @@ impl Kernel {
         // Notify permit, so the wake-up is never lost.
         let (notify, _registration) = self.register_waiter(worker);
         loop {
-            if let Some(assignment) = self.poll_lease(worker_id).await? {
-                return Ok(Some(assignment));
-            }
-            let draining = self
-                .state_store
-                .get_worker(worker_id)
-                .await?
-                .is_some_and(|worker| is_draining(&worker));
-            if draining {
-                return Ok(None);
+            match self.try_lease(worker_id).await? {
+                LeaseAttempt::Assigned(assignment) => return Ok(Some(*assignment)),
+                LeaseAttempt::Draining => return Ok(None),
+                LeaseAttempt::Idle => {}
             }
             let now = Instant::now();
             if now >= deadline {
@@ -645,18 +645,16 @@ impl Kernel {
     }
 
     pub async fn poll_lease(&self, worker_id: &str) -> Result<Option<LeaseAssignment>> {
-        let now_ms = now_ms();
-        let reaped = self
-            .state_store
-            .reap_expired_leases_transition(now_ms)
-            .await?;
-        self.finalize_terminal_streams(reaped.streams_to_finalize.clone())
-            .await?;
-        self.publish_transition_best_effort(&reaped).await;
-        if !reaped.job_event_updates.is_empty() {
-            self.signal_dispatch().await;
-        }
+        Ok(match self.try_lease(worker_id).await? {
+            LeaseAttempt::Assigned(assignment) => Some(*assignment),
+            LeaseAttempt::Idle | LeaseAttempt::Draining => None,
+        })
+    }
 
+    /// One assignment attempt. Expired leases are reaped by the maintenance
+    /// loop, not here, to keep the per-poll path to the worker and job reads.
+    async fn try_lease(&self, worker_id: &str) -> Result<LeaseAttempt> {
+        let now_ms = now_ms();
         let worker = self
             .state_store
             .get_worker(worker_id)
@@ -666,7 +664,7 @@ impl Kernel {
             bail!("worker '{}' heartbeat expired", worker_id);
         }
         if is_draining(&worker) {
-            return Ok(None);
+            return Ok(LeaseAttempt::Draining);
         }
 
         let ordered_candidates = if self.state_store.lease_dispatch_mode()
@@ -677,7 +675,7 @@ impl Kernel {
                 self.scheduler
                     .ordered_jobs_for_worker(&worker, jobs.as_slice(), now_ms);
             if ordered_candidates.is_empty() {
-                return Ok(None);
+                return Ok(LeaseAttempt::Idle);
             }
             ordered_candidates
         } else {
@@ -693,11 +691,14 @@ impl Kernel {
                 now_ms,
             )
             .await?;
-        if let Some(assignment) = assignment.as_ref() {
-            self.publish_job_events_best_effort(&assignment.job.job_id)
-                .await;
-        }
-        Ok(assignment)
+        Ok(match assignment {
+            Some(assignment) => {
+                self.publish_job_events_best_effort(&assignment.job.job_id)
+                    .await;
+                LeaseAttempt::Assigned(Box::new(assignment))
+            }
+            None => LeaseAttempt::Idle,
+        })
     }
 
     pub async fn renew_lease(&self, worker_id: &str, lease_id: &str) -> Result<LeaseRecord> {
