@@ -180,7 +180,13 @@ def pair_policy(region):
 
 
 def run_paired(results, raw, rounds, scenario, direct, anyserve, metrics, expect_worker=None):
-    """Interleave direct/anyserve per round; collect per-round paired deltas."""
+    """Interleave direct/anyserve per round; collect per-round paired deltas.
+
+    One unrecorded warm-up round runs first, so cold-start cost (CUDA graphs,
+    connection pools, caches) does not land on whichever arm happens to go first.
+    """
+    direct(raw, 0)
+    anyserve(raw, 0)
     rows = []
     for round_ in range(1, rounds + 1):
         d, a = direct(raw, round_), anyserve(raw, round_)
