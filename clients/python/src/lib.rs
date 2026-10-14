@@ -68,7 +68,7 @@ struct OpenStreamCall {
     lease_id: Option<String>,
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 struct AnyserveClient {
     endpoint: String,
@@ -154,7 +154,7 @@ impl AnyserveClient {
             job_id,
         };
         let job = py
-            .allow_threads(move || {
+            .detach(move || {
                 let request = submit_job_from_py(request)?;
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.submit_job(request))
@@ -173,7 +173,7 @@ impl AnyserveClient {
     ) -> PyResult<JobEventIterator> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.watch_job(job_id, after_sequence))
             })?;
@@ -190,7 +190,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let jobs = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, |runtime, client| {
                     runtime.block_on(client.list_jobs())
                 })
@@ -205,7 +205,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let job = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.get_job(job_id))
                 })
@@ -218,7 +218,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let job = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.cancel_job(job_id))
                 })
@@ -231,7 +231,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let attempt = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.get_attempt(attempt_id))
                 })
@@ -244,7 +244,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let attempts = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.list_attempts(job_id))
                 })
@@ -286,7 +286,7 @@ impl AnyserveClient {
             worker_id,
         };
         let worker = py
-            .allow_threads(move || {
+            .detach(move || {
                 let request = register_worker_from_py(request);
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.register_worker(request))
@@ -308,7 +308,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let worker = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.heartbeat_worker(
                         worker_id,
@@ -335,7 +335,7 @@ impl AnyserveClient {
         let client = self.client.clone();
         let wait = std::time::Duration::from_millis(wait_timeout_ms);
         let lease = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.poll_lease_wait(worker_id, wait))
                 })
@@ -353,7 +353,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let lease = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.renew_lease(worker_id, lease_id))
                 })
@@ -374,7 +374,7 @@ impl AnyserveClient {
     ) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             let kind = parse_event_kind(&kind)?;
             with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.report_event(
@@ -401,7 +401,7 @@ impl AnyserveClient {
     ) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             let outputs = py_objects_to_proto(outputs.unwrap_or_default())?;
             with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.complete_lease(
@@ -428,7 +428,7 @@ impl AnyserveClient {
     ) -> PyResult<()> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.fail_lease(
                     worker_id,
@@ -479,7 +479,7 @@ impl AnyserveClient {
             lease_id,
         };
         let stream = py
-            .allow_threads(move || {
+            .detach(move || {
                 let request = open_stream_from_py(request);
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.open_stream(request))
@@ -493,7 +493,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let stream = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.get_stream(stream_id))
                 })
@@ -506,7 +506,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let streams = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.list_streams(job_id))
                 })
@@ -530,7 +530,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let stream = py
-            .allow_threads(move || {
+            .detach(move || {
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.close_stream(
                         stream_id,
@@ -556,7 +556,7 @@ impl AnyserveClient {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
         let summary = py
-            .allow_threads(move || {
+            .detach(move || {
                 let frames = frame_writes_from_py(frames)?;
                 with_client(&runtime, &client, move |runtime, client| {
                     runtime.block_on(client.push_frames(stream_id, frames, worker_id, lease_id))
@@ -576,7 +576,7 @@ impl AnyserveClient {
     ) -> PyResult<FrameIterator> {
         let runtime = self.runtime.clone();
         let client = self.client.clone();
-        py.allow_threads(move || {
+        py.detach(move || {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))
             })?;
@@ -604,7 +604,7 @@ impl JobEventIterator {
         let runtime = self.runtime.clone();
         let stream = self.stream.clone();
         let next = py
-            .allow_threads(move || next_job_event(&runtime, &stream))
+            .detach(move || next_job_event(&runtime, &stream))
             .map_err(to_py_err)?;
         next.map(|event| job_event_to_py(py, event)).transpose()
     }
@@ -624,7 +624,7 @@ impl FrameIterator {
         let runtime = self.runtime.clone();
         let stream = self.stream.clone();
         let next = py
-            .allow_threads(move || next_frame(&runtime, &stream))
+            .detach(move || next_frame(&runtime, &stream))
             .map_err(to_py_err)?;
         next.map(|frame| frame_to_py(py, frame)).transpose()
     }
