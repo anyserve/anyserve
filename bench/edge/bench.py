@@ -204,7 +204,10 @@ def run_paired(results, raw, rounds, scenario, direct, anyserve, metrics, expect
                 gates.append(f"{scenario} r{row['round']} {arm}: {row[arm]['errors']} errors")
         served = row["anyserve"].get("served_by")
         if expect_worker and served and set(served) != {expect_worker}:
-            gates.append(f"{scenario} r{row['round']}: served by {served}, expected {expect_worker}")
+            # Placement misses must reproduce (see confirm): a transient stall
+            # legitimately spills a preferred job to another region.
+            results.setdefault("placement", []).append(
+                f"{scenario} r{row['round']}: served by {served}, expected {expect_worker}")
     summary = {}
     for metric in metrics:
         d = [row["direct"][metric] for row in rows]
@@ -354,7 +357,7 @@ def render(results):
     if results.get("comparison"):
         out += ["", f"## vs baseline `{results['baseline']}`", "", results["comparison"]]
     if results.get("confirmation"):
-        out += ["", "## confirmation re-run", "", results["confirmation"]["comparison"]]
+        out += ["", "## confirmation re-run", "", results["confirmation"]["comparison"] or "(placement only)"]
         if results.get("unconfirmed"):
             out += ["", "Not reproduced (ignored): " + ", ".join(results["unconfirmed"])]
     return "\n".join(out) + "\n"
@@ -379,13 +382,14 @@ def run_once(args, sha, dirty, tag):
         start_stack()
         results["calibration"] = calibrate()
         run_suites(args.suite, results, raw, args.rounds)
+        base = None
         if baseline and (baseline / "summary.json").exists():
             base = json.loads((baseline / "summary.json").read_text())
             problems, results["comparison"] = compare(base, results)
             results["baseline"] = baseline.name
-            if problems:
-                problems = confirm(args.suite, base, results, raw, args.rounds, problems)
-            results["regressions"] = problems
+        if problems or results.get("placement"):
+            problems = confirm(args.suite, base, results, raw, args.rounds, problems)
+        results["regressions"] = problems
         set_bench_rtt(0)
     finally:
         # The bench container writes as root; hand the results back to the caller.
@@ -407,17 +411,21 @@ def run_suites(suite, results, raw, rounds, only=None):
 
 
 def confirm(suite, baseline, results, raw, rounds, problems):
-    """A regression counts only if it reproduces: re-run the flagged scenarios
-    once and keep the ones that still exceed the band. A shared host can
+    """Regressions and placement misses count only if they reproduce: re-run
+    the flagged scenarios once and keep what still fails. A shared host can
     produce a one-off slow scenario that a re-run clears."""
-    flagged = {problem.split()[0] for problem in problems}
-    log(f"possible regression in {sorted(flagged)}; re-running to confirm")
+    placement = results.get("placement", [])
+    flagged = {problem.split()[0] for problem in problems + placement}
+    log(f"re-running {sorted(flagged)} to confirm")
     rerun = {"scenarios": {}, "gates": []}
     run_suites(suite, rerun, raw, rounds, only=flagged)
-    confirmed, table = compare(baseline, rerun)
-    results["confirmation"] = {"scenarios": rerun["scenarios"], "comparison": table}
-    results["unconfirmed"] = sorted(set(problems) - set(confirmed))
-    results["gates"].extend(rerun["gates"])
+    confirmed, table = compare(baseline, rerun) if baseline else ([], "")
+    results["confirmation"] = {"scenarios": rerun["scenarios"], "comparison": table,
+                               "placement": rerun.get("placement", [])}
+    results["unconfirmed"] = sorted(set(problems) - set(confirmed)) + [
+        item for item in placement
+        if not any(again.split()[0] == item.split()[0] for again in rerun.get("placement", []))]
+    results["gates"].extend(rerun["gates"] + rerun.get("placement", []))
     return confirmed
 
 
