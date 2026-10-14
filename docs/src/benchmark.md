@@ -30,14 +30,15 @@ Exit code is non-zero when a correctness gate fails or an overhead regresses.
    overhead is the median of per-round differences (min..max shown), so slow
    drift of the backend or host hits both arms equally.
 5. **Correctness gates.** Zero errors; anyserve traffic served by the expected
-   region's worker; the session-failover scenario must migrate with no failed
+   region's worker (a miss must reproduce on re-run, since a transient stall
+   legitimately spills a preferred job); the session-failover scenario must migrate with no failed
    step and no step slower than far RTT + 60 ms.
 6. **Regression check.** Against the previous run (or `--baseline DIR`): a p50
    overhead may grow by at most max(2 ms, 20 %), a p99 overhead by at most
    max(5 ms, 50 %) (tails are noisier: across repeated runs p99 overheads moved
    by up to 2.3 ms, p50 by at most 0.3 ms), and a throughput ratio
    (anyserve / direct) may drop by at most 0.05. A flagged scenario is re-run
-   once and counts as a regression only if the re-run also exceeds the band;
+   once and counts only if the re-run also fails;
    one-off slow scenarios on a shared host are reported as "not reproduced".
    Each scenario records the host load average for triage.
 

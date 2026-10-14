@@ -146,7 +146,7 @@ async fn lease_loop(
     context: WorkerContext,
     mut client: AnyserveClient,
     mut accepting: watch::Receiver<bool>,
-    stop: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
     slot: u32,
 ) {
     let config = &context.config;
@@ -157,7 +157,11 @@ async fn lease_loop(
         }
         if !*accepting.borrow_and_update() {
             // Backend unhealthy: the control plane already treats us as draining.
-            let _ = accepting.changed().await;
+            // Wake on shutdown too, or a stop while unhealthy waits out the drain timeout.
+            tokio::select! {
+                _ = accepting.changed() => {}
+                _ = stop.changed() => {}
+            }
             continue;
         }
 
