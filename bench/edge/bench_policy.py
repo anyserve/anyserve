@@ -23,16 +23,21 @@ def pct(values, q):
 
 
 BODY = None  # --body overrides the random observation payload
+ERRORS = {}  # "status: body" -> count, for diagnosing failed requests
 
 
 async def step(session, url, headers, obs_dim, served, sticky=None):
     body = BODY if BODY is not None else {"obs": [random.random() for _ in range(obs_dim)]}
     started = time.perf_counter()
     async with session.post(url, json=body, headers=headers) as response:
-        await response.read()
+        data = await response.read()
         ok = response.status == 200
         worker = response.headers.get("x-anyserve-worker-id", "direct")
-    served[worker] = served.get(worker, 0) + 1
+    if ok:
+        served[worker] = served.get(worker, 0) + 1
+    else:
+        key = f"{response.status}: {data[:160].decode(errors='replace')}"
+        ERRORS[key] = ERRORS.get(key, 0) + 1
     if sticky is not None and ok and worker != "direct":
         # Session affinity: keep this episode on the worker holding its state,
         # spilling to another worker only if that one stops answering.
@@ -113,7 +118,7 @@ async def main():
         while time.perf_counter() < warm:
             await step(session, args.url, headers, args.obs_dim, {})
         result = await (rollout if args.mode == "rollout" else control)(args, session, headers)
-    result = {"label": args.label, "mode": args.mode, **result}
+    result = {"label": args.label, "mode": args.mode, **result, **({"error_detail": ERRORS} if ERRORS else {})}
     print(json.dumps(result))
     if args.out:
         with open(args.out, "a") as handle:

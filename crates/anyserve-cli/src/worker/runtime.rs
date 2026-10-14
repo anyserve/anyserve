@@ -59,18 +59,25 @@ pub(crate) async fn run(control_plane_endpoint: &str, args: WorkerArgs) -> Resul
     };
 
     let (health_tx, health_rx) = watch::channel(true);
-    if let Some(health_url) = config.health_url.clone() {
-        tokio::spawn(health_loop(context.clone(), health_url, health_tx));
-    }
-    tokio::spawn(heartbeat_loop(context.clone()));
-
+    // Without a health URL the sender stays here, so health never changes.
+    let _static_health = match config.health_url.clone() {
+        Some(health_url) => {
+            tokio::spawn(health_loop(context.clone(), health_url, health_tx));
+            None
+        }
+        None => Some(health_tx),
+    };
     let (stop_tx, stop_rx) = watch::channel(false);
+    let (accepting_tx, accepting_rx) = watch::channel(true);
+    tokio::spawn(track_accepting(health_rx, stop_rx.clone(), accepting_tx));
+    tokio::spawn(heartbeat_loop(context.clone(), accepting_rx.clone()));
+
     let mut lease_loops = JoinSet::new();
     for slot in 0..config.max_active_leases {
         lease_loops.spawn(lease_loop(
             context.clone(),
             client.clone(),
-            health_rx.clone(),
+            accepting_rx.clone(),
             stop_rx.clone(),
             slot,
         ));
@@ -85,8 +92,9 @@ pub(crate) async fn run(control_plane_endpoint: &str, args: WorkerArgs) -> Resul
         }
     }
 
-    // Drain: stop taking leases, let in-flight jobs finish, then exit, so a
-    // rolling restart or scale-down never strands a lease until its TTL.
+    // Drain: report draining (the control plane stops assigning and releases
+    // parked polls), finish in-flight jobs, then exit. Polls are never
+    // cancelled client-side, so an assignment cannot be lost in flight.
     let in_flight = context.activity.lock().await.active_lease_ids.len();
     tracing::info!(worker_id = %context.worker_id, in_flight, "worker draining");
     let _ = stop_tx.send(true);
@@ -117,11 +125,28 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// Accepting work = backend healthy and not shutting down. Reported to the
+/// control plane as the `draining` heartbeat flag.
+async fn track_accepting(
+    mut healthy: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
+    accepting: watch::Sender<bool>,
+) {
+    loop {
+        let value = *healthy.borrow_and_update() && !*stop.borrow_and_update();
+        accepting.send_if_modified(|current| std::mem::replace(current, value) != value);
+        tokio::select! {
+            changed = healthy.changed() => if changed.is_err() { return },
+            changed = stop.changed() => if changed.is_err() { return },
+        }
+    }
+}
+
 async fn lease_loop(
     context: WorkerContext,
     mut client: AnyserveClient,
-    mut healthy: watch::Receiver<bool>,
-    mut stop: watch::Receiver<bool>,
+    mut accepting: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
     slot: u32,
 ) {
     let config = &context.config;
@@ -130,28 +155,18 @@ async fn lease_loop(
         if *stop.borrow() {
             return;
         }
-        if !*healthy.borrow_and_update() {
-            // Upstream is down: stop taking work so other clusters absorb it.
-            let _ = healthy.changed().await;
+        if !*accepting.borrow_and_update() {
+            // Backend unhealthy: the control plane already treats us as draining.
+            let _ = accepting.changed().await;
             continue;
         }
 
-        let poll = async {
-            if config.long_poll.is_zero() {
-                client.poll_lease(worker_id.clone()).await
-            } else {
-                client
-                    .poll_lease_wait(worker_id.clone(), config.long_poll)
-                    .await
-            }
-        };
-        // Abandon an in-flight long-poll as soon as the upstream turns unhealthy,
-        // otherwise a draining worker would keep accepting work for up to
-        // `long_poll` after its backend died.
-        let polled = tokio::select! {
-            polled = poll => polled,
-            _ = wait_unhealthy(&mut healthy) => continue,
-            _ = stop.changed() => return,
+        let polled = if config.long_poll.is_zero() {
+            client.poll_lease(worker_id.clone()).await
+        } else {
+            client
+                .poll_lease_wait(worker_id.clone(), config.long_poll)
+                .await
         };
         let grant = match polled {
             Ok(Some(grant)) => grant,
@@ -171,8 +186,8 @@ async fn lease_loop(
             }
         };
 
-        if !*healthy.borrow() {
-            // Lost the race with the health check: hand the job straight back.
+        if !*accepting.borrow() && !*stop.borrow() {
+            // Assigned just before the backend went down: hand it to another worker.
             let _ = client
                 .fail_lease(
                     worker_id.clone(),
@@ -186,15 +201,6 @@ async fn lease_loop(
         }
 
         handle_grant(&context, &mut client, grant).await;
-    }
-}
-
-async fn wait_unhealthy(healthy: &mut watch::Receiver<bool>) {
-    while *healthy.borrow_and_update() {
-        if healthy.changed().await.is_err() {
-            // Health loop gone: never report unhealthy.
-            std::future::pending::<()>().await;
-        }
     }
 }
 

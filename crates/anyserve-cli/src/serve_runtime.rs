@@ -25,6 +25,7 @@ use crate::serve_console::run_server as run_console_server;
 use crate::serve_invoke::run_server as run_serve_invoke;
 use crate::serve_openai::run_server as run_serve_openai;
 
+const MAX_PENDING_RESET_STREAMS: usize = 1024;
 const POSTGRES_MEMORY_SINGLETON_LOCK_ID: i64 = 0x4153_5256_5047_4d4d;
 
 struct PostgresMemorySingletonLock {
@@ -298,6 +299,9 @@ async fn run_grpc_server(
     builder
         .tcp_nodelay(true)
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        // A draining worker cancels all its parked long-polls at once; the
+        // default rapid-reset guard (20) would drop the whole connection.
+        .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_RESET_STREAMS))
         .layer(AuthLayer::new(auth))
         .add_service(health_service)
         .add_service(grpc_service)

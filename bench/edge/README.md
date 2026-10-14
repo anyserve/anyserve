@@ -12,14 +12,13 @@ Two emulated clusters behind one control plane, on one GPU host.
 | `bench` | client; `bench-net` netem emulates direct WAN calls for baselines |
 
 ```bash
-docker build -t anyserve:edge-dev ../..
 docker volume create anyserve-hf-cache
-docker compose up -d
-./run-policy.sh   # RL rollout + 30 Hz control loop + failover   -> results/policy.jsonl
-./run-llm.sh      # vllm bench serve, sequential sweep (c1/c16/c64)  -> results/llm-*.json
-./run-llm-latency.sh  # fresh vLLM, arms interleaved x3 (use for A/B)  -> results/llm-lat-*.json
-./run-image.sh    # text-to-image, stops vLLM                     -> results/image.jsonl
+./bench.py run                 # quick: policy rollout / 30 Hz control / session failover
+./bench.py run --suite full    # + LLM and text-to-image (GPU)
+./bench.py run --repeat 3      # repeated runs with cross-run spread
 ```
 
-RTTs: `HALF_RTT_NEAR=15 HALF_RTT_FAR=35 docker compose up -d` (half applied on each end).
-Recreating `bench-net` requires recreating `bench` (shared network namespace).
+Method, scenarios and regression thresholds: [docs/src/benchmark.md](../../docs/src/benchmark.md).
+Results land in `results/<utc>_<sha>_<suite>/`.
+
+`bench-net` and `bench` share a network namespace; recreate them together (bench.py does).

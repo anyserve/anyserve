@@ -9,11 +9,12 @@
 name: anyserve-edge
 
 x-anyserve: &anyserve
-  image: anyserve:edge-dev
+  image: ${ANYSERVE_IMAGE:-anyserve:edge-dev}
   cap_add: [NET_ADMIN]
   entrypoint: ["/bench/netem-exec.sh"]
   volumes: ["./:/bench:ro"]
   restart: unless-stopped
+  stop_grace_period: 30s   # workers drain in-flight jobs on SIGTERM
 
 x-tokens: &tokens
   ANYSERVE_CLIENT_TOKENS: ${CLIENT_TOKEN:-bench-client-token}
