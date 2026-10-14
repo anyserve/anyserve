@@ -47,6 +47,9 @@ const DISPATCH_RECHECK: Duration = Duration::from_secs(1);
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(2);
 const PURGE_INTERVAL: Duration = Duration::from_secs(30);
 pub const QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
+/// Worker heartbeat metadata key: `"true"` means the worker is draining (shutting
+/// down or its backend is unhealthy) and must not be assigned new work.
+pub const DRAINING_KEY: &str = "draining";
 /// Retryable failures stop requeueing after this many attempts so a job that
 /// breaks every worker cannot bounce between clusters forever.
 pub const MAX_ATTEMPTS: usize = 3;
@@ -335,6 +338,13 @@ impl Kernel {
             .sum()
     }
 
+    fn wake_worker_polls(&self, worker_id: &str) {
+        let waiting = self.waiting.lock().expect("waiting registry poisoned");
+        if let Some(entry) = waiting.get(worker_id) {
+            entry.notify.notify_waiters();
+        }
+    }
+
     fn register_waiter(&self, worker: WorkerRecord) -> (Arc<Notify>, WaitRegistration<'_>) {
         let worker_id = worker.worker_id.clone();
         let mut waiting = self.waiting.lock().expect("waiting registry poisoned");
@@ -375,6 +385,14 @@ impl Kernel {
         loop {
             if let Some(assignment) = self.poll_lease(worker_id).await? {
                 return Ok(Some(assignment));
+            }
+            let draining = self
+                .state_store
+                .get_worker(worker_id)
+                .await?
+                .is_some_and(|worker| is_draining(&worker));
+            if draining {
+                return Ok(None);
             }
             let now = Instant::now();
             if now >= deadline {
@@ -618,6 +636,11 @@ impl Kernel {
         worker.status.last_seen_at_ms = now_ms;
         worker.expires_at_ms = now_ms + self.heartbeat_ttl_secs * 1000;
         self.state_store.upsert_worker(worker.clone()).await?;
+        if is_draining(&worker) {
+            // Release its parked long-polls so they return empty instead of
+            // the worker having to cancel them (which could drop an assignment).
+            self.wake_worker_polls(worker_id);
+        }
         Ok(worker)
     }
 
@@ -634,18 +657,21 @@ impl Kernel {
             self.signal_dispatch().await;
         }
 
+        let worker = self
+            .state_store
+            .get_worker(worker_id)
+            .await?
+            .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
+        if worker.expires_at_ms <= now_ms {
+            bail!("worker '{}' heartbeat expired", worker_id);
+        }
+        if is_draining(&worker) {
+            return Ok(None);
+        }
+
         let ordered_candidates = if self.state_store.lease_dispatch_mode()
             == LeaseDispatchMode::KernelOrderedCandidates
         {
-            let worker = self
-                .state_store
-                .get_worker(worker_id)
-                .await?
-                .ok_or_else(|| anyhow!("worker '{}' does not exist", worker_id))?;
-            if worker.expires_at_ms <= now_ms {
-                bail!("worker '{}' heartbeat expired", worker_id);
-            }
-
             let jobs = self.state_store.list_pending_jobs().await?;
             let ordered_candidates =
                 self.scheduler
@@ -1210,6 +1236,10 @@ impl Kernel {
     }
 }
 
+fn is_draining(worker: &WorkerRecord) -> bool {
+    worker.status.metadata.get(DRAINING_KEY).map(String::as_str) == Some("true")
+}
+
 fn validate_job_spec(spec: &JobSpec) -> Result<()> {
     if spec.interface_name.trim().is_empty() {
         bail!("job interface_name is required");
@@ -1710,5 +1740,51 @@ mod tests {
         assert!(kernel.get_job(&lease.job_id).await.is_err());
         // The pending index still serves dispatch after the purge.
         assert!(kernel.poll_lease("worker-1").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn draining_heartbeat_releases_parked_polls_and_blocks_assignment() {
+        let kernel = test_kernel();
+        register(&kernel, "worker-1", "local").await;
+        let waiter = {
+            let kernel = Arc::clone(&kernel);
+            tokio::spawn(async move {
+                let started = tokio::time::Instant::now();
+                let grant = kernel
+                    .poll_lease_wait("worker-1", Duration::from_secs(10))
+                    .await
+                    .unwrap();
+                (grant, started.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        kernel
+            .heartbeat_worker(
+                "worker-1",
+                BTreeMap::new(),
+                0,
+                Attributes::from([(super::DRAINING_KEY.to_string(), "true".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        let (grant, elapsed) = waiter.await.unwrap();
+        assert!(grant.is_none());
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "poll released after {elapsed:?}"
+        );
+
+        kernel
+            .submit_job(
+                Some("job-1".to_string()),
+                JobSpec {
+                    interface_name: "demo.execute.v1".to_string(),
+                    ..JobSpec::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(kernel.poll_lease("worker-1").await.unwrap().is_none());
     }
 }

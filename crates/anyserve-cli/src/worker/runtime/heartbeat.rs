@@ -1,17 +1,26 @@
 use anyserve_client::AnyserveClient;
+use anyserve_core::kernel::DRAINING_KEY;
 use tokio::sync::watch;
 
 use super::WorkerContext;
 use crate::worker::helpers::{available_capacity, connect_client};
 
-pub(super) async fn heartbeat_loop(context: WorkerContext) {
+pub(super) async fn heartbeat_loop(context: WorkerContext, mut accepting: watch::Receiver<bool>) {
     let worker_id = context.worker_id.clone();
     let mut interval = tokio::time::interval(context.config.heartbeat_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut client: Option<AnyserveClient> = None;
 
     loop {
-        interval.tick().await;
+        // Report a change in accepting state right away, not at the next tick.
+        tokio::select! {
+            _ = interval.tick() => {}
+            changed = accepting.changed() => if changed.is_err() { return },
+        }
+        let mut metadata = context.config.metadata.clone();
+        if !*accepting.borrow_and_update() {
+            metadata.insert(DRAINING_KEY.to_string(), "true".to_string());
+        }
 
         let active_lease_ids = context.activity.lock().await.active_lease_ids.clone();
         let active_leases = active_lease_ids.len() as u32;
@@ -33,7 +42,7 @@ pub(super) async fn heartbeat_loop(context: WorkerContext) {
                 worker_id.clone(),
                 available_capacity(&context.config.capacity, active_leases),
                 active_leases,
-                context.config.metadata.clone(),
+                metadata,
             )
             .await
         {
