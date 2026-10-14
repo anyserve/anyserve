@@ -195,6 +195,11 @@ struct MemoryState {
     jobs: BTreeMap<String, JobRecord>,
     /// Ids of pending jobs, so dispatch does not scan every retained job.
     pending: BTreeSet<String>,
+    // Secondary indexes so per-job/per-lease lookups do not scan everything
+    // retained (attempt and stream owners never change after creation).
+    attempts_by_job: BTreeMap<String, BTreeSet<String>>,
+    attempt_by_lease: BTreeMap<String, String>,
+    streams_by_job: BTreeMap<String, BTreeSet<String>>,
     events: BTreeMap<String, Vec<JobEvent>>,
     attempts: BTreeMap<String, AttemptRecord>,
     workers: BTreeMap<String, WorkerRecord>,
@@ -211,6 +216,31 @@ impl MemoryState {
             self.pending.remove(&job.job_id);
         }
         self.jobs.insert(job.job_id.clone(), job);
+    }
+
+    fn put_attempt(&mut self, attempt: AttemptRecord) {
+        self.attempts_by_job
+            .entry(attempt.job_id.clone())
+            .or_default()
+            .insert(attempt.attempt_id.clone());
+        self.attempt_by_lease
+            .insert(attempt.lease_id.clone(), attempt.attempt_id.clone());
+        self.attempts.insert(attempt.attempt_id.clone(), attempt);
+    }
+
+    fn put_stream(&mut self, stream: StreamRecord) {
+        self.streams_by_job
+            .entry(stream.job_id.clone())
+            .or_default()
+            .insert(stream.stream_id.clone());
+        self.streams.insert(stream.stream_id.clone(), stream);
+    }
+
+    fn job_stream_ids(&self, job_id: &str) -> Vec<String> {
+        self.streams_by_job
+            .get(job_id)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -273,12 +303,7 @@ impl MemoryStateStore {
 }
 
 fn latest_attempt_id_for_lease(inner: &MemoryState, lease_id: &str) -> Option<String> {
-    inner
-        .attempts
-        .values()
-        .filter(|attempt| attempt.lease_id == lease_id)
-        .max_by_key(|attempt| (attempt.created_at_ms, attempt.attempt_id.clone()))
-        .map(|attempt| attempt.attempt_id.clone())
+    inner.attempt_by_lease.get(lease_id).cloned()
 }
 
 fn append_job_event_locked(
@@ -311,16 +336,27 @@ fn close_job_streams_locked(
     job_id: &str,
     now_ms: u64,
 ) -> Vec<StreamRecord> {
-    inner
-        .streams
-        .values_mut()
-        .filter(|stream| stream.job_id == job_id && !stream.state.is_terminal())
-        .map(|stream| {
+    close_streams_locked(inner, job_id, now_ms, |_| true)
+}
+
+fn close_streams_locked(
+    inner: &mut MemoryState,
+    job_id: &str,
+    now_ms: u64,
+    matches: impl Fn(&StreamRecord) -> bool,
+) -> Vec<StreamRecord> {
+    let mut closed = Vec::new();
+    for stream_id in inner.job_stream_ids(job_id) {
+        if let Some(stream) = inner.streams.get_mut(&stream_id)
+            && !stream.state.is_terminal()
+            && matches(stream)
+        {
             stream.state = StreamState::Closed;
             stream.closed_at_ms = Some(now_ms);
-            stream.clone()
-        })
-        .collect()
+            closed.push(stream.clone());
+        }
+    }
+    closed
 }
 
 fn close_lease_streams_locked(
@@ -329,20 +365,9 @@ fn close_lease_streams_locked(
     lease_id: &str,
     now_ms: u64,
 ) -> Vec<StreamRecord> {
-    inner
-        .streams
-        .values_mut()
-        .filter(|stream| {
-            stream.job_id == job_id
-                && stream.lease_id.as_deref() == Some(lease_id)
-                && !stream.state.is_terminal()
-        })
-        .map(|stream| {
-            stream.state = StreamState::Closed;
-            stream.closed_at_ms = Some(now_ms);
-            stream.clone()
-        })
-        .collect()
+    close_streams_locked(inner, job_id, now_ms, |stream| {
+        stream.lease_id.as_deref() == Some(lease_id)
+    })
 }
 
 #[async_trait]
@@ -551,7 +576,7 @@ impl StateStore for MemoryStateStore {
 
                 inner.put_job(job.clone());
                 inner.leases.insert(lease_id.clone(), lease.clone());
-                inner.attempts.insert(attempt_id.clone(), attempt.clone());
+                inner.put_attempt(attempt.clone());
                 append_job_event_locked(
                     &mut inner,
                     &job.job_id,
@@ -715,6 +740,16 @@ impl StateStore for MemoryStateStore {
         inner
             .attempts
             .retain(|_, attempt| !expired.contains(&attempt.job_id));
+        let live_attempts: BTreeSet<String> = inner.attempts.keys().cloned().collect();
+        inner
+            .attempt_by_lease
+            .retain(|_, attempt_id| live_attempts.contains(attempt_id));
+        inner
+            .attempts_by_job
+            .retain(|job_id, _| !expired.contains(job_id));
+        inner
+            .streams_by_job
+            .retain(|job_id, _| !expired.contains(job_id));
         let mut removed_streams = Vec::new();
         inner.streams.retain(|stream_id, stream| {
             let keep = !expired.contains(&stream.job_id);
@@ -838,7 +873,7 @@ impl StateStore for MemoryStateStore {
             attempt.state = AttemptState::Succeeded;
             attempt.finished_at_ms = Some(now_ms);
             attempt.last_error = None;
-            inner.attempts.insert(attempt.attempt_id.clone(), attempt);
+            inner.put_attempt(attempt);
 
             let streams_to_finalize =
                 close_lease_streams_locked(&mut inner, &job.job_id, lease_id, now_ms);
@@ -924,7 +959,7 @@ impl StateStore for MemoryStateStore {
             attempt.state = AttemptState::Failed;
             attempt.finished_at_ms = Some(now_ms);
             attempt.last_error = Some(reason.clone());
-            inner.attempts.insert(attempt.attempt_id.clone(), attempt);
+            inner.put_attempt(attempt);
 
             job.last_error = Some(reason);
             job.updated_at_ms = now_ms;
@@ -997,7 +1032,7 @@ impl StateStore for MemoryStateStore {
                 {
                     attempt.state = AttemptState::Expired;
                     attempt.finished_at_ms = Some(now_ms);
-                    inner.attempts.insert(attempt.attempt_id.clone(), attempt);
+                    inner.put_attempt(attempt);
                 }
 
                 if let Some(mut job) = inner.jobs.get(&lease.job_id).cloned()
@@ -1085,7 +1120,7 @@ impl StateStore for MemoryStateStore {
         if inner.attempts.contains_key(&attempt.attempt_id) {
             bail!("attempt '{}' already exists", attempt.attempt_id);
         }
-        inner.attempts.insert(attempt.attempt_id.clone(), attempt);
+        inner.put_attempt(attempt);
         Ok(())
     }
 
@@ -1103,9 +1138,11 @@ impl StateStore for MemoryStateStore {
     async fn list_attempts_for_job(&self, job_id: &str) -> Result<Vec<AttemptRecord>> {
         let inner = self.inner.lock().await;
         let mut attempts: Vec<AttemptRecord> = inner
-            .attempts
-            .values()
-            .filter(|attempt| attempt.job_id == job_id)
+            .attempts_by_job
+            .get(job_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|attempt_id| inner.attempts.get(attempt_id))
             .cloned()
             .collect();
         attempts.sort_by_key(|attempt| (attempt.created_at_ms, attempt.attempt_id.clone()));
@@ -1117,7 +1154,7 @@ impl StateStore for MemoryStateStore {
         if !inner.attempts.contains_key(&attempt.attempt_id) {
             bail!("attempt '{}' does not exist", attempt.attempt_id);
         }
-        inner.attempts.insert(attempt.attempt_id.clone(), attempt);
+        inner.put_attempt(attempt);
         Ok(())
     }
 
@@ -1188,9 +1225,7 @@ impl StateStore for MemoryStateStore {
         if inner.streams.contains_key(&stream.stream_id) {
             bail!("stream '{}' already exists", stream.stream_id);
         }
-        inner
-            .streams
-            .insert(stream.stream_id.clone(), stream.clone());
+        inner.put_stream(stream.clone());
         drop(inner);
         self.notify_job_streams(&BTreeSet::from([stream.job_id.clone()]))
             .await;
@@ -1205,9 +1240,9 @@ impl StateStore for MemoryStateStore {
     async fn list_streams_for_job(&self, job_id: &str) -> Result<Vec<StreamRecord>> {
         let inner = self.inner.lock().await;
         let mut streams: Vec<StreamRecord> = inner
-            .streams
-            .values()
-            .filter(|stream| stream.job_id == job_id)
+            .job_stream_ids(job_id)
+            .iter()
+            .filter_map(|stream_id| inner.streams.get(stream_id))
             .cloned()
             .collect();
         streams.sort_by_key(|stream| (stream.created_at_ms, stream.stream_id.clone()));
@@ -1219,9 +1254,7 @@ impl StateStore for MemoryStateStore {
         if !inner.streams.contains_key(&stream.stream_id) {
             bail!("stream '{}' does not exist", stream.stream_id);
         }
-        inner
-            .streams
-            .insert(stream.stream_id.clone(), stream.clone());
+        inner.put_stream(stream.clone());
         drop(inner);
         self.notify_job_streams(&BTreeSet::from([stream.job_id.clone()]))
             .await;
