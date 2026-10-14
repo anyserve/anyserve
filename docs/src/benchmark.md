@@ -24,8 +24,9 @@ Exit code is non-zero when a correctness gate fails or an overhead regresses.
    and aborts if it is more than 3 ms off.
 3. **Fresh backends.** The stack is recreated per run; vLLM is restarted before
    the LLM suite because it slows down over long runs on T4.
-4. **Paired, interleaved rounds.** Every scenario runs the direct call and the
-   anyserve call back to back at the same RTT, for N rounds. The reported
+4. **Paired, interleaved rounds.** Every scenario first runs one unrecorded
+   warm-up round of both arms, then the direct call and the anyserve call back
+   to back at the same RTT, for N rounds. The reported
    overhead is the median of per-round differences (min..max shown), so slow
    drift of the backend or host hits both arms equally.
 5. **Correctness gates.** Zero errors; anyserve traffic served by the expected
