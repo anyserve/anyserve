@@ -30,7 +30,7 @@ http = "1.3.1"
 prost = "0.13.5"
 prost-build = "0.13.5"
 prost-types = "0.13.5"
-pyo3 = { version = "0.24.1", features = ["abi3-py312", "extension-module"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py312", "extension-module"] }
 reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls", "stream"] }
 redis = { version = "0.29.2", features = ["aio", "tokio-comp"] }
 serde = { version = "1.0.219", features = ["derive"] }
