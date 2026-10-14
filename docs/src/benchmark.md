@@ -36,7 +36,10 @@ Exit code is non-zero when a correctness gate fails or an overhead regresses.
    overhead may grow by at most max(2 ms, 20 %), a p99 overhead by at most
    max(5 ms, 50 %) (tails are noisier: across repeated runs p99 overheads moved
    by up to 2.3 ms, p50 by at most 0.3 ms), and a throughput ratio
-   (anyserve / direct) may drop by at most 0.05.
+   (anyserve / direct) may drop by at most 0.05. A flagged scenario is re-run
+   once and counts as a regression only if the re-run also exceeds the band;
+   one-off slow scenarios on a shared host are reported as "not reproduced".
+   Each scenario records the host load average for triage.
 
 ## Scenarios
 
