@@ -40,7 +40,6 @@ struct SubmitJobCall {
     preferred_attributes: HashMap<String, String>,
     required_capacity: HashMap<String, i64>,
     metadata: HashMap<String, String>,
-    profile: String,
     priority: i32,
     lease_ttl_secs: u32,
     queue_timeout_ms: u64,
@@ -111,7 +110,6 @@ impl AnyserveClient {
         preferred_attributes=None,
         required_capacity=None,
         metadata=None,
-        profile=None,
         priority=0,
         lease_ttl_secs=None,
         job_id=None,
@@ -129,7 +127,6 @@ impl AnyserveClient {
         preferred_attributes: Option<HashMap<String, String>>,
         required_capacity: Option<HashMap<String, i64>>,
         metadata: Option<HashMap<String, String>>,
-        profile: Option<String>,
         priority: i32,
         lease_ttl_secs: Option<u32>,
         job_id: Option<String>,
@@ -146,7 +143,6 @@ impl AnyserveClient {
             preferred_attributes: preferred_attributes.unwrap_or_default(),
             required_capacity: required_capacity.unwrap_or_default(),
             metadata: metadata.unwrap_or_default(),
-            profile: profile.unwrap_or_else(|| "basic".to_string()),
             priority,
             lease_ttl_secs: lease_ttl_secs.unwrap_or(30),
             queue_timeout_ms,
@@ -673,7 +669,6 @@ fn submit_job_from_py(request: SubmitJobCall) -> Result<JobSubmission> {
         preferred_attributes: request.preferred_attributes,
         required_capacity: request.required_capacity,
         metadata: request.metadata,
-        profile: request.profile,
         priority: request.priority,
         lease_ttl_secs: request.lease_ttl_secs,
         queue_timeout_ms: request.queue_timeout_ms,
@@ -1001,7 +996,6 @@ fn worker_status_to_py(py: Python<'_>, status: Option<WorkerStatus>) -> PyResult
 fn execution_policy_to_py(py: Python<'_>, policy: Option<ExecutionPolicy>) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     if let Some(policy) = policy {
-        dict.set_item("profile", policy.profile)?;
         dict.set_item("priority", policy.priority)?;
         dict.set_item("lease_ttl_secs", policy.lease_ttl_secs)?;
     }

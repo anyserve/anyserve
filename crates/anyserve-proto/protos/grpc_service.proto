@@ -41,7 +41,8 @@ message Demand {
 }
 
 message ExecutionPolicy {
-  string profile = 1;
+  reserved 1;
+  reserved "profile";
   int32 priority = 2;
   uint32 lease_ttl_secs = 3;
   // Fail the job if no worker leases it within this window. 0 disables.

@@ -14,7 +14,6 @@ pub struct Demand {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ExecutionPolicy {
-    pub profile: String,
     pub priority: i32,
     pub lease_ttl_secs: u64,
     /// Fail the job if it is still pending this long after submission. 0 disables.
@@ -29,7 +28,6 @@ pub struct ExecutionPolicy {
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
-            profile: "basic".to_string(),
             priority: 0,
             lease_ttl_secs: 30,
             queue_timeout_ms: 0,

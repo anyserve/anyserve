@@ -126,7 +126,6 @@ export interface Demand {
 }
 
 export interface ExecutionPolicy {
-  profile: string;
   priority: number;
   lease_ttl_secs: number;
 }

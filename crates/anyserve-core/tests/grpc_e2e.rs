@@ -112,7 +112,6 @@ async fn grpc_streaming_e2e_round_trip() -> Result<()> {
                     }],
                 }),
                 policy: Some(ExecutionPolicy {
-                    profile: "basic".to_string(),
                     priority: 0,
                     lease_ttl_secs: 15,
                     ..Default::default()
@@ -472,7 +471,6 @@ async fn grpc_follow_streams_wake_on_new_events_and_frames() -> Result<()> {
                     }],
                 }),
                 policy: Some(ExecutionPolicy {
-                    profile: "basic".to_string(),
                     priority: 0,
                     lease_ttl_secs: 15,
                     ..Default::default()
@@ -615,7 +613,6 @@ async fn grpc_can_list_and_cancel_jobs() -> Result<()> {
                         required_capacity: Vec::new(),
                     }),
                     policy: Some(ExecutionPolicy {
-                        profile: "basic".to_string(),
                         priority: 0,
                         lease_ttl_secs: 15,
                         ..Default::default()
