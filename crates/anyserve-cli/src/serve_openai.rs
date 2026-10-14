@@ -28,11 +28,24 @@ pub async fn run_server(
     auth: Arc<AuthPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("bind openai listener {listen}"))?;
+
+    axum::serve(listener, router(kernel, config, auth))
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.changed().await;
+        })
+        .await
+        .context("run openai http server")
+}
+
+fn router(kernel: Arc<Kernel>, config: ServeOpenAIConfig, auth: Arc<AuthPolicy>) -> Router {
     let state = AppState {
         kernel,
         config: Arc::new(config),
     };
-    let app = Router::new()
+    Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route("/readyz", axum::routing::get(readyz))
         .route("/v1/models", axum::routing::get(list_models))
@@ -45,16 +58,5 @@ pub async fn run_server(
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::edge_routing::require_client_token,
-        ));
-
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("bind openai listener {listen}"))?;
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
-        })
-        .await
-        .context("run openai http server")
+        ))
 }

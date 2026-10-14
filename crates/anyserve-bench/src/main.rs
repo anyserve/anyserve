@@ -164,7 +164,7 @@ impl MetricsRecorder {
 
 impl LatencySummary {
     fn from_histogram(histogram: &Histogram<u64>) -> Self {
-        if histogram.len() == 0 {
+        if histogram.is_empty() {
             return Self {
                 p50: 0.0,
                 p95: 0.0,

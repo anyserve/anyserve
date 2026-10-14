@@ -65,31 +65,6 @@ pub struct AnyserveClient {
     inner: ControlPlaneClient,
 }
 
-/// Terminal result of [`AnyserveClient::invoke`].
-#[derive(Clone, Debug)]
-pub struct InvokeOutcome {
-    pub job: JobRecord,
-    /// Worker that ran the final attempt, when known.
-    pub worker_id: Option<String>,
-}
-
-impl InvokeOutcome {
-    pub fn succeeded(&self) -> bool {
-        self.job.state == JobState::Succeeded as i32
-    }
-
-    /// First inline output payload, if the worker returned one.
-    pub fn inline_output(&self) -> Option<&[u8]> {
-        self.job
-            .outputs
-            .iter()
-            .find_map(|output| match output.reference.as_ref() {
-                Some(object_ref::Reference::Inline(content)) => Some(content.as_slice()),
-                _ => None,
-            })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct JobSubmission {
     pub job_id: Option<String>,
@@ -124,19 +99,6 @@ impl JobSubmission {
             queue_timeout_ms: 0,
             spillover_after_ms: 0,
         }
-    }
-
-    /// Single inline input payload, the cheapest way to ship a request body.
-    pub fn with_inline_input(
-        mut self,
-        content: impl Into<Vec<u8>>,
-        metadata: HashMap<String, String>,
-    ) -> Self {
-        self.inputs = vec![ObjectRef {
-            reference: Some(object_ref::Reference::Inline(content.into())),
-            metadata,
-        }];
-        self
     }
 }
 
@@ -301,44 +263,6 @@ impl AnyserveClient {
 
     pub fn into_inner(self) -> ControlPlaneClient {
         self.inner
-    }
-
-    /// Submits a job and waits for it to reach a terminal state.
-    ///
-    /// On timeout the job is cancelled so it does not run after the caller gave up.
-    pub async fn invoke(
-        &mut self,
-        request: JobSubmission,
-        timeout: Duration,
-    ) -> Result<InvokeOutcome> {
-        let job = self.submit_job(request).await?;
-        let job_id = job.job_id.clone();
-        let mut watcher = self.clone();
-        let wait = async move {
-            let mut events = watcher.watch_job(job_id.clone(), 0).await?;
-            let mut worker_id = None;
-            while let Some(event) = events.message().await.context("read job event")? {
-                if let Some(worker) = event.metadata.get("worker_id") {
-                    worker_id = Some(worker.clone());
-                }
-                let kind = EventKind::try_from(event.kind).unwrap_or(EventKind::Unspecified);
-                if matches!(
-                    kind,
-                    EventKind::Succeeded | EventKind::Failed | EventKind::Cancelled
-                ) {
-                    break;
-                }
-            }
-            let job = watcher.get_job(job_id).await?;
-            Ok::<_, anyhow::Error>(InvokeOutcome { job, worker_id })
-        };
-        match tokio::time::timeout(timeout, wait).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                let _ = self.cancel_job(job.job_id.clone()).await;
-                bail!("job '{}' did not finish within {:?}", job.job_id, timeout)
-            }
-        }
     }
 
     pub async fn submit_job(&mut self, request: JobSubmission) -> Result<JobRecord> {

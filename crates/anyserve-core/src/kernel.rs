@@ -1164,11 +1164,10 @@ impl Kernel {
     async fn finalize_terminal_streams(&self, streams: Vec<StreamRecord>) -> Result<()> {
         for mut stream in streams {
             if let Some(last_sequence) = self.frame_plane.latest_sequence(&stream.stream_id).await?
+                && last_sequence > stream.last_sequence
             {
-                if last_sequence > stream.last_sequence {
-                    stream.last_sequence = last_sequence;
-                    self.state_store.update_stream(stream.clone()).await?;
-                }
+                stream.last_sequence = last_sequence;
+                self.state_store.update_stream(stream.clone()).await?;
             }
             self.frame_plane.stream_updated(&stream).await?;
             self.cache_stream(&stream).await;

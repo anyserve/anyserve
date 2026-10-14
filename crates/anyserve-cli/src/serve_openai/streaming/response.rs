@@ -14,7 +14,7 @@ use anyserve_core::model::JobState;
 use super::super::state::{AppState, JobCancellationGuard};
 use super::OUTPUT_STREAM;
 use super::output::extract_data_chunks;
-use super::waiters::{wait_for_job_or_stream_change, wait_for_stream_or_job_change};
+use super::waiters::JobWatchers;
 
 pub(super) fn streaming_response(state: AppState, job_id: String) -> Response {
     let kernel = Arc::clone(&state.kernel);
@@ -22,31 +22,10 @@ pub(super) fn streaming_response(state: AppState, job_id: String) -> Response {
     let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());
     let stream = stream! {
         let mut cancel_guard = JobCancellationGuard::new(Arc::clone(&kernel), job_id.clone());
-        let mut job_stream_updates = match kernel.subscribe_job_streams(&job_id).await {
-            Ok(updates) => updates,
+        let mut watchers = match JobWatchers::subscribe(&kernel, &job_id).await {
+            Ok(watchers) => watchers,
             Err(error) => {
-                yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe job streams: {error}")));
-                return;
-            }
-        };
-        let mut cluster_job_stream_updates = match kernel.subscribe_cluster_job_streams(&job_id).await {
-            Ok(updates) => updates,
-            Err(error) => {
-                yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe cluster job streams: {error}")));
-                return;
-            }
-        };
-        let mut job_event_updates = match kernel.subscribe_job_events(&job_id).await {
-            Ok(updates) => updates,
-            Err(error) => {
-                yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe job events: {error}")));
-                return;
-            }
-        };
-        let mut cluster_job_event_updates = match kernel.subscribe_cluster_job_events(&job_id).await {
-            Ok(updates) => updates,
-            Err(error) => {
-                yield Err::<Vec<u8>, io::Error>(io::Error::other(format!("subscribe cluster job events: {error}")));
+                yield Err::<Vec<u8>, io::Error>(error);
                 return;
             }
         };
@@ -188,29 +167,13 @@ pub(super) fn streaming_response(state: AppState, job_id: String) -> Response {
                 }
             }
 
-            let wait_result = if let Some(stream_id) = output_stream_id.as_ref() {
-                wait_for_stream_or_job_change(
-                    kernel.as_ref(),
-                    stream_id,
-                    after_sequence,
-                    deadline,
-                    poll_interval,
-                    &mut job_event_updates,
-                    &mut cluster_job_event_updates,
-                    "request timed out waiting for worker stream",
-                )
-                .await
-            } else {
-                wait_for_job_or_stream_change(
-                    deadline,
-                    poll_interval,
-                    &mut job_stream_updates,
-                    &mut cluster_job_stream_updates,
-                    &mut job_event_updates,
-                    &mut cluster_job_event_updates,
-                    "request timed out waiting for worker stream",
-                )
-                .await
+            let wait_result = match output_stream_id.as_ref() {
+                Some(stream_id) => {
+                    watchers
+                        .stream_or_job_change(&kernel, stream_id, after_sequence, deadline, poll_interval)
+                        .await
+                }
+                None => watchers.job_or_stream_change(deadline, poll_interval).await,
             };
 
             if let Err(error) = wait_result {

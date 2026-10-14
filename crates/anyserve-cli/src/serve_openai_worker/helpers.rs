@@ -57,24 +57,23 @@ pub(crate) async fn read_request_body(
         if let Some(input_stream) = streams
             .into_iter()
             .find(|stream| stream.stream_name == DEFAULT_INPUT_STREAM)
-        {
-            if matches!(
+            && matches!(
                 input_stream.state(),
                 StreamState::Closed | StreamState::Error
-            ) {
-                let mut frames = client.pull_frames(input_stream.stream_id, 0, false).await?;
-                let mut body = Vec::new();
-                while let Some(frame) = frames.next().await {
-                    let frame = frame.context("read input frame")?;
-                    if frame.kind() == FrameKind::Data {
-                        body.extend(frame.payload);
-                    }
+            )
+        {
+            let mut frames = client.pull_frames(input_stream.stream_id, 0, false).await?;
+            let mut body = Vec::new();
+            while let Some(frame) = frames.next().await {
+                let frame = frame.context("read input frame")?;
+                if frame.kind() == FrameKind::Data {
+                    body.extend(frame.payload);
                 }
-                if body.is_empty() {
-                    bail!("job '{job_id}' input.default closed without body");
-                }
-                return Ok(body);
             }
+            if body.is_empty() {
+                bail!("job '{job_id}' input.default closed without body");
+            }
+            return Ok(body);
         }
 
         if tokio::time::Instant::now() >= deadline {

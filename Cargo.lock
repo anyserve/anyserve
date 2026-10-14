@@ -112,7 +112,6 @@ dependencies = [
  "anyhow",
  "anyserve-client",
  "clap",
- "futures",
  "hdrhistogram",
  "serde",
  "serde_json",
@@ -126,7 +125,6 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "anyserve-proto",
- "tokio",
  "tokio-stream",
  "tonic",
 ]
@@ -172,7 +170,6 @@ name = "anyserve-proto"
 version = "0.4.0"
 dependencies = [
  "prost",
- "prost-build",
  "tonic",
  "tonic-build",
 ]

@@ -1777,7 +1777,7 @@ impl StateStore for SqlStateStore {
             .await
             .context("commit reap expired leases transition")?;
         for job_id in &notified_event_jobs {
-            self.notify_job_events(&job_id).await;
+            self.notify_job_events(job_id).await;
         }
         for job_id in notified_stream_jobs.keys() {
             self.notify_job_streams(job_id).await;
