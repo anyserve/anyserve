@@ -72,7 +72,9 @@ async def control(args, session, headers):
     sticky = dict(headers) if args.sticky else None
     timeline = []
     next_tick = time.perf_counter()
-    for _ in range(steps):
+    for index in range(steps):
+        if args.progress and index % 30 == 0:
+            print(f"progress {index}", flush=True)
         ms, ok = await step(session, args.url, sticky or headers, args.obs_dim, served, sticky)
         timeline.append(round(ms, 1))
         if not ok:
@@ -103,6 +105,7 @@ async def main():
     parser.add_argument("--obs-dim", type=int, default=256)
     parser.add_argument("--warmup", type=float, default=2)
     parser.add_argument("--sticky", action="store_true", help="control mode: pin the session to one worker")
+    parser.add_argument("--progress", action="store_true", help="control mode: print 'progress N' every 30 steps")
     parser.add_argument("--out")
     parser.add_argument("--body", help="fixed JSON request body (e.g. an image prompt)")
     args = parser.parse_args()
