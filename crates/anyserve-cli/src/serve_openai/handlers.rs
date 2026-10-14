@@ -4,18 +4,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use anyserve_core::kernel::OpenStreamCommand;
-use anyserve_core::model::{
-    Attributes, Demand, ExecutionPolicy, FrameKind, JobRecord, JobSpec, StreamDirection,
-    StreamScope,
-};
+use anyserve_core::model::{Attributes, Demand, ExecutionPolicy, JobRecord, JobSpec, ObjectRef};
 
 use crate::edge_routing::apply_routing_headers;
 
 use super::state::{AppState, OpenAIError};
-use super::streaming::{cancel_submitted_job, streaming_response, wait_for_output_bytes};
-
-const INPUT_STREAM: &str = "input.default";
+use super::streaming::{streaming_response, wait_for_output_bytes};
 
 pub(super) async fn healthz() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
@@ -105,88 +99,25 @@ pub(super) async fn submit_request(
     payload: Vec<u8>,
 ) -> Result<JobRecord, OpenAIError> {
     let (demand, policy) = placement(state, headers)?;
-    if payload.len() <= state.config.inline_request_limit_bytes {
-        return state
-            .kernel
-            .submit_job(
-                None,
-                JobSpec {
-                    interface_name: interface_name.to_string(),
-                    inputs: Vec::new(),
-                    params: payload,
-                    demand,
-                    policy,
-                    metadata: Attributes::from([("source".to_string(), "openai".to_string())]),
-                },
-            )
-            .await
-            .map_err(|error| OpenAIError::internal(format!("submit job: {error}")));
-    }
-
-    let job = state
+    state
         .kernel
         .submit_job(
             None,
             JobSpec {
                 interface_name: interface_name.to_string(),
-                inputs: Vec::new(),
+                inputs: vec![ObjectRef::Inline {
+                    content: payload,
+                    metadata: Attributes::from([(
+                        "content_type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                }],
                 params: Vec::new(),
                 demand,
                 policy,
-                metadata: Attributes::from([
-                    ("source".to_string(), "openai".to_string()),
-                    ("input_mode".to_string(), "stream".to_string()),
-                ]),
+                metadata: Attributes::from([("source".to_string(), "openai".to_string())]),
             },
         )
         .await
-        .map_err(|error| OpenAIError::internal(format!("submit job: {error}")))?;
-
-    if let Err(error) = attach_streamed_input(state, &job.job_id, payload).await {
-        return Err(cancel_submitted_job(state.kernel.clone(), job.job_id, error).await);
-    }
-
-    Ok(job)
-}
-
-async fn attach_streamed_input(
-    state: &AppState,
-    job_id: &str,
-    payload: Vec<u8>,
-) -> Result<(), String> {
-    let input_stream = state
-        .kernel
-        .open_stream(OpenStreamCommand {
-            job_id: job_id.to_string(),
-            attempt_id: None,
-            worker_id: None,
-            lease_id: None,
-            stream_name: INPUT_STREAM.to_string(),
-            scope: StreamScope::Job,
-            direction: StreamDirection::ClientToWorker,
-            metadata: Attributes::new(),
-        })
-        .await
-        .map_err(|error| format!("open input stream: {error}"))?;
-
-    state
-        .kernel
-        .push_frame(
-            &input_stream.stream_id,
-            None,
-            None,
-            FrameKind::Data,
-            payload,
-            Attributes::new(),
-        )
-        .await
-        .map_err(|error| format!("push input frame: {error}"))?;
-
-    state
-        .kernel
-        .close_stream(&input_stream.stream_id, None, None, Attributes::new())
-        .await
-        .map_err(|error| format!("close input stream: {error}"))?;
-
-    Ok(())
+        .map_err(|error| OpenAIError::internal(format!("submit job: {error}")))
 }

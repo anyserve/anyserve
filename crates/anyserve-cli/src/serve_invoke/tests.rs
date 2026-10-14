@@ -20,7 +20,7 @@ use tonic::transport::Server;
 use super::router;
 use crate::edge_routing::RoutingDefaults;
 use crate::serve_config::ServeInvokeConfig;
-use crate::serve_openai_worker::{ServeOpenAIWorkerArgs, run as run_worker};
+use crate::worker::{WorkerArgs, run as run_worker};
 
 const CLIENT_TOKEN: &str = "client-secret";
 const WORKER_TOKEN: &str = "worker-secret";
@@ -180,7 +180,7 @@ fn spawn_worker(endpoint: &str, config: PathBuf) {
     tokio::spawn(async move {
         let _ = run_worker(
             &endpoint,
-            ServeOpenAIWorkerArgs {
+            WorkerArgs {
                 config,
                 worker_id: None,
             },

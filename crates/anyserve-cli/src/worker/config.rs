@@ -11,14 +11,19 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 1;
 const DEFAULT_LONG_POLL_MS: u64 = 20_000;
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 5;
-const DEFAULT_INPUT_STREAM_WAIT_SECS: u64 = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_RETRYABLE_STATUSES: &[u16] = &[429, 502, 503, 504];
+/// OpenAI-compatible endpoints served by `kind = "llm"`; config routes override them.
+const LLM_ROUTES: &[(&str, &str)] = &[
+    ("llm.chat.v1", "chat/completions"),
+    ("llm.embed.v1", "embeddings"),
+    ("llm.embeddings.v1", "embeddings"),
+];
 pub(crate) const KIND_LLM: &str = "llm";
 pub(crate) const KIND_HTTP: &str = "http";
 
 #[derive(Args, Debug)]
-pub struct ServeOpenAIWorkerArgs {
+pub struct WorkerArgs {
     #[arg(long = "config", value_name = "PATH")]
     pub config: PathBuf,
     #[arg(long = "worker-id")]
@@ -31,7 +36,7 @@ pub(crate) struct LeaseActivity {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ResolvedServeOpenAIWorkerConfig {
+pub(crate) struct WorkerConfig {
     pub(crate) kind: String,
     pub(crate) worker_id: Option<String>,
     pub(crate) provider: String,
@@ -49,9 +54,8 @@ pub(crate) struct ResolvedServeOpenAIWorkerConfig {
     pub(crate) heartbeat_interval: Duration,
     pub(crate) health_url: Option<String>,
     pub(crate) health_interval: Duration,
-    pub(crate) input_stream_wait: Duration,
     pub(crate) upstream_timeout: Duration,
-    /// `http` kind: interface name -> path appended to `base_url`.
+    /// Interface name -> path appended to `base_url`.
     pub(crate) routes: HashMap<String, String>,
     /// `http` kind: upstream statuses that are retried on another worker.
     pub(crate) retryable_statuses: BTreeSet<u16>,
@@ -62,7 +66,7 @@ pub(crate) struct ResolvedServeOpenAIWorkerConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ServeOpenAIWorkerConfigFile {
+struct WorkerConfigFile {
     #[serde(default)]
     kind: Option<String>,
     base_url: String,
@@ -93,8 +97,6 @@ struct ServeOpenAIWorkerConfigFile {
     #[serde(default)]
     health_interval_secs: Option<u64>,
     #[serde(default)]
-    input_stream_wait_secs: Option<u64>,
-    #[serde(default)]
     upstream_timeout_secs: Option<u64>,
     #[serde(default)]
     routes: HashMap<String, String>,
@@ -108,19 +110,19 @@ struct ServeOpenAIWorkerConfigFile {
     metadata: HashMap<String, String>,
 }
 
-pub(crate) fn load_config(args: &ServeOpenAIWorkerArgs) -> Result<ResolvedServeOpenAIWorkerConfig> {
+pub(crate) fn load_config(args: &WorkerArgs) -> Result<WorkerConfig> {
     let raw = fs::read_to_string(&args.config)
         .with_context(|| format!("read worker config {}", args.config.display()))?;
-    let file: ServeOpenAIWorkerConfigFile = toml::from_str(&raw)
+    let file: WorkerConfigFile = toml::from_str(&raw)
         .with_context(|| format!("parse worker config {}", args.config.display()))?;
     resolve_config(file, args.worker_id.clone())
         .with_context(|| format!("resolve worker config {}", args.config.display()))
 }
 
 fn resolve_config(
-    file: ServeOpenAIWorkerConfigFile,
+    file: WorkerConfigFile,
     worker_id_override: Option<String>,
-) -> Result<ResolvedServeOpenAIWorkerConfig> {
+) -> Result<WorkerConfig> {
     let kind = file.kind.unwrap_or_else(|| KIND_LLM.to_string());
     if kind != KIND_LLM && kind != KIND_HTTP {
         bail!("unsupported worker kind '{kind}'; expected '{KIND_LLM}' or '{KIND_HTTP}'");
@@ -169,27 +171,34 @@ fn resolve_config(
         .entry("slot".to_string())
         .or_insert(i64::from(max_active_leases));
 
+    let mut routes = file.routes;
+    if kind == KIND_LLM {
+        for (interface, path) in LLM_ROUTES {
+            routes
+                .entry(interface.to_string())
+                .or_insert_with(|| path.to_string());
+        }
+    }
     let interfaces = if !file.interfaces.is_empty() {
         file.interfaces
     } else if kind == KIND_LLM {
         vec!["llm.chat.v1".to_string(), "llm.embed.v1".to_string()]
     } else {
-        let mut interfaces = file.routes.keys().cloned().collect::<Vec<_>>();
+        let mut interfaces = routes.keys().cloned().collect::<Vec<_>>();
         interfaces.sort();
         interfaces
     };
     if interfaces.is_empty() {
-        bail!("worker must declare at least one interface (or route for kind = 'http')");
+        bail!("worker must declare at least one interface (or route)");
     }
-    if kind == KIND_HTTP
-        && let Some(missing) = interfaces
-            .iter()
-            .find(|interface| !file.routes.contains_key(*interface))
+    if let Some(missing) = interfaces
+        .iter()
+        .find(|interface| !routes.contains_key(*interface))
     {
-        bail!("kind = 'http' requires a route for interface '{missing}'");
+        bail!("no route for interface '{missing}'");
     }
 
-    Ok(ResolvedServeOpenAIWorkerConfig {
+    Ok(WorkerConfig {
         kind,
         worker_id: Some(worker_id),
         provider,
@@ -212,15 +221,11 @@ fn resolve_config(
             file.health_interval_secs
                 .unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS),
         ),
-        input_stream_wait: Duration::from_secs(
-            file.input_stream_wait_secs
-                .unwrap_or(DEFAULT_INPUT_STREAM_WAIT_SECS),
-        ),
         upstream_timeout: Duration::from_secs(
             file.upstream_timeout_secs
                 .unwrap_or(DEFAULT_UPSTREAM_TIMEOUT_SECS),
         ),
-        routes: file.routes,
+        routes,
         retryable_statuses: file
             .retryable_statuses
             .unwrap_or_else(|| DEFAULT_RETRYABLE_STATUSES.to_vec())
@@ -250,7 +255,7 @@ fn secret_from(value: Option<String>, env_name: Option<&str>) -> Result<Option<S
 mod tests {
     use super::*;
 
-    fn parse(raw: &str) -> Result<ResolvedServeOpenAIWorkerConfig> {
+    fn parse(raw: &str) -> Result<WorkerConfig> {
         resolve_config(toml::from_str(raw)?, None)
     }
 
@@ -304,6 +309,6 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("requires a route"));
+        assert!(error.to_string().contains("no route for interface"));
     }
 }

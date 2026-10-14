@@ -136,7 +136,6 @@ provider = "ollama"
     assert_eq!(openai.listen, "127.0.0.1:8081");
     assert_eq!(openai.models.len(), 2);
     assert_eq!(openai.request_timeout_secs, 15);
-    assert_eq!(openai.inline_request_limit_bytes, 64 * 1024);
     assert_eq!(
         openai
             .demand

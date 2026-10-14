@@ -8,10 +8,9 @@ use reqwest::header::{CONTENT_TYPE, HeaderName, HeaderValue};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::WorkerContext;
-use crate::serve_openai_worker::config::KIND_HTTP;
-use crate::serve_openai_worker::helpers::{
-    DEFAULT_OUTPUT_STREAM, frame_write_with_content_type, open_output_stream, read_request_body,
-    truncate, upstream_path,
+use crate::worker::config::KIND_HTTP;
+use crate::worker::helpers::{
+    DEFAULT_OUTPUT_STREAM, frame_write_with_content_type, open_output_stream, truncate,
 };
 
 /// Input metadata keys with this prefix are forwarded to the upstream as headers.
@@ -74,17 +73,12 @@ pub(super) async fn process_grant(
         .clone()
         .ok_or_else(|| ExecutionError::fatal("job is missing spec"))?;
 
-    let url = if config.kind == KIND_HTTP {
-        let path = config.routes.get(&spec.interface_name).ok_or_else(|| {
-            ExecutionError::fatal(format!("no route for interface '{}'", spec.interface_name))
-        })?;
-        join_url(&config.base_url, path)
-    } else {
-        let path = upstream_path(&spec.interface_name)?;
-        join_url(&config.base_url, path)
-    };
+    let path = config.routes.get(&spec.interface_name).ok_or_else(|| {
+        ExecutionError::fatal(format!("no route for interface '{}'", spec.interface_name))
+    })?;
+    let url = join_url(&config.base_url, path);
 
-    let request = load_request(client, &job.job_id, &spec, config.input_stream_wait).await?;
+    let request = load_request(&job.job_id, &spec)?;
     report_started(context, client, &lease_id);
 
     let mut upstream = context
@@ -169,45 +163,35 @@ pub(super) async fn process_grant(
     Ok(())
 }
 
-async fn load_request(
-    client: &mut AnyserveClient,
+fn load_request(
     job_id: &str,
     spec: &anyserve_client::controlplane::JobSpec,
-    input_stream_wait: std::time::Duration,
 ) -> Result<RequestBody, ExecutionError> {
-    if let Some(input) = spec.inputs.first()
-        && let Some(object_ref::Reference::Inline(content)) = input.reference.as_ref()
-    {
-        let content_type = input
-            .metadata
+    let Some((content, metadata)) =
+        spec.inputs
+            .first()
+            .and_then(|input| match input.reference.as_ref() {
+                Some(object_ref::Reference::Inline(content)) => Some((content, &input.metadata)),
+                _ => None,
+            })
+    else {
+        return Err(ExecutionError::fatal(format!(
+            "job '{job_id}' has no inline input"
+        )));
+    };
+    Ok(RequestBody {
+        body: content.clone(),
+        content_type: metadata
             .get(CONTENT_TYPE_KEY)
             .cloned()
-            .unwrap_or_else(|| "application/json".to_string());
-        let forward_headers = input
-            .metadata
+            .unwrap_or_else(|| "application/json".to_string()),
+        forward_headers: metadata
             .iter()
             .filter_map(|(key, value)| {
                 key.strip_prefix(FORWARD_HEADER_PREFIX)
                     .map(|name| (name.to_string(), value.clone()))
             })
-            .collect();
-        return Ok(RequestBody {
-            body: content.clone(),
-            content_type,
-            forward_headers,
-        });
-    }
-
-    let body = read_request_body(client, job_id, &spec.params, input_stream_wait).await?;
-    if body.is_empty() {
-        return Err(ExecutionError::fatal(format!(
-            "job '{job_id}' request body was empty"
-        )));
-    }
-    Ok(RequestBody {
-        body,
-        content_type: "application/json".to_string(),
-        forward_headers: Vec::new(),
+            .collect(),
     })
 }
 

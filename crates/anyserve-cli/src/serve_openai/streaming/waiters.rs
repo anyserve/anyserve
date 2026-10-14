@@ -92,23 +92,3 @@ impl JobWatchers {
         }
     }
 }
-
-pub(super) async fn wait_for_job_event_change(
-    poll_interval: Duration,
-    local_updates: &mut watch::Receiver<u64>,
-    cluster_updates: &mut ClusterSubscription,
-) {
-    tokio::select! {
-        result = local_updates.changed() => {
-            if result.is_err() {
-                sleep_until(Instant::now() + poll_interval).await;
-            }
-        }
-        result = cluster_updates.changed() => {
-            if result.is_err() {
-                sleep_until(Instant::now() + poll_interval).await;
-            }
-        }
-        _ = sleep_until(Instant::now() + poll_interval) => {}
-    }
-}

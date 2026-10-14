@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::frame::FramePlane;
 use crate::model::{
-    AttemptRecord, Attributes, EventKind, Frame, FrameKind, JobEvent, JobRecord, JobSpec, JobState,
+    AttemptRecord, Attributes, EventKind, Frame, FrameKind, JobRecord, JobSpec, JobState,
     LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
     StreamState, WorkerRecord, WorkerSpec, WorkerStatus,
 };
@@ -477,6 +477,27 @@ impl Kernel {
             .unwrap_or_else(|_| ClusterSubscription::noop()))
     }
 
+    /// Waits until the job reaches a terminal state and returns it. Wakes on
+    /// local and cross-instance event notifications, re-checking at least every
+    /// `watch_poll_interval_ms`.
+    pub async fn wait_for_terminal(&self, job_id: &str) -> Result<JobRecord> {
+        let mut local_updates = self.subscribe_job_events(job_id).await?;
+        let mut cluster_updates = self.subscribe_cluster_job_events(job_id).await?;
+        let poll_interval = Duration::from_millis(self.watch_poll_interval_ms);
+        loop {
+            local_updates.borrow_and_update();
+            let job = self.get_job(job_id).await?;
+            if job.state.is_terminal() {
+                return Ok(job);
+            }
+            tokio::select! {
+                _ = local_updates.changed() => {}
+                _ = cluster_updates.changed() => {}
+                _ = tokio::time::sleep(poll_interval) => {}
+            }
+        }
+    }
+
     pub async fn get_job(&self, job_id: &str) -> Result<JobRecord> {
         self.state_store
             .get_job(job_id)
@@ -548,11 +569,6 @@ impl Kernel {
             bail!("job '{}' does not exist", job_id);
         }
         self.state_store.list_attempts_for_job(job_id).await
-    }
-
-    pub async fn list_job_events(&self, job_id: &str) -> Result<Vec<JobEvent>> {
-        self.get_job(job_id).await?;
-        self.state_store.job_events_after(job_id, 0).await
     }
 
     pub async fn register_worker(
@@ -1564,7 +1580,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let job = kernel.get_job("job-queued").await.unwrap();
         assert_eq!(job.state, JobState::Failed);
-        let events = kernel.list_job_events("job-queued").await.unwrap();
+        let events = kernel.watch_job("job-queued", 0).await.unwrap();
         let last = events.last().unwrap();
         assert_eq!(last.kind, EventKind::Failed);
         assert_eq!(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .client import AnyserveClient
+from ._native import AnyserveClient
 from .highlevel import HandlerSpec, WorkerHandler, get_handler_spec, serve, worker
 
 EVENT_ACCEPTED = "accepted"

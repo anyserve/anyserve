@@ -2,7 +2,7 @@ use anyserve_client::AnyserveClient;
 use tokio::sync::watch;
 
 use super::WorkerContext;
-use crate::serve_openai_worker::helpers::{available_capacity, connect_client};
+use crate::worker::helpers::{available_capacity, connect_client};
 
 pub(super) async fn heartbeat_loop(context: WorkerContext) {
     let worker_id = context.worker_id.clone();

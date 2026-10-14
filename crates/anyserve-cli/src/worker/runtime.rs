@@ -6,9 +6,7 @@ use anyserve_client::{AnyserveClient, LeaseGrant, WorkerRegistration};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinSet;
 
-use super::config::{
-    LeaseActivity, ResolvedServeOpenAIWorkerConfig, ServeOpenAIWorkerArgs, load_config,
-};
+use super::config::{LeaseActivity, WorkerArgs, WorkerConfig, load_config};
 use super::helpers::{build_http_client, connect_client};
 
 mod execution;
@@ -21,13 +19,13 @@ use heartbeat::{health_loop, heartbeat_loop};
 pub(super) struct WorkerContext {
     pub(super) endpoint: String,
     pub(super) worker_id: String,
-    pub(super) config: Arc<ResolvedServeOpenAIWorkerConfig>,
+    pub(super) config: Arc<WorkerConfig>,
     pub(super) http_client: reqwest::Client,
     pub(super) registration: WorkerRegistration,
     pub(super) activity: Arc<Mutex<LeaseActivity>>,
 }
 
-pub(crate) async fn run(control_plane_endpoint: &str, args: ServeOpenAIWorkerArgs) -> Result<()> {
+pub(crate) async fn run(control_plane_endpoint: &str, args: WorkerArgs) -> Result<()> {
     let config = Arc::new(load_config(&args)?);
     let http_client = build_http_client(&config)?;
     let mut client = connect_client(control_plane_endpoint, &config).await?;
