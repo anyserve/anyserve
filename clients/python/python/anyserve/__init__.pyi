@@ -1,4 +1,13 @@
-from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, TypedDict
+from typing import Dict, Iterator, List, Literal, Optional, Tuple, TypedDict
+
+from .highlevel import (
+    HandlerCodec as HandlerCodec,
+    HandlerSpec as HandlerSpec,
+    WorkerHandler as WorkerHandler,
+    get_handler_spec as get_handler_spec,
+    serve as serve,
+    worker as worker,
+)
 
 EventKind = Literal[
     "accepted",
@@ -21,7 +30,6 @@ StreamDirection = Literal[
     "internal",
 ]
 FrameKind = Literal["open", "data", "close", "error", "checkpoint", "control"]
-HandlerCodec = Literal["bytes", "json"]
 
 EVENT_ACCEPTED: str
 EVENT_LEASE_GRANTED: str
@@ -156,31 +164,6 @@ class PushSummary(TypedDict):
     last_sequence: int
     written_frames: int
 
-class HandlerSpec:
-    interface: str
-    attributes: Dict[str, str]
-    capacity: Dict[str, int]
-    metadata: Dict[str, str]
-    codec: HandlerCodec | str
-    input_stream: str
-    output_stream: str
-    max_active_leases: int
-    def __init__(
-        self,
-        interface: str,
-        attributes: Optional[Dict[str, str]] = ...,
-        capacity: Optional[Dict[str, int]] = ...,
-        metadata: Optional[Dict[str, str]] = ...,
-        codec: HandlerCodec | str = ...,
-        input_stream: str = ...,
-        output_stream: str = ...,
-        max_active_leases: int = ...,
-    ) -> None: ...
-
-class WorkerHandler:
-    spec: HandlerSpec
-    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
-
 class AnyserveClient:
     def __init__(self, endpoint: str) -> None: ...
     def submit_job(
@@ -279,27 +262,5 @@ class AnyserveClient:
         follow: bool = ...,
     ) -> Iterator[Frame]: ...
 
-def worker(
-    *,
-    interface: str,
-    attributes: Optional[Dict[str, str]] = ...,
-    capacity: Optional[Dict[str, int]] = ...,
-    metadata: Optional[Dict[str, str]] = ...,
-    codec: HandlerCodec | str = ...,
-    input_stream: str = ...,
-    output_stream: str = ...,
-    max_active_leases: int = ...,
-) -> Callable[[Callable[[Any], Any]], WorkerHandler]: ...
-def get_handler_spec(handler: Callable[[Any], Any]) -> HandlerSpec: ...
-def serve(
-    handler: Callable[[Any], Any],
-    endpoint: Optional[str] = ...,
-    *,
-    worker_id: Optional[str] = ...,
-    heartbeat_interval_secs: float = ...,
-    poll_interval_secs: float = ...,
-    long_poll_ms: int = ...,
-    client: Any = ...,
-) -> None: ...
 def inline_object(content: bytes, metadata: Optional[Dict[str, str]] = ...) -> ObjectRef: ...
 def uri_object(uri: str, metadata: Optional[Dict[str, str]] = ...) -> ObjectRef: ...

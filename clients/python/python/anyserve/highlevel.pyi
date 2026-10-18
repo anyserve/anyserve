@@ -48,5 +48,6 @@ def serve(
     worker_id: Optional[str] = ...,
     heartbeat_interval_secs: float = ...,
     poll_interval_secs: float = ...,
+    long_poll_ms: int = ...,
     client: Any = ...,
 ) -> None: ...

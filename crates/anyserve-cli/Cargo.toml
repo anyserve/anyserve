@@ -11,16 +11,16 @@ anyserve-client = { path = "../anyserve-client" }
 anyserve-core = { path = "../anyserve-core" }
 anyserve-proto = { path = "../anyserve-proto" }
 async-stream.workspace = true
-axum = "0.7.9"
+axum.workspace = true
 clap.workspace = true
 futures.workspace = true
-reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-toml = "0.8.23"
+toml.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
 tracing.workspace = true

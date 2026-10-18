@@ -1,4 +1,3 @@
-mod errors;
 mod handlers;
 mod readiness;
 mod state;

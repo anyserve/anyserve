@@ -1,28 +1,10 @@
-use axum::response::Response;
-
-#[cfg(test)]
-use anyserve_core::model::JobRecord;
-
-use super::state::{AppState, OpenAIError};
-
 mod output;
 mod response;
 mod waiters;
 
 const OUTPUT_STREAM: &str = "output.default";
 
-pub(super) async fn wait_for_output_bytes(
-    state: &AppState,
-    job_id: String,
-) -> Result<Vec<u8>, OpenAIError> {
-    output::wait_for_output_bytes(state, job_id).await
-}
-
 #[cfg(test)]
-pub(super) fn read_output_from_job(job: &JobRecord) -> Result<Option<Vec<u8>>, OpenAIError> {
-    output::read_output_from_job(job)
-}
-
-pub(super) fn streaming_response(state: AppState, job_id: String) -> Response {
-    response::streaming_response(state, job_id)
-}
+pub(super) use output::read_output_from_job;
+pub(super) use output::wait_for_output_bytes;
+pub(super) use response::streaming_response;

@@ -1,5 +1,5 @@
+use anyserve_core::now_ms;
 use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyserve_client::{
     AttemptState, JobRecord, JobState, StreamDirection, StreamScope, StreamState,
@@ -160,13 +160,6 @@ pub(super) fn human_duration(duration_ms: u64) -> String {
     } else {
         format!("{duration_ms}ms")
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 pub(super) fn job_state_name(state: JobState) -> &'static str {

@@ -44,24 +44,20 @@ class WorkerHandler:
 @dataclass
 class _LeaseState:
     active_lease_id: Optional[str] = None
-    active_leases: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def start(self, lease_id: str) -> None:
         with self.lock:
             self.active_lease_id = lease_id
-            self.active_leases += 1
 
     def finish(self, lease_id: str) -> None:
         with self.lock:
             if self.active_lease_id == lease_id:
                 self.active_lease_id = None
-            if self.active_leases > 0:
-                self.active_leases -= 1
 
-    def snapshot(self) -> tuple[Optional[str], int]:
+    def snapshot(self) -> Optional[str]:
         with self.lock:
-            return self.active_lease_id, self.active_leases
+            return self.active_lease_id
 
 
 def worker(
@@ -235,7 +231,8 @@ def _heartbeat_loop(
     interval_secs: float,
 ) -> None:
     while not stop_event.wait(interval_secs):
-        active_lease_id, active_leases = state.snapshot()
+        active_lease_id = state.snapshot()
+        active_leases = int(active_lease_id is not None)
         try:
             worker_client.heartbeat_worker(
                 worker_id,

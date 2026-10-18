@@ -15,6 +15,7 @@ use serde_json::json;
 
 use anyserve_core::auth::AuthPolicy;
 use anyserve_core::model::JobState;
+use anyserve_core::now_ms;
 
 use super::api::{
     ApiError, AppState, CancelJobResponse, HistorySummary, JobDetail, JobDetailResponse, JobsQuery,
@@ -326,14 +327,6 @@ pub(super) fn parse_states(raw: Option<&str>) -> Result<Option<Vec<JobState>>, A
         }
     }
     Ok(Some(states))
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be valid")
-        .as_millis() as u64
 }
 
 fn internal_error(context: &'static str) -> impl Fn(anyhow::Error) -> ApiError {

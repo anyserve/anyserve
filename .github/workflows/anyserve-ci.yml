@@ -6,6 +6,7 @@ on:
     paths:
       - "crates/**"
       - "clients/python/**"
+      - "console/**"
       - "examples/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -19,6 +20,7 @@ on:
     paths:
       - "crates/**"
       - "clients/python/**"
+      - "console/**"
       - "examples/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -42,6 +44,7 @@ jobs:
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
       python: ${{ steps.filter.outputs.python }}
+      console: ${{ steps.filter.outputs.console }}
       distribution: ${{ steps.filter.outputs.distribution }}
     steps:
       - uses: actions/checkout@v4
@@ -53,6 +56,8 @@ jobs:
           filters: |
             rust:
               - "crates/**"
+              - "clients/python/**/*.rs"
+              - "clients/python/Cargo.toml"
               - "examples/**"
               - "Cargo.toml"
               - "Cargo.lock"
@@ -60,6 +65,7 @@ jobs:
               - ".github/workflows/anyserve-ci.yml"
             python:
               - "clients/python/**"
+              - "scripts/install-python-wheel.py"
               - "crates/anyserve-proto/**"
               - "Cargo.toml"
               - "Cargo.lock"
@@ -70,6 +76,26 @@ jobs:
               - "scripts/**"
               - ".github/workflows/release.yml"
               - ".github/workflows/anyserve-ci.yml"
+            console:
+              - "console/**"
+              - ".github/workflows/anyserve-ci.yml"
+
+  console:
+    needs: changes
+    if: needs.changes.outputs.console == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci
+      - run: npm run build
 
   distribution:
     needs: changes
@@ -148,6 +174,12 @@ jobs:
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           . "$HOME/.cargo/env"
           mise run check
+
+      - name: Clippy
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          . "$HOME/.cargo/env"
+          mise run clippy
 
       - name: Test
         run: |

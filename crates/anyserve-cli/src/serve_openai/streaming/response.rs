@@ -16,7 +16,7 @@ use super::OUTPUT_STREAM;
 use super::output::extract_data_chunks;
 use super::waiters::JobWatchers;
 
-pub(super) fn streaming_response(state: AppState, job_id: String) -> Response {
+pub(in crate::serve_openai) fn streaming_response(state: AppState, job_id: String) -> Response {
     let kernel = Arc::clone(&state.kernel);
     let deadline = Instant::now() + Duration::from_secs(state.config.request_timeout_secs);
     let poll_interval = Duration::from_millis(kernel.watch_poll_interval_ms());

@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use anyserve_core::model::{Capacity, WorkerRecord};
+use anyserve_core::now_ms;
 
 use super::state::{AppState, OpenAIError};
 
@@ -99,12 +100,4 @@ fn required_capacity_match(available: &Capacity, required: &Capacity) -> bool {
     required
         .iter()
         .all(|(key, value)| available.get(key).copied().unwrap_or_default() >= *value)
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be valid")
-        .as_millis() as u64
 }
