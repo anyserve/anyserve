@@ -15,6 +15,7 @@ use crate::model::{
     StreamState, WorkerRecord, WorkerSpec, WorkerStatus,
 };
 use crate::notify::{ClusterNotifier, ClusterSubscription};
+use crate::now_ms;
 use crate::scheduler::{Scheduler, worker_can_take};
 use crate::store::{
     JobStateCounts, JobSummaryPage, LeaseDispatchMode, StateStore, StateTransition,
@@ -1220,15 +1221,6 @@ fn validate_worker_spec(spec: &WorkerSpec) -> Result<()> {
         bail!("worker must expose at least one interface");
     }
     Ok(())
-}
-
-fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

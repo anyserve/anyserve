@@ -8,7 +8,7 @@ use anyserve_core::model::{Frame, FrameKind, JobRecord, JobState};
 use super::super::state::{AppState, OpenAIError};
 use super::OUTPUT_STREAM;
 
-pub(super) async fn wait_for_output_bytes(
+pub(in crate::serve_openai) async fn wait_for_output_bytes(
     state: &AppState,
     job_id: String,
 ) -> Result<Vec<u8>, OpenAIError> {
@@ -20,7 +20,7 @@ pub(super) async fn wait_for_output_bytes(
     {
         Ok(result) => result,
         Err(_) => {
-            cancel_job_best_effort(Arc::clone(&state.kernel), job_id).await;
+            let _ = state.kernel.cancel_job(&job_id).await;
             Err(OpenAIError::gateway_timeout(
                 "request timed out waiting for worker",
             ))
@@ -28,11 +28,9 @@ pub(super) async fn wait_for_output_bytes(
     }
 }
 
-pub(super) async fn cancel_job_best_effort(kernel: Arc<Kernel>, job_id: String) {
-    let _ = kernel.cancel_job(&job_id).await;
-}
-
-pub(super) fn read_output_from_job(job: &JobRecord) -> Result<Option<Vec<u8>>, OpenAIError> {
+pub(in crate::serve_openai) fn read_output_from_job(
+    job: &JobRecord,
+) -> Result<Option<Vec<u8>>, OpenAIError> {
     for output in &job.outputs {
         match output {
             anyserve_core::model::ObjectRef::Inline { content, .. } if !content.is_empty() => {

@@ -1,5 +1,8 @@
 target
 .git
 console/node_modules
+console/dist
+docs/book
+clients/python/dist
 **/__pycache__
 **/.venv

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use anyserve_core::kernel::Kernel;
+use anyserve_core::now_ms;
 
 const BUCKETS_MS: &[f64] = &[
     5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 10000.0,
@@ -58,10 +59,7 @@ impl InvokeMetrics {
             }
         }
         if let Ok(workers) = kernel.list_workers().await {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or_default();
+            let now = now_ms();
             let mut by_region: BTreeMap<String, (u64, u64)> = BTreeMap::new();
             for worker in workers.iter().filter(|worker| worker.expires_at_ms > now) {
                 let region = worker

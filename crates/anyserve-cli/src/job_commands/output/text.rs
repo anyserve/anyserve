@@ -11,7 +11,11 @@ use super::shared::{
     stream_scope_name, stream_state_name,
 };
 
-pub(super) fn print_job_list_text(endpoint: &str, jobs: &[JobRecord], states: &[JobStateFilter]) {
+pub(in crate::job_commands) fn print_job_list_text(
+    endpoint: &str,
+    jobs: &[JobRecord],
+    states: &[JobStateFilter],
+) {
     let counts = count_jobs(jobs);
     print_section("Control Plane");
     let mut entries = vec![
@@ -57,7 +61,7 @@ pub(super) fn print_job_list_text(endpoint: &str, jobs: &[JobRecord], states: &[
     );
 }
 
-pub(super) fn print_job_inspect_text(
+pub(in crate::job_commands) fn print_job_inspect_text(
     endpoint: &str,
     job: &JobRecord,
     attempts: &[AttemptRecord],
@@ -137,7 +141,7 @@ pub(super) fn print_job_inspect_text(
     }
 }
 
-pub(super) fn print_single_cancel_text(endpoint: &str, job: &JobRecord) {
+pub(in crate::job_commands) fn print_single_cancel_text(endpoint: &str, job: &JobRecord) {
     let state = job_state_name(job.state()).to_string();
     let updated_at = format_timestamp(job.updated_at_ms);
 

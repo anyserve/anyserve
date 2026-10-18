@@ -83,12 +83,12 @@ pub(crate) struct CancelJsonResult {
     pub(crate) error: Option<String>,
 }
 
-pub(super) fn write_job_list_json(jobs: &[JobRecord]) -> Result<()> {
+pub(in crate::job_commands) fn write_job_list_json(jobs: &[JobRecord]) -> Result<()> {
     let payload = jobs.iter().map(job_json_record).collect::<Vec<_>>();
     write_json(&payload)
 }
 
-pub(super) fn write_job_inspect_json(
+pub(in crate::job_commands) fn write_job_inspect_json(
     job: &JobRecord,
     attempts: &[AttemptRecord],
     streams: &[StreamRecord],

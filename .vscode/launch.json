@@ -27,19 +27,19 @@
       }
     },
     {
-      "name": "Debug anyserve client (submit)",
+      "name": "Debug demo submitter",
       "type": "lldb",
       "request": "launch",
       "cargo": {
         "args": [
           "build",
           "--package",
-          "anyserve-client",
+          "anyserve-demo",
           "--bin",
-          "anyserve-client"
+          "anyserve-demo"
         ],
         "filter": {
-          "name": "anyserve-client",
+          "name": "anyserve-demo",
           "kind": "bin"
         }
       },
@@ -53,19 +53,19 @@
       }
     },
     {
-      "name": "Debug anyserve client (worker)",
+      "name": "Debug demo worker",
       "type": "lldb",
       "request": "launch",
       "cargo": {
         "args": [
           "build",
           "--package",
-          "anyserve-client",
+          "anyserve-demo",
           "--bin",
-          "anyserve-client"
+          "anyserve-demo"
         ],
         "filter": {
-          "name": "anyserve-client",
+          "name": "anyserve-demo",
           "kind": "bin"
         }
       },

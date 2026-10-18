@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use anyserve_core::auth::AuthPolicy;
 use anyserve_core::kernel::{Kernel, QUEUE_TIMEOUT_REASON};
 use anyserve_core::model::{Attributes, JobRecord, JobSpec, JobState, ObjectRef};
+use anyserve_core::now_ms;
 
 use crate::edge_routing::{
     TIMEOUT_HEADER, apply_routing_headers, header_number, require_client_token,
@@ -311,13 +312,6 @@ fn with_job_id(mut response: Response, job_id: &str) -> Response {
             .insert(HeaderName::from_static("x-anyserve-job-id"), value);
     }
     response
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

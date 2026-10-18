@@ -154,7 +154,7 @@ impl AnyserveClient {
         spillover_after_ms: u64,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let request = SubmitJobCall {
             interface_name,
             inputs: inputs.unwrap_or_default(),
@@ -172,9 +172,7 @@ impl AnyserveClient {
         let job = py
             .detach(move || {
                 let request = submit_job_from_py(request)?;
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.submit_job(request))
-                })
+                runtime.block_on(client.submit_job(request))
             })
             .map_err(to_py_err)?;
         job_record_to_py(py, job)
@@ -188,11 +186,9 @@ impl AnyserveClient {
         after_sequence: u64,
     ) -> PyResult<JobEventIterator> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         py.detach(move || {
-            let stream = with_client(&runtime, &client, move |runtime, client| {
-                runtime.block_on(client.watch_job(job_id, after_sequence))
-            })?;
+            let stream = runtime.block_on(client.watch_job(job_id, after_sequence))?;
             Ok(JobEventIterator {
                 runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
@@ -203,13 +199,9 @@ impl AnyserveClient {
 
     fn list_jobs(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let jobs = py
-            .detach(move || {
-                with_client(&runtime, &client, |runtime, client| {
-                    runtime.block_on(client.list_jobs())
-                })
-            })
+            .detach(move || runtime.block_on(client.list_jobs()))
             .map_err(to_py_err)?;
         jobs.into_iter()
             .map(|job| job_record_to_py(py, job))
@@ -218,52 +210,36 @@ impl AnyserveClient {
 
     fn get_job(&self, py: Python<'_>, job_id: String) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let job = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.get_job(job_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.get_job(job_id)))
             .map_err(to_py_err)?;
         job_record_to_py(py, job)
     }
 
     fn cancel_job(&self, py: Python<'_>, job_id: String) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let job = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.cancel_job(job_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.cancel_job(job_id)))
             .map_err(to_py_err)?;
         job_record_to_py(py, job)
     }
 
     fn get_attempt(&self, py: Python<'_>, attempt_id: String) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let attempt = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.get_attempt(attempt_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.get_attempt(attempt_id)))
             .map_err(to_py_err)?;
         attempt_record_to_py(py, attempt)
     }
 
     fn list_attempts(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<Py<PyDict>>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let attempts = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.list_attempts(job_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.list_attempts(job_id)))
             .map_err(to_py_err)?;
         attempts
             .into_iter()
@@ -291,7 +267,7 @@ impl AnyserveClient {
         worker_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let request = RegisterWorkerCall {
             interfaces,
             attributes: attributes.unwrap_or_default(),
@@ -303,9 +279,7 @@ impl AnyserveClient {
         let worker = py
             .detach(move || {
                 let request = register_worker_from_py(request);
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.register_worker(request))
-                })
+                runtime.block_on(client.register_worker(request))
             })
             .map_err(to_py_err)?;
         worker_record_to_py(py, worker)
@@ -321,17 +295,15 @@ impl AnyserveClient {
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let worker = py
             .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.heartbeat_worker(
-                        worker_id,
-                        available_capacity.unwrap_or_default(),
-                        active_leases,
-                        metadata.unwrap_or_default(),
-                    ))
-                })
+                runtime.block_on(client.heartbeat_worker(
+                    worker_id,
+                    available_capacity.unwrap_or_default(),
+                    active_leases,
+                    metadata.unwrap_or_default(),
+                ))
             })
             .map_err(to_py_err)?;
         worker_record_to_py(py, worker)
@@ -347,14 +319,10 @@ impl AnyserveClient {
         wait_timeout_ms: u64,
     ) -> PyResult<Option<Py<PyDict>>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let wait = std::time::Duration::from_millis(wait_timeout_ms);
         let lease = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.poll_lease_wait(worker_id, wait))
-                })
-            })
+            .detach(move || runtime.block_on(client.poll_lease_wait(worker_id, wait)))
             .map_err(to_py_err)?;
         lease.map(|grant| lease_grant_to_py(py, grant)).transpose()
     }
@@ -366,13 +334,9 @@ impl AnyserveClient {
         lease_id: String,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let lease = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.renew_lease(worker_id, lease_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.renew_lease(worker_id, lease_id)))
             .map_err(to_py_err)?;
         lease_record_to_py(py, lease)
     }
@@ -388,18 +352,16 @@ impl AnyserveClient {
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         py.detach(move || {
             let kind = parse_event_kind(&kind)?;
-            with_client(&runtime, &client, move |runtime, client| {
-                runtime.block_on(client.report_event(
-                    worker_id,
-                    lease_id,
-                    kind,
-                    payload.unwrap_or_default(),
-                    metadata.unwrap_or_default(),
-                ))
-            })
+            runtime.block_on(client.report_event(
+                worker_id,
+                lease_id,
+                kind,
+                payload.unwrap_or_default(),
+                metadata.unwrap_or_default(),
+            ))
         })
         .map_err(to_py_err)?;
         Ok(())
@@ -415,17 +377,15 @@ impl AnyserveClient {
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         py.detach(move || {
             let outputs = py_objects_to_proto(outputs.unwrap_or_default())?;
-            with_client(&runtime, &client, move |runtime, client| {
-                runtime.block_on(client.complete_lease(
-                    worker_id,
-                    lease_id,
-                    outputs,
-                    metadata.unwrap_or_default(),
-                ))
-            })
+            runtime.block_on(client.complete_lease(
+                worker_id,
+                lease_id,
+                outputs,
+                metadata.unwrap_or_default(),
+            ))
         })
         .map_err(to_py_err)?;
         Ok(())
@@ -442,17 +402,15 @@ impl AnyserveClient {
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<()> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         py.detach(move || {
-            with_client(&runtime, &client, move |runtime, client| {
-                runtime.block_on(client.fail_lease(
-                    worker_id,
-                    lease_id,
-                    reason,
-                    retryable,
-                    metadata.unwrap_or_default(),
-                ))
-            })
+            runtime.block_on(client.fail_lease(
+                worker_id,
+                lease_id,
+                reason,
+                retryable,
+                metadata.unwrap_or_default(),
+            ))
         })
         .map_err(to_py_err)?;
         Ok(())
@@ -482,7 +440,7 @@ impl AnyserveClient {
         lease_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let request = OpenStreamCall {
             job_id,
             stream_name,
@@ -496,9 +454,7 @@ impl AnyserveClient {
         let stream = py
             .detach(move || {
                 let request = open_stream_from_py(request);
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.open_stream(request))
-                })
+                runtime.block_on(client.open_stream(request))
             })
             .map_err(to_py_err)?;
         stream_record_to_py(py, stream)
@@ -506,26 +462,18 @@ impl AnyserveClient {
 
     fn get_stream(&self, py: Python<'_>, stream_id: String) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let stream = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.get_stream(stream_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.get_stream(stream_id)))
             .map_err(to_py_err)?;
         stream_record_to_py(py, stream)
     }
 
     fn list_streams(&self, py: Python<'_>, job_id: String) -> PyResult<Vec<Py<PyDict>>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let streams = py
-            .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.list_streams(job_id))
-                })
-            })
+            .detach(move || runtime.block_on(client.list_streams(job_id)))
             .map_err(to_py_err)?;
         streams
             .into_iter()
@@ -543,17 +491,15 @@ impl AnyserveClient {
         metadata: Option<HashMap<String, String>>,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let stream = py
             .detach(move || {
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.close_stream(
-                        stream_id,
-                        worker_id,
-                        lease_id,
-                        metadata.unwrap_or_default(),
-                    ))
-                })
+                runtime.block_on(client.close_stream(
+                    stream_id,
+                    worker_id,
+                    lease_id,
+                    metadata.unwrap_or_default(),
+                ))
             })
             .map_err(to_py_err)?;
         stream_record_to_py(py, stream)
@@ -569,13 +515,11 @@ impl AnyserveClient {
         lease_id: Option<String>,
     ) -> PyResult<Py<PyDict>> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         let summary = py
             .detach(move || {
                 let frames = frame_writes_from_py(frames)?;
-                with_client(&runtime, &client, move |runtime, client| {
-                    runtime.block_on(client.push_frames(stream_id, frames, worker_id, lease_id))
-                })
+                runtime.block_on(client.push_frames(stream_id, frames, worker_id, lease_id))
             })
             .map_err(to_py_err)?;
         push_summary_to_py(py, summary)
@@ -590,11 +534,9 @@ impl AnyserveClient {
         follow: bool,
     ) -> PyResult<FrameIterator> {
         let runtime = self.runtime.clone();
-        let client = self.client.clone();
+        let mut client = self.client.clone();
         py.detach(move || {
-            let stream = with_client(&runtime, &client, move |runtime, client| {
-                runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))
-            })?;
+            let stream = runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))?;
             Ok(FrameIterator {
                 runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
@@ -662,16 +604,6 @@ fn build_runtime() -> Result<Runtime> {
         .enable_all()
         .build()
         .context("create tokio runtime")
-}
-
-fn with_client<F, T>(runtime: &SharedRuntime, client: &RustAnyserveClient, op: F) -> Result<T>
-where
-    F: FnOnce(&Runtime, &mut RustAnyserveClient) -> Result<T>,
-{
-    // Tonic channels are multiplexed. Clone the handle so long-polls and
-    // heartbeats can run concurrently on the shared runtime.
-    let mut client = client.clone();
-    op(runtime, &mut client)
 }
 
 fn lock_shared<'a, T>(shared: &'a Arc<Mutex<T>>, label: &str) -> Result<MutexGuard<'a, T>> {

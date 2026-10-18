@@ -954,7 +954,7 @@ impl StateStore for SqlStateStore {
         sqlx::query(statement.as_ref())
             .bind(&job.job_id)
             .bind(enum_text(&job.state)?)
-            .bind(json_text(&stored_job_spec(&job.spec))?)
+            .bind(json_text(&job.spec)?)
             .bind(json_text(&stored_job_inputs(&job.spec))?)
             .bind(json_text(&job.outputs)?)
             .bind(job.lease_id.clone())
@@ -1121,7 +1121,7 @@ impl StateStore for SqlStateStore {
         );
         let rows = sqlx::query(statement.as_ref())
             .bind(enum_text(&job.state)?)
-            .bind(json_text(&stored_job_spec(&job.spec))?)
+            .bind(json_text(&job.spec)?)
             .bind(json_text(&stored_job_inputs(&job.spec))?)
             .bind(json_text(&job.outputs)?)
             .bind(job.lease_id.clone())
@@ -2231,10 +2231,6 @@ fn enum_text<T: Serialize>(value: &T) -> Result<String> {
 fn enum_value<T: DeserializeOwned>(raw: &str) -> Result<T> {
     serde_json::from_value(Value::String(raw.to_string()))
         .with_context(|| format!("deserialize enum payload: {raw}"))
-}
-
-fn stored_job_spec(spec: &JobSpec) -> JobSpec {
-    spec.clone()
 }
 
 fn stored_job_inputs(spec: &JobSpec) -> Vec<ObjectRef> {
