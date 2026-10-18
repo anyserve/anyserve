@@ -9,6 +9,7 @@ use crate::model::{
     AttemptRecord, AttemptState, Attributes, EventKind, JobEvent, JobRecord, JobState,
     LeaseAssignment, LeaseRecord, ObjectRef, StreamRecord, StreamState, WorkerRecord,
 };
+use crate::scheduler::{capacity_match, unreserved_capacity, worker_can_take};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeaseDispatchMode {
@@ -532,12 +533,24 @@ impl StateStore for MemoryStateStore {
             if active_leases >= worker.spec.max_active_leases {
                 return Ok(None);
             }
+            let available = unreserved_capacity(
+                &worker,
+                inner
+                    .leases
+                    .values()
+                    .filter(|lease| lease.worker_id == worker_id)
+                    .filter_map(|lease| inner.jobs.get(&lease.job_id))
+                    .map(|job| &job.spec.demand.required_capacity),
+            );
 
             for candidate in ordered_candidates {
                 let Some(current) = inner.jobs.get(&candidate.job_id).cloned() else {
                     continue;
                 };
-                if current.state != JobState::Pending {
+                if current.state != JobState::Pending
+                    || !worker_can_take(&worker, &current, now_ms)
+                    || !capacity_match(&available, &current.spec.demand.required_capacity)
+                {
                     continue;
                 }
 

@@ -1,6 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { cancelJob, getJob, getJobs, getOverview, getWorkers } from "./api";
+import {
+  AuthenticationError,
+  cancelJob,
+  getJob,
+  getJobs,
+  getOverview,
+  getWorkers,
+  setConsoleToken,
+} from "./api";
 import {
   CONSOLE_TABS,
   DETAIL_POLL_MS,
@@ -31,6 +39,15 @@ export default function App() {
   const [jobDetail, setJobDetail] = useState<JobDetailResponse | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [token, setToken] = useState("");
+
+  function handleError(nextError: unknown) {
+    setError(asErrorMessage(nextError));
+    if (nextError instanceof AuthenticationError) {
+      setAuthRequired(true);
+    }
+  }
 
   const activeSelectedJobId =
     activeTab === "history"
@@ -64,11 +81,12 @@ export default function App() {
         setOverview(nextOverview);
         setError(null);
       } catch (nextError) {
-        setError(asErrorMessage(nextError));
+        handleError(nextError);
       }
     },
     activeTab === "queue" ? OVERVIEW_POLL_MS : 2_000,
     [activeTab],
+    !authRequired,
   );
 
   usePollingEffect(
@@ -78,11 +96,12 @@ export default function App() {
         setQueueJobs(sortJobs(response.jobs));
         setError(null);
       } catch (nextError) {
-        setError(asErrorMessage(nextError));
+        handleError(nextError);
       }
     },
     activeTab === "queue" ? QUEUE_POLL_MS : 3_000,
     [activeTab],
+    !authRequired,
   );
 
   usePollingEffect(
@@ -92,11 +111,12 @@ export default function App() {
         setHistoryJobs(sortJobs(response.jobs));
         setError(null);
       } catch (nextError) {
-        setError(asErrorMessage(nextError));
+        handleError(nextError);
       }
     },
     activeTab === "history" ? 2_000 : HISTORY_POLL_MS,
     [activeTab],
+    !authRequired,
   );
 
   usePollingEffect(
@@ -106,11 +126,12 @@ export default function App() {
         setWorkers(sortWorkers(response.workers));
         setError(null);
       } catch (nextError) {
-        setError(asErrorMessage(nextError));
+        handleError(nextError);
       }
     },
     activeTab === "workers" ? 2_000 : WORKERS_POLL_MS,
     [activeTab],
+    !authRequired,
   );
 
   useEffect(() => {
@@ -132,12 +153,12 @@ export default function App() {
         setError(null);
       } catch (nextError) {
         setJobDetail(null);
-        setError(asErrorMessage(nextError));
+        handleError(nextError);
       }
     },
     activeTab === "queue" ? DETAIL_POLL_MS : 2_000,
     [activeTab, activeSelectedJobId],
-    activeSelectedJobId !== null,
+    !authRequired && activeSelectedJobId !== null,
   );
 
   const queueSelection = useMemo(
@@ -241,7 +262,7 @@ export default function App() {
           : current,
       );
     } catch (nextError) {
-      setError(asErrorMessage(nextError));
+      handleError(nextError);
     } finally {
       setIsCancelling(false);
     }
@@ -254,6 +275,36 @@ export default function App() {
 
     setActiveTab(nextTab);
     window.history.pushState(null, "", TAB_PATHS[nextTab]);
+  }
+
+  if (authRequired) {
+    return (
+      <main className="auth">
+        <form
+          className="auth__form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setConsoleToken(token);
+            setToken("");
+            setError(null);
+            setAuthRequired(false);
+          }}
+        >
+          <h1>Anyserve Console</h1>
+          <label htmlFor="client-token">Client token</label>
+          <input
+            id="client-token"
+            type="password"
+            autoComplete="off"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            required
+          />
+          {error ? <p role="alert">{error}</p> : null}
+          <button type="submit">Connect</button>
+        </form>
+      </main>
+    );
   }
 
   return (

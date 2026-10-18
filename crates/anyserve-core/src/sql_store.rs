@@ -14,10 +14,11 @@ use tokio::sync::{Mutex, watch};
 use uuid::Uuid;
 
 use crate::model::{
-    AttemptRecord, AttemptState, Attributes, EventKind, JobEvent, JobRecord, JobSpec, JobState,
-    LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
+    AttemptRecord, AttemptState, Attributes, Capacity, EventKind, JobEvent, JobRecord, JobSpec,
+    JobState, LeaseAssignment, LeaseRecord, ObjectRef, StreamDirection, StreamRecord, StreamScope,
     StreamState, WorkerRecord,
 };
+use crate::scheduler::{capacity_match, unreserved_capacity, worker_can_take};
 use crate::store::{
     JobListSummary, JobStateCounts, JobSummaryPage, LeaseDispatchMode, StateStore, StateTransition,
 };
@@ -674,6 +675,36 @@ impl SqlStateStore {
         )
     }
 
+    async fn leased_capacity_tx(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Any>,
+        worker_id: &str,
+    ) -> Result<Vec<Capacity>> {
+        let capacity_json = match self.dialect {
+            SqlDialect::Postgres => {
+                "COALESCE(jobs.spec_json::jsonb -> 'demand' -> 'required_capacity', '{}'::jsonb)::text"
+            }
+            SqlDialect::Sqlite => {
+                "COALESCE(json_extract(jobs.spec_json, '$.demand.required_capacity'), '{}')"
+            }
+        };
+        let query = format!(
+            "SELECT {capacity_json} FROM leases
+             JOIN jobs ON jobs.job_id = leases.job_id
+             WHERE leases.worker_id = ?",
+        );
+        let statement = self.sql(&query);
+        let reservations: Vec<String> = sqlx::query_scalar(statement.as_ref())
+            .bind(worker_id)
+            .fetch_all(&mut **tx)
+            .await
+            .context("read leased capacity reservations")?;
+        reservations
+            .iter()
+            .map(|capacity| json_value(capacity))
+            .collect()
+    }
+
     async fn try_assign_job_postgres(
         &self,
         worker_id: &str,
@@ -701,13 +732,8 @@ impl SqlStateStore {
             return Ok(None);
         }
 
-        let active_leases: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM leases WHERE worker_id = $1")
-                .bind(worker_id)
-                .fetch_one(&mut *tx)
-                .await
-                .with_context(|| format!("count active leases for worker '{worker_id}'"))?;
-        if from_i64(active_leases)? >= u64::from(worker.spec.max_active_leases) {
+        let reservations = self.leased_capacity_tx(&mut tx, worker_id).await?;
+        if reservations.len() >= worker.spec.max_active_leases as usize {
             tx.commit()
                 .await
                 .context("commit saturated postgres worker assignment tx")?;
@@ -717,7 +743,7 @@ impl SqlStateStore {
         let candidate_sql = Self::postgres_dispatch_candidate_sql(worker.spec.interfaces.len());
         let pending_state = enum_text(&JobState::Pending)?;
         let worker_attributes = json_text(&worker.spec.attributes)?;
-        let worker_capacity = json_text(&worker.status.available_capacity)?;
+        let worker_capacity = json_text(&unreserved_capacity(&worker, &reservations))?;
 
         let mut candidate_query = sqlx::query(candidate_sql.as_str()).bind(pending_state);
         for interface in &worker.spec.interfaces {
@@ -1163,24 +1189,24 @@ impl StateStore for SqlStateStore {
             bail!("worker '{}' heartbeat expired", worker_id);
         }
 
-        let active_statement = self.sql("SELECT COUNT(*) FROM leases WHERE worker_id = ?");
-        let active_leases: i64 = sqlx::query_scalar(active_statement.as_ref())
-            .bind(worker_id)
-            .fetch_one(&mut *tx)
-            .await
-            .with_context(|| format!("count active leases for worker '{worker_id}'"))?;
-        if from_i64(active_leases)? >= u64::from(worker.spec.max_active_leases) {
+        let reservations = self.leased_capacity_tx(&mut tx, worker_id).await?;
+        if reservations.len() >= worker.spec.max_active_leases as usize {
             tx.commit()
                 .await
                 .context("commit saturated worker assignment tx")?;
             return Ok(None);
         }
 
+        let available = unreserved_capacity(&worker, &reservations);
+
         for candidate in ordered_candidates {
             let Some(current) = self.get_job_tx(&mut tx, &candidate.job_id).await? else {
                 continue;
             };
-            if current.state != JobState::Pending {
+            if current.state != JobState::Pending
+                || !worker_can_take(&worker, &current, now_ms)
+                || !capacity_match(&available, &current.spec.demand.required_capacity)
+            {
                 continue;
             }
 

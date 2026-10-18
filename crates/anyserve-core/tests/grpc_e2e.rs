@@ -29,13 +29,6 @@ async fn spawn_server() -> Result<(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
 )> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("bind test listener")?;
-    let addr = listener
-        .local_addr()
-        .context("resolve test listener addr")?;
-
     let kernel = Arc::new(Kernel::new(
         Arc::new(MemoryStateStore::new()),
         Arc::new(MemoryFramePlane::new()),
@@ -45,6 +38,18 @@ async fn spawn_server() -> Result<(
         30,
         250,
     ));
+    spawn_server_with_kernel(kernel).await
+}
+
+async fn spawn_server_with_kernel(
+    kernel: Arc<Kernel>,
+) -> Result<(
+    String,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+)> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
     let service = ControlPlaneGrpcService::new(kernel);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let incoming = TcpListenerStream::new(listener);
@@ -59,6 +64,103 @@ async fn spawn_server() -> Result<(
 
     println!("control plane started endpoint={addr}");
     Ok((format!("http://{addr}"), shutdown_tx, handle))
+}
+
+#[tokio::test]
+async fn grpc_follow_observes_close_on_another_kernel() -> Result<()> {
+    use anyserve_core::kernel::OpenStreamCommand;
+    use anyserve_core::model;
+
+    let store = Arc::new(MemoryStateStore::new());
+    let frames = Arc::new(MemoryFramePlane::new());
+    let writer = Kernel::new(
+        store.clone(),
+        frames.clone(),
+        Arc::new(NoopClusterNotifier),
+        Arc::new(BasicScheduler),
+        30,
+        30,
+        25,
+    );
+    let reader = Arc::new(Kernel::new(
+        store,
+        frames,
+        Arc::new(NoopClusterNotifier),
+        Arc::new(BasicScheduler),
+        30,
+        30,
+        25,
+    ));
+    let job = writer
+        .submit_job(
+            None,
+            model::JobSpec {
+                interface_name: "test.follow".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let stream = writer
+        .open_stream(OpenStreamCommand {
+            job_id: job.job_id,
+            attempt_id: None,
+            worker_id: None,
+            lease_id: None,
+            stream_name: "input.default".into(),
+            scope: model::StreamScope::Job,
+            direction: model::StreamDirection::ClientToWorker,
+            metadata: Default::default(),
+        })
+        .await?;
+    assert_eq!(
+        reader.get_stream(&stream.stream_id).await?.state,
+        model::StreamState::Open
+    );
+    writer
+        .push_frame(
+            &stream.stream_id,
+            None,
+            None,
+            model::FrameKind::Data,
+            b"hello".to_vec(),
+            Default::default(),
+        )
+        .await?;
+    let (endpoint, shutdown, handle) = spawn_server_with_kernel(reader.clone()).await?;
+    let mut client = ControlPlaneServiceClient::connect(endpoint).await?;
+    let mut following = client
+        .pull_frames(PullFramesRequest {
+            stream_id: stream.stream_id.clone(),
+            after_sequence: 0,
+            follow: true,
+        })
+        .await?
+        .into_inner();
+    assert_eq!(following.message().await?.unwrap().payload, b"hello");
+    writer
+        .close_stream(&stream.stream_id, None, None, Default::default())
+        .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), following.message())
+            .await??
+            .is_none()
+    );
+    assert!(
+        reader
+            .push_frame(
+                &stream.stream_id,
+                None,
+                None,
+                model::FrameKind::Data,
+                b"late".to_vec(),
+                Default::default()
+            )
+            .await
+            .is_err()
+    );
+    shutdown.send(()).unwrap();
+    handle.await??;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

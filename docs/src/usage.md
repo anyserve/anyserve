@@ -36,6 +36,14 @@ CLI flags override the config file if you provide both.
 
 The gRPC health service is available on the same port as gRPC. Example endpoint strings like `http://127.0.0.1:50052` are gRPC channel URIs, not REST endpoints.
 
+When `[auth]` tokens are configured, the console API requires a client bearer
+token, just like the HTTP gateways. The console prompts for that token and keeps
+it in the current browser tab's session storage. CORS `allowed_origins` controls
+which browser origins may access the console; it does not replace authentication.
+
+The gRPC client and server both accept messages up to 64 MiB, including protobuf
+overhead. HTTP gateways may enforce a smaller request-body limit.
+
 ## Run the Built-In LLM Worker
 
 ```bash

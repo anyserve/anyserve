@@ -17,19 +17,39 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use tokio::runtime::{Builder, Runtime};
 use tonic::Streaming;
 
-type SharedRuntime = Arc<Mutex<Runtime>>;
-type SharedClient = Arc<Mutex<RustAnyserveClient>>;
+type SharedRuntime = Arc<Runtime>;
 type SharedJobEventStream = Arc<Mutex<Option<Streaming<JobEvent>>>>;
 type SharedFrameStream = Arc<Mutex<Option<Streaming<Frame>>>>;
 
-#[derive(FromPyObject)]
 struct PyObjectRef {
-    #[pyo3(item("inline"))]
     inline: Option<Vec<u8>>,
-    #[pyo3(item("uri"))]
     uri: Option<String>,
-    #[pyo3(item("metadata"))]
     metadata: Option<HashMap<String, String>>,
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for PyObjectRef {
+    type Error = PyErr;
+
+    fn extract(object: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let object = object.cast::<PyDict>()?;
+        Ok(Self {
+            inline: object
+                .get_item("inline")?
+                .map(|value| value.extract())
+                .transpose()?
+                .flatten(),
+            uri: object
+                .get_item("uri")?
+                .map(|value| value.extract())
+                .transpose()?
+                .flatten(),
+            metadata: object
+                .get_item("metadata")?
+                .map(|value| value.extract())
+                .transpose()?
+                .flatten(),
+        })
+    }
 }
 
 struct SubmitJobCall {
@@ -72,7 +92,7 @@ struct OpenStreamCall {
 struct AnyserveClient {
     endpoint: String,
     runtime: SharedRuntime,
-    client: SharedClient,
+    client: RustAnyserveClient,
 }
 
 #[pyclass]
@@ -97,8 +117,8 @@ impl AnyserveClient {
             .map_err(to_py_err)?;
         Ok(Self {
             endpoint,
-            runtime: Arc::new(Mutex::new(runtime)),
-            client: Arc::new(Mutex::new(client)),
+            runtime: Arc::new(runtime),
+            client,
         })
     }
 
@@ -173,9 +193,8 @@ impl AnyserveClient {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.watch_job(job_id, after_sequence))
             })?;
-            let iterator_runtime = Arc::new(Mutex::new(build_runtime()?));
             Ok(JobEventIterator {
-                runtime: iterator_runtime,
+                runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
             })
         })
@@ -576,9 +595,8 @@ impl AnyserveClient {
             let stream = with_client(&runtime, &client, move |runtime, client| {
                 runtime.block_on(client.pull_frames(stream_id, after_sequence, follow))
             })?;
-            let iterator_runtime = Arc::new(Mutex::new(build_runtime()?));
             Ok(FrameIterator {
-                runtime: iterator_runtime,
+                runtime,
                 stream: Arc::new(Mutex::new(Some(stream))),
             })
         })
@@ -646,13 +664,14 @@ fn build_runtime() -> Result<Runtime> {
         .context("create tokio runtime")
 }
 
-fn with_client<F, T>(runtime: &SharedRuntime, client: &SharedClient, op: F) -> Result<T>
+fn with_client<F, T>(runtime: &SharedRuntime, client: &RustAnyserveClient, op: F) -> Result<T>
 where
-    F: FnOnce(&mut Runtime, &mut RustAnyserveClient) -> Result<T>,
+    F: FnOnce(&Runtime, &mut RustAnyserveClient) -> Result<T>,
 {
-    let mut runtime = lock_shared(runtime, "anyserve tokio runtime")?;
-    let mut client = lock_shared(client, "anyserve client")?;
-    op(&mut runtime, &mut client)
+    // Tonic channels are multiplexed. Clone the handle so long-polls and
+    // heartbeats can run concurrently on the shared runtime.
+    let mut client = client.clone();
+    op(runtime, &mut client)
 }
 
 fn lock_shared<'a, T>(shared: &'a Arc<Mutex<T>>, label: &str) -> Result<MutexGuard<'a, T>> {
@@ -719,7 +738,6 @@ fn next_job_event(
     runtime: &SharedRuntime,
     stream: &SharedJobEventStream,
 ) -> Result<Option<JobEvent>> {
-    let runtime = lock_shared(runtime, "anyserve tokio runtime")?;
     let mut stream = lock_shared(stream, "job event stream")?;
     let Some(inner) = stream.as_mut() else {
         return Ok(None);
@@ -734,7 +752,6 @@ fn next_job_event(
 }
 
 fn next_frame(runtime: &SharedRuntime, stream: &SharedFrameStream) -> Result<Option<Frame>> {
-    let runtime = lock_shared(runtime, "anyserve tokio runtime")?;
     let mut stream = lock_shared(stream, "frame stream")?;
     let Some(inner) = stream.as_mut() else {
         return Ok(None);

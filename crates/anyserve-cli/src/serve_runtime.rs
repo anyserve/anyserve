@@ -25,6 +25,9 @@ use crate::serve_console::run_server as run_console_server;
 use crate::serve_invoke::run_server as run_serve_invoke;
 use crate::serve_openai::run_server as run_serve_openai;
 
+#[cfg(test)]
+mod tests;
+
 const MAX_PENDING_RESET_STREAMS: usize = 1024;
 const POSTGRES_MEMORY_SINGLETON_LOCK_ID: i64 = 0x4153_5256_5047_4d4d;
 
@@ -194,6 +197,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             Arc::clone(&kernel),
             console_config,
             config.runtime_mode(),
+            Arc::clone(&auth),
             shutdown_tx.subscribe(),
         )))
     } else {
@@ -267,7 +271,9 @@ async fn run_grpc_server(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let service = ControlPlaneGrpcService::new(kernel);
-    let grpc_service = ControlPlaneServiceServer::new(service);
+    let grpc_service = ControlPlaneServiceServer::new(service)
+        .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<ControlPlaneServiceServer<ControlPlaneGrpcService>>()

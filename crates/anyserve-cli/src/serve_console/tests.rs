@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use anyserve_core::auth::AuthPolicy;
 use anyserve_core::frame::MemoryFramePlane;
 use anyserve_core::kernel::Kernel;
 use anyserve_core::model::{Attributes, JobSpec, WorkerSpec};
@@ -18,6 +19,101 @@ use super::handlers::{parse_states, router};
 fn parse_states_rejects_invalid_values() {
     let error = parse_states(Some("pending,nope")).expect_err("should reject invalid state");
     assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn console_requires_client_auth_for_reads_and_cancellation() {
+    let kernel = test_kernel();
+    let job = kernel
+        .submit_job(None, test_job_spec("demo.auth.v1"))
+        .await
+        .unwrap();
+    let policy = AuthPolicy::new(["client-secret".into()], ["worker-secret".into()]);
+    let (base_url, handle) = spawn_test_server_with_auth(kernel.clone(), policy).await;
+    let client = reqwest::Client::new();
+
+    for (token, expected) in [
+        (None, 401),
+        (Some("wrong"), 401),
+        (Some("worker-secret"), 403),
+    ] {
+        for path in [
+            "/api/overview",
+            "/api/jobs",
+            "/api/workers",
+            &format!("/api/jobs/{}", job.job_id),
+        ] {
+            let mut request = client.get(format!("{base_url}{path}"));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            assert_eq!(request.send().await.unwrap().status().as_u16(), expected);
+        }
+        let mut request = client.post(format!("{base_url}/api/jobs/{}/cancel", job.job_id));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        assert_eq!(request.send().await.unwrap().status().as_u16(), expected);
+        assert_eq!(
+            kernel.get_job(&job.job_id).await.unwrap().state,
+            anyserve_core::model::JobState::Pending
+        );
+    }
+    assert_eq!(
+        client
+            .get(format!("{base_url}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, format!("{base_url}/api/jobs"))
+        .header("origin", "http://console.test")
+        .header("access-control-request-headers", "authorization")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status().as_u16(), 204);
+    assert_eq!(
+        preflight.headers()["access-control-allow-origin"],
+        "http://console.test"
+    );
+    assert!(
+        preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .contains("Authorization")
+    );
+    assert_eq!(
+        client
+            .get(format!("{base_url}/api/jobs"))
+            .bearer_auth("client-secret")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        client
+            .post(format!("{base_url}/api/jobs/{}/cancel", job.job_id))
+            .bearer_auth("client-secret")
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    assert_eq!(
+        kernel.get_job(&job.job_id).await.unwrap().state,
+        anyserve_core::model::JobState::Cancelled
+    );
+    handle.abort();
 }
 
 #[tokio::test]
@@ -102,7 +198,7 @@ async fn job_detail_and_cancel_endpoint_return_payloads() {
         .unwrap();
     assert_eq!(detail.status(), axum::http::StatusCode::OK);
     let body: Value = detail.json().await.unwrap();
-    assert!(body["events"].as_array().unwrap().len() >= 1);
+    assert!(!body["events"].as_array().unwrap().is_empty());
     assert_eq!(body["job"]["params_size_bytes"], 5);
     assert_eq!(body["job"]["inputs"][0]["kind"], "inline");
     assert!(body["job"]["inputs"][0].get("content").is_none());
@@ -152,12 +248,19 @@ fn test_kernel() -> Arc<Kernel> {
 }
 
 async fn spawn_test_server(kernel: Arc<Kernel>) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_test_server_with_auth(kernel, AuthPolicy::default()).await
+}
+
+async fn spawn_test_server_with_auth(
+    kernel: Arc<Kernel>,
+    auth: AuthPolicy,
+) -> (String, tokio::task::JoinHandle<()>) {
     let state = AppState {
         kernel,
-        allowed_origins: Arc::new(BTreeSet::new()),
+        allowed_origins: Arc::new(BTreeSet::from(["http://console.test".to_string()])),
         runtime: runtime_mode_summary(RuntimeMode::Memory),
     };
-    let app = router(state);
+    let app = router(state, Arc::new(auth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {

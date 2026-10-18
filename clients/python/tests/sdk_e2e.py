@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socket import AF_INET, SOCK_STREAM, socket
 
-from anyserve import AnyserveClient, FRAME_DATA
+from anyserve import AnyserveClient, FRAME_DATA, inline_object, uri_object
 
 TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
 
@@ -173,14 +175,15 @@ class PythonSdkE2ETests(unittest.TestCase):
             serve(
                 echo,
                 endpoint="{endpoint}",
-                heartbeat_interval_secs=1,
+                heartbeat_interval_secs=0.1,
                 poll_interval_secs=0.2,
+                long_poll_ms=3000,
             )
             """
         ).strip()
 
         with ManagedProcess(
-            [str(self.cli_bin), "serve", "--grpc-port", str(port)],
+            [str(self.cli_bin), "serve", "--grpc-port", str(port), "--heartbeat-ttl-secs", "1"],
             cwd=self.repo_root,
             name="control-plane",
         ) as server:
@@ -200,11 +203,18 @@ class PythonSdkE2ETests(unittest.TestCase):
                         metadata={"source": "python-sdk-highlevel-e2e"},
                     )
 
+                    self._wait_for_job_state(client, job["job_id"], "running")
+                    self.assertEqual(client.list_streams(job["job_id"]), [])
+
                     stream = client.open_stream(job["job_id"], "input.default")
                     client.push_frames(
                         stream["stream_id"],
-                        [(FRAME_DATA, b"hello decorator", {})],
+                        [(FRAME_DATA, b"hello ", {})],
                     )
+                    # The handler must wait for the rest of the input and EOF.
+                    time.sleep(0.3)
+                    self.assertEqual(client.get_job(job["job_id"])["state"], "running")
+                    client.push_frames(stream["stream_id"], [(FRAME_DATA, b"decorator", {})])
                     client.close_stream(stream["stream_id"])
 
                     final_job = self._wait_for_terminal_job(client, job["job_id"])
@@ -217,6 +227,22 @@ class PythonSdkE2ETests(unittest.TestCase):
                         ["accepted", "lease_granted", "started", "output_ready", "succeeded"],
                     )
                     self.assertEqual(payload, b"HELLO DECORATOR")
+
+                    # Idle long-polls must not block heartbeats, even with a
+                    # server TTL shorter than the long-poll duration.
+                    time.sleep(1.5)
+                    self.assertIsNone(worker.poll(), worker.log_tail())
+                    for payload in (b"inline hello", b""):
+                        inline_job = client.submit_job(
+                            interface_name="demo.echo.v1",
+                            inputs=[inline_object(payload)],
+                            required_attributes={"runtime": "python"},
+                        )
+                        final_inline_job = self._wait_for_terminal_job(client, inline_job["job_id"])
+                        self.assertEqual(final_inline_job["state"], "succeeded")
+                        self.assertEqual(
+                            self._read_output_payload(client, inline_job["job_id"]), payload.upper()
+                        )
                 except Exception as exc:
                     raise AssertionError(
                         self._failure_context(
@@ -225,6 +251,74 @@ class PythonSdkE2ETests(unittest.TestCase):
                             worker=worker,
                         )
                     ) from exc
+
+    def test_object_refs_accept_optional_keys_and_validate_references(self) -> None:
+        port = _reserve_port()
+        endpoint = f"http://127.0.0.1:{port}"
+        with ManagedProcess(
+            [str(self.cli_bin), "serve", "--grpc-port", str(port)],
+            cwd=self.repo_root,
+            name="object-refs",
+        ) as server:
+            self._wait_for_server(endpoint, server)
+            client = AnyserveClient(endpoint)
+            objects = [inline_object(b"hello"), uri_object("file:///tmp/example"), {"inline": b""}]
+            for obj in objects:
+                job = client.submit_job(interface_name="test.objects", inputs=[obj])
+                stored = client.get_job(job["job_id"])["spec"]["inputs"][0]
+                for key, value in obj.items():
+                    self.assertEqual(stored[key], value)
+            for obj in [{}, {"inline": b"a", "uri": "file:///tmp/example"}]:
+                with self.assertRaises(ValueError):
+                    client.submit_job(interface_name="test.objects", inputs=[obj])
+            worker = client.register_worker(interfaces=["test.objects"])
+            grant = client.poll_lease(worker["worker_id"])
+            client.complete_lease(
+                worker["worker_id"], grant["lease"]["lease_id"], outputs=[inline_object(b"result")]
+            )
+            completed = client.get_job(grant["job"]["job_id"])
+            self.assertEqual(completed["outputs"][0]["inline"], b"result")
+
+    def test_heartbeat_runs_while_same_client_long_polls(self) -> None:
+        port = _reserve_port()
+        endpoint = f"http://127.0.0.1:{port}"
+        with ManagedProcess(
+            [str(self.cli_bin), "serve", "--grpc-port", str(port)],
+            cwd=self.repo_root,
+            name="concurrent-client",
+        ) as server:
+            self._wait_for_server(endpoint, server)
+            client = AnyserveClient(endpoint)
+            worker = client.register_worker(interfaces=["test.concurrent"])
+            heartbeat_done = threading.Event()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                poll = pool.submit(client.poll_lease, worker["worker_id"], 5000)
+                time.sleep(0.1)
+
+                def heartbeat():
+                    client.heartbeat_worker(worker["worker_id"])
+                    heartbeat_done.set()
+
+                heartbeat_result = pool.submit(heartbeat)
+                ran_during_poll = heartbeat_done.wait(timeout=1)
+                # Always release the poll before asserting, so a failing test
+                # cannot leave a blocked thread behind.
+                other = AnyserveClient(endpoint)
+                other.submit_job(interface_name="test.concurrent")
+                self.assertIsNotNone(poll.result(timeout=5))
+                heartbeat_result.result(timeout=5)
+                self.assertTrue(ran_during_poll, "long-poll held the client lock")
+
+    def _wait_for_job_state(self, client: AnyserveClient, job_id: str, state: str) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = client.get_job(job_id)
+            if job["state"] == state:
+                return
+            if job["state"] in TERMINAL_JOB_STATES:
+                self.fail(f"job terminated before {state}: {job}")
+            time.sleep(0.02)
+        self.fail(f"job never reached {state}: {job}")
 
     def _wait_for_server(self, endpoint: str, server: ManagedProcess, timeout_secs: float = 10) -> None:
         deadline = time.monotonic() + timeout_secs

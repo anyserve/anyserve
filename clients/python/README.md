@@ -55,6 +55,12 @@ serve(echo, endpoint="http://127.0.0.1:50052")
 
 Examples use endpoint strings like `http://127.0.0.1:50052` because the bindings connect through a gRPC channel URI. This is not a REST base URL.
 
+`serve(...)` accepts inline input objects or waits for the configured input
+stream to be opened and closed before calling the handler. For an empty input,
+submit `inline_object(b"")` or close an empty stream. URI inputs require a custom
+worker that resolves them. Long-polls and streaming reads can share a client
+with heartbeat calls from another thread.
+
 ## API Surface
 
 - `submit_job`

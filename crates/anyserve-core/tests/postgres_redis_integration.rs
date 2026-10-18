@@ -98,6 +98,16 @@ async fn postgres_and_redis_share_state_and_frames_across_kernels() {
         .await
         .unwrap();
 
+    // Populate the peer's view while the stream is still open.
+    assert!(
+        !kernel_b
+            .get_stream(&stream.stream_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal()
+    );
+
     kernel_a
         .push_frame(
             &stream.stream_id,
@@ -134,6 +144,20 @@ async fn postgres_and_redis_share_state_and_frames_across_kernels() {
 
     let stream_from_b = kernel_b.get_stream(&stream.stream_id).await.unwrap();
     assert_eq!(stream_from_b.last_sequence, 2);
+    assert!(stream_from_b.state.is_terminal());
+    assert!(
+        kernel_b
+            .push_frame(
+                &stream.stream_id,
+                None,
+                None,
+                FrameKind::Data,
+                b"after close".to_vec(),
+                Attributes::new()
+            )
+            .await
+            .is_err()
+    );
 
     let frames_from_b = kernel_b.pull_frames(&stream.stream_id, 0).await.unwrap();
     assert_eq!(frames_from_b.len(), 2);
