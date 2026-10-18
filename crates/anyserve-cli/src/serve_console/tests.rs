@@ -1,13 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::test_support::{Server, Worker};
 use anyserve_core::auth::AuthPolicy;
-use anyserve_core::frame::MemoryFramePlane;
-use anyserve_core::kernel::Kernel;
-use anyserve_core::model::{Attributes, JobSpec, WorkerSpec};
-use anyserve_core::notify::NoopClusterNotifier;
-use anyserve_core::scheduler::BasicScheduler;
-use anyserve_core::store::MemoryStateStore;
+use anyserve_core::runtime::{
+    Runtime,
+    api::{
+        Demand, Durability, ExecutionPolicy, JobSpec, JobState, Metadata, Object, RuntimeConfig,
+        SubmitRequest,
+    },
+};
 use serde_json::Value;
 
 use crate::serve_config::RuntimeMode;
@@ -17,19 +19,23 @@ use super::handlers::{parse_states, router};
 
 #[test]
 fn parse_states_rejects_invalid_values() {
-    let error = parse_states(Some("pending,nope")).expect_err("should reject invalid state");
+    let error = parse_states(Some("queued,nope")).expect_err("should reject invalid state");
     assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn console_requires_client_auth_for_reads_and_cancellation() {
-    let kernel = test_kernel();
-    let job = kernel
-        .submit_job(None, test_job_spec("demo.auth.v1"))
+    let runtime = test_runtime().await;
+    let job = runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.auth.v1"),
+            ..Default::default()
+        })
         .await
-        .unwrap();
+        .unwrap()
+        .job;
     let policy = AuthPolicy::new(["client-secret".into()], ["worker-secret".into()]);
-    let (base_url, handle) = spawn_test_server_with_auth(kernel.clone(), policy).await;
+    let (base_url, handle) = spawn_test_server_with_auth(runtime.clone(), policy).await;
     let client = reqwest::Client::new();
 
     for (token, expected) in [
@@ -55,8 +61,8 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
         }
         assert_eq!(request.send().await.unwrap().status().as_u16(), expected);
         assert_eq!(
-            kernel.get_job(&job.job_id).await.unwrap().state,
-            anyserve_core::model::JobState::Pending
+            runtime.get_job(&job.job_id, false).await.unwrap().state,
+            JobState::Queued
         );
     }
     assert_eq!(
@@ -110,27 +116,39 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
         200
     );
     assert_eq!(
-        kernel.get_job(&job.job_id).await.unwrap().state,
-        anyserve_core::model::JobState::Cancelled
+        runtime.get_job(&job.job_id, false).await.unwrap().state,
+        JobState::Cancelled
     );
     handle.abort();
 }
 
 #[tokio::test]
 async fn overview_reports_runtime_queue_history_and_workers() {
-    let kernel = test_kernel();
-    register_worker(&kernel, "worker-overview").await;
-    kernel
-        .submit_job(None, test_job_spec("demo.queue.v1"))
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let runtime = server.runtime.clone();
+    let _worker =
+        Worker::connect(&server, "worker-overview", vec!["demo.worker.v1".into()], 4).await;
+    runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.queue.v1"),
+            ..Default::default()
+        })
         .await
         .unwrap();
-    let cancelled = kernel
-        .submit_job(None, test_job_spec("demo.history.v1"))
+    let cancelled = runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.history.v1"),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    runtime
+        .cancel(&cancelled.job_id, "test cancellation".into())
         .await
         .unwrap();
-    kernel.cancel_job(&cancelled.job_id).await.unwrap();
 
-    let (base_url, handle) = spawn_test_server(kernel).await;
+    let (base_url, handle) = spawn_test_server(runtime).await;
     let response = reqwest::get(format!("{base_url}/api/overview"))
         .await
         .unwrap();
@@ -138,7 +156,7 @@ async fn overview_reports_runtime_queue_history_and_workers() {
 
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["runtime"]["code"], "memory");
-    assert_eq!(body["queue"]["pending"], 1);
+    assert_eq!(body["queue"]["queued"], 1);
     assert_eq!(body["history"]["cancelled"], 1);
     assert_eq!(body["workers"]["healthy"], 1);
 
@@ -147,22 +165,36 @@ async fn overview_reports_runtime_queue_history_and_workers() {
 
 #[tokio::test]
 async fn jobs_endpoint_filters_and_paginates() {
-    let kernel = test_kernel();
-    let first = kernel
-        .submit_job(None, test_job_spec("demo.first.v1"))
+    let runtime = test_runtime().await;
+    let first = runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.first.v1"),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let second = runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.second.v1"),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    runtime
+        .cancel(&second.job_id, "test cancellation".into())
         .await
         .unwrap();
-    let second = kernel
-        .submit_job(None, test_job_spec("demo.second.v1"))
-        .await
-        .unwrap();
-    kernel.cancel_job(&second.job_id).await.unwrap();
-    kernel
-        .submit_job(None, test_job_spec("demo.third.v1"))
+    runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.third.v1"),
+            ..Default::default()
+        })
         .await
         .unwrap();
 
-    let (base_url, handle) = spawn_test_server(kernel).await;
+    let (base_url, handle) = spawn_test_server(runtime).await;
     let response = reqwest::get(format!(
         "{base_url}/api/jobs?states=cancelled&limit=1&offset=0"
     ))
@@ -171,7 +203,7 @@ async fn jobs_endpoint_filters_and_paginates() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 
     let body: Value = response.json().await.unwrap();
-    assert_eq!(body["total"], 1);
+    assert!(body["next_page_token"].is_null());
     assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
     assert_eq!(body["jobs"][0]["state"], "cancelled");
     assert_eq!(body["jobs"][0]["job_id"], second.job_id);
@@ -182,13 +214,17 @@ async fn jobs_endpoint_filters_and_paginates() {
 
 #[tokio::test]
 async fn job_detail_and_cancel_endpoint_return_payloads() {
-    let kernel = test_kernel();
-    let job = kernel
-        .submit_job(None, test_job_spec("demo.detail.v1"))
+    let runtime = test_runtime().await;
+    let job = runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.detail.v1"),
+            ..Default::default()
+        })
         .await
-        .unwrap();
+        .unwrap()
+        .job;
 
-    let (base_url, handle) = spawn_test_server(kernel.clone()).await;
+    let (base_url, handle) = spawn_test_server(runtime.clone()).await;
     let client = reqwest::Client::new();
 
     let detail = client
@@ -199,6 +235,8 @@ async fn job_detail_and_cancel_endpoint_return_payloads() {
     assert_eq!(detail.status(), axum::http::StatusCode::OK);
     let body: Value = detail.json().await.unwrap();
     assert!(!body["events"].as_array().unwrap().is_empty());
+    assert_eq!(body["history_incomplete"], false);
+    assert!(body.get("streams").is_none());
     assert_eq!(body["job"]["params_size_bytes"], 5);
     assert_eq!(body["job"]["inputs"][0]["kind"], "inline");
     assert!(body["job"]["inputs"][0].get("content").is_none());
@@ -217,10 +255,11 @@ async fn job_detail_and_cancel_endpoint_return_payloads() {
 
 #[tokio::test]
 async fn workers_endpoint_reports_health() {
-    let kernel = test_kernel();
-    register_worker(&kernel, "worker-health").await;
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let runtime = server.runtime.clone();
+    let _worker = Worker::connect(&server, "worker-health", vec!["demo.worker.v1".into()], 4).await;
 
-    let (base_url, handle) = spawn_test_server(kernel).await;
+    let (base_url, handle) = spawn_test_server(runtime).await;
     let response = reqwest::get(format!("{base_url}/api/workers"))
         .await
         .unwrap();
@@ -235,30 +274,80 @@ async fn workers_endpoint_reports_health() {
     handle.abort();
 }
 
-fn test_kernel() -> Arc<Kernel> {
-    Arc::new(Kernel::new(
-        Arc::new(MemoryStateStore::new()),
-        Arc::new(MemoryFramePlane::new()),
-        Arc::new(NoopClusterNotifier),
-        Arc::new(BasicScheduler),
-        30,
-        30,
-        250,
-    ))
+#[tokio::test]
+async fn evicted_durable_details_show_missing_spec_and_incomplete_history() {
+    use crate::test_support::temporary_path;
+    use anyserve_core::runtime::api::JournalConfig;
+    use std::time::Duration;
+    let path = temporary_path("console-journal.sqlite");
+    let server = Server::start(
+        RuntimeConfig {
+            journal: Some(JournalConfig::new(&path)),
+            max_terminal_jobs: 0,
+            ..Default::default()
+        },
+        AuthPolicy::default(),
+    )
+    .await;
+    let mut worker = Worker::connect(&server, "cold-console", vec!["demo.cold.v1".into()], 1).await;
+    let mut spec = test_job_spec("demo.cold.v1");
+    spec.policy.durability = Some(Durability::Durable);
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let _assignment = worker.assignment().await;
+    server
+        .runtime
+        .cancel(&job.job_id, "test".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.runtime.spec(&job.job_id).is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (url, handle) = spawn_test_server(server.runtime.clone()).await;
+    let response = reqwest::get(format!("{url}/api/jobs/{}", job.job_id))
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["job"]["state"], "cancelled");
+    assert!(body["job"]["demand"].is_null());
+    assert!(body["job"]["policy"].is_null());
+    assert!(body["job"]["inputs"].as_array().unwrap().is_empty());
+    assert_eq!(body["history_incomplete"], true);
+    assert!(body["attempts"].as_array().unwrap().is_empty());
+    assert!(body.get("streams").is_none());
+    handle.abort();
+    server.stop().await;
+    let _ = std::fs::remove_file(path);
 }
 
-async fn spawn_test_server(kernel: Arc<Kernel>) -> (String, tokio::task::JoinHandle<()>) {
-    spawn_test_server_with_auth(kernel, AuthPolicy::default()).await
+async fn test_runtime() -> Runtime {
+    Runtime::start(RuntimeConfig::default()).await.unwrap()
+}
+
+async fn spawn_test_server(runtime: Runtime) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_test_server_with_auth(runtime, AuthPolicy::default()).await
 }
 
 async fn spawn_test_server_with_auth(
-    kernel: Arc<Kernel>,
+    runtime: Runtime,
     auth: AuthPolicy,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let state = AppState {
-        kernel,
+        runtime,
         allowed_origins: Arc::new(BTreeSet::from(["http://console.test".to_string()])),
-        runtime: runtime_mode_summary(RuntimeMode::Memory),
+        mode: runtime_mode_summary(RuntimeMode::Memory),
     };
     let app = router(state, Arc::new(auth));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -271,35 +360,16 @@ async fn spawn_test_server_with_auth(
 
 fn test_job_spec(interface_name: &str) -> JobSpec {
     JobSpec {
-        interface_name: interface_name.to_string(),
-        inputs: vec![anyserve_core::model::ObjectRef::inline(b"hello".to_vec())],
-        params: b"world".to_vec(),
-        metadata: Attributes::from([("source".to_string(), "runtime".to_string())]),
-        ..JobSpec::default()
+        demand: Demand {
+            interface: interface_name.into(),
+            ..Default::default()
+        },
+        policy: ExecutionPolicy {
+            durability: Some(Durability::Ephemeral),
+            ..Default::default()
+        },
+        inputs: vec![Object::inline(b"hello".as_slice())],
+        params: b"world".as_slice().into(),
+        metadata: Metadata::from([("source".to_string(), "runtime".to_string())]),
     }
-}
-
-async fn register_worker(kernel: &Arc<Kernel>, worker_id: &str) {
-    let worker = kernel
-        .register_worker(
-            Some(worker_id.to_string()),
-            WorkerSpec {
-                interfaces: BTreeSet::from(["demo.queue.v1".to_string()]),
-                attributes: BTreeMap::from([("region".to_string(), "local".to_string())]),
-                total_capacity: BTreeMap::from([("slot".to_string(), 4)]),
-                max_active_leases: 4,
-                metadata: BTreeMap::new(),
-            },
-        )
-        .await
-        .unwrap();
-    kernel
-        .heartbeat_worker(
-            &worker.worker_id,
-            BTreeMap::from([("slot".to_string(), 4)]),
-            0,
-            BTreeMap::new(),
-        )
-        .await
-        .unwrap();
 }

@@ -3,16 +3,20 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use anyserve_core::auth::AuthPolicy;
-use anyserve_core::model::{Attributes, Capacity, Demand};
+use anyserve_core::runtime::api::{Capacity, Demand, Metadata as Attributes};
 use serde::Deserialize;
 
 use super::{
-    DEFAULT_CHAT_INTERFACE, DEFAULT_CLOSED_RETENTION_SECS, DEFAULT_CONSOLE_LISTEN,
-    DEFAULT_EMBEDDINGS_INTERFACE, DEFAULT_INVOKE_LISTEN, DEFAULT_INVOKE_MAX_BODY_BYTES,
-    DEFAULT_INVOKE_TIMEOUT_MS, DEFAULT_OPENAI_LISTEN, DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS,
-    DEFAULT_WATCH_POLL_INTERVAL_MS, FrameBackend, FrameConfig, ServeConsoleConfig,
-    ServeInvokeConfig, ServeOpenAIConfig, StorageBackend, StorageConfig,
+    DEFAULT_CHAT_INTERFACE, DEFAULT_CONSOLE_LISTEN, DEFAULT_EMBEDDINGS_INTERFACE,
+    DEFAULT_INVOKE_LISTEN, DEFAULT_INVOKE_MAX_BODY_BYTES, DEFAULT_INVOKE_TIMEOUT_MS,
+    DEFAULT_OPENAI_LISTEN, DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS, ServeConsoleConfig,
+    ServeInvokeConfig, ServeOpenAIConfig,
 };
+use anyserve_core::runtime::api::{InterfacePolicy, JournalConfig, RuntimeConfig};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
 use crate::edge_routing::RoutingDefaults;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -20,6 +24,10 @@ use crate::edge_routing::RoutingDefaults;
 pub(super) struct AnyserveConfigFile {
     #[serde(default)]
     pub(super) server: Option<ServerConfigFile>,
+    #[serde(default)]
+    pub(super) runtime: Option<RuntimeConfigFile>,
+    #[serde(default)]
+    pub(super) journal: Option<JournalConfigFile>,
     #[serde(default)]
     pub(super) console: Option<ServeConsoleConfigFile>,
     #[serde(default)]
@@ -71,9 +79,9 @@ pub(super) struct RoutingPolicyConfigFile {
     #[serde(default)]
     spillover_after_ms: Option<u64>,
     #[serde(default)]
-    lease_ttl_secs: Option<u64>,
+    execution_timeout_ms: Option<u64>,
     #[serde(default)]
-    priority: Option<i32>,
+    priority: Option<u32>,
 }
 
 impl RoutingPolicyConfigFile {
@@ -81,7 +89,7 @@ impl RoutingPolicyConfigFile {
         RoutingDefaults {
             queue_timeout_ms: self.queue_timeout_ms.unwrap_or_default(),
             spillover_after_ms: self.spillover_after_ms.unwrap_or_default(),
-            lease_ttl_secs: self.lease_ttl_secs.unwrap_or_default(),
+            execution_timeout_ms: self.execution_timeout_ms.unwrap_or_default(),
             priority: self.priority.unwrap_or_default(),
         }
     }
@@ -135,7 +143,16 @@ impl AnyserveConfigFile {
     pub(super) fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read config file {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parse config file {}", path.display()))
+        let value: toml::Value = toml::from_str(&raw).context("parse TOML")?;
+        if value
+            .get("server")
+            .is_some_and(|server| server.get("storage").is_some() || server.get("frames").is_some())
+        {
+            anyhow::bail!(
+                "server.storage and server.frames were replaced by [journal]; see docs/src/architecture.md#migration-from-04"
+            );
+        }
+        toml::from_str(&raw).with_context(|| format!("parse config file {}; for 0.4 configuration migration see docs/src/architecture.md#migration-from-04", path.display()))
     }
 }
 
@@ -147,101 +164,7 @@ pub(super) struct ServerConfigFile {
     #[serde(default)]
     pub(super) grpc_port: Option<u16>,
     #[serde(default)]
-    pub(super) heartbeat_ttl_secs: Option<u64>,
-    #[serde(default)]
-    pub(super) default_lease_ttl_secs: Option<u64>,
-    #[serde(default)]
-    pub(super) job_retention_secs: Option<u64>,
-    #[serde(default)]
-    pub(super) storage: Option<StorageConfigFile>,
-    #[serde(default)]
-    pub(super) frames: Option<FrameConfigFile>,
-    #[serde(default)]
     pub(super) tls: Option<TlsConfigFile>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct StorageConfigFile {
-    #[serde(default)]
-    backend: Option<String>,
-    #[serde(default)]
-    dsn: Option<String>,
-}
-
-impl StorageConfigFile {
-    pub(super) fn resolve(self) -> Result<StorageConfig> {
-        let backend = match self.backend.as_deref().unwrap_or("memory") {
-            "memory" => StorageBackend::Memory,
-            "sqlite" => StorageBackend::Sqlite,
-            "postgres" => StorageBackend::Postgres,
-            other => anyhow::bail!("unsupported storage backend '{other}'"),
-        };
-        if matches!(backend, StorageBackend::Sqlite | StorageBackend::Postgres)
-            && self.dsn.is_none()
-        {
-            anyhow::bail!("storage.dsn is required for non-memory backends");
-        }
-        Ok(StorageConfig {
-            backend,
-            dsn: self.dsn,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub(super) struct FrameConfigFile {
-    #[serde(default)]
-    backend: Option<String>,
-    #[serde(default)]
-    redis_url: Option<String>,
-    #[serde(default)]
-    closed_retention_secs: Option<u64>,
-    #[serde(default)]
-    watch_poll_interval_ms: Option<u64>,
-}
-
-impl FrameConfigFile {
-    pub(super) fn resolve(self, storage_backend: StorageBackend) -> Result<FrameConfig> {
-        let backend = match self.backend.as_deref() {
-            Some("memory") => FrameBackend::Memory,
-            Some("redis") => FrameBackend::Redis,
-            Some(other) => anyhow::bail!("unsupported frames backend '{other}'"),
-            None => {
-                if storage_backend == StorageBackend::Postgres {
-                    FrameBackend::Redis
-                } else {
-                    FrameBackend::Memory
-                }
-            }
-        };
-        if backend == FrameBackend::Redis && self.redis_url.is_none() {
-            anyhow::bail!("frames.redis_url is required when frames.backend = 'redis'");
-        }
-        match (storage_backend, backend) {
-            (StorageBackend::Memory, FrameBackend::Memory)
-            | (StorageBackend::Sqlite, FrameBackend::Memory)
-            | (StorageBackend::Postgres, FrameBackend::Memory)
-            | (StorageBackend::Postgres, FrameBackend::Redis) => {}
-            (StorageBackend::Memory, FrameBackend::Redis) => {
-                anyhow::bail!("memory storage only supports frames.backend = 'memory'")
-            }
-            (StorageBackend::Sqlite, FrameBackend::Redis) => {
-                anyhow::bail!("sqlite storage only supports frames.backend = 'memory'")
-            }
-        }
-        Ok(FrameConfig {
-            backend,
-            redis_url: self.redis_url,
-            closed_retention_secs: self
-                .closed_retention_secs
-                .unwrap_or(DEFAULT_CLOSED_RETENTION_SECS),
-            watch_poll_interval_ms: self
-                .watch_poll_interval_ms
-                .unwrap_or(DEFAULT_WATCH_POLL_INTERVAL_MS),
-        })
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -353,9 +276,142 @@ struct DemandConfigFile {
 impl DemandConfigFile {
     fn resolve(self) -> Demand {
         Demand {
+            interface: String::new(),
             required_attributes: self.required_attributes,
             preferred_attributes: self.preferred_attributes,
             required_capacity: self.required_capacity,
         }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct JournalConfigFile {
+    enabled: Option<bool>,
+    path: Option<PathBuf>,
+    full_sync: Option<bool>,
+    queue_capacity: Option<usize>,
+    max_batch: Option<usize>,
+    retention_secs: Option<u64>,
+}
+impl JournalConfigFile {
+    pub(super) fn resolve(self, path_override: Option<PathBuf>) -> Result<Option<JournalConfig>> {
+        if !self.enabled.unwrap_or(true) && path_override.is_none() {
+            return Ok(None);
+        }
+        let mut config = JournalConfig::new(
+            path_override
+                .or(self.path)
+                .unwrap_or_else(|| PathBuf::from(".anyserve/journal.sqlite")),
+        );
+        if let Some(value) = self.full_sync {
+            config.full_sync = value;
+        }
+        if let Some(value) = self.queue_capacity {
+            config.queue_capacity = value;
+        }
+        if let Some(value) = self.max_batch {
+            config.max_batch = value;
+        }
+        if let Some(value) = self.retention_secs {
+            config.retention = Duration::from_secs(value);
+        }
+        if config.path.as_os_str().is_empty() || config.queue_capacity == 0 || config.max_batch == 0
+        {
+            anyhow::bail!("journal path, queue_capacity and max_batch must be non-empty/positive");
+        }
+        Ok(Some(config))
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RuntimeConfigFile {
+    heartbeat_interval_ms: Option<u64>,
+    heartbeat_timeout_ms: Option<u64>,
+    max_attempts: Option<u32>,
+    max_queue: Option<usize>,
+    max_pending_bytes: Option<u64>,
+    max_pending_jobs: Option<usize>,
+    max_event_bytes: Option<u64>,
+    max_result_bytes: Option<u64>,
+    max_sessions: Option<usize>,
+    consumer_stall_timeout_ms: Option<u64>,
+    cancel_grace_ms: Option<u64>,
+    terminal_retention_secs: Option<u64>,
+    max_terminal_jobs: Option<usize>,
+    event_log_max_events: Option<usize>,
+    event_log_max_bytes: Option<usize>,
+    #[serde(default)]
+    interfaces: BTreeMap<String, InterfaceConfigFile>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct InterfaceConfigFile {
+    max_queue: Option<usize>,
+    queue_timeout_ms: Option<u64>,
+}
+impl RuntimeConfigFile {
+    pub(super) fn resolve(self) -> RuntimeConfig {
+        let mut config = RuntimeConfig::default();
+        if let Some(value) = self.heartbeat_interval_ms {
+            config.heartbeat_interval = Duration::from_millis(value);
+        }
+        if let Some(value) = self.heartbeat_timeout_ms {
+            config.heartbeat_timeout = Duration::from_millis(value);
+        }
+        if let Some(value) = self.max_attempts {
+            config.default_max_attempts = value;
+        }
+        if let Some(value) = self.max_queue {
+            config.default_max_queue = value;
+        }
+        if let Some(value) = self.max_pending_bytes {
+            config.max_pending_bytes = value;
+        }
+        if let Some(value) = self.max_pending_jobs {
+            config.max_pending_jobs = value;
+        }
+        if let Some(value) = self.max_event_bytes {
+            config.max_event_bytes = value;
+        }
+        if let Some(value) = self.max_result_bytes {
+            config.max_result_bytes = value;
+        }
+        if let Some(value) = self.max_sessions {
+            config.max_sessions = value;
+        }
+        if let Some(value) = self.consumer_stall_timeout_ms {
+            config.consumer_stall_timeout = Duration::from_millis(value);
+        }
+        if let Some(value) = self.cancel_grace_ms {
+            config.cancel_grace = Duration::from_millis(value);
+        }
+        if let Some(value) = self.terminal_retention_secs {
+            config.terminal_retention = Duration::from_secs(value);
+        }
+        if let Some(value) = self.max_terminal_jobs {
+            config.max_terminal_jobs = value;
+        }
+        if let Some(value) = self.event_log_max_events {
+            config.event_log_max_events = value;
+        }
+        if let Some(value) = self.event_log_max_bytes {
+            config.event_log_max_bytes = value;
+        }
+        config.interfaces = self
+            .interfaces
+            .into_iter()
+            .map(|(name, policy)| {
+                (
+                    name,
+                    InterfacePolicy {
+                        max_queue: policy.max_queue,
+                        queue_timeout: policy.queue_timeout_ms.map(Duration::from_millis),
+                    },
+                )
+            })
+            .collect();
+        config
     }
 }

@@ -7,11 +7,12 @@
 use std::sync::Arc;
 
 use anyserve_core::auth::AuthPolicy;
-use anyserve_core::model::{Attributes, Demand, ExecutionPolicy};
+use anyserve_core::runtime::api::{Demand, ExecutionPolicy, Metadata as Attributes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use std::time::Duration;
 
 pub(crate) const REQUIRE_HEADER: &str = "x-anyserve-require";
 pub(crate) const PREFER_HEADER: &str = "x-anyserve-prefer";
@@ -25,22 +26,19 @@ pub(crate) const PRIORITY_HEADER: &str = "x-anyserve-priority";
 pub(crate) struct RoutingDefaults {
     pub(crate) queue_timeout_ms: u64,
     pub(crate) spillover_after_ms: u64,
-    pub(crate) lease_ttl_secs: u64,
-    pub(crate) priority: i32,
+    pub(crate) execution_timeout_ms: u64,
+    pub(crate) priority: u32,
 }
 
 impl RoutingDefaults {
     pub(crate) fn policy(&self) -> ExecutionPolicy {
-        let mut policy = ExecutionPolicy {
-            queue_timeout_ms: self.queue_timeout_ms,
-            spillover_after_ms: self.spillover_after_ms,
+        ExecutionPolicy {
+            queue_timeout: milliseconds(self.queue_timeout_ms),
+            spillover_after: milliseconds(self.spillover_after_ms),
+            execution_timeout: milliseconds(self.execution_timeout_ms),
             priority: self.priority,
             ..ExecutionPolicy::default()
-        };
-        if self.lease_ttl_secs > 0 {
-            policy.lease_ttl_secs = self.lease_ttl_secs;
         }
-        policy
     }
 }
 
@@ -57,12 +55,12 @@ pub(crate) fn apply_routing_headers(
         demand.preferred_attributes.extend(parse_attributes(value)?);
     }
     if let Some(value) = header_number::<u64>(headers, QUEUE_TIMEOUT_HEADER)? {
-        policy.queue_timeout_ms = value;
+        policy.queue_timeout = milliseconds(value);
     }
     if let Some(value) = header_number::<u64>(headers, SPILLOVER_HEADER)? {
-        policy.spillover_after_ms = value;
+        policy.spillover_after = milliseconds(value);
     }
-    if let Some(value) = header_number::<i32>(headers, PRIORITY_HEADER)? {
+    if let Some(value) = header_number::<u32>(headers, PRIORITY_HEADER)? {
         policy.priority = value;
     }
     Ok(())
@@ -141,6 +139,10 @@ pub(crate) async fn require_client_token(
     }
 }
 
+fn milliseconds(value: u64) -> Option<Duration> {
+    (value > 0).then(|| Duration::from_millis(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,8 +177,8 @@ mod tests {
                 .map(String::as_str),
             Some("mumbai")
         );
-        assert_eq!(policy.spillover_after_ms, 40);
-        assert_eq!(policy.queue_timeout_ms, 2000);
+        assert_eq!(policy.spillover_after, Some(Duration::from_millis(40)));
+        assert_eq!(policy.queue_timeout, Some(Duration::from_millis(2000)));
     }
 
     #[test]

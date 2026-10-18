@@ -44,6 +44,20 @@ which browser origins may access the console; it does not replace authentication
 The gRPC client and server both accept messages up to 64 MiB, including protobuf
 overhead. HTTP gateways may enforce a smaller request-body limit.
 
+## CLI authentication
+
+`anyserve job ls`, `anyserve job inspect <job-id>` and `anyserve job cancel
+<job-id>` read a single client bearer token from `ANYSERVE_TOKEN`. Set it to a
+client token accepted by the server's `[auth]`; there is no token flag. Native
+SDK clients use the same default environment variable. Worker credentials are
+separate and can be selected with `token_env` in the worker configuration.
+
+Gateway `/readyz` requires `Runtime::health().ready` and a connected, non-draining
+worker matching the configured required demand. OpenAI uses its chat interface
+as the primary readiness requirement; embeddings are reported separately. The
+invoke gateway accepts any matching interface. Busy workers still count as live;
+zero free credit does not itself mark a deployment unready.
+
 ## Run the Built-In LLM Worker
 
 ```bash
@@ -97,31 +111,20 @@ def echo(payload: bytes) -> bytes:
 serve(echo, endpoint="http://127.0.0.1:50052")
 ```
 
-## Python Example
+## Client execution API
 
-```python
-from anyserve import AnyserveClient, FRAME_DATA
+The installed SDK exposes `AnyserveClient.submit(interface, inputs, job_id=...)`,
+`invoke(interface, inputs)`, `invoke_stream(interface)`, `watch(job_id)` and `get(job_id)`.
+Inputs are bytes or object references; `ExecutionOptions` carries demand and policy;
+`max_attempts=0` selects the server default. Submit defaults to durable and needs
+an enabled journal. Invoke is ephemeral and closes when its caller disconnects.
+See the existing [submitter](https://github.com/anyserve/anyserve/blob/main/examples/python/submit.py)
+and [worker](https://github.com/anyserve/anyserve/blob/main/examples/python/worker.py).
+There are no named-stream creation or frame-push client APIs.
 
-client = AnyserveClient("http://127.0.0.1:50052")
-# gRPC channel URI used by the bindings client.
-# Assumes the control plane and a compatible worker are already running.
-
-job = client.submit_job(
-    interface_name="demo.echo.v1",
-    required_attributes={"runtime": "demo"},
-    required_capacity={"slot": 1},
-)
-
-stream = client.open_stream(job["job_id"], "input.default")
-client.push_frames(
-    stream["stream_id"],
-    [(FRAME_DATA, b"hello from python", {})],
-)
-client.close_stream(stream["stream_id"])
-
-for event in client.watch_job(job["job_id"]):
-    print(event["kind"], event["metadata"])
-```
+`anyserve serve` enables `.anyserve/journal.sqlite`; use `serve --ephemeral` for
+memory-only execution. Configuration and the 0.4 migration boundary are documented
+in [architecture](architecture.md) and [configuration](configuration.md).
 
 ## Test the Workspace
 

@@ -4,9 +4,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
-use anyserve_core::model::{Attributes, Demand, ExecutionPolicy, JobRecord, JobSpec, ObjectRef};
+use anyserve_core::runtime::api::{self, Demand, ExecutionPolicy};
+use std::time::Duration;
 
-use crate::edge_routing::apply_routing_headers;
+use crate::edge_routing::{TIMEOUT_HEADER, apply_routing_headers, header_number};
 
 use super::state::{AppState, OpenAIError};
 use super::streaming::{streaming_response, wait_for_output_bytes};
@@ -47,12 +48,23 @@ pub(super) async fn chat_completions(
     let payload = serde_json::to_vec(&request)
         .map_err(|error| OpenAIError::bad_request(format!("serialize request: {error}")))?;
 
-    let job = submit_request(&state, &headers, &state.config.chat_interface, payload).await?;
+    let delivery = if stream {
+        api::Delivery::Streamed
+    } else {
+        api::Delivery::Buffered
+    };
+    let (execution, timeout) = submit_request(
+        &state,
+        &headers,
+        &state.config.chat_interface,
+        payload,
+        delivery,
+    )
+    .await?;
     if stream {
-        return Ok(streaming_response(state, job.job_id));
+        return streaming_response(execution, timeout).await;
     }
-
-    let output = wait_for_output_bytes(&state, job.job_id).await?;
+    let output = wait_for_output_bytes(timeout, execution).await?;
     let response_json: Value = serde_json::from_slice(&output).map_err(|error| {
         OpenAIError::bad_gateway(format!("worker returned invalid json: {error}"))
     })?;
@@ -67,14 +79,15 @@ pub(super) async fn embeddings(
 ) -> Result<Response, OpenAIError> {
     let payload = serde_json::to_vec(&request)
         .map_err(|error| OpenAIError::bad_request(format!("serialize request: {error}")))?;
-    let job = submit_request(
+    let (execution, timeout) = submit_request(
         &state,
         &headers,
         &state.config.embeddings_interface,
         payload,
+        api::Delivery::Buffered,
     )
     .await?;
-    let output = wait_for_output_bytes(&state, job.job_id).await?;
+    let output = wait_for_output_bytes(timeout, execution).await?;
     let response_json: Value = serde_json::from_slice(&output).map_err(|error| {
         OpenAIError::bad_gateway(format!("worker returned invalid json: {error}"))
     })?;
@@ -97,27 +110,42 @@ pub(super) async fn submit_request(
     headers: &HeaderMap,
     interface_name: &str,
     payload: Vec<u8>,
-) -> Result<JobRecord, OpenAIError> {
-    let (demand, policy) = placement(state, headers)?;
-    state
-        .kernel
-        .submit_job(
-            None,
-            JobSpec {
-                interface_name: interface_name.to_string(),
-                inputs: vec![ObjectRef::Inline {
-                    content: payload,
-                    metadata: Attributes::from([(
-                        "content_type".to_string(),
-                        "application/json".to_string(),
+    delivery: api::Delivery,
+) -> Result<(api::Execution, Duration), OpenAIError> {
+    let (mut demand, mut policy) = placement(state, headers)?;
+    demand.interface = interface_name.to_owned();
+    let timeout_ms = header_number::<u64>(headers, TIMEOUT_HEADER)
+        .map_err(OpenAIError::bad_request)?
+        .unwrap_or(state.config.request_timeout_secs.saturating_mul(1000))
+        .max(1);
+    policy.total_timeout = Some(Duration::from_millis(timeout_ms));
+    if policy
+        .queue_timeout
+        .is_none_or(|queue| queue > Duration::from_millis(timeout_ms))
+    {
+        policy.queue_timeout = Some(Duration::from_millis(timeout_ms));
+    }
+    let timeout = Duration::from_millis(timeout_ms);
+    let execution = state
+        .runtime
+        .invoke(api::InvokeRequest {
+            spec: api::JobSpec {
+                demand,
+                inputs: vec![api::Object::Inline {
+                    data: payload.into(),
+                    metadata: api::Metadata::from([(
+                        "content_type".to_owned(),
+                        "application/json".to_owned(),
                     )]),
                 }],
-                params: Vec::new(),
-                demand,
                 policy,
-                metadata: Attributes::from([("source".to_string(), "openai".to_string())]),
+                metadata: api::Metadata::from([("source".to_owned(), "openai".to_owned())]),
+                ..Default::default()
             },
-        )
+            input: api::InputMode::Complete,
+            delivery,
+        })
         .await
-        .map_err(|error| OpenAIError::internal(format!("submit job: {error}")))
+        .map_err(OpenAIError::runtime)?;
+    Ok((execution, timeout))
 }

@@ -1,5 +1,5 @@
 import { formatDuration, formatNumber, formatTimestamp } from "./format";
-import type { AttemptSummary, JobEventSummary, StreamSummary } from "./types";
+import type { AttemptSummary, JobEventSummary } from "./types";
 import { EmptyState } from "./pane-tables";
 
 export function Timeline(props: {
@@ -31,23 +31,9 @@ export function AttemptsTimeline(props: { attempts: AttemptSummary[] }) {
         title: `${attempt.state} · ${attempt.worker_id ?? "unassigned"}`,
         subtitle: formatTimestamp(attempt.created_at_ms),
         meta:
-          attempt.duration_ms != null ? formatDuration(attempt.duration_ms) : attempt.lease_id ?? "pending",
+          attempt.duration_ms != null ? formatDuration(attempt.duration_ms) : "in progress",
       }))}
       emptyMessage="No attempts"
-    />
-  );
-}
-
-export function StreamsTimeline(props: { streams: StreamSummary[] }) {
-  return (
-    <Timeline
-      items={props.streams.map((stream) => ({
-        key: stream.stream_id,
-        title: `${stream.stream_name} · ${stream.state}`,
-        subtitle: `${stream.scope} / ${stream.direction}`,
-        meta: `seq ${stream.last_sequence}`,
-      }))}
-      emptyMessage="No streams"
     />
   );
 }

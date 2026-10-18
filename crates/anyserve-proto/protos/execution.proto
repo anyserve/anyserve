@@ -1,0 +1,186 @@
+syntax = "proto3";
+package anyserve.v2;
+
+// ---------- 共用 ----------
+message Object {                       // 小对象 inline；大对象由调用方给出 uri，控制面只透传
+  oneof body { bytes inline = 1; string uri = 2; }
+  map<string, string> metadata = 3;
+}
+message Demand {
+  string interface = 1;
+  map<string, string> required_attributes = 2;
+  map<string, string> preferred_attributes = 3;
+  map<string, int64> required_capacity = 4;
+}
+enum Durability { DURABILITY_UNSPECIFIED = 0; EPHEMERAL = 1; DURABLE = 2; }
+message ExecutionPolicy {
+  Durability durability = 1;
+  uint32 priority = 2;                 // 0..levels-1，超出范围会被服务端截断
+  uint64 queue_timeout_ms = 3;         // schedule_to_start
+  uint64 execution_timeout_ms = 4;     // start_to_close
+  uint64 total_timeout_ms = 5;         // schedule_to_close
+  uint64 spillover_after_ms = 6;
+  uint32 max_attempts = 7;             // 0 = 使用服务端默认
+}
+message JobSpec {
+  Demand demand = 1;
+  repeated Object inputs = 2;
+  bytes params = 3;
+  ExecutionPolicy policy = 4;
+  map<string, string> metadata = 5;    // 除约定的 trace/request-context 键外都计入 spec_hash
+}
+enum JobState { JOB_STATE_UNSPECIFIED = 0; QUEUED = 1; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 5; }
+message ErrorInfo { string code = 1; string message = 2; bool retryable = 3; }
+message Job {
+  string job_id = 1; JobState state = 2; Durability durability = 3; string interface = 4;
+  uint32 attempt_count = 5; string current_attempt_id = 6; string current_worker_id = 7;
+  uint64 created_at_ms = 8; uint64 updated_at_ms = 9; ErrorInfo error = 10;
+  repeated Object outputs = 11;        // 只在 include_outputs 且已终态时填充
+  map<string, string> metadata = 12; string spec_hash = 13;
+}
+
+// ---------- Client ----------
+enum ConflictPolicy { CONFLICT_POLICY_UNSPECIFIED = 0; FAIL = 1; USE_EXISTING = 2; }
+message SubmitRequest { string job_id = 1; ConflictPolicy conflict_policy = 2; JobSpec spec = 3; }
+message SubmitResponse { Job job = 1; bool created = 2; }
+
+message InvokeRequest {                // 第一条必须是 start；之后可选输入块
+  oneof msg { InvokeStart start = 1; InputChunk input = 2; InputEnd input_end = 3; }
+}
+message InvokeStart { JobSpec spec = 1; bool streaming_input = 2; }  // durability 强制为 EPHEMERAL
+message InputChunk { bytes data = 1; map<string, string> metadata = 2; }
+message InputEnd {}
+
+message ExecutionEvent {
+  string job_id = 1; uint64 sequence = 2; string attempt_id = 3; uint64 at_ms = 4;
+  oneof event {
+    Accepted accepted = 10; Assigned assigned = 11; Output output = 12;
+    AttemptRestarted attempt_restarted = 13; ExecutionFinished finished = 14;
+  }
+}
+message Accepted {}
+message Assigned { string worker_id = 1; uint32 attempt_number = 2; }
+message Output { bytes data = 1; map<string, string> metadata = 2; bool progress = 3; }
+message AttemptRestarted { string previous_attempt_id = 1; ErrorInfo reason = 2; }  // 只会在没有对外暴露过输出时出现
+message ExecutionFinished { JobState state = 1; repeated Object outputs = 2; ErrorInfo error = 3; }
+
+message WatchRequest {
+  string job_id = 1;
+  // 0 = from the earliest retained event
+  uint64 after_sequence = 2;
+}
+message GetJobRequest { string job_id = 1; bool include_outputs = 2; }
+message CancelRequest { string job_id = 1; string reason = 2; }
+message ListJobsRequest { repeated JobState states = 1; uint32 limit = 2; string page_token = 3; }
+message ListJobsResponse { repeated Job jobs = 1; string next_page_token = 2; }
+
+service Client {
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+  rpc Invoke(stream InvokeRequest) returns (stream ExecutionEvent);  // 连接断开即取消
+  rpc Watch(WatchRequest) returns (stream ExecutionEvent);
+  rpc GetJob(GetJobRequest) returns (Job);
+  rpc Cancel(CancelRequest) returns (Job);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+}
+
+// ---------- Worker：控制面 ----------
+message WorkerMessage {
+  oneof msg {
+    Hello hello = 1; Credit credit = 2; Heartbeat heartbeat = 3;
+    AssignReply assign_reply = 4; CancelAck cancel_ack = 5; Draining draining = 6;
+  }
+}
+message Hello {
+  string worker_id = 1; string resume_session_id = 2; repeated string interfaces = 3;
+  map<string, string> attributes = 4; map<string, int64> total_capacity = 5;
+  uint32 max_concurrency = 6; string sdk_version = 7;
+  repeated string held_lease_ids = 8;  // Leases held during a reconnect.
+  map<string, string> metadata = 9;
+}
+message Credit { uint32 free_slots = 1; }
+message Heartbeat { Load load = 1; }
+message Load {
+  uint32 queued = 1; uint32 running = 2;
+  double utilization = 3;             // 0..1，具体含义由 worker 定义
+  map<string, double> custom = 4;
+}
+message AssignReply { string lease_id = 1; bool accepted = 2; string reject_reason = 3; }
+message CancelAck { string lease_id = 1; }
+message Draining {}
+
+message ServerMessage {
+  oneof msg { Welcome welcome = 1; Assign assign = 2; Cancel cancel = 3; Fence fence = 4; Drain drain = 5; }
+}
+message Limits {
+  uint32 max_control_message_bytes = 1; uint32 max_chunk_bytes = 2;
+  uint32 attempt_window_bytes = 3; uint32 assign_inline_limit = 4;
+}
+message Welcome {
+  string session_id = 1; uint64 generation = 2;
+  uint32 heartbeat_interval_ms = 3; uint32 heartbeat_timeout_ms = 4; Limits limits = 5;
+  repeated string resumed_lease_ids = 6;   // 其余 held_lease_ids 会逐个收到 Fence
+}
+message Assign {
+  string lease_id = 1; string attempt_id = 2; string job_id = 3; uint32 attempt_number = 4;
+  uint64 generation = 5; string interface = 6; bytes params = 7;
+  map<string, int64> reserved_capacity = 8; map<string, string> metadata = 9;
+  repeated Object inline_inputs = 10;  // 总大小不超过 assign_inline_limit 时内联
+  bool inputs_via_attempt = 11;        // 否则需在 Attempt 流上拉取
+  bool streaming_input = 12;
+  uint64 execution_deadline_ms = 13; uint64 total_deadline_ms = 14;
+}
+message Cancel { string lease_id = 1; string reason = 2; }
+message Fence { string lease_id = 1; string reason = 2; }  // 例如 stale_generation、lease_expired
+message Drain {}
+
+// ---------- Worker：数据面（每个 attempt 一条） ----------
+message AttemptUp {
+  oneof msg {
+    AttemptOpen open = 1; Frame frame = 2; ResultChunk result = 3;
+    Finish finish = 5;
+  }
+}
+message AttemptOpen { string lease_id = 1; uint64 generation = 2; uint64 resume_after_sequence = 3; }
+message Frame { uint64 sequence = 1; bytes data = 2; map<string, string> metadata = 3; bool progress = 4; }
+message ResultChunk {
+  uint32 index = 1; bytes data = 2; bool last = 3;
+  map<string, string> metadata = 4; string uri = 5;   // 设置了 uri 时 data 为空
+}
+message Finish {
+  oneof outcome { Succeeded succeeded = 1; ErrorInfo failed = 2; Cancelled cancelled = 3; }
+}
+message Succeeded {}
+message Cancelled {}
+
+message AttemptDown {
+  oneof msg { AttemptOpened opened = 1; InputData input = 2; Ack ack = 3; AttemptFinished finished = 4; }
+}
+message AttemptOpened {
+  uint64 resume_from_sequence = 1;
+  // The lease already completed; only resend results and Finish (no input is
+  // sent). The server compares its own digest of the resent result.
+  bool terminal_replay = 2;
+}
+message InputData {
+  uint64 sequence = 1;
+  bytes data = 2;
+  // True only on the final input message. No object is carried on this trailer.
+  bool last = 3;
+  map<string, string> metadata = 4;
+  // Presence distinguishes an empty object from a trailer or parameter chunk.
+  optional uint32 object_index = 5;
+  string uri = 6;
+  bool parameter_chunk = 7;
+  // End of a logical input object or streaming input chunk.
+  bool object_end = 8;
+}
+message Ack { uint64 up_to_sequence = 1; uint64 result_bytes = 2; }
+message AttemptFinished {
+  enum Status { STATUS_UNSPECIFIED = 0; COMMITTED = 1; FENCED = 2; REJECTED = 3; }
+  Status status = 1; string reason = 2;
+}
+
+service Worker {
+  rpc Session(stream WorkerMessage) returns (stream ServerMessage);  // 控制 channel
+  rpc Attempt(stream AttemptUp) returns (stream AttemptDown);        // 数据 channel
+}

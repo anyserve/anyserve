@@ -66,8 +66,9 @@ anyserve serve --config examples/ollama/anyserve.toml
 
 This starts:
 
-- gRPC on `127.0.0.1:50052`
-- the OpenAI-compatible gateway on `127.0.0.1:8080`
+- gRPC bound to `0.0.0.0:50052` (local clients use `127.0.0.1:50052`)
+- the OpenAI-compatible gateway bound to `0.0.0.0:8080` (local requests use `127.0.0.1:8080`)
+- the console API on `127.0.0.1:3001`
 
 ## 4. Start the Built-In LLM Worker
 
@@ -75,7 +76,8 @@ This starts:
 anyserve worker --config examples/ollama/worker.toml
 ```
 
-The worker pulls jobs from AnyServe and forwards them to Ollama.
+The worker opens an outbound Session, receives assignments and forwards requests to Ollama.
+Heartbeat timing is negotiated by the server; no polling interval is configured.
 
 ## 5. Call the OpenAI-Compatible Endpoint
 
@@ -127,8 +129,8 @@ curl http://127.0.0.1:8080/v1/embeddings \
 
 ## Current Behavior
 
-- The gateway is thin. It submits jobs into AnyServe and waits for the LLM worker.
+- The gateway invokes ephemeral execution in the Runtime and waits for the LLM worker.
 - The worker mostly forwards raw OpenAI-style JSON to the upstream.
 - `model` is passed through as-is.
 - Streaming is real streaming and event-driven inside AnyServe, but it is still chunk-based forwarding from the upstream response, not a token-aware rewriter.
-- There is no aliasing, routing, auth, or automatic model discovery yet.
+- Bearer authentication and demand-based placement are supported; configure `[auth]` before exposing these listeners. Model aliases and automatic model discovery are not implemented.

@@ -1,268 +1,224 @@
 use std::fs;
+use std::time::Duration;
 
-use super::{
-    DEFAULT_HEARTBEAT_TTL_SECS, DEFAULT_LEASE_TTL_SECS, DEFAULT_WATCH_POLL_INTERVAL_MS,
-    FrameBackend, ResolvedServeConfig, ServeOverrides, StorageBackend,
-};
+use super::{ResolvedServeConfig, ServeOverrides};
 
-fn temp_file_path(name: &str) -> std::path::PathBuf {
-    let unique = format!(
-        "anyserve-cli-{name}-{}-{}.toml",
+fn config(raw: &str, mut overrides: ServeOverrides) -> anyhow::Result<ResolvedServeConfig> {
+    let path = std::env::temp_dir().join(format!(
+        "anyserve-config-{}-{}.toml",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time should be valid")
+            .unwrap()
             .as_nanos()
-    );
-    std::env::temp_dir().join(unique)
+    ));
+    fs::write(&path, raw)?;
+    overrides.config = Some(path.clone());
+    let result = ResolvedServeConfig::load(overrides);
+    fs::remove_file(path)?;
+    result
 }
 
 #[test]
-fn serve_config_uses_defaults_without_file() {
+fn defaults_enable_a_local_full_sync_journal() {
     let resolved = ResolvedServeConfig::load(ServeOverrides::default()).unwrap();
-    assert_eq!(resolved.grpc.host, "0.0.0.0");
+    assert_eq!(resolved.grpc.host, "127.0.0.1");
     assert_eq!(resolved.grpc.port, 50_052);
-    assert!(!resolved.grpc.tls_enabled);
-    assert!(resolved.openai.is_none());
-    assert_eq!(resolved.heartbeat_ttl_secs, DEFAULT_HEARTBEAT_TTL_SECS);
-    assert_eq!(resolved.default_lease_ttl_secs, DEFAULT_LEASE_TTL_SECS);
-    assert_eq!(resolved.storage.backend, StorageBackend::Memory);
-    assert_eq!(resolved.frames.backend, FrameBackend::Memory);
+    let journal = resolved.runtime.journal.unwrap();
     assert_eq!(
-        resolved.frames.watch_poll_interval_ms,
-        DEFAULT_WATCH_POLL_INTERVAL_MS
+        journal.path,
+        std::path::Path::new(".anyserve/journal.sqlite")
+    );
+    assert!(journal.full_sync);
+    assert!(resolved.openai.is_none());
+}
+
+#[test]
+fn cli_can_select_ephemeral_mode_or_override_journal_path() {
+    let resolved = config(
+        "[journal]\npath='file.sqlite'",
+        ServeOverrides {
+            ephemeral: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(resolved.runtime.journal.is_none());
+    let resolved = config(
+        "[journal]\nenabled=false",
+        ServeOverrides {
+            journal_path: Some("override.sqlite".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        resolved.runtime.journal.unwrap().path,
+        std::path::Path::new("override.sqlite")
     );
 }
 
 #[test]
-fn serve_config_reads_values_from_toml() {
-    let path = temp_file_path("server");
-    fs::write(
-        &path,
+fn file_configures_runtime_and_tls_and_cli_overrides_listener() {
+    let resolved = config(
         r#"
 [server]
-grpc_host = "127.0.0.1"
+grpc_host = "0.0.0.0"
 grpc_port = 50062
-heartbeat_ttl_secs = 45
-default_lease_ttl_secs = 90
-
 [server.tls]
 enabled = true
-cert_file = "/tmp/server.pem"
-key_file = "/tmp/server.key"
+cert_file = "/tmp/cert.pem"
+key_file = "/tmp/key.pem"
+[runtime]
+heartbeat_timeout_ms = 45000
+max_attempts = 5
+max_pending_bytes = 1048576
+[runtime.interfaces."image.v1"]
+max_queue = 3
+queue_timeout_ms = 250
+[journal]
+path = "recovery.sqlite"
+queue_capacity = 32
+max_batch = 8
 "#,
+        ServeOverrides {
+            grpc_port: Some(50072),
+            ..Default::default()
+        },
     )
     .unwrap();
-
-    let resolved = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        ..ServeOverrides::default()
-    })
-    .unwrap();
-
-    fs::remove_file(path).unwrap();
-
-    assert_eq!(resolved.grpc.host, "127.0.0.1");
-    assert_eq!(resolved.grpc.port, 50062);
-    assert!(resolved.grpc.tls_enabled);
-    assert_eq!(resolved.grpc.cert_file.as_deref(), Some("/tmp/server.pem"));
-    assert_eq!(resolved.grpc.key_file.as_deref(), Some("/tmp/server.key"));
-    assert_eq!(resolved.heartbeat_ttl_secs, 45);
-    assert_eq!(resolved.default_lease_ttl_secs, 90);
-}
-
-#[test]
-fn serve_config_prefers_cli_over_file() {
-    let path = temp_file_path("override");
-    fs::write(
-        &path,
-        r#"
-[server]
-grpc_host = "127.0.0.1"
-grpc_port = 50062
-heartbeat_ttl_secs = 45
-default_lease_ttl_secs = 90
-"#,
-    )
-    .unwrap();
-
-    let resolved = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        grpc_host: Some("0.0.0.0".to_string()),
-        grpc_port: Some(50072),
-        heartbeat_ttl_secs: Some(15),
-        default_lease_ttl_secs: Some(25),
-        ..ServeOverrides::default()
-    })
-    .unwrap();
-
-    fs::remove_file(path).unwrap();
-
-    assert_eq!(resolved.grpc.host, "0.0.0.0");
     assert_eq!(resolved.grpc.port, 50072);
-    assert_eq!(resolved.heartbeat_ttl_secs, 15);
-    assert_eq!(resolved.default_lease_ttl_secs, 25);
+    assert_eq!(resolved.grpc.host, "0.0.0.0");
+    assert!(resolved.grpc.tls_enabled);
+    assert_eq!(resolved.grpc.cert_file.as_deref(), Some("/tmp/cert.pem"));
+    assert_eq!(resolved.runtime.heartbeat_timeout, Duration::from_secs(45));
+    assert_eq!(resolved.runtime.default_max_attempts, 5);
+    assert_eq!(resolved.runtime.interfaces["image.v1"].max_queue, Some(3));
+    assert_eq!(
+        resolved.runtime.interfaces["image.v1"].queue_timeout,
+        Some(Duration::from_millis(250))
+    );
+    assert_eq!(resolved.runtime.journal.unwrap().max_batch, 8);
 }
 
 #[test]
-fn serve_config_enables_openai_when_requested() {
-    let path = temp_file_path("openai");
-    fs::write(
-        &path,
+fn openai_placement_remains_engine_neutral() {
+    let resolved = config(
         r#"
 [openai]
 enabled = true
 listen = "127.0.0.1:8081"
-models = ["chat-fast", "embed-default"]
-chat_interface = "llm.chat.v1"
-embeddings_interface = "llm.embed.v1"
+models = ["demo"]
 request_timeout_secs = 15
-
 [openai.demand.required_attributes]
 provider = "ollama"
 "#,
+        ServeOverrides::default(),
     )
     .unwrap();
-
-    let resolved = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        ..ServeOverrides::default()
-    })
-    .unwrap();
-
-    fs::remove_file(path).unwrap();
-
-    let openai = resolved.openai.expect("openai config should be enabled");
-    assert_eq!(openai.listen, "127.0.0.1:8081");
-    assert_eq!(openai.models.len(), 2);
+    let openai = resolved.openai.unwrap();
+    assert_eq!(openai.models, vec!["demo"]);
     assert_eq!(openai.request_timeout_secs, 15);
-    assert_eq!(
-        openai
-            .demand
-            .required_attributes
-            .get("provider")
-            .map(String::as_str),
-        Some("ollama")
-    );
+    assert_eq!(openai.demand.required_attributes["provider"], "ollama");
 }
 
 #[test]
-fn postgres_storage_defaults_to_redis_frames() {
-    let path = temp_file_path("postgres-redis");
-    fs::write(
-        &path,
-        r#"
-[server.storage]
-backend = "postgres"
-dsn = "postgres://example:anyserve@localhost/anyserve"
-
-[server.frames]
-redis_url = "redis://127.0.0.1:6379"
-"#,
-    )
-    .unwrap();
-
-    let resolved = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        ..ServeOverrides::default()
-    })
-    .unwrap();
-
-    fs::remove_file(path).unwrap();
-
-    assert_eq!(resolved.storage.backend, StorageBackend::Postgres);
-    assert_eq!(resolved.frames.backend, FrameBackend::Redis);
-    assert_eq!(
-        resolved.frames.redis_url.as_deref(),
-        Some("redis://127.0.0.1:6379")
-    );
+fn obsolete_storage_configuration_requires_explicit_migration() {
+    for raw in [
+        "[server.storage]\nbackend='postgres'",
+        "[server.frames]\nbackend='redis'",
+    ] {
+        let error = config(raw, ServeOverrides::default()).unwrap_err();
+        assert!(error.to_string().contains("replaced by [journal]"));
+    }
 }
 
 #[test]
-fn postgres_storage_allows_explicit_memory_frames() {
-    let path = temp_file_path("postgres-memory");
-    fs::write(
-        &path,
-        r#"
-[server.storage]
-backend = "postgres"
-dsn = "postgres://example:anyserve@localhost/anyserve"
-
-[server.frames]
-backend = "memory"
-"#,
-    )
-    .unwrap();
-
-    let resolved = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        ..ServeOverrides::default()
-    })
-    .unwrap();
-
-    fs::remove_file(path).unwrap();
-
-    assert_eq!(resolved.storage.backend, StorageBackend::Postgres);
-    assert_eq!(resolved.frames.backend, FrameBackend::Memory);
-    assert!(resolved.frames.redis_url.is_none());
+fn invalid_journal_limits_are_rejected() {
+    for raw in [
+        "[journal]\nqueue_capacity=0",
+        "[journal]\nmax_batch=0",
+        "[journal]\npath=''",
+    ] {
+        assert!(
+            config(raw, ServeOverrides::default())
+                .unwrap_err()
+                .to_string()
+                .contains("must be non-empty/positive")
+        );
+    }
 }
 
 #[test]
-fn memory_storage_rejects_redis_frames() {
-    let path = temp_file_path("memory-redis-invalid");
-    fs::write(
-        &path,
-        r#"
-[server.frames]
-backend = "redis"
-redis_url = "redis://127.0.0.1:6379"
-"#,
-    )
-    .unwrap();
-
-    let error = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        ..ServeOverrides::default()
-    })
-    .unwrap_err();
-
-    fs::remove_file(path).unwrap();
-
-    assert!(
-        error
-            .to_string()
-            .contains("memory storage only supports frames.backend = 'memory'")
-    );
+fn legacy_server_keys_point_to_the_existing_migration_section() {
+    for raw in [
+        "[server]\nheartbeat_ttl_secs=30",
+        "[server]\ndefault_lease_ttl_secs=30",
+        "[server.storage]\nbackend='sqlite'",
+    ] {
+        let message = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
+        assert!(
+            message.contains("docs/src/architecture.md#migration-from-04"),
+            "{message}"
+        );
+    }
 }
 
 #[test]
-fn sqlite_storage_rejects_redis_frames() {
-    let path = temp_file_path("sqlite-redis-invalid");
-    fs::write(
-        &path,
-        r#"
-[server.storage]
-backend = "sqlite"
-dsn = "sqlite:///tmp/anyserve.db"
+fn all_repository_example_and_benchmark_toml_files_parse() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::path::{Path, PathBuf};
 
-[server.frames]
-backend = "redis"
-redis_url = "redis://127.0.0.1:6379"
-"#,
-    )
-    .unwrap();
+    fn visit(directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules") {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                visit(&path, files)?;
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
 
-    let error = ResolvedServeConfig::load(ServeOverrides {
-        config: Some(path.clone()),
-        ..ServeOverrides::default()
-    })
-    .unwrap_err();
-
-    fs::remove_file(path).unwrap();
-
-    assert!(
-        error
-            .to_string()
-            .contains("sqlite storage only supports frames.backend = 'memory'")
-    );
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    visit(&root.join("examples"), &mut files)?;
+    visit(&root.join("bench"), &mut files)?;
+    files.sort();
+    let mut servers = 0;
+    let mut workers = 0;
+    for path in files {
+        let raw = fs::read_to_string(&path)?;
+        let value: toml::Value =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("Cargo.toml" | "pyproject.toml")
+        ) {
+            continue;
+        }
+        // Deserialize the actual schemas without requiring host-specific auth
+        // environment variables or starting a backend.
+        if value.get("base_url").is_some() {
+            crate::worker::validate_config(&raw)
+                .with_context(|| format!("worker schema {}", path.display()))?;
+            workers += 1;
+        } else {
+            super::file::AnyserveConfigFile::load(&path)
+                .with_context(|| format!("server schema {}", path.display()))?;
+            servers += 1;
+        }
+    }
+    assert!(servers > 0 && workers > 0);
+    Ok(())
 }

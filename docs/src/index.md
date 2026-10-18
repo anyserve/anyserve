@@ -1,46 +1,15 @@
 # Anyserve
 
-Serve Models Anywhere, Anytime, on Any Platform.
+Anyserve runs inference through workers on your own hosts and clusters. One
+control-plane Runtime owns routing, admission, attempts, cancellation and bounded
+output events; workers own their inference backends and connect outbound.
 
-Anyserve is a workload-neutral control plane for serving models across your own
-workers without rebuilding infrastructure for each workload.
+The control plane is a single process. Invoke handles ephemeral live requests;
+Submit defaults to recoverable execution with complete input in an optional
+SQLite journal. A short restart can recover durable jobs within their attempt
+budget. Live output history and ephemeral jobs do not survive restart.
 
-The core model is intentionally workload-neutral:
-
-- jobs declare an `interface_name`
-- jobs express `Demand` through attributes and capacity keys
-- workers expose `Supply` through interfaces, attributes, and available capacity
-- the kernel issues leases, collects events, and requeues expired work
-
-The smallest runtime is zero-dependency:
-
-- in-memory control-plane metadata
-- in-memory frames
-- basic scheduler
-- inline object payloads
-
-Anyserve also supports:
-
-- `sqlite + memory` for single-machine durable metadata
-- `postgres + memory` for single-machine PostgreSQL-backed metadata
-- `postgres + redis` for multi-instance deployments
-
-Higher-level workload semantics can live above this core instead of being hard-coded into it.
-
-The runtime surface is pure gRPC:
-
-- control plane APIs
-- worker APIs
-- gRPC health service
-
-Examples may still use endpoint strings such as `http://127.0.0.1:50052`. In this codebase that is a gRPC channel URI for the client transport, not a REST API base URL.
-
-## Production Surface
-
-The kernel stays generic, but the production surface should feel concrete:
-
-- create a production-grade inference endpoint in front of your own workers
-- start with a single-region quickstart
-- hide the scheduling internals behind an endpoint, API key, worker connect flow, and dashboard
-
-See [Create Gateway](create-gateway.md) for the concrete production surface and dashboard shape.
+Start with [usage](usage.md), the [architecture](architecture.md), and
+[configuration](configuration.md). Existing [Ollama](ollama.md) and
+[edge](edge.md) walkthroughs use the same execution runtime. The
+[acceptance records](redesign.md) describe what has actually been verified.

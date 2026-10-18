@@ -16,7 +16,7 @@ import {
   ObjectRefList,
   PreviewMeta,
 } from "./pane-inspector-details";
-import { AttemptsTimeline, EventsTimeline, StreamsTimeline } from "./pane-inspector-timeline";
+import { AttemptsTimeline, EventsTimeline } from "./pane-inspector-timeline";
 import type { JobDetailResponse, JobState } from "./types";
 
 export function JobInspector(props: {
@@ -76,16 +76,16 @@ export function JobInspector(props: {
 
       <InspectorGroup
         title="Payload"
-        meta="Demand, request preview, and persisted artifacts"
+        meta="Retained request and result previews"
       >
         <InspectorSection title="Demand">
-          <InlineList
+          {detail.job.demand && detail.job.policy ? <InlineList
             values={[
               `required ${formatCapacityMap(detail.job.demand.required_capacity)}`,
               `attrs ${formatCapacityMap(detail.job.demand.required_attributes)}`,
               `priority ${detail.job.policy.priority}`,
             ]}
-          />
+          /> : <EmptyState message="Request specification is no longer retained in memory." compact />}
         </InspectorSection>
 
         <InspectorSection title="Request">
@@ -105,11 +105,11 @@ export function JobInspector(props: {
         </InspectorSection>
 
         <InspectorSection title="Inputs">
-          <ObjectRefList objects={detail.job.inputs} emptyMessage="No persisted inputs" />
+          <ObjectRefList objects={detail.job.inputs} emptyMessage="No retained inputs; terminal jobs release input data" />
         </InspectorSection>
 
         <InspectorSection title="Outputs">
-          <ObjectRefList objects={detail.job.outputs} emptyMessage="No persisted outputs" />
+          <ObjectRefList objects={detail.job.outputs} emptyMessage="No retained outputs" />
         </InspectorSection>
 
         <InspectorSection title="Response">
@@ -136,14 +136,11 @@ export function JobInspector(props: {
 
       <InspectorGroup
         title="Execution"
-        meta="Attempts, streams, events, and runtime diagnostics"
+        meta="Attempts and retained execution events"
       >
         <InspectorSection title="Attempts">
+          {detail.history_incomplete ? <p role="status">历史不完整 / Incomplete history: earlier execution events are no longer retained.</p> : null}
           <AttemptsTimeline attempts={detail.attempts} />
-        </InspectorSection>
-
-        <InspectorSection title="Streams">
-          <StreamsTimeline streams={detail.streams} />
         </InspectorSection>
 
         <InspectorSection title="Events">

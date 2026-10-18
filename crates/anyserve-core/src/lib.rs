@@ -1,12 +1,9 @@
 pub mod auth;
-pub mod frame;
-pub mod kernel;
-pub mod model;
-pub mod notify;
-pub mod scheduler;
-pub mod service;
-pub mod sql_store;
-pub mod store;
+pub mod client_service;
+pub mod error;
+pub mod journal;
+pub mod runtime;
+pub mod worker_service;
 
 /// Milliseconds since the Unix epoch for persisted record timestamps.
 pub fn now_ms() -> u64 {

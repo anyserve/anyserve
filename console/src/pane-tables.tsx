@@ -99,10 +99,10 @@ export function WorkersTable(props: { workers: WorkerSummary[]; emptyMessage: st
               </td>
               <td>{worker.interfaces.join(", ") || "None"}</td>
               <td>
-                {worker.active_leases} / {worker.max_active_leases}
+                {worker.active_leases} / {worker.max_concurrency}
               </td>
               <td className="table__mono">
-                {formatCapacityMap(worker.available_capacity)}
+                {worker.free_slots} free slots
                 <div className="table__secondary">
                   total {formatCapacityMap(worker.total_capacity)}
                 </div>
@@ -133,7 +133,7 @@ function StateBadge(props: { state: JobState }) {
 function WorkerBadge(props: { healthy: boolean }) {
   return (
     <span className={`badge ${props.healthy ? "badge--healthy" : "badge--expired"}`}>
-      {props.healthy ? "healthy" : "expired"}
+      {props.healthy ? "healthy" : "unavailable"}
     </span>
   );
 }

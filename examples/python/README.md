@@ -35,9 +35,10 @@ The submitter uses the low-level `AnyserveClient` API.
 
 ## Real-Time Video Streaming Demo
 
-This demo keeps one Anyserve job open and streams every captured frame through the data plane.
-Frames stay in memory and are encoded to JPEG for transport. The worker processes each frame,
-returns an annotated frame on a second stream, and the client displays the returned video.
+This existing demo uses ephemeral duplex Invoke for JPEG frames and annotated
+output events. It rotates invocations before the input replay budget fills, and
+processes each frame before sending the next one. Video processing requires the
+optional OpenCV and model dependencies.
 
 Install the extra demo dependencies:
 
@@ -84,5 +85,5 @@ uv run python video_stream_worker.py --model yolo11s.pt --tracker bytetrack.yaml
 uv run python video_stream_client.py --source ./demo.mp4 --headless --max-frames 120
 ```
 
-Press `q` in the OpenCV window to stop the client and close the input stream. The worker will
-finish the lease after it drains the final frames and closes the output stream.
+Press `q` in the OpenCV window to stop capture and finish the current invocation.
+Closing an active invocation cancels it. No named input/output streams are used.

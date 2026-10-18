@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let proto_dir = manifest_dir.join("protos");
-    let proto = proto_dir.join("grpc_service.proto");
-    println!("cargo:rerun-if-changed={}", proto.display());
-
-    tonic_build::configure().compile_protos(&[proto], &[proto_dir])?;
-
+    let proto_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("protos");
+    let protos = [proto_dir.join("execution.proto")];
+    for proto in &protos {
+        println!("cargo:rerun-if-changed={}", proto.display());
+    }
+    tonic_build::configure()
+        .bytes([".anyserve.v2"])
+        .compile_protos(&protos, &[proto_dir])?;
     Ok(())
 }

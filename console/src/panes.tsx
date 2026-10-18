@@ -49,7 +49,7 @@ export function WorkersPane(props: {
 }) {
   const { overview, workers } = props;
   const healthyWorkers = workers.filter((worker) => worker.healthy);
-  const expiredWorkers = workers.filter((worker) => !worker.healthy);
+  const unavailableWorkers = workers.filter((worker) => !worker.healthy);
 
   return (
     <section className="panel panel--full">
@@ -57,7 +57,7 @@ export function WorkersPane(props: {
         stats={[
           { label: "Workers", value: overview?.workers.total ?? 0 },
           { label: "Healthy", value: overview?.workers.healthy ?? 0 },
-          { label: "Expired", value: overview?.workers.expired ?? 0 },
+          { label: "Unavailable", value: overview?.workers.unavailable ?? 0 },
           { label: "Active leases", value: overview?.workers.active_leases ?? 0 },
         ]}
       />
@@ -66,7 +66,7 @@ export function WorkersPane(props: {
         title="Workers"
         meta={
           overview
-            ? `Capacity ${formatCapacityMap(overview.workers.available_capacity)} available`
+            ? `Capacity ${formatCapacityMap(overview.workers.total_capacity)} total`
             : "Loading"
         }
       />
@@ -84,14 +84,14 @@ export function WorkersPane(props: {
         </WorkerSection>
 
         <WorkerSection
-          title="Expired workers"
+          title="Unavailable workers"
           meta={
-            expiredWorkers.length > 0
-              ? "Retained for history, not eligible for new leases"
-              : "No expired workers"
+            unavailableWorkers.length > 0
+              ? "Disconnected or draining sessions"
+              : "No unavailable workers"
           }
         >
-          <WorkersTable workers={expiredWorkers} emptyMessage="No expired workers" />
+          <WorkersTable workers={unavailableWorkers} emptyMessage="No unavailable workers" />
         </WorkerSection>
       </div>
     </section>

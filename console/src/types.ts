@@ -1,38 +1,6 @@
-export type JobState =
-  | "pending"
-  | "leased"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "cancelled";
-
-export type AttemptState =
-  | "created"
-  | "leased"
-  | "running"
-  | "succeeded"
-  | "failed"
-  | "expired"
-  | "cancelled";
-
-export type StreamScope = "job" | "attempt" | "lease";
-export type StreamDirection =
-  | "client_to_worker"
-  | "worker_to_client"
-  | "bidirectional"
-  | "internal";
-export type StreamState = "open" | "closing" | "closed" | "error";
-export type EventKind =
-  | "accepted"
-  | "lease_granted"
-  | "started"
-  | "progress"
-  | "output_ready"
-  | "succeeded"
-  | "failed"
-  | "cancelled"
-  | "lease_expired"
-  | "requeued";
+export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+export type AttemptState = "assigned" | "restarted" | "succeeded" | "failed" | "cancelled";
+export type EventKind = "accepted" | "assigned" | "output" | "progress" | "attempt_restarted" | "finished";
 
 export type CapacityMap = Record<string, number>;
 export type MetadataMap = Record<string, string>;
@@ -40,17 +8,13 @@ export type MetadataMap = Record<string, string>;
 export interface RuntimeModeSummary {
   code:
     | "memory"
-    | "memory_plus_postgres"
-    | "memory_plus_sqlite"
-    | "postgres_and_redis";
+    | "memory_plus_sqlite";
   label: string;
-  storage_backend: string;
-  frame_backend: string;
+  journal: "disabled" | "sqlite";
 }
 
 export interface QueueSummary {
-  pending: number;
-  leased: number;
+  queued: number;
   running: number;
   active: number;
 }
@@ -65,10 +29,9 @@ export interface HistorySummary {
 export interface WorkerRollup {
   total: number;
   healthy: number;
-  expired: number;
+  unavailable: number;
   active_leases: number;
   total_capacity: CapacityMap;
-  available_capacity: CapacityMap;
   last_seen_at_ms: number | null;
 }
 
@@ -97,9 +60,7 @@ export interface JobSummary {
 
 export interface JobsResponse {
   jobs: JobSummary[];
-  total: number;
-  limit: number;
-  offset: number;
+  next_page_token: string | null;
 }
 
 export interface ObjectRefSummary {
@@ -120,6 +81,7 @@ export interface InlinePreviewSummary {
 }
 
 export interface Demand {
+  interface: string;
   required_attributes: MetadataMap;
   preferred_attributes: MetadataMap;
   required_capacity: CapacityMap;
@@ -127,7 +89,12 @@ export interface Demand {
 
 export interface ExecutionPolicy {
   priority: number;
-  lease_ttl_secs: number;
+  max_attempts: number | null;
+  durability: "Ephemeral" | "Durable" | null;
+  queue_timeout: { secs: number; nanos: number } | null;
+  execution_timeout: { secs: number; nanos: number } | null;
+  total_timeout: { secs: number; nanos: number } | null;
+  spillover_after: { secs: number; nanos: number } | null;
 }
 
 export interface JobDetail {
@@ -139,13 +106,11 @@ export interface JobDetail {
   updated_at_ms: number;
   duration_ms: number | null;
   current_attempt_id: string | null;
-  lease_id: string | null;
-  version: number;
   last_error: string | null;
   metadata: MetadataMap;
-  demand: Demand;
-  policy: ExecutionPolicy;
-  params_size_bytes: number;
+  demand: Demand | null;
+  policy: ExecutionPolicy | null;
+  params_size_bytes: number | null;
   params_preview: string | null;
   params_truncated: boolean;
   output_preview: InlinePreviewSummary | null;
@@ -157,27 +122,10 @@ export interface AttemptSummary {
   attempt_id: string;
   state: AttemptState;
   worker_id: string | null;
-  lease_id: string | null;
   created_at_ms: number;
-  started_at_ms: number | null;
   finished_at_ms: number | null;
   duration_ms: number | null;
   last_error: string | null;
-  metadata: MetadataMap;
-}
-
-export interface StreamSummary {
-  stream_id: string;
-  stream_name: string;
-  scope: StreamScope;
-  direction: StreamDirection;
-  state: StreamState;
-  attempt_id: string | null;
-  lease_id: string | null;
-  created_at_ms: number;
-  closed_at_ms: number | null;
-  last_sequence: number;
-  metadata: MetadataMap;
 }
 
 export interface JobEventSummary {
@@ -185,7 +133,6 @@ export interface JobEventSummary {
   kind: EventKind;
   created_at_ms: number;
   payload_size_bytes: number;
-  metadata: MetadataMap;
 }
 
 export interface WorkerSummary {
@@ -194,14 +141,13 @@ export interface WorkerSummary {
   interfaces: string[];
   attributes: MetadataMap;
   total_capacity: CapacityMap;
-  available_capacity: CapacityMap;
-  max_active_leases: number;
+  max_concurrency: number;
+  free_slots: number;
+  utilization: number;
+  connected: boolean;
+  draining: boolean;
   active_leases: number;
-  registered_at_ms: number;
   last_seen_at_ms: number;
-  expires_at_ms: number;
-  spec_metadata: MetadataMap;
-  status_metadata: MetadataMap;
 }
 
 export interface WorkersResponse {
@@ -213,7 +159,7 @@ export interface WorkersResponse {
 export interface JobDetailResponse {
   job: JobDetail;
   attempts: AttemptSummary[];
-  streams: StreamSummary[];
+  history_incomplete: boolean;
   events: JobEventSummary[];
   latest_worker: WorkerSummary | null;
 }

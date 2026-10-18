@@ -1,161 +1,56 @@
-# anyserve Python Bindings
+# Anyserve Python SDK
 
-This package provides high-performance Python bindings for AnyServe.
-Its transport implementation comes from `crates/anyserve-client`; the public package adds
-the low-level `AnyserveClient` surface and higher-level worker helpers on top.
+The package uses the native Rust transport for the current execution protocol.
+Use the SDK and control-plane binary from the same release. Python 3.12+ is
+required; the 0.4 control-plane protocol is not supported by this source tree.
 
-## Install
+Install from this checkout with `pip install ./clients/python`. Build and test
+instructions are in [the workspace testing guide](../../docs/src/testing.md).
 
-From PyPI:
+## Client execution
 
-```bash
-pip install anyserve-runtime
-```
+`ExecutionClient` (also exported as `AnyserveClient` in Python) provides:
 
-The published distribution name is `anyserve-runtime`, while the import package remains:
+- `submit(interface, inputs, job_id=..., options=...)`: complete-input submission,
+  durable by default. An explicit ID is idempotent for the same specification.
+- `invoke(interface, inputs, options=...)`: ephemeral execution events.
+- `invoke_stream(interface, options=...)`: duplex invocation; call `send` and
+  `finish_input`, and iterate the returned execution events. Closing the context
+  cancels unfinished execution and closes both transport directions.
+- `execute(...)`: collect an ephemeral invocation's terminal outputs.
+- `get`, `watch`, `cancel` and `result`: inspect or follow an accepted job.
 
-```python
-import anyserve
-```
+Inputs are bytes or object dictionaries from `inline_object` / `uri_object`.
+`ExecutionOptions` carries required/preferred attributes, resource quantities,
+metadata, params, priority, timeouts and `max_attempts` (zero means server default).
+URI objects remain opaque references; the SDK does not automatically fetch them.
 
-From a local wheel:
+Pass `token=` or set `ANYSERVE_TOKEN` to a client bearer token. `RpcError` preserves
+the numeric gRPC status in `status_code`. `result()` reads the job once and, if it
+is still running, follows `watch(job_id, after_sequence=0)` until Finished.
+A zero cursor starts at the earliest retained event, including after recovery;
+expired nonzero cursors report cursor expiry. Use event streams as context managers
+when you may stop reading before Finished. Durable jobs require an enabled
+journal; live output history is bounded and does not survive restart.
 
-```bash
-pip install target/wheels/anyserve_runtime-*.whl
-```
+## Workers
 
-From local source:
+The existing [worker](../../examples/python/worker.py) and
+[submitter](../../examples/python/submit.py) use the current API. `@worker` declares
+an interface, attributes, capacity, codec and concurrency; `serve` runs the
+outbound control session and bounded handler pool. Normal return values become
+terminal outputs; generators produce output events. `pass_context=True` exposes
+cancellation and assignment metadata. `streaming_input=True` supplies input
+fragments without waiting for InputEnd.
 
-```bash
-pip install ./clients/python
-```
+Use a worker-role token. Permanent connection errors (InvalidArgument,
+PermissionDenied, Unauthenticated) propagate to the caller. Transport failures
+are logged and reconnect; a server Drain stops this session's new assignments,
+and the worker reconnects when the session ends. It keeps in-flight handlers
+until completion or cancellation/fencing from the server. Python callbacks cancel
+cooperatively. A local interrupt stops serving.
 
-Source installs build the native extension locally, so they require a working Rust toolchain on `PATH`.
-
-The top-level `AnyserveClient` exposes the generic control-plane surface.
-
-It also includes a high-level worker API for function-style handlers:
-
-```python
-from anyserve import serve, worker
-
-
-@worker(
-    interface="demo.echo.v1",
-    attributes={"runtime": "python"},
-    capacity={"slot": 1},
-    codec="bytes",
-)
-def echo(payload: bytes) -> bytes:
-    return payload
-
-
-serve(echo, endpoint="http://127.0.0.1:50052")
-```
-
-Examples use endpoint strings like `http://127.0.0.1:50052` because the bindings connect through a gRPC channel URI. This is not a REST base URL.
-
-`serve(...)` accepts inline input objects or waits for the configured input
-stream to be opened and closed before calling the handler. For an empty input,
-submit `inline_object(b"")` or close an empty stream. URI inputs require a custom
-worker that resolves them. Long-polls and streaming reads can share a client
-with heartbeat calls from another thread.
-
-## API Surface
-
-- `submit_job`
-- `watch_job`
-- `list_jobs`
-- `get_job`
-- `cancel_job`
-- `get_attempt`
-- `list_attempts`
-- `register_worker`
-- `heartbeat_worker`
-- `poll_lease`
-- `renew_lease`
-- `report_event`
-- `complete_lease`
-- `fail_lease`
-- `open_stream`
-- `get_stream`
-- `list_streams`
-- `close_stream`
-- `push_frames`
-- `pull_frames`
-
-`watch_job(...)` and `pull_frames(...)` return iterators so the Python API preserves streaming
-semantics instead of materializing the full stream into a list.
-
-It also includes two convenience constructors:
-
-- `inline_object(...)`
-- `uri_object(...)`
-
-And high-level worker helpers:
-
-- `worker(...)`
-- `serve(...)`
-- `get_handler_spec(...)`
-
-## Local Development
-
-Build and install from local source into the active environment:
-
-```bash
-pip install ./clients/python
-```
-
-Or install the extension directly into the active environment through `maturin`:
-
-```bash
-python3 -m pip install --user maturin
-python3 -m maturin develop --manifest-path clients/python/Cargo.toml
-```
-
-Live end-to-end validation:
-
-```bash
-source "$HOME/.cargo/env"
-cargo build --workspace
-python clients/python/tests/sdk_e2e.py
-```
-
-## PyPI Publishing
-
-The repository is set up to publish the Python package through PyPI Trusted Publishing.
-
-- PyPI project name: `anyserve-runtime`
-- GitHub repository: `anyserve/anyserve`
-- Workflow path: `.github/workflows/python-publish.yml`
-- GitHub environment: `pypi`
-
-For the first release, create a pending Trusted Publisher for `anyserve-runtime` on PyPI,
-then run the publish workflow or push a `v*` tag.
-
-## Example
-
-Low-level submitter example:
-
-```python
-from anyserve import AnyserveClient, FRAME_DATA
-
-client = AnyserveClient("http://127.0.0.1:50052")
-# Assumes the control plane and a compatible worker are already running.
-
-job = client.submit_job(
-    interface_name="demo.echo.v1",
-    required_attributes={"runtime": "demo"},
-    required_capacity={"slot": 1},
-)
-
-stream = client.open_stream(job["job_id"], "input.default")
-client.push_frames(
-    stream["stream_id"],
-    [(FRAME_DATA, b"hello from python", {})],
-)
-client.close_stream(stream["stream_id"])
-
-for event in client.watch_job(job["job_id"]):
-    print(event["kind"], event["metadata"])
-```
+The native attempt transport retries delivery with exponential backoff and
+jitter, bounded by four negotiated heartbeat timeouts per open/commit operation.
+Job deadlines are enforced by the server. Re-sending a completed result does not
+run the handler again or wait for input replay to finish.
