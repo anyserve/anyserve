@@ -241,8 +241,8 @@ impl AnyserveClient {
             .await
             .context("connect anyserve gRPC endpoint")?;
         let inner = ControlPlaneServiceClient::with_interceptor(channel, BearerAuth::new(token)?)
-            .max_decoding_message_size(64 * 1024 * 1024)
-            .max_encoding_message_size(64 * 1024 * 1024);
+            .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
         Ok(Self { endpoint, inner })
     }
 

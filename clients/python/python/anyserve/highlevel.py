@@ -179,7 +179,9 @@ def _process_grant(
     state.start(lease_id)
     try:
         worker_client.report_event(worker_id, lease_id, _EVENT_STARTED)
-        payload = _read_input_payload(worker_client, job["job_id"], spec.input_stream)
+        payload = _read_input_payload(worker_client, job, spec.input_stream)
+        if payload is None:
+            return
         input_value = _decode_payload(spec.codec, payload)
         output_value = handler(input_value)
         output_payload = _encode_payload(spec.codec, output_value)
@@ -253,17 +255,40 @@ def _heartbeat_loop(
             pass
 
 
-def _read_input_payload(worker_client: Any, job_id: str, stream_name: str) -> bytes:
-    streams = worker_client.list_streams(job_id)
-    stream = next((item for item in streams if item["stream_name"] == stream_name), None)
-    if stream is None:
-        return b""
+def _read_input_payload(
+    worker_client: Any, job: dict[str, Any], stream_name: str
+) -> Optional[bytes]:
+    inputs = job.get("spec", {}).get("inputs", [])
+    if inputs:
+        if any(item.get("inline") is None for item in inputs):
+            raise ValueError("serve(...) only supports inline inputs or input streams")
+        return b"".join(item["inline"] for item in inputs)
 
-    frames = worker_client.pull_frames(stream["stream_id"])
+    # SubmitJob makes work immediately assignable. The submitter may still be
+    # opening its input stream, so absence does not mean an empty payload.
+    while True:
+        streams = worker_client.list_streams(job["job_id"])
+        stream = next((item for item in streams if item["stream_name"] == stream_name), None)
+        if stream is not None:
+            break
+        current = worker_client.get_job(job["job_id"])
+        if (
+            current["state"] not in {"leased", "running"}
+            or current.get("lease_id") != job.get("lease_id")
+        ):
+            return None
+        time.sleep(0.05)
+
+    frames = worker_client.pull_frames(stream["stream_id"], follow=True)
     payload = bytearray()
     for frame in frames:
         if frame["kind"] == _FRAME_DATA:
             payload.extend(frame["payload"])
+        elif frame["kind"] == "error":
+            raise RuntimeError(frame["payload"].decode("utf-8", errors="replace"))
+    current = worker_client.get_job(job["job_id"])
+    if current.get("lease_id") != job.get("lease_id"):
+        return None
     return bytes(payload)
 
 

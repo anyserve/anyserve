@@ -25,7 +25,6 @@ pub struct Kernel {
     frame_plane: Arc<dyn FramePlane>,
     notifier: Arc<dyn ClusterNotifier>,
     scheduler: Arc<dyn Scheduler>,
-    stream_cache: Mutex<BTreeMap<String, StreamRecord>>,
     heartbeat_ttl_secs: u64,
     default_lease_ttl_secs: u64,
     watch_poll_interval_ms: u64,
@@ -128,7 +127,6 @@ impl Kernel {
             frame_plane,
             notifier,
             scheduler,
-            stream_cache: Mutex::new(BTreeMap::new()),
             heartbeat_ttl_secs,
             default_lease_ttl_secs,
             watch_poll_interval_ms,
@@ -228,11 +226,6 @@ impl Kernel {
             .state_store
             .purge_terminal_jobs(now_ms().saturating_sub(retention_ms))
             .await?;
-        let mut cache = self.stream_cache.lock().await;
-        for stream_id in &removed {
-            cache.remove(stream_id);
-        }
-        drop(cache);
         for stream_id in &removed {
             self.frame_plane.forget_stream(stream_id).await?;
         }
@@ -860,7 +853,6 @@ impl Kernel {
         };
         self.state_store.create_stream(stream.clone()).await?;
         self.frame_plane.stream_created(&stream).await?;
-        self.cache_stream(&stream).await;
         self.publish_job_streams_best_effort(&stream.job_id).await;
         Ok(stream)
     }
@@ -886,7 +878,6 @@ impl Kernel {
                 stream.last_sequence = last_sequence;
             }
         }
-        self.cache_streams(&streams).await;
         Ok(streams)
     }
 
@@ -921,7 +912,6 @@ impl Kernel {
         stream.metadata.extend(metadata);
         self.state_store.update_stream(stream.clone()).await?;
         self.frame_plane.stream_updated(&stream).await?;
-        self.cache_stream(&stream).await;
         self.persist_default_input_stream(&stream).await?;
         self.publish_job_streams_best_effort(&stream.job_id).await;
         Ok(stream)
@@ -952,7 +942,6 @@ impl Kernel {
                 stream.last_sequence = frame.sequence;
                 self.state_store.update_stream(stream.clone()).await?;
                 self.frame_plane.stream_updated(&stream).await?;
-                self.cache_stream(&stream).await;
                 self.persist_default_input_stream(&stream).await?;
                 self.publish_job_streams_best_effort(&stream.job_id).await;
             }
@@ -962,7 +951,6 @@ impl Kernel {
                 stream.last_sequence = frame.sequence;
                 self.state_store.update_stream(stream.clone()).await?;
                 self.frame_plane.stream_updated(&stream).await?;
-                self.cache_stream(&stream).await;
                 self.publish_job_streams_best_effort(&stream.job_id).await;
             }
             _ => {}
@@ -1002,31 +990,11 @@ impl Kernel {
     }
 
     async fn load_stream_record(&self, stream_id: &str) -> Result<StreamRecord> {
-        if let Some(stream) = self.stream_cache.lock().await.get(stream_id).cloned() {
-            return Ok(stream);
-        }
-
-        let stream = self
-            .state_store
+        // Stream state can change on another control-plane instance.
+        self.state_store
             .get_stream(stream_id)
             .await?
-            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))?;
-        self.cache_stream(&stream).await;
-        Ok(stream)
-    }
-
-    async fn cache_stream(&self, stream: &StreamRecord) {
-        self.stream_cache
-            .lock()
-            .await
-            .insert(stream.stream_id.clone(), stream.clone());
-    }
-
-    async fn cache_streams(&self, streams: &[StreamRecord]) {
-        let mut cache = self.stream_cache.lock().await;
-        for stream in streams {
-            cache.insert(stream.stream_id.clone(), stream.clone());
-        }
+            .ok_or_else(|| anyhow!("stream '{}' does not exist", stream_id))
     }
 
     async fn persist_default_input_stream(&self, stream: &StreamRecord) -> Result<()> {
@@ -1213,7 +1181,6 @@ impl Kernel {
                 self.state_store.update_stream(stream.clone()).await?;
             }
             self.frame_plane.stream_updated(&stream).await?;
-            self.cache_stream(&stream).await;
             self.publish_job_streams_best_effort(&stream.job_id).await;
         }
         Ok(())

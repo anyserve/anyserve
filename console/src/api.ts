@@ -7,11 +7,16 @@ import type {
 } from "./types";
 
 const apiBase = (import.meta.env.VITE_CONSOLE_API_BASE_URL ?? "").replace(/\/$/, "");
+const tokenKey = "anyserve.console.token";
+
+export class AuthenticationError extends Error {}
+
+export function setConsoleToken(token: string): void {
+  sessionStorage.setItem(tokenKey, token.trim());
+}
 
 interface ApiErrorPayload {
-  error?: {
-    message?: string;
-  };
+  error?: string | { message?: string };
 }
 
 function apiUrl(path: string): string {
@@ -19,10 +24,12 @@ function apiUrl(path: string): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = sessionStorage.getItem(tokenKey);
   const response = await fetch(apiUrl(path), {
     ...init,
     headers: {
       Accept: "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -31,11 +38,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let message = `${response.status} ${response.statusText}`;
     try {
       const payload = (await response.json()) as ApiErrorPayload;
-      if (payload.error?.message) {
+      if (typeof payload.error === "string") {
+        message = payload.error;
+      } else if (payload.error?.message) {
         message = payload.error.message;
       }
     } catch {
       // Ignore non-JSON error bodies.
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new AuthenticationError(message);
     }
     throw new Error(message);
   }

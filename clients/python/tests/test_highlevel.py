@@ -12,6 +12,7 @@ class StopServing(KeyboardInterrupt):
 class FakeWorkerClient:
     def __init__(self, grants, streams, frames) -> None:
         self._grants = list(grants)
+        self._jobs = {grant["job"]["job_id"]: grant["job"] for grant in self._grants}
         self._streams = dict(streams)
         self._frames = dict(frames)
         self.register_calls = []
@@ -50,6 +51,9 @@ class FakeWorkerClient:
 
     def list_streams(self, job_id):
         return list(self._streams.get(job_id, []))
+
+    def get_job(self, job_id):
+        return self._jobs[job_id]
 
     def pull_frames(self, stream_id, after_sequence=0, follow=False):
         return iter(self._frames.get(stream_id, []))
@@ -137,7 +141,7 @@ def _grant(job_id="job-1", attempt_id="attempt-1", lease_id="lease-1"):
     return {
         "lease": {"lease_id": lease_id, "job_id": job_id, "worker_id": "worker-1"},
         "attempt": {"attempt_id": attempt_id, "job_id": job_id, "worker_id": "worker-1", "lease_id": lease_id},
-        "job": {"job_id": job_id, "spec": {}, "state": "leased"},
+        "job": {"job_id": job_id, "lease_id": lease_id, "spec": {}, "state": "leased"},
     }
 
 
@@ -232,7 +236,7 @@ class HighLevelTests(unittest.TestCase):
 
         client = FakeWorkerClient(
             grants=[_grant(job_id="job-json", attempt_id="attempt-json", lease_id="lease-json")],
-            streams={"job-json": []},
+            streams={"job-json": [{"stream_id": "input-json", "stream_name": "input.default"}]},
             frames={},
         )
 
@@ -252,6 +256,35 @@ class HighLevelTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             serve(raw_handler, client=client)
         self.assertEqual(client.register_calls, [])
+
+    def test_cancelled_job_does_not_run_handler_while_waiting_for_input(self):
+        calls = []
+
+        @worker(interface="demo.echo.v1")
+        def echo(payload):
+            calls.append(payload)
+            return payload
+
+        client = FakeWorkerClient(grants=[_grant()], streams={}, frames={})
+        client._jobs["job-1"] = {"state": "cancelled", "lease_id": None}
+        with self.assertRaises(StopServing):
+            serve(echo, client=client)
+        self.assertEqual(calls, [])
+        self.assertEqual(client.complete_calls, [])
+        self.assertEqual(client.fail_calls, [])
+
+    def test_uri_input_fails_explicitly(self):
+        @worker(interface="demo.echo.v1")
+        def echo(payload):
+            return payload
+
+        grant = _grant()
+        grant["job"]["spec"]["inputs"] = [{"uri": "file:///tmp/example"}]
+        client = FakeWorkerClient(grants=[grant], streams={}, frames={})
+        with self.assertRaises(StopServing):
+            serve(echo, client=client)
+        self.assertEqual(client.complete_calls, [])
+        self.assertIn("only supports inline inputs or input streams", client.fail_calls[0]["reason"])
 
 
 if __name__ == "__main__":

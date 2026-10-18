@@ -1,6 +1,8 @@
 mod api;
 mod handlers;
 mod snapshot;
+#[cfg(test)]
+mod tests;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,6 +11,7 @@ use anyhow::{Context, Result};
 use axum::serve;
 use tokio::sync::watch;
 
+use anyserve_core::auth::AuthPolicy;
 use anyserve_core::kernel::Kernel;
 
 use crate::serve_config::{RuntimeMode, ServeConsoleConfig};
@@ -21,6 +24,7 @@ pub async fn run_server(
     kernel: Arc<Kernel>,
     config: ServeConsoleConfig,
     runtime_mode: RuntimeMode,
+    auth: Arc<AuthPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let state = AppState {
@@ -32,7 +36,7 @@ pub async fn run_server(
         .await
         .with_context(|| format!("bind console listener {addr}"))?;
 
-    serve(listener, router(state))
+    serve(listener, router(state, auth))
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;
         })

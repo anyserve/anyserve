@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -11,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
+use anyserve_core::auth::AuthPolicy;
 use anyserve_core::model::JobState;
 
 use super::api::{
@@ -27,7 +30,7 @@ const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 200;
 const INLINE_PREVIEW_LIMIT_BYTES: usize = 4 * 1024;
 
-pub(crate) fn router(state: AppState) -> Router {
+pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
     let middleware_state = state.clone();
     Router::new()
         .route("/healthz", get(healthz))
@@ -37,6 +40,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/jobs/:job_id/cancel", post(cancel_job))
         .route("/api/workers", get(list_workers))
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            auth,
+            crate::edge_routing::require_client_token,
+        ))
         .layer(middleware::from_fn_with_state(
             middleware_state,
             cors_middleware,
@@ -277,7 +284,7 @@ async fn cors_middleware(
     );
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Accept, Content-Type"),
+        HeaderValue::from_static("Accept, Content-Type, Authorization"),
     );
 
     if let Some(origin) = origin
@@ -291,7 +298,7 @@ async fn cors_middleware(
     response
 }
 
-fn parse_states(raw: Option<&str>) -> Result<Option<Vec<JobState>>, ApiError> {
+pub(super) fn parse_states(raw: Option<&str>) -> Result<Option<Vec<JobState>>, ApiError> {
     let Some(raw) = raw else {
         return Ok(None);
     };

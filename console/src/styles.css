@@ -63,6 +63,39 @@ button {
   overflow: hidden;
 }
 
+.auth {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.auth__form {
+  display: grid;
+  gap: 16px;
+  width: min(100%, 360px);
+  padding: 28px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.auth__form h1 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.auth__form input,
+.auth__form button {
+  min-width: 0;
+  padding: 10px;
+}
+
+.auth__form p {
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
 .topbar {
   position: sticky;
   top: 0;

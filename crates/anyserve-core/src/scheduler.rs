@@ -90,10 +90,38 @@ fn preferred_attribute_matches(worker: &WorkerRecord, job: &JobRecord) -> usize 
         .count()
 }
 
-fn capacity_match(available: &Capacity, required: &Capacity) -> bool {
+pub(crate) fn capacity_match(available: &Capacity, required: &Capacity) -> bool {
     required
         .iter()
         .all(|(key, value)| available.get(key).copied().unwrap_or_default() >= *value)
+}
+
+/// Bound the worker's reported free capacity by resources not already leased.
+/// Heartbeats may already account for running work, so take the minimum rather
+/// than subtracting reservations from the reported free capacity a second time.
+pub(crate) fn unreserved_capacity<'a>(
+    worker: &WorkerRecord,
+    reservations: impl IntoIterator<Item = &'a Capacity>,
+) -> Capacity {
+    let mut remaining = worker.spec.total_capacity.clone();
+    for required in reservations {
+        for (key, amount) in required {
+            if let Some(available) = remaining.get_mut(key) {
+                *available = available.saturating_sub(*amount).max(0);
+            }
+        }
+    }
+    worker
+        .status
+        .available_capacity
+        .iter()
+        .map(|(key, reported)| {
+            (
+                key.clone(),
+                (*reported).min(remaining.get(key).copied().unwrap_or_default()),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
