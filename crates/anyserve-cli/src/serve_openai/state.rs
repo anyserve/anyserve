@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyserve_core::kernel::Kernel;
+use anyserve_core::runtime::Runtime;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -9,7 +9,7 @@ use crate::serve_config::ServeOpenAIConfig;
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    pub(super) kernel: Arc<Kernel>,
+    pub(super) runtime: Runtime,
     pub(super) config: Arc<ServeOpenAIConfig>,
 }
 
@@ -34,41 +34,24 @@ pub(super) struct OpenAIError {
     pub(super) code: &'static str,
 }
 
-pub(super) struct JobCancellationGuard {
-    kernel: Arc<Kernel>,
-    job_id: String,
-    active: bool,
-}
-
-impl JobCancellationGuard {
-    pub(super) fn new(kernel: Arc<Kernel>, job_id: String) -> Self {
-        Self {
-            kernel,
-            job_id,
-            active: true,
-        }
-    }
-
-    pub(super) fn disarm(&mut self) {
-        self.active = false;
-    }
-}
-
-impl Drop for JobCancellationGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-
-        let kernel = Arc::clone(&self.kernel);
-        let job_id = self.job_id.clone();
-        tokio::spawn(async move {
-            let _ = kernel.cancel_job(&job_id).await;
-        });
-    }
-}
-
 impl OpenAIError {
+    pub(super) fn runtime(error: anyserve_core::error::RuntimeError) -> Self {
+        Self {
+            status: crate::serve_execution::runtime_status(&error),
+            message: error.to_string(),
+            error_type: "server_error",
+            code: "runtime_error",
+        }
+    }
+    pub(super) fn execution(error: Option<&anyserve_core::runtime::api::ErrorInfo>) -> Self {
+        let mut response = Self::bad_gateway(
+            error
+                .map(|error| error.message.as_str())
+                .unwrap_or("execution cancelled"),
+        );
+        response.status = crate::serve_execution::execution_status(error);
+        response
+    }
     pub(super) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -93,15 +76,6 @@ impl OpenAIError {
             message: message.into(),
             error_type: "upstream_error",
             code: "bad_gateway",
-        }
-    }
-
-    pub(super) fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-            error_type: "server_error",
-            code: "internal_error",
         }
     }
 }

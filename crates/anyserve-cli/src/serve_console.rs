@@ -12,7 +12,7 @@ use axum::serve;
 use tokio::sync::watch;
 
 use anyserve_core::auth::AuthPolicy;
-use anyserve_core::kernel::Kernel;
+use anyserve_core::runtime::Runtime;
 
 use crate::serve_config::{RuntimeMode, ServeConsoleConfig};
 
@@ -21,16 +21,16 @@ use handlers::router;
 
 pub async fn run_server(
     addr: SocketAddr,
-    kernel: Arc<Kernel>,
+    runtime: Runtime,
     config: ServeConsoleConfig,
     runtime_mode: RuntimeMode,
     auth: Arc<AuthPolicy>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let state = AppState {
-        kernel,
+        runtime,
         allowed_origins: Arc::new(config.allowed_origins.into_iter().collect()),
-        runtime: runtime_mode_summary(runtime_mode),
+        mode: runtime_mode_summary(runtime_mode),
     };
     let listener = tokio::net::TcpListener::bind(addr)
         .await

@@ -12,7 +12,7 @@ use axum::Router;
 use tokio::sync::watch;
 
 use anyserve_core::auth::AuthPolicy;
-use anyserve_core::kernel::Kernel;
+use anyserve_core::runtime::Runtime;
 
 use crate::serve_config::ServeOpenAIConfig;
 
@@ -22,7 +22,7 @@ use state::AppState;
 
 pub async fn run_server(
     listen: std::net::SocketAddr,
-    kernel: Arc<Kernel>,
+    runtime: Runtime,
     config: ServeOpenAIConfig,
     auth: Arc<AuthPolicy>,
     mut shutdown: watch::Receiver<bool>,
@@ -31,7 +31,7 @@ pub async fn run_server(
         .await
         .with_context(|| format!("bind openai listener {listen}"))?;
 
-    axum::serve(listener, router(kernel, config, auth))
+    axum::serve(listener, router(runtime, config, auth))
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;
         })
@@ -39,9 +39,9 @@ pub async fn run_server(
         .context("run openai http server")
 }
 
-fn router(kernel: Arc<Kernel>, config: ServeOpenAIConfig, auth: Arc<AuthPolicy>) -> Router {
+fn router(runtime: Runtime, config: ServeOpenAIConfig, auth: Arc<AuthPolicy>) -> Router {
     let state = AppState {
-        kernel,
+        runtime: runtime.clone(),
         config: Arc::new(config),
     };
     Router::new()
@@ -53,6 +53,9 @@ fn router(kernel: Arc<Kernel>, config: ServeOpenAIConfig, auth: Arc<AuthPolicy>)
             axum::routing::post(chat_completions),
         )
         .route("/v1/embeddings", axum::routing::post(embeddings))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            runtime.config().limits.max_inline_object_bytes as usize,
+        ))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
             auth,

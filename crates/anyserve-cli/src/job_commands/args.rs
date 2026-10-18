@@ -22,8 +22,9 @@ pub(crate) enum OutputFormat {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum JobStateFilter {
-    Pending,
-    Leased,
+    #[value(alias = "pending")]
+    Queued,
+    #[value(alias = "leased")]
     Running,
     Succeeded,
     Failed,
@@ -34,6 +35,10 @@ pub(crate) enum JobStateFilter {
 pub(crate) struct JobLsArgs {
     #[arg(long = "state", value_enum)]
     pub(crate) states: Vec<JobStateFilter>,
+    #[arg(long, default_value_t = 100)]
+    pub(crate) limit: u32,
+    #[arg(long)]
+    pub(crate) page_token: Option<String>,
     #[command(flatten)]
     pub(crate) output: OutputArgs,
 }
@@ -58,4 +63,17 @@ pub(crate) struct JobCancelArgs {
     pub(crate) stdin: bool,
     #[command(flatten)]
     pub(crate) output: OutputArgs,
+}
+
+impl JobStateFilter {
+    pub(crate) fn protocol(self) -> i32 {
+        use anyserve_client::execution::v2::JobState;
+        (match self {
+            Self::Queued => JobState::Queued,
+            Self::Running => JobState::Running,
+            Self::Succeeded => JobState::Succeeded,
+            Self::Failed => JobState::Failed,
+            Self::Cancelled => JobState::Cancelled,
+        }) as i32
+    }
 }

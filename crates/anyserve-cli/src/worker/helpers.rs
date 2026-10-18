@@ -1,12 +1,7 @@
-use std::collections::HashMap;
-
 use anyhow::{Context, Result};
-use anyserve_client::{AnyserveClient, FrameWrite, StreamDirection, StreamOpen};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 
 use super::config::WorkerConfig;
-
-pub(crate) const DEFAULT_OUTPUT_STREAM: &str = "output.default";
 
 pub(crate) fn build_http_client(config: &WorkerConfig) -> Result<reqwest::Client> {
     let mut headers = HeaderMap::new();
@@ -21,28 +16,10 @@ pub(crate) fn build_http_client(config: &WorkerConfig) -> Result<reqwest::Client
         .default_headers(headers)
         .tcp_nodelay(true)
         .pool_max_idle_per_host(config.max_active_leases as usize)
-        .timeout(config.upstream_timeout)
+        .connect_timeout(config.upstream_timeout)
+        .read_timeout(config.upstream_timeout)
         .build()
         .context("build HTTP client")
-}
-
-pub(crate) async fn connect_client(
-    control_plane_endpoint: &str,
-    config: &WorkerConfig,
-) -> Result<AnyserveClient> {
-    AnyserveClient::connect_with_token(control_plane_endpoint.to_string(), config.token.as_deref())
-        .await
-}
-
-pub(crate) fn available_capacity(
-    total: &HashMap<String, i64>,
-    active_leases: u32,
-) -> HashMap<String, i64> {
-    let mut available = total.clone();
-    if let Some(slots) = available.get_mut("slot") {
-        *slots = (*slots - i64::from(active_leases)).max(0);
-    }
-    available
 }
 
 pub(crate) fn truncate(value: &str, limit: usize) -> String {
@@ -53,41 +30,74 @@ pub(crate) fn truncate(value: &str, limit: usize) -> String {
     chars.into_iter().take(limit).collect::<String>()
 }
 
-pub(crate) fn open_output_stream(
-    job_id: String,
-    worker_id: String,
-    lease_id: String,
-    attempt_id: String,
-) -> StreamOpen {
-    StreamOpen::job(
-        job_id,
-        DEFAULT_OUTPUT_STREAM,
-        StreamDirection::WorkerToClient,
-    )
-    .with_worker_id(worker_id)
-    .with_lease_id(lease_id)
-    .with_attempt_id(attempt_id)
-}
-
-pub(crate) fn frame_write_with_content_type(chunk: Vec<u8>, content_type: String) -> FrameWrite {
-    FrameWrite::data(chunk)
-        .with_metadata(HashMap::from([("content_type".to_string(), content_type)]))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use super::{available_capacity, truncate};
-
-    #[test]
-    fn llm_worker_reduces_slot_capacity_for_active_lease() {
-        let available = available_capacity(&HashMap::from([("slot".to_string(), 4)]), 2);
-        assert_eq!(available.get("slot").copied(), Some(2));
-    }
-
     #[test]
     fn truncate_keeps_short_values() {
-        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(super::truncate("hello", 10), "hello");
+    }
+    #[tokio::test]
+    async fn upstream_timeout_limits_inactivity_instead_of_stream_lifetime() {
+        use crate::test_support::{Backend, temporary_path};
+        use crate::worker::config::{WorkerArgs, load_config};
+        use axum::body::Body;
+        use std::time::Duration;
+
+        let backend = Backend::start(
+            axum::Router::new()
+                .route(
+                    "/active",
+                    axum::routing::get(|| async {
+                        Body::from_stream(async_stream::stream! {
+                            for _ in 0..5 {
+                                yield Ok::<_, std::convert::Infallible>("x");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        })
+                    }),
+                )
+                .route(
+                    "/idle",
+                    axum::routing::get(|| async {
+                        Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::convert::Infallible>("x");
+                            std::future::pending::<()>().await;
+                        })
+                    }),
+                ),
+        )
+        .await;
+        let path = temporary_path("worker-read-timeout.toml");
+        std::fs::write(&path, format!("base_url={:?}", backend.url)).unwrap();
+        let mut config = load_config(&WorkerArgs {
+            config: path.clone(),
+            worker_id: None,
+        })
+        .unwrap();
+        std::fs::remove_file(path).unwrap();
+        config.upstream_timeout = Duration::from_millis(300);
+        let client = super::build_http_client(&config).unwrap();
+        let started = tokio::time::Instant::now();
+        let bytes = client
+            .get(format!("{}/active", backend.url))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"xxxxx");
+        assert!(started.elapsed() > config.upstream_timeout);
+        assert!(
+            client
+                .get(format!("{}/idle", backend.url))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap_err()
+                .is_timeout()
+        );
     }
 }

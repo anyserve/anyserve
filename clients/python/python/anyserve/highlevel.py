@@ -3,20 +3,24 @@ from __future__ import annotations
 import functools
 import inspect
 import json
-import threading
 import time
+import threading
+import logging
+import os
+import socket
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from ._native import AnyserveClient
+from ._native import WorkerConnection
+
+_LOG = logging.getLogger(__name__)
+_PERMANENT_RPC_CODES = {3, 7, 16}
+_TRANSPORT_RPC_CODES = {1, 2, 4, 13, 14}
+_RETIRED_RPC_CODES = {9, 10}
 
 _CODEC_BYTES = "bytes"
 _CODEC_JSON = "json"
-_FRAME_DATA = "data"
-_STREAM_SCOPE_JOB = "job"
-_STREAM_DIRECTION_WORKER_TO_CLIENT = "worker_to_client"
-_EVENT_STARTED = "started"
-_EVENT_OUTPUT_READY = "output_ready"
 
 
 @dataclass(frozen=True)
@@ -26,9 +30,9 @@ class HandlerSpec:
     capacity: dict[str, int] = field(default_factory=dict)
     metadata: dict[str, str] = field(default_factory=dict)
     codec: str = _CODEC_BYTES
-    input_stream: str = "input.default"
-    output_stream: str = "output.default"
     max_active_leases: int = 1
+    pass_context: bool = False
+    streaming_input: bool = False
 
 
 class WorkerHandler:
@@ -41,25 +45,6 @@ class WorkerHandler:
         return self._fn(*args, **kwargs)
 
 
-@dataclass
-class _LeaseState:
-    active_lease_id: Optional[str] = None
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
-    def start(self, lease_id: str) -> None:
-        with self.lock:
-            self.active_lease_id = lease_id
-
-    def finish(self, lease_id: str) -> None:
-        with self.lock:
-            if self.active_lease_id == lease_id:
-                self.active_lease_id = None
-
-    def snapshot(self) -> Optional[str]:
-        with self.lock:
-            return self.active_lease_id
-
-
 def worker(
     *,
     interface: str,
@@ -67,9 +52,9 @@ def worker(
     capacity: Optional[dict[str, int]] = None,
     metadata: Optional[dict[str, str]] = None,
     codec: str = _CODEC_BYTES,
-    input_stream: str = "input.default",
-    output_stream: str = "output.default",
     max_active_leases: int = 1,
+    pass_context: bool = False,
+    streaming_input: bool = False,
 ) -> Callable[[Callable[[Any], Any]], WorkerHandler]:
     spec = _build_handler_spec(
         interface=interface,
@@ -77,9 +62,9 @@ def worker(
         capacity=capacity,
         metadata=metadata,
         codec=codec,
-        input_stream=input_stream,
-        output_stream=output_stream,
         max_active_leases=max_active_leases,
+        pass_context=pass_context,
+        streaming_input=streaming_input,
     )
 
     def decorator(fn: Callable[[Any], Any]) -> WorkerHandler:
@@ -100,193 +85,193 @@ def get_handler_spec(handler: Callable[[Any], Any]) -> HandlerSpec:
 
 
 def serve(
-    handler: Callable[[Any], Any],
-    endpoint: Optional[str] = None,
-    *,
-    worker_id: Optional[str] = None,
-    heartbeat_interval_secs: float = 5,
-    poll_interval_secs: float = 1,
-    long_poll_ms: int = 20_000,
-    client: Any = None,
+    handler: Callable[[Any], Any], endpoint: Optional[str] = None, *,
+    worker_id: Optional[str] = None, token: Optional[str] = None,
+    reconnect_interval_secs: float = 1.0, connection: Any = None,
 ) -> None:
+    """Run handlers over the outbound worker session with bounded concurrency.
+
+    A generator handler emits output frames. A normal return value becomes the
+    terminal result. Callbacks can observe cancellation through a context when
+    decorated with ``pass_context=True``; Python callbacks cancel cooperatively.
+    """
     spec = get_handler_spec(handler)
-    _validate_loop_intervals(heartbeat_interval_secs, poll_interval_secs)
-    if client is None:
-        if endpoint is None:
-            raise ValueError("endpoint is required when client is not provided")
-        worker_client = AnyserveClient(endpoint)
-    else:
-        worker_client = client
+    if reconnect_interval_secs <= 0:
+        raise ValueError("reconnect_interval_secs must be positive")
+    if connection is None and endpoint is None:
+        raise ValueError("endpoint is required")
+    worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
+    active: dict[str, tuple[Any, Future]] = {}
+    active_lock = threading.Lock()
+    credit_lock = threading.Lock()
+    pool = ThreadPoolExecutor(max_workers=spec.max_active_leases)
+    session_id = ""
+    conn = connection
+    credit_sent = False
+    session_draining = False
 
-    registered = worker_client.register_worker(
-        interfaces=[spec.interface],
-        attributes=dict(spec.attributes),
-        total_capacity=dict(spec.capacity),
-        max_active_leases=spec.max_active_leases,
-        metadata=dict(spec.metadata),
-        worker_id=worker_id,
-    )
-    registered_worker_id = registered["worker_id"]
+    def report_capacity(current: Any) -> None:
+        with credit_lock:
+            entries = _active_snapshot(active, active_lock)
+            free = 0 if session_draining or any(item.cancelled for _, (item, _) in entries) else spec.max_active_leases - len(entries)
+            current.credit(free)
 
-    state = _LeaseState()
-    stop_event = threading.Event()
-    heartbeat = threading.Thread(
-        target=_heartbeat_loop,
-        args=(
-            worker_client,
-            registered_worker_id,
-            spec,
-            state,
-            stop_event,
-            heartbeat_interval_secs,
-        ),
-        daemon=True,
-    )
-    heartbeat.start()
+    def completed(lease_id: str, future: Future) -> None:
+        with active_lock:
+            entry = active.pop(lease_id, None)
+        failure = None if future.cancelled() else future.exception()
+        if failure is not None and (entry is None or not entry[0].cancelled):
+            _LOG.warning("attempt %s ended: %s", lease_id, failure)
+        current = conn
+        if current is not None and entry is not None:
+            try:
+                if entry[0].cancelled:
+                    current.cancel_ack(lease_id)
+                if getattr(failure, "status_code", None) in _TRANSPORT_RPC_CODES:
+                    # Omit the failed lease on reconnect; preserve other attempts.
+                    current.close()
+                    return
+                report_capacity(current)
+            except RuntimeError as exc:
+                _LOG.warning("worker control update failed: %s", exc)
 
     try:
         while True:
-            if long_poll_ms > 0:
-                grant = worker_client.poll_lease(registered_worker_id, long_poll_ms)
-            else:
-                grant = worker_client.poll_lease(registered_worker_id)
-            if grant is None:
-                if long_poll_ms <= 0:
-                    time.sleep(poll_interval_secs)
-                continue
-            _process_grant(worker_client, registered_worker_id, handler, spec, state, grant)
+            if conn is None:
+                try:
+                    conn = WorkerConnection(endpoint, {
+                        "worker_id": worker_id, "interfaces": [spec.interface],
+                        "attributes": {**spec.attributes, "worker_id": worker_id},
+                        "capacity": spec.capacity, "metadata": spec.metadata, "max_concurrency": spec.max_active_leases,
+                        "resume_session_id": session_id, "held_lease_ids": _active_ids(active, active_lock),
+                    }, token)
+                    session_draining = False
+                    session_id = conn.session_id
+                    for lease_id, (assignment, _) in _active_snapshot(active, active_lock):
+                        if lease_id not in conn.resumed_lease_ids:
+                            assignment.cancel()
+                except RuntimeError as exc:
+                    if getattr(exc, "status_code", None) in _PERMANENT_RPC_CODES:
+                        raise
+                    _LOG.warning("worker connection failed; reconnecting: %s", exc)
+                    time.sleep(reconnect_interval_secs)
+                    continue
+            try:
+                if not credit_sent:
+                    report_capacity(conn)
+                    credit_sent = True
+                message = conn.receive(0.2)
+                if message is None:
+                    continue
+                kind = message["type"]
+                lease_id = message.get("lease_id")
+                if kind == "assignment":
+                    assignment = message["assignment"]
+                    entries = _active_snapshot(active, active_lock)
+                    used: dict[str, int] = {}
+                    for _, (held, _) in entries:
+                        for resource, amount in held.reserved_capacity.items():
+                            used[resource] = used.get(resource, 0) + amount
+                    accepted = not session_draining and len(entries) < spec.max_active_leases and all(
+                        used.get(resource, 0) + amount <= spec.capacity.get(resource, 0)
+                        for resource, amount in assignment.reserved_capacity.items()
+                    )
+                    conn.accept(lease_id, accepted, "local capacity limit" if not accepted else "")
+                    if accepted:
+                        future = pool.submit(_process_assignment, handler, spec, assignment)
+                        with active_lock:
+                            active[lease_id] = (assignment, future)
+                        future.add_done_callback(lambda done, lease_id=lease_id: completed(lease_id, done))
+                    else:
+                        report_capacity(conn)
+                elif kind in {"cancel", "fence"}:
+                    with active_lock:
+                        entry = active.get(lease_id)
+                    if entry is not None:
+                        entry[0].cancel()
+                        report_capacity(conn)
+                    elif kind == "cancel":
+                        conn.cancel_ack(lease_id)
+                elif kind == "drain":
+                    session_draining = True
+                    report_capacity(conn)
+            except RuntimeError as exc:
+                conn.close()
+                if getattr(exc, "status_code", None) in _PERMANENT_RPC_CODES or connection is not None:
+                    raise
+                _LOG.warning("worker session interrupted; reconnecting: %s", exc)
+                conn = None
+                credit_sent = False
+                time.sleep(reconnect_interval_secs)
     finally:
-        stop_event.set()
-        heartbeat.join(timeout=0.5)
+        if conn is not None:
+            try:
+                conn.drain()
+            except RuntimeError:
+                pass
+        for _, (assignment, _) in _active_snapshot(active, active_lock):
+            assignment.cancel()
+        pool.shutdown(wait=True, cancel_futures=True)
+        if conn is not None:
+            conn.close()
 
 
-def _process_grant(
-    worker_client: Any,
-    worker_id: str,
-    handler: Callable[[Any], Any],
-    spec: HandlerSpec,
-    state: _LeaseState,
-    grant: dict[str, Any],
-) -> None:
-    lease = grant["lease"]
-    attempt = grant["attempt"]
-    job = grant["job"]
-    lease_id = lease["lease_id"]
-    state.start(lease_id)
+def _active_ids(active: dict, lock: threading.Lock) -> list[str]:
+    with lock:
+        return list(active)
+
+
+def _active_snapshot(active: dict, lock: threading.Lock) -> list:
+    with lock:
+        return list(active.items())
+
+
+def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -> None:
+    attempt = assignment.open_stream() if spec.streaming_input else assignment.open()
+    if attempt.cancelled or attempt.terminal_replay:
+        return
     try:
-        worker_client.report_event(worker_id, lease_id, _EVENT_STARTED)
-        payload = _read_input_payload(worker_client, job, spec.input_stream)
-        if payload is None:
-            return
-        input_value = _decode_payload(spec.codec, payload)
-        output_value = handler(input_value)
-        output_payload = _encode_payload(spec.codec, output_value)
-
-        output_stream = worker_client.open_stream(
-            job["job_id"],
-            spec.output_stream,
-            scope=_STREAM_SCOPE_JOB,
-            direction=_STREAM_DIRECTION_WORKER_TO_CLIENT,
-            metadata={},
-            attempt_id=attempt["attempt_id"],
-            worker_id=worker_id,
-            lease_id=lease_id,
-        )
-        worker_client.push_frames(
-            output_stream["stream_id"],
-            [(_FRAME_DATA, output_payload, {})],
-            worker_id=worker_id,
-            lease_id=lease_id,
-        )
-        worker_client.close_stream(
-            output_stream["stream_id"],
-            worker_id=worker_id,
-            lease_id=lease_id,
-            metadata={},
-        )
-        worker_client.report_event(
-            worker_id,
-            lease_id,
-            _EVENT_OUTPUT_READY,
-            metadata={"stream_name": spec.output_stream},
-        )
-        worker_client.complete_lease(worker_id, lease_id)
+        if spec.streaming_input:
+            value = _input_fragments(attempt)
+        else:
+            inputs = attempt.inputs
+            if any("inline" not in item for item in inputs):
+                raise ValueError("serve(...) requires inline inputs")
+            value = _decode_payload(spec.codec, b"".join(item["inline"] for item in inputs))
+        result = handler(value, attempt) if spec.pass_context else handler(value)
+        if inspect.isgenerator(result):
+            try:
+                for item in result:
+                    if attempt.cancelled:
+                        return
+                    payload = _encode_payload(spec.codec, item)
+                    if spec.codec == _CODEC_JSON:
+                        payload += b"\n"
+                    attempt.frame(payload)
+            finally:
+                result.close()
+            outputs = []
+        else:
+            outputs = [{"inline": _encode_payload(spec.codec, result), "metadata": {}}]
+        if not attempt.cancelled:
+            attempt.complete(outputs)
     except Exception as exc:
-        worker_client.fail_lease(
-            worker_id,
-            lease_id,
-            _failure_reason(exc),
-            retryable=False,
-        )
-    finally:
-        state.finish(lease_id)
+        code = getattr(exc, "status_code", None)
+        if code in _TRANSPORT_RPC_CODES or code in _RETIRED_RPC_CODES:
+            raise
+        if not attempt.cancelled:
+            attempt.fail(_failure_reason(exc), retryable=code == 8)
 
 
-def _heartbeat_loop(
-    worker_client: Any,
-    worker_id: str,
-    spec: HandlerSpec,
-    state: _LeaseState,
-    stop_event: threading.Event,
-    interval_secs: float,
-) -> None:
-    while not stop_event.wait(interval_secs):
-        active_lease_id = state.snapshot()
-        active_leases = int(active_lease_id is not None)
-        try:
-            worker_client.heartbeat_worker(
-                worker_id,
-                available_capacity=_available_capacity(spec.capacity, active_leases),
-                active_leases=active_leases,
-                metadata=dict(spec.metadata),
-            )
-        except Exception:
-            pass
-
-        if active_lease_id is None:
-            continue
-
-        try:
-            worker_client.renew_lease(worker_id, active_lease_id)
-        except Exception:
-            pass
-
-
-def _read_input_payload(
-    worker_client: Any, job: dict[str, Any], stream_name: str
-) -> Optional[bytes]:
-    inputs = job.get("spec", {}).get("inputs", [])
-    if inputs:
-        if any(item.get("inline") is None for item in inputs):
-            raise ValueError("serve(...) only supports inline inputs or input streams")
-        return b"".join(item["inline"] for item in inputs)
-
-    # SubmitJob makes work immediately assignable. The submitter may still be
-    # opening its input stream, so absence does not mean an empty payload.
+def _input_fragments(attempt: Any):
+    for index, item in enumerate(attempt.inputs):
+        yield {"object_index": index, "data": item.get("inline", b""), "uri": item.get("uri", ""),
+               "metadata": item.get("metadata", {}), "object_end": True, "parameter_chunk": False}
     while True:
-        streams = worker_client.list_streams(job["job_id"])
-        stream = next((item for item in streams if item["stream_name"] == stream_name), None)
-        if stream is not None:
-            break
-        current = worker_client.get_job(job["job_id"])
-        if (
-            current["state"] not in {"leased", "running"}
-            or current.get("lease_id") != job.get("lease_id")
-        ):
-            return None
-        time.sleep(0.05)
-
-    frames = worker_client.pull_frames(stream["stream_id"], follow=True)
-    payload = bytearray()
-    for frame in frames:
-        if frame["kind"] == _FRAME_DATA:
-            payload.extend(frame["payload"])
-        elif frame["kind"] == "error":
-            raise RuntimeError(frame["payload"].decode("utf-8", errors="replace"))
-    current = worker_client.get_job(job["job_id"])
-    if current.get("lease_id") != job.get("lease_id"):
-        return None
-    return bytes(payload)
+        part = attempt.input_chunk()
+        if part is None:
+            return
+        yield part
 
 
 def _decode_payload(codec: str, payload: bytes) -> Any:
@@ -320,41 +305,28 @@ def _build_handler_spec(
     capacity: Optional[dict[str, int]],
     metadata: Optional[dict[str, str]],
     codec: str,
-    input_stream: str,
-    output_stream: str,
     max_active_leases: int,
+    pass_context: bool,
+    streaming_input: bool,
 ) -> HandlerSpec:
     if not interface:
         raise ValueError("worker interface must be non-empty")
     if codec not in {_CODEC_BYTES, _CODEC_JSON}:
         raise ValueError(f"unsupported codec: {codec}")
-    if not input_stream:
-        raise ValueError("input_stream must be non-empty")
-    if not output_stream:
-        raise ValueError("output_stream must be non-empty")
-    if max_active_leases != 1:
-        raise ValueError("serve(...) currently only supports max_active_leases=1")
+    if streaming_input and codec != _CODEC_BYTES:
+        raise ValueError("streaming_input uses byte fragments; decode inside the handler")
+    if max_active_leases < 1:
+        raise ValueError("max_active_leases must be positive")
 
+    resources = dict(capacity or {})
+    resources.setdefault("slot", max_active_leases)
     return HandlerSpec(
         interface=interface,
         attributes=dict(attributes or {}),
-        capacity=dict(capacity or {}),
+        capacity=resources,
         metadata=dict(metadata or {}),
         codec=codec,
-        input_stream=input_stream,
-        output_stream=output_stream,
         max_active_leases=max_active_leases,
+        pass_context=pass_context,
+        streaming_input=streaming_input,
     )
-
-
-def _validate_loop_intervals(heartbeat_interval_secs: float, poll_interval_secs: float) -> None:
-    if heartbeat_interval_secs <= 0:
-        raise ValueError("heartbeat_interval_secs must be greater than 0")
-    if poll_interval_secs < 0:
-        raise ValueError("poll_interval_secs must be non-negative")
-
-
-def _available_capacity(capacity: dict[str, int], active_leases: int) -> dict[str, int]:
-    if active_leases <= 0:
-        return dict(capacity)
-    return {name: 0 for name in capacity}

@@ -1,381 +1,296 @@
-from __future__ import annotations
+"""Exercise the built wheel against a real control-plane process.
 
+Run after cargo build -p anyserve and installing the current wheel. No GPU,
+external database, Redis, or additional Python dependency is required.
+"""
+from __future__ import annotations
+import multiprocessing
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
+from pathlib import Path
+import socket
 import subprocess
-import threading
-import sys
 import tempfile
-import textwrap
+import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from socket import AF_INET, SOCK_STREAM, socket
+import uuid
 
-from anyserve import AnyserveClient, FRAME_DATA, inline_object, uri_object
-
-TERMINAL_JOB_STATES = {"succeeded", "failed", "cancelled"}
+from anyserve import AnyserveClient, ExecutionOptions, RpcError, serve, worker
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _reserve_port() -> int:
-    with socket(AF_INET, SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-class ManagedProcess:
-    def __init__(self, args: list[str], *, cwd: Path, name: str) -> None:
-        self._args = args
-        self._cwd = cwd
-        self._name = name
-        self._tmpdir = tempfile.TemporaryDirectory(prefix=f"anyserve-{name}-")
-        self._log_path = Path(self._tmpdir.name) / f"{name}.log"
-        self._log_handle = None
-        self._proc: subprocess.Popen[str] | None = None
-
-    def start(self) -> "ManagedProcess":
-        self._log_handle = self._log_path.open("w", encoding="utf-8")
-        self._proc = subprocess.Popen(
-            self._args,
-            cwd=self._cwd,
-            stdout=self._log_handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        return self
-
-    def stop(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
-        if proc.poll() is None:
-            proc.terminate()
+def run_worker(endpoint: str, interface: str, kind: str, marker: str | None = None) -> None:
+    if kind == "duplex":
+        @worker(interface=interface, max_active_leases=2, pass_context=True, streaming_input=True)
+        def handler(parts, context):
+            buffer = bytearray()
             try:
-                proc.wait(timeout=5)
+                for part in parts:
+                    if part["parameter_chunk"]:
+                        continue
+                    buffer.extend(part["data"])
+                    if part["object_end"]:
+                        yield b"result:" + bytes(buffer)
+                        buffer.clear()
+            finally:
+                if marker and context.cancelled:
+                    Path(marker).write_text("cancelled")
+    else:
+        @worker(interface=interface, max_active_leases=4, pass_context=True)
+        def handler(payload, context):
+            if kind == "slow":
+                if marker:
+                    Path(marker).write_text(context.attempt_id)
+                until = time.monotonic() + 2
+                while time.monotonic() < until:
+                    if context.cancelled:
+                        return b""
+                    time.sleep(0.01)
+            return payload
+    serve(handler, endpoint, worker_id=f"python-{os.getpid()}", token="worker", reconnect_interval_secs=0.1)
+
+
+def free_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def eventually(check, timeout: float = 10):
+    until = time.monotonic() + timeout
+    while True:
+        try:
+            result = check()
+            if result:
+                return result
+        except (RuntimeError, OSError):
+            pass
+        if time.monotonic() >= until:
+            raise AssertionError("condition did not become true before its deadline")
+        time.sleep(0.02)
+
+
+class SDKEndToEnd(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="anyserve-sdk-v2-")
+        self.path = Path(self.directory.name)
+        self.port = free_port()
+        self.endpoint = f"http://127.0.0.1:{self.port}"
+        self.binary = Path(os.environ.get("ANYSERVE_BIN", "target/debug/anyserve")).resolve()
+        self.config = self.path / "server.toml"
+        self.config.write_text(f'''[server]
+grpc_host="127.0.0.1"
+grpc_port={self.port}
+[runtime]
+heartbeat_interval_ms=500
+heartbeat_timeout_ms=3000
+[journal]
+path="{self.path / 'journal.sqlite'}"
+[auth]
+client_tokens=["client"]
+worker_tokens=["worker"]
+''')
+        self.workers = []
+        self.process = None
+        self.log = (self.path / "server.log").open("ab")
+        self.start_server()
+
+    def tearDown(self):
+        for process in self.workers:
+            process.terminate()
+            process.join(timeout=3)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=3)
+        self.stop_server()
+        self.log.close()
+        self.directory.cleanup()
+
+    def start_server(self):
+        self.process = subprocess.Popen([str(self.binary), "serve", "--config", str(self.config)],
+                                        stdout=self.log, stderr=self.log)
+        def ready():
+            if self.process.poll() is not None:
+                self.log.flush()
+                raise AssertionError((self.path / "server.log").read_text())
+            client = AnyserveClient(self.endpoint, token="client")
+            try:
+                client.get("startup-probe")
+            except RpcError as error:
+                if error.status_code == 5:
+                    return client
+                raise
+            raise AssertionError("startup probe unexpectedly exists")
+        self.client = eventually(ready)
+
+    def stop_server(self, kill=False):
+        if self.process is not None and self.process.poll() is None:
+            self.process.kill() if kill else self.process.terminate()
+            try:
+                self.process.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        if self._log_handle is not None:
-            self._log_handle.close()
-            self._log_handle = None
-        self._tmpdir.cleanup()
+                self.process.kill()
+                self.process.wait(timeout=3)
 
-    def poll(self) -> int | None:
-        if self._proc is None:
-            return None
-        return self._proc.poll()
+    def start_worker(self, interface: str, kind="echo", marker: Path | None = None):
+        process = multiprocessing.get_context("spawn").Process(target=run_worker,
+            args=(self.endpoint, interface, kind, str(marker) if marker else None))
+        process.start()
+        self.workers.append(process)
+        return process
 
-    def log_tail(self, lines: int = 40) -> str:
-        if not self._log_path.exists():
-            return f"<no {self._name} log>"
-        content = self._log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        if not content:
-            return f"<empty {self._name} log>"
-        return "\n".join(content[-lines:])
+    def test_durable_idempotency_and_large_inline_input_result(self):
+        interface = "test.python.echo"
+        self.start_worker(interface)
+        payload = b"x" * (5 * 1024 * 1024)
+        options = ExecutionOptions(total_timeout_ms=15_000, metadata={"business": "one"})
+        job_id = str(uuid.uuid4())
+        first = self.client.submit(interface, payload, job_id=job_id, options=options)
+        self.assertTrue(first["created"])
+        self.assertEqual(first["durability"], "durable")
+        self.assertEqual(self.client.result(job_id)[0]["inline"], payload)
+        self.assertFalse(self.client.submit(interface, payload, job_id=job_id, options=options)["created"])
+        with self.assertRaises(RpcError) as conflict:
+            self.client.submit(interface, b"different", job_id=job_id, options=options)
+        self.assertEqual(conflict.exception.status_code, 6)
 
-    def __enter__(self) -> "ManagedProcess":
-        return self.start()
+    def test_duplex_output_arrives_before_input_end_with_large_object_boundaries(self):
+        interface = "test.python.duplex"
+        self.start_worker(interface, "duplex")
+        with self.client.invoke_stream(interface, options=ExecutionOptions(total_timeout_ms=10_000)) as invocation:
+            for payload in [b"first", b"x" * (256 * 1024)]:
+                invocation.send(payload)
+                expected = b"result:" + payload
+                received = bytearray()
+                while len(received) < len(expected):
+                    event = next(invocation)
+                    self.assertNotEqual(event["type"], "finished")
+                    if event["type"] == "output":
+                        received.extend(event["data"])
+                self.assertEqual(bytes(received), expected)
+            invocation.finish_input()
+            terminal = [event for event in invocation if event["type"] == "finished"]
+            self.assertEqual(terminal[0]["state"], "succeeded")
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.stop()
+    def test_closing_an_invocation_cancels_a_handler_waiting_for_more_input(self):
+        interface = "test.python.cancel"
+        marker = self.path / "cancelled"
+        self.start_worker(interface, "duplex", marker)
+        invocation = self.client.invoke_stream(interface, options=ExecutionOptions(total_timeout_ms=10_000))
+        invocation.send(b"first")
+        job_id = None
+        while True:
+            event = next(invocation)
+            job_id = event["job_id"]
+            if event["type"] == "output":
+                break
+        invocation.close()
+        eventually(lambda: marker.exists())
+        eventually(lambda: self.client.get(job_id)["state"] == "cancelled")
 
+    def test_sigkill_recovers_an_inflight_durable_job_and_fences_the_old_attempt(self):
+        interface = "test.python.recovery"
+        marker = self.path / "attempt"
+        process = self.start_worker(interface, "slow", marker)
+        job = self.client.submit(interface, b"recover me", options=ExecutionOptions(total_timeout_ms=20_000))
+        eventually(lambda: marker.exists())
+        self.stop_server(kill=True)
+        self.start_server()
+        self.assertTrue(process.is_alive(), "the worker should reconnect after a control-plane restart")
+        self.assertEqual(self.client.result(job["job_id"])[0]["inline"], b"recover me")
+        self.assertEqual(self.client.get(job["job_id"])["attempt_count"], 2)
 
-class PythonSdkE2ETests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        root = _repo_root()
-        cls.repo_root = root
-        cls.cli_bin = root / "target" / "debug" / "anyserve"
-        cls.demo_bin = root / "target" / "debug" / "anyserve-demo"
-        if not cls.cli_bin.exists():
-            raise unittest.SkipTest(f"missing control-plane binary: {cls.cli_bin}")
-        if not cls.demo_bin.exists():
-            raise unittest.SkipTest(f"missing demo worker binary: {cls.demo_bin}")
+    def test_worker_survives_graceful_server_restart(self):
+        interface = "test.python.graceful"
+        process = self.start_worker(interface)
+        self.assertEqual(self.client.execute(interface, b"before")[0]["inline"], b"before")
+        self.stop_server()
+        self.assertTrue(process.is_alive(), "server Drain must not exit the Python worker")
+        self.start_server()
+        self.assertEqual(self.client.execute(interface, b"after", options=ExecutionOptions(total_timeout_ms=10_000))[0]["inline"], b"after")
+        self.assertTrue(process.is_alive())
 
-    def test_low_level_submitter_round_trip_with_rust_worker(self) -> None:
-        port = _reserve_port()
-        endpoint = f"http://127.0.0.1:{port}"
-        with ManagedProcess(
-            [str(self.cli_bin), "serve", "--grpc-port", str(port)],
-            cwd=self.repo_root,
-            name="control-plane",
-        ) as server:
-            self._wait_for_server(endpoint, server)
-            with ManagedProcess(
-                [str(self.demo_bin), "--mode", "worker", "--endpoint", endpoint],
-                cwd=self.repo_root,
-                name="rust-worker",
-            ) as worker:
-                try:
-                    time.sleep(0.5)
-                    client = AnyserveClient(endpoint)
-                    job = client.submit_job(
-                        interface_name="demo.echo.v1",
-                        required_attributes={"runtime": "demo"},
-                        required_capacity={"slot": 1},
-                        metadata={"source": "python-sdk-e2e"},
-                    )
-                    self.assertIn(job["job_id"], {item["job_id"] for item in client.list_jobs()})
+    def test_builtin_worker_survives_graceful_server_restart(self):
+        class Echo(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["content-length"]))
+                self.send_response(200)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *_):
+                pass
+        backend = ThreadingHTTPServer(("127.0.0.1", 0), Echo)
+        thread = threading.Thread(target=lambda: backend.serve_forever(poll_interval=0.02))
+        thread.start()
+        config = self.path / "builtin-worker.toml"
+        config.write_text(f"""kind='http'
+base_url='http://127.0.0.1:{backend.server_port}'
+token='worker'
+[routes]
+"test.builtin.graceful"='/echo'
+""")
+        process = subprocess.Popen([str(self.binary), "--endpoint", self.endpoint, "worker", "--config", str(config)], stdout=self.log, stderr=subprocess.STDOUT)
+        try:
+            options = ExecutionOptions(total_timeout_ms=10_000)
+            self.assertEqual(self.client.execute("test.builtin.graceful", b"before", options=options)[0]["inline"], b"before")
+            self.stop_server()
+            self.assertIsNone(process.poll(), "server Drain must not exit the built-in worker")
+            self.start_server()
+            self.assertEqual(self.client.execute("test.builtin.graceful", b"after", options=options)[0]["inline"], b"after")
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            backend.shutdown()
+            backend.server_close()
+            thread.join(timeout=2)
 
-                    stream = client.open_stream(job["job_id"], "input.default")
-                    client.push_frames(
-                        stream["stream_id"],
-                        [
-                            (FRAME_DATA, b"hello ", {}),
-                            (FRAME_DATA, b"from python sdk", {}),
-                        ],
-                    )
-                    client.close_stream(stream["stream_id"])
+    def test_closing_a_connection_releases_the_gil_while_receive_holds_the_lock(self):
+        from anyserve import WorkerConnection
+        connection = WorkerConnection(self.endpoint, {"worker_id": "gil-close", "interfaces": ["test.gil"], "max_concurrency": 1}, "worker")
+        entered = threading.Event()
+        stop = threading.Event()
+        ticks = []
+        errors = []
+        def receive():
+            entered.set()
+            try:
+                connection.receive(0.4)
+            except RuntimeError as error:
+                errors.append(error)
+        def tick():
+            while not stop.is_set():
+                ticks.append(True)
+                time.sleep(0.005)
+        receiver = threading.Thread(target=receive)
+        ticker = threading.Thread(target=tick)
+        receiver.start()
+        ticker.start()
+        try:
+            self.assertTrue(entered.wait(timeout=2))
+            time.sleep(0.03)
+            before = len(ticks)
+            connection.close()
+            self.assertGreater(len(ticks) - before, 2, "close held the GIL while waiting for receive")
+        finally:
+            stop.set()
+            receiver.join(timeout=2)
+            ticker.join(timeout=2)
+            connection.close()
+        self.assertFalse(receiver.is_alive())
+        self.assertEqual(errors, [])
 
-                    final_job = self._wait_for_terminal_job(client, job["job_id"])
-                    event_kinds = [event["kind"] for event in client.watch_job(job["job_id"])]
-                    payload = self._read_output_payload(client, job["job_id"])
-
-                    self.assertEqual(final_job["state"], "succeeded")
-                    self.assertEqual(
-                        event_kinds,
-                        [
-                            "accepted",
-                            "lease_granted",
-                            "started",
-                            "progress",
-                            "output_ready",
-                            "succeeded",
-                        ],
-                    )
-                    self.assertEqual(payload, b"hello from python sdk")
-                except Exception as exc:
-                    raise AssertionError(
-                        self._failure_context(
-                            "low-level SDK round trip failed",
-                            server=server,
-                            worker=worker,
-                        )
-                    ) from exc
-
-    def test_high_level_worker_round_trip(self) -> None:
-        port = _reserve_port()
-        endpoint = f"http://127.0.0.1:{port}"
-        python_worker = textwrap.dedent(
-            f"""
-            from anyserve import serve, worker
-
-            @worker(
-                interface="demo.echo.v1",
-                attributes={{"runtime": "python"}},
-                capacity={{"slot": 1}},
-                codec="bytes",
-            )
-            def echo(payload: bytes) -> bytes:
-                return payload.upper()
-
-            serve(
-                echo,
-                endpoint="{endpoint}",
-                heartbeat_interval_secs=0.1,
-                poll_interval_secs=0.2,
-                long_poll_ms=3000,
-            )
-            """
-        ).strip()
-
-        with ManagedProcess(
-            [str(self.cli_bin), "serve", "--grpc-port", str(port), "--heartbeat-ttl-secs", "1"],
-            cwd=self.repo_root,
-            name="control-plane",
-        ) as server:
-            self._wait_for_server(endpoint, server)
-            with ManagedProcess(
-                [sys.executable, "-u", "-c", python_worker],
-                cwd=self.repo_root,
-                name="python-worker",
-            ) as worker:
-                try:
-                    time.sleep(0.5)
-                    client = AnyserveClient(endpoint)
-                    job = client.submit_job(
-                        interface_name="demo.echo.v1",
-                        required_attributes={"runtime": "python"},
-                        required_capacity={"slot": 1},
-                        metadata={"source": "python-sdk-highlevel-e2e"},
-                    )
-
-                    self._wait_for_job_state(client, job["job_id"], "running")
-                    self.assertEqual(client.list_streams(job["job_id"]), [])
-
-                    stream = client.open_stream(job["job_id"], "input.default")
-                    client.push_frames(
-                        stream["stream_id"],
-                        [(FRAME_DATA, b"hello ", {})],
-                    )
-                    # The handler must wait for the rest of the input and EOF.
-                    time.sleep(0.3)
-                    self.assertEqual(client.get_job(job["job_id"])["state"], "running")
-                    client.push_frames(stream["stream_id"], [(FRAME_DATA, b"decorator", {})])
-                    client.close_stream(stream["stream_id"])
-
-                    final_job = self._wait_for_terminal_job(client, job["job_id"])
-                    event_kinds = [event["kind"] for event in client.watch_job(job["job_id"])]
-                    payload = self._read_output_payload(client, job["job_id"])
-
-                    self.assertEqual(final_job["state"], "succeeded")
-                    self.assertEqual(
-                        event_kinds,
-                        ["accepted", "lease_granted", "started", "output_ready", "succeeded"],
-                    )
-                    self.assertEqual(payload, b"HELLO DECORATOR")
-
-                    # Idle long-polls must not block heartbeats, even with a
-                    # server TTL shorter than the long-poll duration.
-                    time.sleep(1.5)
-                    self.assertIsNone(worker.poll(), worker.log_tail())
-                    for payload in (b"inline hello", b""):
-                        inline_job = client.submit_job(
-                            interface_name="demo.echo.v1",
-                            inputs=[inline_object(payload)],
-                            required_attributes={"runtime": "python"},
-                        )
-                        final_inline_job = self._wait_for_terminal_job(client, inline_job["job_id"])
-                        self.assertEqual(final_inline_job["state"], "succeeded")
-                        self.assertEqual(
-                            self._read_output_payload(client, inline_job["job_id"]), payload.upper()
-                        )
-                except Exception as exc:
-                    raise AssertionError(
-                        self._failure_context(
-                            "high-level worker round trip failed",
-                            server=server,
-                            worker=worker,
-                        )
-                    ) from exc
-
-    def test_object_refs_accept_optional_keys_and_validate_references(self) -> None:
-        port = _reserve_port()
-        endpoint = f"http://127.0.0.1:{port}"
-        with ManagedProcess(
-            [str(self.cli_bin), "serve", "--grpc-port", str(port)],
-            cwd=self.repo_root,
-            name="object-refs",
-        ) as server:
-            self._wait_for_server(endpoint, server)
-            client = AnyserveClient(endpoint)
-            objects = [inline_object(b"hello"), uri_object("file:///tmp/example"), {"inline": b""}]
-            for obj in objects:
-                job = client.submit_job(interface_name="test.objects", inputs=[obj])
-                stored = client.get_job(job["job_id"])["spec"]["inputs"][0]
-                for key, value in obj.items():
-                    self.assertEqual(stored[key], value)
-            for obj in [{}, {"inline": b"a", "uri": "file:///tmp/example"}]:
-                with self.assertRaises(ValueError):
-                    client.submit_job(interface_name="test.objects", inputs=[obj])
-            worker = client.register_worker(interfaces=["test.objects"])
-            grant = client.poll_lease(worker["worker_id"])
-            client.complete_lease(
-                worker["worker_id"], grant["lease"]["lease_id"], outputs=[inline_object(b"result")]
-            )
-            completed = client.get_job(grant["job"]["job_id"])
-            self.assertEqual(completed["outputs"][0]["inline"], b"result")
-
-    def test_heartbeat_runs_while_same_client_long_polls(self) -> None:
-        port = _reserve_port()
-        endpoint = f"http://127.0.0.1:{port}"
-        with ManagedProcess(
-            [str(self.cli_bin), "serve", "--grpc-port", str(port)],
-            cwd=self.repo_root,
-            name="concurrent-client",
-        ) as server:
-            self._wait_for_server(endpoint, server)
-            client = AnyserveClient(endpoint)
-            worker = client.register_worker(interfaces=["test.concurrent"])
-            heartbeat_done = threading.Event()
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                poll = pool.submit(client.poll_lease, worker["worker_id"], 5000)
-                time.sleep(0.1)
-
-                def heartbeat():
-                    client.heartbeat_worker(worker["worker_id"])
-                    heartbeat_done.set()
-
-                heartbeat_result = pool.submit(heartbeat)
-                ran_during_poll = heartbeat_done.wait(timeout=1)
-                # Always release the poll before asserting, so a failing test
-                # cannot leave a blocked thread behind.
-                other = AnyserveClient(endpoint)
-                other.submit_job(interface_name="test.concurrent")
-                self.assertIsNotNone(poll.result(timeout=5))
-                heartbeat_result.result(timeout=5)
-                self.assertTrue(ran_during_poll, "long-poll held the client lock")
-
-    def _wait_for_job_state(self, client: AnyserveClient, job_id: str, state: str) -> None:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            job = client.get_job(job_id)
-            if job["state"] == state:
-                return
-            if job["state"] in TERMINAL_JOB_STATES:
-                self.fail(f"job terminated before {state}: {job}")
-            time.sleep(0.02)
-        self.fail(f"job never reached {state}: {job}")
-
-    def _wait_for_server(self, endpoint: str, server: ManagedProcess, timeout_secs: float = 10) -> None:
-        deadline = time.monotonic() + timeout_secs
-        command = [str(self.cli_bin), "--endpoint", endpoint, "job", "ls"]
-        while time.monotonic() < deadline:
-            if server.poll() is not None:
-                raise RuntimeError(f"control plane exited early\n{server.log_tail()}")
-            result = subprocess.run(
-                command,
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0:
-                return
-            time.sleep(0.2)
-        raise TimeoutError(f"timed out waiting for control plane at {endpoint}")
-
-    def _wait_for_terminal_job(
-        self,
-        client: AnyserveClient,
-        job_id: str,
-        timeout_secs: float = 15,
-    ) -> dict[str, object]:
-        deadline = time.monotonic() + timeout_secs
-        last_job = None
-        while time.monotonic() < deadline:
-            last_job = client.get_job(job_id)
-            if last_job["state"] in TERMINAL_JOB_STATES:
-                return last_job
-            time.sleep(0.2)
-        raise TimeoutError(f"timed out waiting for terminal job state: {last_job}")
-
-    def _read_output_payload(self, client: AnyserveClient, job_id: str) -> bytes:
-        streams = client.list_streams(job_id)
-        output_stream = next(
-            stream for stream in streams if stream["stream_name"] == "output.default"
-        )
-        return b"".join(
-            frame["payload"]
-            for frame in client.pull_frames(output_stream["stream_id"], follow=False)
-            if frame["kind"] == "data"
-        )
-
-    def _failure_context(
-        self,
-        summary: str,
-        *,
-        server: ManagedProcess,
-        worker: ManagedProcess,
-    ) -> str:
-        return (
-            f"{summary}\n\n"
-            f"SERVER LOG\n{server.log_tail()}\n\n"
-            f"WORKER LOG\n{worker.log_tail()}"
-        )
+    def test_role_errors_are_typed(self):
+        for token, code in [("", 16), ("invalid", 16), ("worker", 7)]:
+            client = AnyserveClient(self.endpoint, token=token)
+            with self.assertRaises(RpcError) as denied:
+                client.get("missing")
+            self.assertEqual(denied.exception.status_code, code)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

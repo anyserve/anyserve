@@ -1,18 +1,23 @@
-use std::collections::BTreeMap;
-
-use anyhow::Result;
-
-use anyserve_core::kernel::Kernel;
-use anyserve_core::model::{
-    AttemptRecord, FrameKind, JobEvent, JobRecord, ObjectRef, StreamRecord, WorkerRecord,
-};
-use anyserve_core::store::JobListSummary as StoreJobListSummary;
-
 use super::api::{
     AttemptSummary, InlinePreviewSummary, JobEventSummary, JobSummary, ObjectRefSummary,
-    StreamSummary, WorkerSummary,
+    WorkerSummary,
 };
+use anyserve_core::runtime::api::{
+    EventKind, ExecutionEvent, JobState, JobView, Metadata, Object, WorkerView,
+};
+use std::collections::BTreeMap;
 
+pub(crate) const INLINE_PREVIEW_LIMIT_BYTES: usize = 4 * 1024;
+
+pub(crate) fn state_name(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "queued",
+        JobState::Running => "running",
+        JobState::Succeeded => "succeeded",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+    }
+}
 pub(crate) fn aggregate_capacity<'a>(
     capacities: impl Iterator<Item = &'a BTreeMap<String, i64>>,
 ) -> BTreeMap<String, i64> {
@@ -24,115 +29,134 @@ pub(crate) fn aggregate_capacity<'a>(
     }
     total
 }
-
-pub(crate) fn job_summary(job: &JobRecord, attempts: &[AttemptRecord]) -> JobSummary {
+pub(crate) fn job_summary(job: &JobView) -> JobSummary {
     JobSummary {
         job_id: job.job_id.clone(),
-        state: job.state,
-        interface_name: job.spec.interface_name.clone(),
-        source: metadata_value(&job.spec.metadata, "source"),
-        created_at_ms: job.created_at_ms,
-        updated_at_ms: job.updated_at_ms,
-        duration_ms: job_duration_ms(job),
-        current_attempt_id: non_empty(&job.current_attempt_id),
-        latest_worker_id: latest_worker_id(attempts),
-        attempt_count: attempts.len(),
-        last_error: non_empty(&job.last_error),
-        metadata: job.spec.metadata.clone(),
-    }
-}
-
-pub(crate) fn job_summary_from_store(job: &StoreJobListSummary) -> JobSummary {
-    JobSummary {
-        job_id: job.job_id.clone(),
-        state: job.state,
-        interface_name: job.interface_name.clone(),
-        source: job.source.clone(),
+        state: state_name(job.state),
+        interface_name: job.interface.clone(),
+        source: metadata_value(&job.metadata, "source"),
         created_at_ms: job.created_at_ms,
         updated_at_ms: job.updated_at_ms,
         duration_ms: job
             .state
             .is_terminal()
             .then(|| job.updated_at_ms.saturating_sub(job.created_at_ms)),
-        current_attempt_id: non_empty(&job.current_attempt_id),
-        latest_worker_id: job.latest_worker_id.clone(),
+        current_attempt_id: job.current_attempt_id.clone(),
+        latest_worker_id: job.current_worker_id.clone(),
         attempt_count: job.attempt_count,
-        last_error: non_empty(&job.last_error),
+        last_error: job.error.as_ref().map(|error| error.message.clone()),
         metadata: job.metadata.clone(),
     }
 }
-
-pub(crate) fn worker_summary(worker: &WorkerRecord, now_ms: u64) -> WorkerSummary {
+pub(crate) fn worker_summary(worker: &WorkerView) -> WorkerSummary {
     WorkerSummary {
         worker_id: worker.worker_id.clone(),
-        healthy: worker.expires_at_ms > now_ms,
-        interfaces: worker.spec.interfaces.iter().cloned().collect(),
-        attributes: worker.spec.attributes.clone(),
-        total_capacity: worker.spec.total_capacity.clone(),
-        available_capacity: worker.status.available_capacity.clone(),
-        max_active_leases: worker.spec.max_active_leases,
-        active_leases: worker.status.active_leases,
-        registered_at_ms: worker.registered_at_ms,
-        last_seen_at_ms: worker.status.last_seen_at_ms,
-        expires_at_ms: worker.expires_at_ms,
-        spec_metadata: worker.spec.metadata.clone(),
-        status_metadata: worker.status.metadata.clone(),
+        healthy: worker.connected && !worker.draining,
+        interfaces: worker.interfaces.clone(),
+        attributes: worker.attributes.clone(),
+        total_capacity: worker.total_capacity.clone(),
+        max_concurrency: worker.max_concurrency,
+        active_leases: worker.active_leases,
+        free_slots: worker.free_slots,
+        utilization: worker.load.utilization,
+        connected: worker.connected,
+        draining: worker.draining,
+        last_seen_at_ms: worker.last_seen_ms,
     }
 }
-
-pub(crate) fn attempt_summary(attempt: &AttemptRecord) -> AttemptSummary {
-    AttemptSummary {
-        attempt_id: attempt.attempt_id.clone(),
-        state: attempt.state,
-        worker_id: non_empty_string(&attempt.worker_id),
-        lease_id: non_empty_string(&attempt.lease_id),
-        created_at_ms: attempt.created_at_ms,
-        started_at_ms: attempt.started_at_ms,
-        finished_at_ms: attempt.finished_at_ms,
-        duration_ms: attempt_duration_ms(attempt),
-        last_error: non_empty(&attempt.last_error),
-        metadata: attempt.metadata.clone(),
+pub(crate) fn attempts_from_events(events: &[ExecutionEvent]) -> Vec<AttemptSummary> {
+    let mut attempts: Vec<AttemptSummary> = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::Assigned { worker_id, .. } => {
+                if let Some(attempt_id) = &event.attempt_id {
+                    attempts.push(AttemptSummary {
+                        attempt_id: attempt_id.clone(),
+                        state: "assigned",
+                        worker_id: worker_id.clone(),
+                        created_at_ms: event.at_ms,
+                        finished_at_ms: None,
+                        duration_ms: None,
+                        last_error: None,
+                    });
+                }
+            }
+            EventKind::AttemptRestarted {
+                previous_attempt_id,
+                reason,
+            } => {
+                if let Some(attempt) = attempts
+                    .iter_mut()
+                    .rev()
+                    .find(|attempt| &attempt.attempt_id == previous_attempt_id)
+                {
+                    finish_attempt(
+                        attempt,
+                        "restarted",
+                        event.at_ms,
+                        Some(reason.message.clone()),
+                    );
+                }
+            }
+            EventKind::Finished { state, error, .. } => {
+                if let Some(attempt) = attempts
+                    .iter_mut()
+                    .rev()
+                    .find(|attempt| Some(&attempt.attempt_id) == event.attempt_id.as_ref())
+                {
+                    finish_attempt(
+                        attempt,
+                        state_name(*state),
+                        event.at_ms,
+                        error.as_ref().map(|error| error.message.clone()),
+                    );
+                }
+            }
+            _ => {}
+        }
     }
+    attempts
 }
-
-pub(crate) fn stream_summary(stream: &StreamRecord) -> StreamSummary {
-    StreamSummary {
-        stream_id: stream.stream_id.clone(),
-        stream_name: stream.stream_name.clone(),
-        scope: stream.scope,
-        direction: stream.direction,
-        state: stream.state,
-        attempt_id: non_empty(&stream.attempt_id),
-        lease_id: non_empty(&stream.lease_id),
-        created_at_ms: stream.created_at_ms,
-        closed_at_ms: stream.closed_at_ms,
-        last_sequence: stream.last_sequence,
-        metadata: stream.metadata.clone(),
-    }
+fn finish_attempt(
+    attempt: &mut AttemptSummary,
+    state: &'static str,
+    at_ms: u64,
+    error: Option<String>,
+) {
+    attempt.state = state;
+    attempt.finished_at_ms = Some(at_ms);
+    attempt.duration_ms = Some(at_ms.saturating_sub(attempt.created_at_ms));
+    attempt.last_error = error;
 }
-
-pub(crate) fn event_summary(event: &JobEvent) -> JobEventSummary {
+pub(crate) fn event_summary(event: &ExecutionEvent) -> JobEventSummary {
+    let (kind, payload_size_bytes) = match &event.kind {
+        EventKind::Accepted => ("accepted", 0),
+        EventKind::Assigned { .. } => ("assigned", 0),
+        EventKind::Output { data, progress, .. } => {
+            (if *progress { "progress" } else { "output" }, data.len())
+        }
+        EventKind::AttemptRestarted { .. } => ("attempt_restarted", 0),
+        EventKind::Finished { .. } => ("finished", 0),
+    };
     JobEventSummary {
         sequence: event.sequence,
-        kind: event.kind,
-        created_at_ms: event.created_at_ms,
-        payload_size_bytes: event.payload.len(),
-        metadata: event.metadata.clone(),
+        kind,
+        created_at_ms: event.at_ms,
+        payload_size_bytes,
     }
 }
-
-pub(crate) fn object_ref_summary(value: &ObjectRef) -> ObjectRefSummary {
+pub(crate) fn object_ref_summary(value: &Object) -> ObjectRefSummary {
     match value {
-        ObjectRef::Inline { content, metadata } => ObjectRefSummary {
+        Object::Inline { data, metadata } => ObjectRefSummary {
             kind: "inline",
-            size_bytes: Some(content.len()),
+            size_bytes: Some(data.len()),
             uri: None,
             content_type: metadata_value(metadata, "content_type"),
-            preview: inline_preview(content),
-            truncated: content.len() > INLINE_PREVIEW_LIMIT_BYTES,
+            preview: inline_preview(data),
+            truncated: data.len() > INLINE_PREVIEW_LIMIT_BYTES,
             metadata: metadata.clone(),
         },
-        ObjectRef::Uri { uri, metadata } => ObjectRefSummary {
+        Object::Uri { uri, metadata } => ObjectRefSummary {
             kind: "uri",
             size_bytes: None,
             uri: Some(uri.clone()),
@@ -143,107 +167,71 @@ pub(crate) fn object_ref_summary(value: &ObjectRef) -> ObjectRefSummary {
         },
     }
 }
-
-pub(crate) async fn read_output_preview(
-    kernel: &Kernel,
-    streams: &[StreamRecord],
-) -> Result<Option<InlinePreviewSummary>> {
-    let Some(output_stream) = streams
+pub(crate) fn output_preview(
+    events: &[ExecutionEvent],
+    outputs: &[Object],
+) -> Option<InlinePreviewSummary> {
+    let mut size = 0usize;
+    let mut preview = Vec::new();
+    let mut content_type = None;
+    let frames: Vec<_> = events
         .iter()
-        .find(|stream| stream.stream_name == "output.default")
-    else {
-        return Ok(None);
+        .filter_map(|event| match &event.kind {
+            EventKind::Output {
+                data,
+                metadata,
+                progress: false,
+            } => Some((data.as_ref(), metadata)),
+            _ => None,
+        })
+        .collect();
+    let chunks: Vec<_> = if frames.is_empty() {
+        outputs
+            .iter()
+            .filter_map(|object| match object {
+                Object::Inline { data, metadata } => Some((data.as_ref(), metadata)),
+                _ => None,
+            })
+            .collect()
+    } else {
+        frames
     };
-
-    let frames = kernel.pull_frames(&output_stream.stream_id, 0).await?;
-    let mut payload = Vec::new();
-    let mut content_type = metadata_value(&output_stream.metadata, "content_type");
-
-    for frame in frames {
-        match frame.kind {
-            FrameKind::Data => {
-                if content_type.is_none() {
-                    content_type = metadata_value(&frame.metadata, "content_type");
-                }
-                payload.extend(frame.payload);
-            }
-            FrameKind::Error => {
-                if payload.is_empty() {
-                    payload.extend(frame.payload);
-                }
-            }
-            _ => {}
+    for (data, metadata) in chunks {
+        size = size.saturating_add(data.len());
+        if content_type.is_none() {
+            content_type = metadata_value(metadata, "content_type");
         }
+        let remaining = INLINE_PREVIEW_LIMIT_BYTES.saturating_sub(preview.len());
+        preview.extend_from_slice(&data[..data.len().min(remaining)]);
     }
-
-    if payload.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(InlinePreviewSummary {
-        size_bytes: payload.len(),
+    (size > 0).then(|| InlinePreviewSummary {
+        size_bytes: size,
         content_type,
-        preview: inline_preview(&payload),
-        truncated: payload.len() > INLINE_PREVIEW_LIMIT_BYTES,
-    }))
+        preview: inline_preview(&preview),
+        truncated: size > INLINE_PREVIEW_LIMIT_BYTES,
+    })
 }
-
 pub(crate) fn inline_preview(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() || !is_probably_text(bytes) {
+    if bytes.is_empty() {
         return None;
     }
-
-    let preview = &bytes[..bytes.len().min(INLINE_PREVIEW_LIMIT_BYTES)];
-    Some(String::from_utf8_lossy(preview).trim().to_string())
-}
-
-pub(crate) fn is_probably_text(bytes: &[u8]) -> bool {
-    if bytes.is_empty() {
-        return false;
-    }
-
     let sample = &bytes[..bytes.len().min(512)];
-    let binary_like = sample
+    let binary = sample
         .iter()
         .filter(|byte| matches!(byte, 0..=8 | 11..=12 | 14..=31))
         .count();
-
-    binary_like * 10 <= sample.len()
+    if binary * 10 > sample.len() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&bytes[..bytes.len().min(INLINE_PREVIEW_LIMIT_BYTES)])
+            .trim()
+            .to_string(),
+    )
 }
-
-pub(crate) fn metadata_value(metadata: &BTreeMap<String, String>, key: &str) -> Option<String> {
-    metadata.get(key).and_then(|value| non_empty_string(value))
+pub(crate) fn metadata_value(metadata: &Metadata, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
 }
-
-pub(crate) fn latest_worker_id(attempts: &[AttemptRecord]) -> Option<String> {
-    attempts
-        .iter()
-        .max_by(|left, right| {
-            left.created_at_ms
-                .cmp(&right.created_at_ms)
-                .then_with(|| left.attempt_id.cmp(&right.attempt_id))
-        })
-        .and_then(|attempt| non_empty_string(&attempt.worker_id))
-}
-
-pub(crate) fn attempt_duration_ms(attempt: &AttemptRecord) -> Option<u64> {
-    attempt.finished_at_ms.map(|finished| {
-        finished.saturating_sub(attempt.started_at_ms.unwrap_or(attempt.created_at_ms))
-    })
-}
-
-pub(crate) fn job_duration_ms(job: &JobRecord) -> Option<u64> {
-    job.state
-        .is_terminal()
-        .then(|| job.updated_at_ms.saturating_sub(job.created_at_ms))
-}
-
-pub(crate) fn non_empty(value: &Option<String>) -> Option<String> {
-    value.as_deref().and_then(non_empty_string)
-}
-
-pub(crate) fn non_empty_string(value: &str) -> Option<String> {
-    (!value.trim().is_empty()).then(|| value.to_string())
-}
-
-const INLINE_PREVIEW_LIMIT_BYTES: usize = 4 * 1024;

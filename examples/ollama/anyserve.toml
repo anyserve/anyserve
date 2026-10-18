@@ -1,8 +1,9 @@
 [server]
 grpc_host = "0.0.0.0"
 grpc_port = 50052
-heartbeat_ttl_secs = 30
-default_lease_ttl_secs = 30
+[runtime]
+heartbeat_interval_ms = 5000
+heartbeat_timeout_ms = 30000
 
 [server.tls]
 enabled = false

@@ -1,416 +1,411 @@
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyserve_core::auth::{AuthLayer, AuthPolicy};
-use anyserve_core::frame::MemoryFramePlane;
-use anyserve_core::kernel::Kernel;
-use anyserve_core::model::Demand;
-use anyserve_core::notify::NoopClusterNotifier;
-use anyserve_core::scheduler::BasicScheduler;
-use anyserve_core::service::ControlPlaneGrpcService;
-use anyserve_core::store::MemoryStateStore;
-use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
-use axum::http::StatusCode;
-use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use anyserve_core::auth::AuthPolicy;
+use anyserve_core::runtime::api::{Demand, RuntimeConfig};
+use axum::body::{Body, Bytes};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 
 use super::router;
 use crate::edge_routing::RoutingDefaults;
 use crate::serve_config::ServeInvokeConfig;
-use crate::worker::{WorkerArgs, run as run_worker};
+use crate::test_support::{Backend, BuiltinWorker, Server};
 
-const CLIENT_TOKEN: &str = "client-secret";
-const WORKER_TOKEN: &str = "worker-secret";
-
-struct Cluster {
-    grpc_endpoint: String,
-    invoke_url: String,
-}
-
-async fn spawn_cluster(auth: AuthPolicy) -> Cluster {
-    let kernel = Arc::new(Kernel::new(
-        Arc::new(MemoryStateStore::new()),
-        Arc::new(MemoryFramePlane::new()),
-        Arc::new(NoopClusterNotifier),
-        Arc::new(BasicScheduler),
-        30,
-        30,
-        250,
-    ));
-    kernel.start_background().await;
-
-    let grpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let grpc_addr = grpc_listener.local_addr().unwrap();
-    let grpc_kernel = Arc::clone(&kernel);
-    let grpc_auth = auth.clone();
-    tokio::spawn(async move {
-        Server::builder()
-            .layer(AuthLayer::new(grpc_auth))
-            .add_service(ControlPlaneServiceServer::new(
-                ControlPlaneGrpcService::new(grpc_kernel),
-            ))
-            .serve_with_incoming(TcpListenerStream::new(grpc_listener))
-            .await
-            .unwrap();
-    });
-
-    let config = ServeInvokeConfig {
-        listen: "127.0.0.1:0".to_string(),
-        default_timeout_ms: 5_000,
-        max_body_bytes: 1024 * 1024,
-        forward_headers: vec!["x-tenant".to_string()],
+fn config() -> ServeInvokeConfig {
+    ServeInvokeConfig {
+        listen: "127.0.0.1:0".into(),
+        default_timeout_ms: 3_000,
+        max_body_bytes: 16 * 1024 * 1024,
+        forward_headers: vec!["x-request-id".into()],
         demand: Demand::default(),
         defaults: RoutingDefaults::default(),
-    };
-    let invoke_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let invoke_addr = invoke_listener.local_addr().unwrap();
-    let app = router(kernel, config, Arc::new(auth));
-    tokio::spawn(async move { axum::serve(invoke_listener, app).await.unwrap() });
-
-    Cluster {
-        grpc_endpoint: format!("http://{grpc_addr}"),
-        invoke_url: format!("http://{invoke_addr}"),
     }
 }
+const WORKER: &str = "kind='http'\nmax_active_leases=4\n[routes]\n'policy.v1'='/act'\n";
 
-#[derive(Clone)]
-struct Upstream {
-    addr: SocketAddr,
-    calls: Arc<AtomicUsize>,
-    healthy: Arc<AtomicBool>,
-}
-
-/// Mock inference service: `/act` echoes the body tagged with `name`,
-/// `/reject` returns 422, `/healthz` follows the `healthy` flag.
-async fn spawn_upstream(name: &'static str) -> Upstream {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let healthy = Arc::new(AtomicBool::new(true));
-    let app = axum::Router::new()
-        .route(
-            "/act",
-            axum::routing::post({
-                let calls = Arc::clone(&calls);
-                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
-                    let calls = Arc::clone(&calls);
-                    async move {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        let tenant = headers
-                            .get("x-tenant")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or("-")
-                            .to_string();
-                        axum::Json(serde_json::json!({
-                            "served_by": name,
-                            "tenant": tenant,
-                            "echo": String::from_utf8_lossy(&body),
-                        }))
-                    }
-                }
-            }),
-        )
-        .route(
-            "/reject",
-            axum::routing::post(|| async { (StatusCode::UNPROCESSABLE_ENTITY, "bad observation") }),
-        )
-        .route(
-            "/healthz",
-            axum::routing::get({
-                let healthy = Arc::clone(&healthy);
-                move || {
-                    let healthy = Arc::clone(&healthy);
-                    async move {
-                        if healthy.load(Ordering::SeqCst) {
-                            StatusCode::OK
-                        } else {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        }
-                    }
-                }
-            }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Upstream {
-        addr,
-        calls,
-        healthy,
-    }
-}
-
-fn write_worker_config(name: &str, upstream: &Upstream, region: &str, extra: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "anyserve-invoke-test-{}-{name}.toml",
-        std::process::id()
-    ));
-    std::fs::write(
-        &path,
-        format!(
-            r#"
-kind = "http"
-worker_id = "{name}"
-base_url = "http://{addr}"
-max_active_leases = 4
-poll_interval_secs = 5
-heartbeat_interval_secs = 1
-health_url = "http://{addr}/healthz"
-health_interval_secs = 1
-token = "{WORKER_TOKEN}"
-{extra}
-
-[routes]
-"demo.act.v1" = "/act"
-"demo.reject.v1" = "/reject"
-
-[attributes]
-region = "{region}"
-"#,
-            addr = upstream.addr,
-        ),
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invoke_relays_large_payload_status_content_type_and_selected_worker() {
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let backend = Backend::start(
+        axum::Router::new()
+            .route(
+                "/act",
+                axum::routing::post(|headers: HeaderMap, body: Bytes| async move {
+                    assert_eq!(headers["x-request-id"], "request-123");
+                    (
+                        StatusCode::CREATED,
+                        [("content-type", "application/custom")],
+                        body,
+                    )
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
     )
-    .unwrap();
-    path
-}
-
-fn spawn_worker(endpoint: &str, config: PathBuf) {
-    let endpoint = endpoint.to_string();
-    tokio::spawn(async move {
-        let _ = run_worker(
-            &endpoint,
-            WorkerArgs {
-                config,
-                worker_id: None,
-            },
-        )
-        .await;
-    });
-}
-
-async fn wait_ready(cluster: &Cluster, live_workers: u64) {
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if let Ok(response) = client
-            .get(format!("{}/readyz", cluster.invoke_url))
-            .send()
-            .await
-            && let Ok(body) = response.json::<serde_json::Value>().await
-            && body["live_workers"].as_u64() == Some(live_workers)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("workers never became ready");
-}
-
-fn auth_policy() -> AuthPolicy {
-    AuthPolicy::new([CLIENT_TOKEN.to_string()], [WORKER_TOKEN.to_string()])
-}
-
-async fn invoke(
-    cluster: &Cluster,
-    interface: &str,
-    headers: &[(&str, &str)],
-    body: &str,
-) -> reqwest::Response {
-    let mut request = reqwest::Client::new()
-        .post(format!("{}/v1/invoke/{interface}", cluster.invoke_url))
-        .bearer_auth(CLIENT_TOKEN)
-        .header("content-type", "application/json")
-        .body(body.to_string());
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    request.send().await.unwrap()
+    .await;
+    let worker = BuiltinWorker::start(&server, &backend, WORKER).await;
+    let gateway = Backend::start(router(
+        server.runtime.clone(),
+        config(),
+        Arc::new(AuthPolicy::default()),
+    ))
+    .await;
+    let payload = vec![42; 5 * 1024 * 1024];
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/invoke/policy.v1", gateway.url))
+        .header("x-request-id", "request-123")
+        .body(payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.headers()["content-type"], "application/custom");
+    assert_eq!(
+        response.headers()["x-anyserve-worker-id"].to_str().unwrap(),
+        worker.worker_id
+    );
+    assert_eq!(response.headers()["x-anyserve-attempts"], "1");
+    assert_eq!(response.bytes().await.unwrap().as_ref(), payload);
+    drop(worker);
+    server.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invoke_round_trips_through_a_long_polling_edge_worker() {
-    let cluster = spawn_cluster(auth_policy()).await;
-    let upstream = spawn_upstream("edge-a").await;
-    spawn_worker(
-        &cluster.grpc_endpoint,
-        write_worker_config("edge-a", &upstream, "ap-south-1", ""),
-    );
-    wait_ready(&cluster, 1).await;
-    // Let the worker settle into its long-poll.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let started = Instant::now();
-    let response = invoke(
-        &cluster,
-        "demo.act.v1",
-        &[("x-tenant", "b2c")],
-        r#"{"hand":"AsKd"}"#,
-    )
+async fn retryable_upstream_failure_uses_one_retry_budget_and_client_errors_pass_through() {
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let backend = Backend::start(axum::Router::new().route(
+        "/act",
+        axum::routing::post(move |body: Bytes| {
+            let count = count.clone();
+            async move {
+                if body.as_ref() == b"invalid" {
+                    return (StatusCode::UNPROCESSABLE_ENTITY, "bad input").into_response();
+                }
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                body.into_response()
+            }
+        }),
+    ))
     .await;
-    let elapsed = started.elapsed();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()["x-anyserve-worker-id"].to_str().unwrap(),
-        "edge-a"
-    );
-    assert_eq!(
-        response.headers()["x-anyserve-attempts"].to_str().unwrap(),
-        "1"
-    );
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["served_by"], "edge-a");
-    assert_eq!(body["tenant"], "b2c");
-    assert_eq!(body["echo"], r#"{"hand":"AsKd"}"#);
-    // poll_interval_secs = 5: only a long-poll can answer this fast.
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "invoke took {elapsed:?}"
-    );
-
-    let metrics = reqwest::Client::new()
-        .get(format!("{}/metrics", cluster.invoke_url))
-        .bearer_auth(CLIENT_TOKEN)
+    let worker = BuiltinWorker::start(&server, &backend, WORKER).await;
+    let gateway = Backend::start(router(
+        server.runtime.clone(),
+        config(),
+        Arc::new(AuthPolicy::default()),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/invoke/policy.v1", gateway.url))
+        .body("ok")
         .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-anyserve-attempts"], "2");
+    assert_eq!(response.text().await.unwrap(), "ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let response = client
+        .post(format!("{}/v1/invoke/policy.v1", gateway.url))
+        .body("invalid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(response.text().await.unwrap(), "bad input");
+    drop(worker);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn queue_timeout_is_explicit_when_no_worker_can_serve() {
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let gateway = Backend::start(router(
+        server.runtime.clone(),
+        config(),
+        Arc::new(AuthPolicy::default()),
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/invoke/missing", gateway.url))
+        .header("x-anyserve-queue-timeout-ms", "30")
+        .body("input")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "queue_timeout");
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn caller_deadline_aborts_the_backend_body_and_releases_the_worker_slot() {
+    struct OnDrop(Arc<AtomicBool>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let observed = cancelled.clone();
+    let backend = Backend::start(axum::Router::new().route("/act", axum::routing::post(move || {
+        let observed = observed.clone();
+        async move {
+            let stream = async_stream::stream! {
+                let _guard = OnDrop(observed);
+                loop { tokio::time::sleep(Duration::from_millis(5)).await; yield Ok::<_, std::convert::Infallible>(vec![0u8; 16]); }
+            };
+            Body::from_stream(stream)
+        }
+    }))).await;
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let worker = BuiltinWorker::start(&server, &backend, WORKER).await;
+    let gateway = Backend::start(router(
+        server.runtime.clone(),
+        config(),
+        Arc::new(AuthPolicy::default()),
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/invoke/policy.v1", gateway.url))
+        .header("x-anyserve-timeout-ms", "100")
+        .body("input")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancelled.load(Ordering::SeqCst)
+            || server
+                .runtime
+                .list_workers()
+                .iter()
+                .any(|worker| worker.active_leases != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancellation did not propagate to the backend");
+    drop(worker);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn http_gateway_requires_client_role_but_health_is_public() {
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let auth = Arc::new(AuthPolicy::new(
+        ["client".to_owned()],
+        ["worker".to_owned()],
+    ));
+    let gateway = Backend::start(router(server.runtime.clone(), config(), auth)).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/invoke/missing", gateway.url);
+    assert_eq!(
+        client.post(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&url)
+            .bearer_auth("worker")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/metrics", gateway.url))
+            .bearer_auth("client")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("{}/healthz", gateway.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn readiness_matches_demand_and_live_metrics_exclude_draining_and_disconnected_sessions() {
+    use crate::test_support::Worker;
+    use anyserve_client::execution::v2;
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let worker = Worker::connect(&server, "ready-worker", vec!["policy.v1".into()], 1).await;
+    worker.credit(0).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.runtime.list_workers()[0].free_slots != 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let gateway = Backend::start(router(
+        server.runtime.clone(),
+        config(),
+        Arc::new(AuthPolicy::default()),
+    ))
+    .await;
+    assert_eq!(
+        reqwest::get(format!("{}/readyz", gateway.url))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    for required_attributes in [false, true] {
+        let mut config = config();
+        if required_attributes {
+            config
+                .demand
+                .required_attributes
+                .insert("region".into(), "near".into());
+        } else {
+            config.demand.required_capacity.insert("slot".into(), 2);
+        }
+        let unmatched = Backend::start(router(
+            server.runtime.clone(),
+            config,
+            Arc::new(AuthPolicy::default()),
+        ))
+        .await;
+        assert_eq!(
+            reqwest::get(format!("{}/readyz", unmatched.url))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+    let metrics = reqwest::get(format!("{}/metrics", gateway.url))
         .await
         .unwrap()
         .text()
         .await
         .unwrap();
     assert!(
-        metrics.contains(
-            "anyserve_invoke_duration_ms_count{interface=\"demo.act.v1\",code=\"200\"} 1"
-        )
+        metrics
+            .lines()
+            .any(|line| line == "anyserve_live_workers 1")
     );
-    assert!(metrics.contains("anyserve_live_workers{region=\"ap-south-1\"} 1"));
-    assert!(metrics.contains("anyserve_jobs{state=\"succeeded\"} 1"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invoke_passes_upstream_client_errors_through() {
-    let cluster = spawn_cluster(auth_policy()).await;
-    let upstream = spawn_upstream("edge-a").await;
-    spawn_worker(
-        &cluster.grpc_endpoint,
-        write_worker_config("edge-reject", &upstream, "ap-south-1", ""),
-    );
-    wait_ready(&cluster, 1).await;
-
-    let response = invoke(&cluster, "demo.reject.v1", &[], "{}").await;
-    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(response.text().await.unwrap(), "bad observation");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invoke_prefers_local_cluster_and_spills_over_when_it_drains() {
-    let cluster = spawn_cluster(auth_policy()).await;
-    let near = spawn_upstream("near").await;
-    let far = spawn_upstream("far").await;
-    spawn_worker(
-        &cluster.grpc_endpoint,
-        write_worker_config("near-worker", &near, "near", ""),
-    );
-    spawn_worker(
-        &cluster.grpc_endpoint,
-        write_worker_config("far-worker", &far, "far", ""),
-    );
-    wait_ready(&cluster, 2).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let placement = [
-        ("x-anyserve-prefer", "region=near"),
-        ("x-anyserve-spillover-ms", "300"),
-    ];
-    for _ in 0..10 {
-        let response = invoke(&cluster, "demo.act.v1", &placement, "{}").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()["x-anyserve-worker-id"].to_str().unwrap(),
-            "near-worker"
-        );
-    }
-    assert_eq!(near.calls.load(Ordering::SeqCst), 10);
-    assert_eq!(far.calls.load(Ordering::SeqCst), 0);
-
-    // Near cluster's backend goes unhealthy; its worker stops leasing.
-    near.healthy.store(false, Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-
-    let started = Instant::now();
-    let response = invoke(&cluster, "demo.act.v1", &placement, "{}").await;
-    let elapsed = started.elapsed();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers()["x-anyserve-worker-id"].to_str().unwrap(),
-        "far-worker"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(280),
-        "spilled too early: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(1_000),
-        "spilled too late: {elapsed:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invoke_fails_fast_with_queue_timeout_when_no_worker_can_serve() {
-    let cluster = spawn_cluster(auth_policy()).await;
-
-    let started = Instant::now();
-    let response = invoke(
-        &cluster,
-        "demo.nobody.v1",
-        &[("x-anyserve-queue-timeout-ms", "150")],
-        "{}",
-    )
-    .await;
-    let elapsed = started.elapsed();
-
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response.headers()["x-anyserve-error"].to_str().unwrap(),
-        "queue_timeout"
-    );
-    assert!(
-        elapsed < Duration::from_millis(1_000),
-        "queue timeout took {elapsed:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn invoke_and_worker_rpcs_require_matching_tokens() {
-    let cluster = spawn_cluster(auth_policy()).await;
-
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/invoke/demo.act.v1", cluster.invoke_url))
-        .body("{}")
-        .send()
+    worker
+        .session
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Draining(v2::Draining {})),
+        })
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-    let response = reqwest::Client::new()
-        .post(format!("{}/v1/invoke/demo.act.v1", cluster.invoke_url))
-        .bearer_auth(WORKER_TOKEN)
-        .body("{}")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let mut client = anyserve_client::AnyserveClient::connect_with_token(
-        cluster.grpc_endpoint.clone(),
-        Some(CLIENT_TOKEN),
-    )
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !server.runtime.list_workers()[0].draining {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
     .await
     .unwrap();
-    let error = client
-        .register_worker(anyserve_client::WorkerRegistration::new(vec![
-            "demo.act.v1".to_string(),
-        ]))
+    assert_eq!(
+        reqwest::get(format!("{}/readyz", gateway.url))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(
+        reqwest::get(format!("{}/metrics", gateway.url))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .lines()
+            .any(|line| line == "anyserve_live_workers 0")
+    );
+    drop(worker);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server
+            .runtime
+            .list_workers()
+            .iter()
+            .any(|worker| worker.connected)
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // An idle draining session may be removed immediately. Keep a real lease
+    // on another session to exercise the disconnected grace-period case.
+    let mut grace = Worker::connect(&server, "grace-worker", vec!["policy.v1".into()], 1).await;
+    use anyserve_core::runtime::api::{Durability, ExecutionPolicy, JobSpec, SubmitRequest};
+    server
+        .runtime
+        .submit(SubmitRequest {
+            spec: JobSpec {
+                demand: Demand {
+                    interface: "policy.v1".into(),
+                    ..Default::default()
+                },
+                policy: ExecutionPolicy {
+                    durability: Some(Durability::Ephemeral),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .await
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("cannot call worker method"));
+        .unwrap();
+    let _assignment = grace.assignment().await;
+    drop(grace);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server
+            .runtime
+            .list_workers()
+            .iter()
+            .any(|worker| worker.connected)
+        {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        server.runtime.stats().sessions > 0,
+        "leased session should remain during its grace period"
+    );
+    assert!(
+        reqwest::get(format!("{}/metrics", gateway.url))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .lines()
+            .any(|line| line == "anyserve_live_workers 0")
+    );
+    server.runtime.shutdown().await;
+    assert_eq!(
+        reqwest::get(format!("{}/readyz", gateway.url))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 }

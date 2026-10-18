@@ -1,5 +1,15 @@
-use std::sync::Arc;
-
+use super::api::{
+    ApiError, AppState, CancelJobResponse, JobDetail, JobDetailResponse, JobsQuery, JobsResponse,
+    WorkersResponse,
+};
+use super::snapshot::{
+    INLINE_PREVIEW_LIMIT_BYTES, aggregate_capacity, attempts_from_events, event_summary,
+    inline_preview, job_summary, object_ref_summary, output_preview, worker_summary,
+};
+use anyserve_core::auth::AuthPolicy;
+use anyserve_core::error::{ErrorKind, RuntimeError};
+use anyserve_core::now_ms;
+use anyserve_core::runtime::api::{JobFilter, JobState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -12,24 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::json;
-
-use anyserve_core::auth::AuthPolicy;
-use anyserve_core::model::JobState;
-use anyserve_core::now_ms;
-
-use super::api::{
-    ApiError, AppState, CancelJobResponse, HistorySummary, JobDetail, JobDetailResponse, JobsQuery,
-    JobsResponse, QueueSummary, WorkerRollup, WorkersResponse,
-};
-use super::snapshot::{
-    aggregate_capacity, attempt_summary, event_summary, inline_preview, job_duration_ms,
-    job_summary, job_summary_from_store, latest_worker_id, metadata_value, non_empty,
-    object_ref_summary, read_output_preview, stream_summary, worker_summary,
-};
-
-const DEFAULT_PAGE_SIZE: usize = 50;
-const MAX_PAGE_SIZE: usize = 200;
-const INLINE_PREVIEW_LIMIT_BYTES: usize = 4 * 1024;
+use std::sync::Arc;
 
 pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
     let middleware_state = state.clone();
@@ -50,215 +43,135 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
             cors_middleware,
         ))
 }
-
-async fn healthz() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn healthz(State(state): State<AppState>) -> StatusCode {
+    if state.runtime.health().ready {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
-
-async fn overview(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-    let counts = state
-        .kernel
-        .job_state_counts()
-        .await
-        .map_err(internal_error("count jobs"))?;
-    let workers = state
-        .kernel
+async fn overview(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stats = state.runtime.stats();
+    let workers: Vec<_> = state
+        .runtime
         .list_workers()
-        .await
-        .map_err(internal_error("list workers"))?;
-    let now_ms = now_ms();
-
-    let queue = QueueSummary {
-        pending: counts.pending,
-        leased: counts.leased,
-        running: counts.running,
-        active: counts.pending + counts.leased + counts.running,
-    };
-    let history = HistorySummary {
-        succeeded: counts.succeeded,
-        failed: counts.failed,
-        cancelled: counts.cancelled,
-        total: counts.succeeded + counts.failed + counts.cancelled,
-    };
-
-    let healthy_workers = workers
         .iter()
-        .filter(|worker| worker.expires_at_ms > now_ms)
-        .collect::<Vec<_>>();
-
-    let worker_rollup = WorkerRollup {
-        total: workers.len(),
-        healthy: healthy_workers.len(),
-        expired: workers.len().saturating_sub(healthy_workers.len()),
-        active_leases: workers
-            .iter()
-            .map(|worker| worker.status.active_leases as u64)
-            .sum(),
-        total_capacity: aggregate_capacity(
-            healthy_workers
-                .iter()
-                .map(|worker| &worker.spec.total_capacity),
-        ),
-        available_capacity: aggregate_capacity(
-            healthy_workers
-                .iter()
-                .map(|worker| &worker.status.available_capacity),
-        ),
-        last_seen_at_ms: workers
-            .iter()
-            .map(|worker| worker.status.last_seen_at_ms)
-            .max(),
-    };
-
-    Ok(Json(json!({
-        "runtime": {
-            "code": state.runtime.code,
-            "label": state.runtime.label,
-            "storage_backend": state.runtime.storage_backend,
-            "frame_backend": state.runtime.frame_backend,
+        .map(worker_summary)
+        .collect();
+    let healthy: Vec<_> = workers.iter().filter(|worker| worker.healthy).collect();
+    Json(json!({
+        "runtime": state.mode,
+        "queue": {"queued": stats.queued, "running": stats.running, "active": stats.queued + stats.running},
+        "history": {
+            "succeeded": stats.succeeded,
+            "failed": stats.failed,
+            "cancelled": stats.cancelled,
+            "total": stats.succeeded + stats.failed + stats.cancelled
         },
-        "queue": queue,
-        "history": history,
-        "workers": worker_rollup,
-        "refreshed_at_ms": now_ms,
-    })))
+        "workers": {
+            "total": workers.len(), "healthy": healthy.len(), "unavailable": workers.len() - healthy.len(),
+            "active_leases": workers.iter().map(|worker| u64::from(worker.active_leases)).sum::<u64>(),
+            "total_capacity": aggregate_capacity(healthy.iter().map(|worker| &worker.total_capacity)),
+            "last_seen_at_ms": workers.iter().map(|worker| worker.last_seen_at_ms).max()
+        },
+        "refreshed_at_ms": now_ms()
+    }))
 }
-
 async fn list_jobs(
     State(state): State<AppState>,
     Query(query): Query<JobsQuery>,
 ) -> Result<Json<JobsResponse>, ApiError> {
-    let selected_states = parse_states(query.states.as_deref())?;
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let offset = query.offset.unwrap_or(0);
     let page = state
-        .kernel
-        .list_job_summary_page(selected_states.as_deref().unwrap_or(&[]), limit, offset)
+        .runtime
+        .list_jobs(JobFilter {
+            states: parse_states(query.states.as_deref())?,
+            limit: query.limit.unwrap_or(50).clamp(1, 200),
+            page_token: query.offset.map(|offset| offset.to_string()),
+            ..Default::default()
+        })
         .await
-        .map_err(internal_error("list job summaries"))?;
-
+        .map_err(api_error)?;
     Ok(Json(JobsResponse {
-        jobs: page.jobs.iter().map(job_summary_from_store).collect(),
-        total: page.total,
-        limit,
-        offset,
+        jobs: page.jobs.iter().map(job_summary).collect(),
+        next_page_token: page.next_page_token,
     }))
 }
-
 async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
     let job = state
-        .kernel
-        .get_job(&job_id)
+        .runtime
+        .get_job(&job_id, true)
         .await
-        .map_err(not_found_if_missing("load job"))?;
-    let attempts = state
-        .kernel
-        .list_attempts(&job_id)
-        .await
-        .map_err(internal_error("list attempts"))?;
-    let streams = state
-        .kernel
-        .list_streams(&job_id)
-        .await
-        .map_err(internal_error("list streams"))?;
-    let events = state
-        .kernel
-        .watch_job(&job_id, 0)
-        .await
-        .map_err(internal_error("list events"))?;
-
-    let workers = state
-        .kernel
+        .map_err(api_error)?;
+    let spec = state.runtime.spec(&job_id).ok();
+    let (events, _) = state.runtime.events(&job_id, 0).await.map_err(api_error)?;
+    let attempts = attempts_from_events(&events);
+    let incomplete = attempts.len() < job.attempt_count as usize
+        || events.first().is_some_and(|event| {
+            !matches!(event.kind, anyserve_core::runtime::api::EventKind::Accepted)
+        });
+    let latest_worker_id = job
+        .current_worker_id
+        .as_ref()
+        .or_else(|| attempts.last().map(|attempt| &attempt.worker_id));
+    let latest_worker = state
+        .runtime
         .list_workers()
-        .await
-        .map_err(internal_error("list workers"))?;
-    let latest_worker = latest_worker_id(&attempts).and_then(|worker_id| {
-        workers
-            .iter()
-            .find(|worker| worker.worker_id == worker_id)
-            .cloned()
-    });
-
+        .iter()
+        .find(|worker| Some(&worker.worker_id) == latest_worker_id)
+        .map(worker_summary);
+    let outputs = job.outputs.as_deref().unwrap_or_default();
     Ok(Json(JobDetailResponse {
         job: JobDetail {
-            job_id: job.job_id.clone(),
-            state: job.state,
-            interface_name: job.spec.interface_name.clone(),
-            source: metadata_value(&job.spec.metadata, "source"),
-            created_at_ms: job.created_at_ms,
-            updated_at_ms: job.updated_at_ms,
-            duration_ms: job_duration_ms(&job),
-            current_attempt_id: non_empty(&job.current_attempt_id),
-            lease_id: non_empty(&job.lease_id),
-            version: job.version,
-            last_error: non_empty(&job.last_error),
-            metadata: job.spec.metadata.clone(),
-            demand: job.spec.demand.clone(),
-            policy: job.spec.policy.clone(),
-            params_size_bytes: job.spec.params.len(),
-            params_preview: inline_preview(&job.spec.params),
-            params_truncated: job.spec.params.len() > INLINE_PREVIEW_LIMIT_BYTES,
-            output_preview: read_output_preview(&state.kernel, &streams)
-                .await
-                .map_err(internal_error("read output preview"))?,
-            inputs: job.spec.inputs.iter().map(object_ref_summary).collect(),
-            outputs: job.outputs.iter().map(object_ref_summary).collect(),
+            summary: job_summary(&job),
+            demand: spec.as_ref().map(|spec| spec.demand.clone()),
+            policy: spec.as_ref().map(|spec| spec.policy.clone()),
+            params_size_bytes: spec.as_ref().map(|spec| spec.params.len()),
+            params_preview: spec.as_ref().and_then(|spec| inline_preview(&spec.params)),
+            params_truncated: spec
+                .as_ref()
+                .is_some_and(|spec| spec.params.len() > INLINE_PREVIEW_LIMIT_BYTES),
+            inputs: spec
+                .as_ref()
+                .map(|spec| spec.inputs.iter().map(object_ref_summary).collect())
+                .unwrap_or_default(),
+            outputs: outputs.iter().map(object_ref_summary).collect(),
+            output_preview: output_preview(&events, outputs),
         },
-        attempts: attempts.iter().map(attempt_summary).collect(),
-        streams: streams.iter().map(stream_summary).collect(),
+        attempts,
         events: events.iter().map(event_summary).collect(),
-        latest_worker: latest_worker
-            .as_ref()
-            .map(|worker| worker_summary(worker, now_ms())),
+        history_incomplete: incomplete,
+        latest_worker,
     }))
 }
-
 async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<CancelJobResponse>, ApiError> {
     let job = state
-        .kernel
-        .cancel_job(&job_id)
+        .runtime
+        .cancel(&job_id, "cancelled from console".into())
         .await
-        .map_err(not_found_if_missing("cancel job"))?;
-    let attempts = state
-        .kernel
-        .list_attempts(&job_id)
-        .await
-        .map_err(internal_error("list attempts"))?;
+        .map_err(api_error)?;
     Ok(Json(CancelJobResponse {
-        job: job_summary(&job, &attempts),
+        job: job_summary(&job),
     }))
 }
-
-async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkersResponse>, ApiError> {
-    let workers = state
-        .kernel
+async fn list_workers(State(state): State<AppState>) -> Json<WorkersResponse> {
+    let workers: Vec<_> = state
+        .runtime
         .list_workers()
-        .await
-        .map_err(internal_error("list workers"))?;
-    let now_ms = now_ms();
-
-    Ok(Json(WorkersResponse {
-        healthy: workers
-            .iter()
-            .filter(|worker| worker.expires_at_ms > now_ms)
-            .count(),
+        .iter()
+        .map(worker_summary)
+        .collect();
+    Json(WorkersResponse {
+        healthy: workers.iter().filter(|worker| worker.healthy).count(),
         total: workers.len(),
-        workers: workers
-            .iter()
-            .map(|worker| worker_summary(worker, now_ms))
-            .collect(),
-    }))
+        workers,
+    })
 }
-
 async fn cors_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -299,19 +212,16 @@ async fn cors_middleware(
     response
 }
 
-pub(super) fn parse_states(raw: Option<&str>) -> Result<Option<Vec<JobState>>, ApiError> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
+pub(super) fn parse_states(raw: Option<&str>) -> Result<Vec<JobState>, ApiError> {
     let mut states = Vec::new();
     for value in raw
+        .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
         let state = match value {
-            "pending" => JobState::Pending,
-            "leased" => JobState::Leased,
+            "queued" => JobState::Queued,
             "running" => JobState::Running,
             "succeeded" => JobState::Succeeded,
             "failed" => JobState::Failed,
@@ -326,26 +236,19 @@ pub(super) fn parse_states(raw: Option<&str>) -> Result<Option<Vec<JobState>>, A
             states.push(state);
         }
     }
-    Ok(Some(states))
+    Ok(states)
 }
-
-fn internal_error(context: &'static str) -> impl Fn(anyhow::Error) -> ApiError {
-    move |error| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("{context}: {error}"),
-    }
-}
-
-fn not_found_if_missing(context: &'static str) -> impl Fn(anyhow::Error) -> ApiError {
-    move |error| {
-        let message = error.to_string();
-        if message.contains("does not exist") {
-            ApiError::not_found(message)
-        } else {
-            ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("{context}: {message}"),
-            }
-        }
+fn api_error(error: RuntimeError) -> ApiError {
+    let status = match error.kind {
+        ErrorKind::InvalidArgument => StatusCode::BAD_REQUEST,
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        ErrorKind::Conflict | ErrorKind::StaleLease => StatusCode::CONFLICT,
+        ErrorKind::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+        ErrorKind::PersistenceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+        ErrorKind::CursorExpired { .. } => StatusCode::GONE,
+    };
+    ApiError {
+        status,
+        message: error.to_string(),
     }
 }

@@ -1,321 +1,260 @@
 use std::collections::HashMap;
 
-use anyserve_client::{
-    AnyserveClient, EventKind, FrameKind, FrameWrite, LeaseGrant, ObjectRef, object_ref,
-};
+use anyhow::{Context, Result, bail};
+use anyserve_client::execution::{Attempt, AttemptClient, v2};
 use futures::StreamExt;
 use reqwest::header::{CONTENT_TYPE, HeaderName, HeaderValue};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::watch;
 
 use super::WorkerContext;
 use crate::worker::config::KIND_HTTP;
-use crate::worker::helpers::{
-    DEFAULT_OUTPUT_STREAM, frame_write_with_content_type, open_output_stream, truncate,
-};
+use crate::worker::helpers::truncate;
 
-/// Input metadata keys with this prefix are forwarded to the upstream as headers.
 pub(crate) const FORWARD_HEADER_PREFIX: &str = "http.header.";
 pub(crate) const HTTP_STATUS_KEY: &str = "http_status";
 pub(crate) const CONTENT_TYPE_KEY: &str = "content_type";
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-#[derive(Debug)]
-pub(crate) struct ExecutionError {
-    pub(crate) message: String,
-    /// Whether another worker (possibly in another cluster) should retry the job.
-    pub(crate) retryable: bool,
+pub(super) async fn run_attempt(
+    context: WorkerContext,
+    mut data: AttemptClient,
+    assignment: v2::Assign,
+    limits: v2::Limits,
+    heartbeat_timeout: std::time::Duration,
+    mut cancelled: watch::Receiver<bool>,
+) -> Result<()> {
+    // Dropping the request future aborts the HTTP body and releases its socket.
+    // The control loop sends CancelAck only after this future returns.
+    tokio::select! {
+        biased;
+        _ = cancellation(&mut cancelled) => Ok(()),
+        result = execute(&context, &mut data, &assignment, &limits, heartbeat_timeout) => result,
+    }
 }
 
-impl ExecutionError {
-    fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: true,
+async fn cancellation(cancelled: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancelled.borrow_and_update() {
+            return;
+        }
+        if cancelled.changed().await.is_err() {
+            return;
         }
     }
-
-    fn fatal(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: false,
-        }
-    }
 }
 
-impl From<anyhow::Error> for ExecutionError {
-    fn from(error: anyhow::Error) -> Self {
-        Self::fatal(format!("{error:#}"))
-    }
-}
-
-struct RequestBody {
-    body: Vec<u8>,
-    content_type: String,
-    forward_headers: Vec<(String, String)>,
-}
-
-/// Runs one leased job against the local upstream.
-///
-/// The common case costs two control-plane round trips (the poll that delivered
-/// the job and CompleteLease): the request arrives inline and the response goes
-/// back inline. Only event-stream responses open an output stream, and those
-/// frames are pipelined over one PushFrames call.
-pub(super) async fn process_grant(
+async fn execute(
     context: &WorkerContext,
-    client: &mut AnyserveClient,
-    grant: LeaseGrant,
-) -> Result<(), ExecutionError> {
+    data: &mut AttemptClient,
+    assignment: &v2::Assign,
+    limits: &v2::Limits,
+    heartbeat_timeout: std::time::Duration,
+) -> Result<()> {
+    let mut attempt = Attempt::open(data, assignment, limits, heartbeat_timeout).await?;
+    if attempt.terminal_replay {
+        return Ok(());
+    }
+    let result = request(context, assignment, &mut attempt).await;
+    let (outputs, outcome) = match result {
+        Ok(outputs) => (outputs, v2::finish::Outcome::Succeeded(v2::Succeeded {})),
+        Err(error) => (Vec::new(), v2::finish::Outcome::Failed(error)),
+    };
+    attempt
+        .commit(data, assignment, limits, &outputs, outcome)
+        .await?;
+    Ok(())
+}
+
+async fn request(
+    context: &WorkerContext,
+    assignment: &v2::Assign,
+    attempt: &mut Attempt,
+) -> Result<Vec<v2::Object>, v2::ErrorInfo> {
     let config = &context.config;
-    let job = grant.job;
-    let lease_id = grant.lease.lease_id.clone();
-    let attempt_id = grant.attempt.attempt_id.clone();
-    let spec = job
-        .spec
-        .clone()
-        .ok_or_else(|| ExecutionError::fatal("job is missing spec"))?;
-
-    let path = config.routes.get(&spec.interface_name).ok_or_else(|| {
-        ExecutionError::fatal(format!("no route for interface '{}'", spec.interface_name))
-    })?;
+    let path = config
+        .routes
+        .get(&assignment.interface)
+        .ok_or_else(|| failed("no route for assigned interface", false))?;
     let url = join_url(&config.base_url, path);
-
-    let request = load_request(&job.job_id, &spec)?;
-    report_started(context, client, &lease_id);
-
+    let input = attempt
+        .inputs
+        .first()
+        .ok_or_else(|| failed("HTTP worker requires inline input", false))?;
+    let Some(v2::object::Body::Inline(body)) = &input.body else {
+        return Err(failed("HTTP worker requires inline input", false));
+    };
+    let content_type = input
+        .metadata
+        .get(CONTENT_TYPE_KEY)
+        .map(String::as_str)
+        .unwrap_or("application/json");
     let mut upstream = context
-        .http_client
+        .http
         .post(&url)
-        .header(CONTENT_TYPE, request.content_type.as_str())
-        .header("x-anyserve-job-id", job.job_id.as_str())
-        .body(request.body);
-    for (name, value) in &request.forward_headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
+        .header(CONTENT_TYPE, content_type)
+        .header("x-anyserve-job-id", &assignment.job_id)
+        .body(body.clone());
+    for (name, value) in &input.metadata {
+        if let Some(name) = name.strip_prefix(FORWARD_HEADER_PREFIX)
+            && let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            )
+        {
             upstream = upstream.header(name, value);
         }
     }
-    let response = upstream.send().await.map_err(|error| {
-        // Connection refused / timeout: let a healthy worker elsewhere retry.
-        ExecutionError::retryable(format!("upstream request to {url} failed: {error}"))
-    })?;
-
+    let response = upstream
+        .send()
+        .await
+        .map_err(|error| failed(format!("upstream request failed: {error}"), true))?;
     let status = response.status();
+    if config.retryable_statuses.contains(&status.as_u16())
+        || (!status.is_success() && config.kind != KIND_HTTP)
+    {
+        let retryable = config.retryable_statuses.contains(&status.as_u16());
+        let body = read_bounded(response, 1024).await.unwrap_or_default();
+        return Err(failed(
+            format!(
+                "upstream returned {status}: {}",
+                truncate(&String::from_utf8_lossy(&body), 512)
+            ),
+            retryable,
+        ));
+    }
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream")
-        .to_string();
-
-    if config.retryable_statuses.contains(&status.as_u16()) {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ExecutionError::retryable(format!(
-            "upstream returned {status}: {}",
-            truncate(&body, 512)
-        )));
-    }
-    // LLM workers treat any non-2xx as failure (OpenAI gateway semantics);
-    // HTTP workers pass upstream errors back to the caller verbatim.
-    if !status.is_success() && config.kind != KIND_HTTP {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ExecutionError::fatal(format!(
-            "upstream returned {status}: {}",
-            truncate(&body, 512)
-        )));
-    }
-
-    let output_metadata = HashMap::from([
-        (CONTENT_TYPE_KEY.to_string(), content_type.clone()),
-        (HTTP_STATUS_KEY.to_string(), status.as_u16().to_string()),
-    ]);
-
-    let payload = if content_type.contains("text/event-stream") {
-        stream_response(
-            context,
-            client,
-            &job.job_id,
-            &lease_id,
-            &attempt_id,
-            &content_type,
-            response,
-        )
-        .await?
-    } else {
-        response
-            .bytes()
-            .await
-            .map_err(|error| ExecutionError::retryable(format!("read upstream body: {error}")))?
-            .to_vec()
-    };
-
-    client
-        .complete_lease(
-            context.worker_id.clone(),
-            lease_id,
-            vec![ObjectRef {
-                reference: Some(object_ref::Reference::Inline(payload)),
-                metadata: output_metadata.clone(),
-            }],
-            output_metadata,
-        )
-        .await?;
-    Ok(())
-}
-
-fn load_request(
-    job_id: &str,
-    spec: &anyserve_client::controlplane::JobSpec,
-) -> Result<RequestBody, ExecutionError> {
-    let Some((content, metadata)) =
-        spec.inputs
-            .first()
-            .and_then(|input| match input.reference.as_ref() {
-                Some(object_ref::Reference::Inline(content)) => Some((content, &input.metadata)),
-                _ => None,
-            })
-    else {
-        return Err(ExecutionError::fatal(format!(
-            "job '{job_id}' has no inline input"
-        )));
-    };
-    Ok(RequestBody {
-        body: content.clone(),
-        content_type: metadata
-            .get(CONTENT_TYPE_KEY)
-            .cloned()
-            .unwrap_or_else(|| "application/json".to_string()),
-        forward_headers: metadata
-            .iter()
-            .filter_map(|(key, value)| {
-                key.strip_prefix(FORWARD_HEADER_PREFIX)
-                    .map(|name| (name.to_string(), value.clone()))
-            })
-            .collect(),
-    })
-}
-
-/// Best-effort Started event, sent off the critical path.
-fn report_started(context: &WorkerContext, client: &AnyserveClient, lease_id: &str) {
-    let mut client = client.clone();
-    let worker_id = context.worker_id.clone();
-    let lease_id = lease_id.to_string();
+        .to_owned();
     let metadata = HashMap::from([
-        ("provider".to_string(), context.config.provider.clone()),
-        ("worker.kind".to_string(), context.config.kind.clone()),
-        ("worker_id".to_string(), context.worker_id.clone()),
+        (CONTENT_TYPE_KEY.to_owned(), content_type.clone()),
+        (HTTP_STATUS_KEY.to_owned(), status.as_u16().to_string()),
     ]);
-    tokio::spawn(async move {
-        let _ = client
-            .report_event(
-                worker_id,
-                lease_id,
-                EventKind::Started,
-                Vec::new(),
-                metadata,
-            )
-            .await;
-    });
+    if content_type.contains("text/event-stream") {
+        let mut body = response.bytes_stream();
+        let mut buffered = Vec::new();
+        let mut final_marker = DoneMarker::default();
+        while let Some(chunk) = body.next().await {
+            let chunk =
+                chunk.map_err(|error| failed(format!("read upstream stream: {error}"), true))?;
+            final_marker.push(&chunk);
+            if config.kind == KIND_HTTP {
+                if buffered.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    return Err(failed("upstream response exceeds inline limit", false));
+                }
+                buffered.extend_from_slice(&chunk);
+            }
+            attempt
+                .frame(chunk, metadata.clone(), false)
+                .await
+                .map_err(|error| failed(format!("send output: {error}"), true))?;
+        }
+        if config.kind != KIND_HTTP {
+            if !final_marker.finish() {
+                return Err(failed(
+                    "upstream closed without the OpenAI [DONE] marker",
+                    true,
+                ));
+            }
+            return Ok(Vec::new());
+        }
+        Ok(vec![v2::Object {
+            body: Some(v2::object::Body::Inline(buffered.into())),
+            metadata,
+        }])
+    } else {
+        let body = read_bounded(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|error| failed(format!("read upstream body: {error}"), true))?;
+        Ok(vec![v2::Object {
+            body: Some(v2::object::Body::Inline(body.into())),
+            metadata,
+        }])
+    }
 }
 
-async fn stream_response(
-    context: &WorkerContext,
-    client: &mut AnyserveClient,
-    job_id: &str,
-    lease_id: &str,
-    attempt_id: &str,
-    content_type: &str,
-    response: reqwest::Response,
-) -> Result<Vec<u8>, ExecutionError> {
-    let output_stream = client
-        .open_stream(open_output_stream(
-            job_id.to_string(),
-            context.worker_id.clone(),
-            lease_id.to_string(),
-            attempt_id.to_string(),
-        ))
-        .await?;
-
-    let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<FrameWrite>(256);
-    let mut push_client = client.clone();
-    let push_task = tokio::spawn({
-        let stream_id = output_stream.stream_id.clone();
-        let worker_id = context.worker_id.clone();
-        let lease_id = lease_id.to_string();
-        async move {
-            push_client
-                .push_frames_stream(
-                    stream_id,
-                    ReceiverStream::new(frames_rx),
-                    Some(worker_id),
-                    Some(lease_id),
-                )
-                .await
+async fn read_bounded(response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read response chunk")?;
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            bail!("upstream response exceeds {limit} bytes");
         }
-    });
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
 
-    let mut persisted = Vec::new();
-    let mut body = response.bytes_stream();
-    let mut stream_error = None;
-    while let Some(chunk) = body.next().await {
-        match chunk {
-            Ok(chunk) if chunk.is_empty() => continue,
-            Ok(chunk) => {
-                persisted.extend_from_slice(&chunk);
-                if frames_tx
-                    .send(frame_write_with_content_type(
-                        chunk.to_vec(),
-                        content_type.to_string(),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    stream_error = Some("output frame pipeline closed".to_string());
-                    break;
-                }
-            }
-            Err(error) => {
-                stream_error = Some(format!("read upstream event stream: {error}"));
-                break;
+/// Recognise an SSE terminal line across arbitrary HTTP chunk boundaries.
+/// Long non-terminal lines are skipped without buffering an entire event.
+#[derive(Default)]
+struct DoneMarker {
+    line: Vec<u8>,
+    overflow: bool,
+    done: bool,
+}
+impl DoneMarker {
+    fn push(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if *byte == b'\n' {
+                self.check_line();
+                self.line.clear();
+                self.overflow = false;
+            } else if self.line.len() < 32 {
+                self.line.push(*byte);
+            } else {
+                self.overflow = true;
             }
         }
     }
+    fn check_line(&mut self) {
+        self.done |= !self.overflow && self.line.trim_ascii() == b"data: [DONE]";
+    }
+    fn finish(mut self) -> bool {
+        self.check_line();
+        self.done
+    }
+}
 
-    let closing = match stream_error.as_ref() {
-        Some(message) => FrameWrite::new(FrameKind::Error, message.clone().into_bytes()),
-        None => FrameWrite::new(FrameKind::Close, Vec::new()).with_metadata(HashMap::from([(
-            "stream_name".to_string(),
-            DEFAULT_OUTPUT_STREAM.to_string(),
-        )])),
-    };
-    let _ = frames_tx.send(closing).await;
-    drop(frames_tx);
-    push_task
-        .await
-        .map_err(|error| ExecutionError::fatal(format!("output push task panicked: {error}")))??;
-
-    match stream_error {
-        // Part of the answer already reached the caller, so do not retry.
-        Some(message) => Err(ExecutionError::fatal(message)),
-        None => Ok(persisted),
+fn failed(message: impl Into<String>, retryable: bool) -> v2::ErrorInfo {
+    v2::ErrorInfo {
+        code: "worker_failed".to_owned(),
+        message: message.into(),
+        retryable,
     }
 }
 
 fn join_url(base_url: &str, path: &str) -> String {
     if path.is_empty() {
-        return base_url.to_string();
+        base_url.to_owned()
+    } else {
+        format!(
+            "{}/{}",
+            base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
     }
-    format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::join_url;
-
+    use super::{DoneMarker, join_url};
+    #[test]
+    fn sse_completion_handles_every_chunk_boundary_and_rejects_truncation() {
+        let stream = b"data: {\"text\":\"data: [DONE]\"}\n\ndata: [DONE]\r\n\r\n";
+        for split in 0..=stream.len() {
+            let mut marker = DoneMarker::default();
+            marker.push(&stream[..split]);
+            marker.push(&stream[split..]);
+            assert!(marker.finish());
+        }
+        let mut marker = DoneMarker::default();
+        marker.push(b"data: {\"text\":\"data: [DONE]\"}\n\n");
+        assert!(!marker.finish());
+    }
     #[test]
     fn join_url_normalizes_slashes() {
         assert_eq!(join_url("http://a/v1/", "/chat"), "http://a/v1/chat");

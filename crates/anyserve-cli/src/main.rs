@@ -6,9 +6,12 @@ mod edge_routing;
 mod job_commands;
 mod serve_config;
 mod serve_console;
+mod serve_execution;
 mod serve_invoke;
 mod serve_openai;
 mod serve_runtime;
+#[cfg(test)]
+mod test_support;
 mod worker;
 
 use job_commands::{JobCommands, run_job_command};

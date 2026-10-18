@@ -6,23 +6,18 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use anyserve_core::auth::AuthPolicy;
-use anyserve_core::model::Demand;
+use anyserve_core::runtime::api::Demand;
+use anyserve_core::runtime::api::RuntimeConfig;
 
 use crate::edge_routing::RoutingDefaults;
 use file::{AnyserveConfigFile, ServeOpenAIConfigFile};
 
-pub const DEFAULT_HEARTBEAT_TTL_SECS: u64 = 30;
-pub const DEFAULT_LEASE_TTL_SECS: u64 = 30;
-pub const DEFAULT_WATCH_POLL_INTERVAL_MS: u64 = 250;
-pub const DEFAULT_CLOSED_RETENTION_SECS: u64 = 300;
-const DEFAULT_MEMORY_JOB_RETENTION_SECS: u64 = 600;
-const DEFAULT_SQL_JOB_RETENTION_SECS: u64 = 7 * 24 * 3600;
-const DEFAULT_OPENAI_LISTEN: &str = "0.0.0.0:8080";
+const DEFAULT_OPENAI_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:3001";
 const DEFAULT_CHAT_INTERFACE: &str = "llm.chat.v1";
 const DEFAULT_EMBEDDINGS_INTERFACE: &str = "llm.embed.v1";
 const DEFAULT_OPENAI_REQUEST_TIMEOUT_SECS: u64 = 60;
-const DEFAULT_INVOKE_LISTEN: &str = "0.0.0.0:8090";
+const DEFAULT_INVOKE_LISTEN: &str = "127.0.0.1:8090";
 const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_INVOKE_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -38,7 +33,7 @@ pub struct GrpcConfig {
 impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             port: 50_052,
             tls_enabled: false,
             cert_file: None,
@@ -55,20 +50,15 @@ pub struct ServeOverrides {
     pub grpc_tls_enabled: Option<bool>,
     pub grpc_cert_file: Option<String>,
     pub grpc_key_file: Option<String>,
-    pub heartbeat_ttl_secs: Option<u64>,
-    pub default_lease_ttl_secs: Option<u64>,
+    pub ephemeral: bool,
+    pub journal_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ResolvedServeConfig {
     pub config_path: Option<PathBuf>,
     pub grpc: GrpcConfig,
-    pub heartbeat_ttl_secs: u64,
-    pub default_lease_ttl_secs: u64,
-    /// Terminal jobs older than this are purged; 0 keeps them forever.
-    pub job_retention_secs: u64,
-    pub storage: StorageConfig,
-    pub frames: FrameConfig,
+    pub runtime: RuntimeConfig,
     pub console: Option<ServeConsoleConfig>,
     pub openai: Option<ServeOpenAIConfig>,
     pub invoke: Option<ServeInvokeConfig>,
@@ -87,56 +77,21 @@ pub struct ServeInvokeConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageBackend {
-    Memory,
-    Sqlite,
-    Postgres,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StorageConfig {
-    pub backend: StorageBackend,
-    pub dsn: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrameBackend {
-    Memory,
-    Redis,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FrameConfig {
-    pub backend: FrameBackend,
-    pub redis_url: Option<String>,
-    pub closed_retention_secs: u64,
-    pub watch_poll_interval_ms: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeMode {
     Memory,
-    MemoryPlusPostgres,
     MemoryPlusSqlite,
-    PostgresAndRedis,
 }
-
 impl RuntimeMode {
     pub fn code(self) -> &'static str {
         match self {
             Self::Memory => "memory",
-            Self::MemoryPlusPostgres => "memory_plus_postgres",
             Self::MemoryPlusSqlite => "memory_plus_sqlite",
-            Self::PostgresAndRedis => "postgres_and_redis",
         }
     }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Memory => "Memory",
-            Self::MemoryPlusPostgres => "Memory + PostgreSQL",
-            Self::MemoryPlusSqlite => "Memory + SQLite",
-            Self::PostgresAndRedis => "PostgreSQL + Redis",
+            Self::MemoryPlusSqlite => "Memory + SQLite journal",
         }
     }
 }
@@ -171,16 +126,20 @@ impl ResolvedServeConfig {
             .as_ref()
             .and_then(|config| config.server.as_ref());
         let tls = server.and_then(|server| server.tls.as_ref());
-        let storage = server
-            .and_then(|server| server.storage.as_ref())
-            .cloned()
+        let mut runtime = file_config
+            .as_ref()
+            .and_then(|config| config.runtime.clone())
             .unwrap_or_default()
-            .resolve()?;
-        let frames = server
-            .and_then(|server| server.frames.as_ref())
-            .cloned()
-            .unwrap_or_default()
-            .resolve(storage.backend)?;
+            .resolve();
+        runtime.journal = if overrides.ephemeral {
+            None
+        } else {
+            file_config
+                .as_ref()
+                .and_then(|config| config.journal.clone())
+                .unwrap_or_default()
+                .resolve(overrides.journal_path)?
+        };
         let console = file_config
             .as_ref()
             .and_then(|config| config.console.as_ref())
@@ -209,22 +168,7 @@ impl ResolvedServeConfig {
         Ok(Self {
             config_path: file_path,
             grpc,
-            heartbeat_ttl_secs: overrides
-                .heartbeat_ttl_secs
-                .or_else(|| server.and_then(|server| server.heartbeat_ttl_secs))
-                .unwrap_or(DEFAULT_HEARTBEAT_TTL_SECS),
-            default_lease_ttl_secs: overrides
-                .default_lease_ttl_secs
-                .or_else(|| server.and_then(|server| server.default_lease_ttl_secs))
-                .unwrap_or(DEFAULT_LEASE_TTL_SECS),
-            job_retention_secs: server
-                .and_then(|server| server.job_retention_secs)
-                .unwrap_or(match storage.backend {
-                    StorageBackend::Memory => DEFAULT_MEMORY_JOB_RETENTION_SECS,
-                    _ => DEFAULT_SQL_JOB_RETENTION_SECS,
-                }),
-            storage,
-            frames,
+            runtime,
             console,
             openai: file_config
                 .as_ref()
@@ -243,12 +187,10 @@ impl ResolvedServeConfig {
     }
 
     pub fn runtime_mode(&self) -> RuntimeMode {
-        match (self.storage.backend, self.frames.backend) {
-            (StorageBackend::Memory, FrameBackend::Memory) => RuntimeMode::Memory,
-            (StorageBackend::Sqlite, FrameBackend::Memory) => RuntimeMode::MemoryPlusSqlite,
-            (StorageBackend::Postgres, FrameBackend::Memory) => RuntimeMode::MemoryPlusPostgres,
-            (StorageBackend::Postgres, FrameBackend::Redis) => RuntimeMode::PostgresAndRedis,
-            _ => unreachable!("validated storage and frame backends should map to a runtime mode"),
+        if self.runtime.journal.is_some() {
+            RuntimeMode::MemoryPlusSqlite
+        } else {
+            RuntimeMode::Memory
         }
     }
 }

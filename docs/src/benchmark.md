@@ -2,7 +2,7 @@
 
 `bench/edge/bench.py` measures what anyserve adds on top of calling an edge
 backend directly, and fails when that cost regresses. Run it after any change
-to the kernel, workers, or gateways.
+to the runtime, workers, or gateways.
 
 ```bash
 cd bench/edge

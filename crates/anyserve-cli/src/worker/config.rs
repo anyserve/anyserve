@@ -7,9 +7,7 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use serde::Deserialize;
 
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 1;
-const DEFAULT_LONG_POLL_MS: u64 = 20_000;
-const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+const DEFAULT_RECONNECT_INTERVAL_SECS: u64 = 1;
 const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 5;
 const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_RETRYABLE_STATUSES: &[u16] = &[429, 502, 503, 504];
@@ -30,28 +28,17 @@ pub struct WorkerArgs {
     pub worker_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct LeaseActivity {
-    pub(crate) active_lease_ids: BTreeSet<String>,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerConfig {
     pub(crate) kind: String,
-    pub(crate) worker_id: Option<String>,
+    pub(crate) worker_id: String,
     pub(crate) provider: String,
     pub(crate) base_url: String,
     pub(crate) api_key: Option<String>,
     pub(crate) token: Option<String>,
     pub(crate) interfaces: Vec<String>,
-    /// Number of leases processed concurrently; one long-poll loop per slot.
     pub(crate) max_active_leases: u32,
-    /// Back-off after a failed poll.
-    pub(crate) poll_interval: Duration,
-    /// How long each PollLease call may wait server-side for work. Zero falls
-    /// back to fixed-interval polling.
-    pub(crate) long_poll: Duration,
-    pub(crate) heartbeat_interval: Duration,
+    pub(crate) reconnect_interval: Duration,
     pub(crate) health_url: Option<String>,
     pub(crate) health_interval: Duration,
     pub(crate) upstream_timeout: Duration,
@@ -87,11 +74,7 @@ struct WorkerConfigFile {
     #[serde(default)]
     max_active_leases: Option<u32>,
     #[serde(default)]
-    poll_interval_secs: Option<u64>,
-    #[serde(default)]
-    long_poll_ms: Option<u64>,
-    #[serde(default)]
-    heartbeat_interval_secs: Option<u64>,
+    reconnect_interval_secs: Option<u64>,
     #[serde(default)]
     health_url: Option<String>,
     #[serde(default)]
@@ -200,21 +183,17 @@ fn resolve_config(
 
     Ok(WorkerConfig {
         kind,
-        worker_id: Some(worker_id),
+        worker_id,
         provider,
         base_url: file.base_url.trim_end_matches('/').to_string(),
         api_key,
         token,
         interfaces,
         max_active_leases,
-        poll_interval: Duration::from_secs(
-            file.poll_interval_secs
-                .unwrap_or(DEFAULT_POLL_INTERVAL_SECS),
-        ),
-        long_poll: Duration::from_millis(file.long_poll_ms.unwrap_or(DEFAULT_LONG_POLL_MS)),
-        heartbeat_interval: Duration::from_secs(
-            file.heartbeat_interval_secs
-                .unwrap_or(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+        reconnect_interval: Duration::from_secs(
+            file.reconnect_interval_secs
+                .unwrap_or(DEFAULT_RECONNECT_INTERVAL_SECS)
+                .max(1),
         ),
         health_url: file.health_url,
         health_interval: Duration::from_secs(
@@ -252,6 +231,12 @@ fn secret_from(value: Option<String>, env_name: Option<&str>) -> Result<Option<S
 }
 
 #[cfg(test)]
+pub(crate) fn validate_config(raw: &str) -> Result<()> {
+    toml::from_str::<WorkerConfigFile>(raw)?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -270,8 +255,8 @@ mod tests {
             Some("llm")
         );
         assert_eq!(
-            config.long_poll,
-            Duration::from_millis(DEFAULT_LONG_POLL_MS)
+            config.reconnect_interval,
+            Duration::from_secs(DEFAULT_RECONNECT_INTERVAL_SECS)
         );
     }
 

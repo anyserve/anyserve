@@ -1,9 +1,9 @@
 //! Bearer-token authentication for the control-plane gRPC API.
 //!
 //! Edge workers dial the control plane across the WAN, so the API needs a
-//! credential check before any request reaches the kernel. Tokens are split by
-//! role: worker tokens may lease and report work, client tokens may submit and
-//! cancel jobs, and either may use the shared stream/read RPCs.
+//! credential check before any request reaches the runtime. Tokens are split by
+//! role: worker tokens open execution sessions and attempt data links; client
+//! tokens invoke, submit, inspect and cancel jobs.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -16,20 +16,10 @@ use tonic::Status;
 use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
-const SERVICE_PREFIX: &str = "/controlplane.ControlPlaneService/";
+const V2_CLIENT_PREFIX: &str = "/anyserve.v2.Client/";
+const V2_WORKER_PREFIX: &str = "/anyserve.v2.Worker/";
 const HEALTH_PREFIX: &str = "/grpc.health.v1.Health/";
 const REFLECTION_PREFIX: &str = "/grpc.reflection.";
-
-const WORKER_METHODS: &[&str] = &[
-    "RegisterWorker",
-    "HeartbeatWorker",
-    "PollLease",
-    "RenewLease",
-    "ReportEvent",
-    "CompleteLease",
-    "FailLease",
-];
-const CLIENT_METHODS: &[&str] = &["SubmitJob", "CancelJob"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -99,16 +89,14 @@ impl AuthPolicy {
         let role = bearer_token(headers)
             .and_then(|token| self.role_for_token(token))
             .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
-        let method = path.strip_prefix(SERVICE_PREFIX).unwrap_or(path);
-        match role {
-            Role::Client if WORKER_METHODS.contains(&method) => Err(Status::permission_denied(
-                format!("client token cannot call worker method {method}"),
-            )),
-            Role::Worker if CLIENT_METHODS.contains(&method) => Err(Status::permission_denied(
-                format!("worker token cannot call client method {method}"),
-            )),
-            _ => Ok(()),
+        if (role == Role::Client && path.starts_with(V2_WORKER_PREFIX))
+            || (role == Role::Worker && path.starts_with(V2_CLIENT_PREFIX))
+        {
+            return Err(Status::permission_denied(
+                "token role cannot call this execution service",
+            ));
         }
+        Ok(())
     }
 }
 
@@ -185,12 +173,20 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
         match self
             .policy
             .authorize(request.uri().path(), request.headers())
         {
-            Ok(()) => Box::pin(self.inner.call(request)),
+            Ok(()) => {
+                if self.policy.is_enabled()
+                    && let Some(role) = bearer_token(request.headers())
+                        .and_then(|token| self.policy.role_for_token(token))
+                {
+                    request.extensions_mut().insert(role);
+                }
+                Box::pin(self.inner.call(request))
+            }
             Err(status) => Box::pin(async move { Ok(status.into_http()) }),
         }
     }
@@ -210,60 +206,53 @@ mod tests {
     }
 
     fn path(method: &str) -> String {
-        format!("{SERVICE_PREFIX}{method}")
+        format!("{V2_CLIENT_PREFIX}{method}")
     }
 
     #[test]
     fn disabled_policy_allows_everything() {
         let policy = AuthPolicy::default();
-        assert!(
-            policy
-                .authorize(&path("SubmitJob"), &HeaderMap::new())
-                .is_ok()
-        );
+        assert!(policy.authorize(&path("Submit"), &HeaderMap::new()).is_ok());
     }
 
     #[test]
-    fn roles_are_enforced_per_method() {
+    fn roles_are_enforced_per_service() {
         let policy = AuthPolicy::new(["client-secret".to_string()], ["worker-secret".to_string()]);
-
-        assert!(
-            policy
-                .authorize(&path("SubmitJob"), &headers("client-secret"))
-                .is_ok()
-        );
-        assert!(
-            policy
-                .authorize(&path("PollLease"), &headers("worker-secret"))
-                .is_ok()
-        );
-        assert!(
-            policy
-                .authorize(&path("PushFrames"), &headers("worker-secret"))
-                .is_ok()
-        );
-        assert!(
-            policy
-                .authorize(&path("PushFrames"), &headers("client-secret"))
-                .is_ok()
-        );
-
-        let denied = policy
-            .authorize(&path("PollLease"), &headers("client-secret"))
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-        let denied = policy
-            .authorize(&path("SubmitJob"), &headers("worker-secret"))
-            .unwrap_err();
-        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
-        let missing = policy
-            .authorize(&path("GetJob"), &HeaderMap::new())
-            .unwrap_err();
-        assert_eq!(missing.code(), tonic::Code::Unauthenticated);
-        let wrong = policy
-            .authorize(&path("GetJob"), &headers("nope"))
-            .unwrap_err();
-        assert_eq!(wrong.code(), tonic::Code::Unauthenticated);
+        for method in ["Submit", "Invoke", "Watch", "ListJobs", "GetJob", "Cancel"] {
+            assert!(
+                policy
+                    .authorize(&path(method), &headers("client-secret"))
+                    .is_ok()
+            );
+            assert_eq!(
+                policy
+                    .authorize(&path(method), &headers("worker-secret"))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        for method in ["Session", "Attempt"] {
+            let path = format!("{V2_WORKER_PREFIX}{method}");
+            assert!(policy.authorize(&path, &headers("worker-secret")).is_ok());
+            assert_eq!(
+                policy
+                    .authorize(&path, &headers("client-secret"))
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied
+            );
+        }
+        for token in [None, Some("nope")] {
+            let headers = token.map(headers).unwrap_or_default();
+            assert_eq!(
+                policy
+                    .authorize(&path("GetJob"), &headers)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+        }
     }
 
     #[test]

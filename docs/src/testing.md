@@ -1,120 +1,55 @@
 # Testing
 
-Anyserve currently has four practical testing layers.
+The acceptance gates use the workspace sources, the rebuilt Python wheel and the
+console lockfile. No GPU, external database or broker is required for these
+checks.
 
-## 1. Unit Tests
+## Rust
 
-Run the workspace tests:
-
-```bash
-source "$HOME/.cargo/env"
-cargo test -p anyserve-core -p anyserve
-```
-
-Current core tests cover:
-
-- scheduler matching on generic attributes and capacity
-- lease failure and requeue behavior
-- in-memory stream append and pull ordering
-- kernel-level stream write and read flow
-- a full gRPC e2e covering submit, lease, attempts, streams, and completion
-
-## 2. Local End-to-End
-
-The checked-in examples are the easiest local smoke tests.
-
-For the built-in OpenAI-compatible gateway and worker, use the canonical walkthrough in [examples/ollama/README.md](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md). That page keeps the full startup sequence and request examples together.
-
-This is the user-facing path worth validating first because it exercises the built-in gateway and worker with the same shape you would use in practice.
-
-## 3. Python Bindings Smoke Test
-
-Install the package from local source into an active environment:
+With Rust and protoc available:
 
 ```bash
-python -m pip install ./clients/python
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Run the Python unit tests. These do not require a running control plane:
+Core unit and `runtime_v2` integration tests cover capability matching, admission,
+attempt budgets, stream exposure, cancellation, three memory budgets, SQLite
+acceptance/terminal receipts, restart recovery and cold reads. CLI tests exercise
+real TCP services, HTTP/OpenAI adapters, auth, console reads, large payloads and
+worker cancellation. SDK tests cover delivery backoff and negotiated retry windows.
+
+## Python
+
+Build and install the current extension before testing; an older installed wheel
+can hide protocol or binding regressions. Python 3.12+ is required.
 
 ```bash
-python -m unittest discover -s clients/python/tests -p 'test_*.py'
+cargo build -p anyserve
+python -m pip install --force-reinstall ./clients/python
+python -m unittest discover -s clients/python/tests -p 'test_*.py' -v
+python clients/python/tests/sdk_e2e.py -v
 ```
 
-Build the local binaries once, then run the live Python SDK end-to-end suite:
+`ANYSERVE_BIN` may point the existing process suite at a specific current binary;
+its default is `target/debug/anyserve` from the repository root. The suite starts
+its own authenticated control-plane processes and Python workers in temporary
+directories. It covers durable idempotency, large payloads, duplex output before
+InputEnd, disconnect cancellation, process-kill recovery and typed RPC errors.
+The smaller unit suite covers handler dispatch, codecs and failure handling.
+
+## Console
 
 ```bash
-source "$HOME/.cargo/env"
-cargo build --workspace
-python clients/python/tests/sdk_e2e.py
+cd console
+npm ci
+npm run build
 ```
 
-The install and unit-test path verifies:
+This checks both TypeScript projects and builds the production assets. Backend
+console tests run as part of `cargo test --workspace`.
 
-- wheel installation
-- Python import surface
-- role-specific client helpers such as `list_jobs`
-- bindings constants
-- convenience object constructors
-
-The Python unit tests additionally verify:
-
-- low-level facade forwarding for `list_jobs`, `watch_job`, and `pull_frames`
-- `@worker(...)` metadata capture
-- `serve(...)` success paths for `bytes` and `json`
-- failure handling for malformed JSON input
-
-The Python SDK e2e suite additionally verifies:
-
-- Python low-level submitter APIs against the demo worker
-- Python high-level `@worker` / `serve()` against a live control plane
-- streamed event and frame iteration against a real server
-
-If you also want to exercise the Python bindings against a live server manually, start the control plane and a compatible worker first, then run:
-
-```bash
-python - <<'PY'
-from anyserve import AnyserveClient, FRAME_DATA, inline_object, uri_object
-
-client = AnyserveClient("http://127.0.0.1:50062")
-print(client)
-print(inline_object(b"hello"))
-print(uri_object("file:///tmp/example"))
-job = client.submit_job(
-    interface_name="demo.echo.v1",
-    required_attributes={"runtime": "demo"},
-    required_capacity={"slot": 1},
-)
-stream = client.open_stream(job["job_id"], "input.default")
-print(stream["stream_name"])
-print(client.push_frames(stream["stream_id"], [(FRAME_DATA, b"hello", {})]))
-PY
-```
-
-## 4. Standalone E2E Test
-
-Run the dedicated gRPC end-to-end test:
-
-```bash
-source "$HOME/.cargo/env"
-cargo test -p anyserve-core --test grpc_e2e -- --nocapture
-```
-
-For Docker-backed persistence checks, run the ignored integration tests explicitly:
-
-```bash
-ANYSERVE_TEST_POSTGRES_DSN='postgres://postgres:postgres@127.0.0.1:55432/anyserve_test' \
-cargo test -p anyserve-core --test postgres_memory_persistence -- --ignored --nocapture
-
-ANYSERVE_TEST_POSTGRES_DSN='postgres://postgres:postgres@127.0.0.1:55432/anyserve_test' \
-ANYSERVE_TEST_REDIS_URL='redis://127.0.0.1:56379' \
-cargo test -p anyserve-core --test postgres_redis_integration -- --ignored --nocapture
-```
-
-This test boots an in-process gRPC server, registers a worker, submits a job, pushes input frames, completes the lease, then verifies:
-
-- job events
-- attempt state
-- stream listing
-- output frame round-trip
-- final job state
+The [acceptance record](redesign.md) records actual outcomes and limitations.
+GPU demos and historical performance reports are separate from these gates; they
+must not be interpreted as current execution-protocol benchmark results.

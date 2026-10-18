@@ -355,8 +355,7 @@ export default function App() {
             meta={`${queueJobs.length} active jobs`}
             stats={[
               { label: "Active", value: overview?.queue.active ?? 0 },
-              { label: "Pending", value: overview?.queue.pending ?? 0 },
-              { label: "Leased", value: overview?.queue.leased ?? 0 },
+              { label: "Queued", value: overview?.queue.queued ?? 0 },
               { label: "Running", value: overview?.queue.running ?? 0 },
             ]}
             jobs={queueJobs}

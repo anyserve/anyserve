@@ -3,24 +3,17 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use anyserve_core::auth::{AuthLayer, AuthPolicy};
-use anyserve_core::frame::{FramePlane, MemoryFramePlane, RedisFramePlane};
-use anyserve_core::kernel::Kernel;
-use anyserve_core::notify::{ClusterNotifier, NoopClusterNotifier, RedisClusterNotifier};
-use anyserve_core::scheduler::BasicScheduler;
-use anyserve_core::service::ControlPlaneGrpcService;
-use anyserve_core::sql_store::SqlStateStore;
-use anyserve_core::store::{MemoryStateStore, StateStore};
-use anyserve_proto::controlplane::control_plane_service_server::ControlPlaneServiceServer;
+use anyserve_core::client_service::ClientGrpcService;
+use anyserve_core::runtime::Runtime;
+use anyserve_core::worker_service::WorkerGrpcService;
+use anyserve_proto::v2::{client_server::ClientServer, worker_server::WorkerServer};
 use clap::Args;
-use sqlx::{AnyConnection, Connection};
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
-use crate::serve_config::{
-    FrameBackend, GrpcConfig, ResolvedServeConfig, ServeOverrides, StorageBackend,
-};
+use crate::serve_config::{GrpcConfig, ResolvedServeConfig, ServeOverrides};
 use crate::serve_console::run_server as run_console_server;
 use crate::serve_invoke::run_server as run_serve_invoke;
 use crate::serve_openai::run_server as run_serve_openai;
@@ -29,12 +22,6 @@ use crate::serve_openai::run_server as run_serve_openai;
 mod tests;
 
 const MAX_PENDING_RESET_STREAMS: usize = 1024;
-const POSTGRES_MEMORY_SINGLETON_LOCK_ID: i64 = 0x4153_5256_5047_4d4d;
-
-struct PostgresMemorySingletonLock {
-    _connection: AnyConnection,
-}
-
 #[derive(Args, Debug)]
 pub(crate) struct ServeArgs {
     #[arg(long = "config", value_name = "PATH")]
@@ -53,10 +40,12 @@ pub(crate) struct ServeArgs {
     grpc_cert_file: Option<String>,
     #[arg(long = "grpc-key-file")]
     grpc_key_file: Option<String>,
-    #[arg(long = "heartbeat-ttl-secs")]
-    heartbeat_ttl_secs: Option<u64>,
-    #[arg(long = "default-lease-ttl-secs")]
-    default_lease_ttl_secs: Option<u64>,
+    /// Disable durable jobs and keep the runtime entirely in memory.
+    #[arg(long, conflicts_with = "journal_path")]
+    ephemeral: bool,
+    /// SQLite recovery journal (default: .anyserve/journal.sqlite).
+    #[arg(long = "journal", value_name = "PATH")]
+    journal_path: Option<PathBuf>,
 }
 
 pub(crate) async fn run(args: ServeArgs) -> Result<()> {
@@ -67,72 +56,13 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         grpc_tls_enabled: args.grpc_tls_enabled,
         grpc_cert_file: args.grpc_cert_file,
         grpc_key_file: args.grpc_key_file,
-        heartbeat_ttl_secs: args.heartbeat_ttl_secs,
-        default_lease_ttl_secs: args.default_lease_ttl_secs,
+        ephemeral: args.ephemeral,
+        journal_path: args.journal_path,
     })?;
-    if config.storage.backend == StorageBackend::Postgres
-        && config.frames.backend == FrameBackend::Memory
-    {
-        warn!(
-            "postgres + memory mode is intended for a single control-plane instance; frame data stays in memory and is not shared or persisted"
-        );
-    }
     let grpc_config = config.grpc.clone();
-    let _postgres_memory_lock = match (config.storage.backend, config.frames.backend) {
-        (StorageBackend::Postgres, FrameBackend::Memory) => {
-            let dsn = config
-                .storage
-                .dsn
-                .as_deref()
-                .context("storage dsn is required")?;
-            Some(acquire_postgres_memory_singleton_lock(dsn).await?)
-        }
-        _ => None,
-    };
-    let state_store: Arc<dyn StateStore> = match config.storage.backend {
-        StorageBackend::Memory => Arc::new(MemoryStateStore::new()),
-        StorageBackend::Sqlite | StorageBackend::Postgres => {
-            let dsn = config
-                .storage
-                .dsn
-                .as_deref()
-                .context("storage dsn is required")?;
-            Arc::new(SqlStateStore::connect(dsn).await?)
-        }
-    };
-    let frame_plane: Arc<dyn FramePlane> = match config.frames.backend {
-        FrameBackend::Memory => Arc::new(MemoryFramePlane::new()),
-        FrameBackend::Redis => Arc::new(RedisFramePlane::new(
-            config
-                .frames
-                .redis_url
-                .as_deref()
-                .context("frames redis url is required")?,
-            config.frames.closed_retention_secs,
-        )?),
-    };
-    let notifier: Arc<dyn ClusterNotifier> = match config.frames.backend {
-        FrameBackend::Memory => Arc::new(NoopClusterNotifier),
-        FrameBackend::Redis => Arc::new(RedisClusterNotifier::new(
-            config
-                .frames
-                .redis_url
-                .as_deref()
-                .context("frames redis url is required")?,
-        )?),
-    };
-
-    let kernel = Arc::new(Kernel::new(
-        state_store,
-        frame_plane,
-        notifier,
-        Arc::new(BasicScheduler),
-        config.heartbeat_ttl_secs,
-        config.default_lease_ttl_secs,
-        config.frames.watch_poll_interval_ms,
-    ));
-    kernel.set_job_retention(std::time::Duration::from_secs(config.job_retention_secs));
-    kernel.start_background().await;
+    let runtime = Runtime::start(config.runtime.clone())
+        .await
+        .context("start execution runtime")?;
     let auth = Arc::new(config.auth.clone());
     if !auth.is_enabled() {
         warn!(
@@ -158,51 +88,42 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         .transpose()?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let grpc_task = tokio::spawn(run_grpc_server(
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(run_grpc_server(
         grpc_addr,
-        Arc::clone(&kernel),
+        runtime.clone(),
         grpc_config,
         AuthPolicy::clone(&auth),
         shutdown_rx,
     ));
-    let invoke_task =
-        if let (Some(invoke_config), Some(invoke_addr)) = (config.invoke.clone(), invoke_addr) {
-            Some(tokio::spawn(run_serve_invoke(
-                invoke_addr,
-                Arc::clone(&kernel),
-                invoke_config,
-                Arc::clone(&auth),
-                shutdown_tx.subscribe(),
-            )))
-        } else {
-            None
-        };
-    let openai_task =
-        if let (Some(openai_config), Some(openai_addr)) = (config.openai.clone(), openai_addr) {
-            Some(tokio::spawn(run_serve_openai(
-                openai_addr,
-                Arc::clone(&kernel),
-                openai_config,
-                Arc::clone(&auth),
-                shutdown_tx.subscribe(),
-            )))
-        } else {
-            None
-        };
-    let console_task = if let (Some(console_config), Some(console_addr)) =
-        (config.console.clone(), console_addr)
-    {
-        Some(tokio::spawn(run_console_server(
-            console_addr,
-            Arc::clone(&kernel),
-            console_config,
+    if let (Some(adapter), Some(addr)) = (config.invoke.clone(), invoke_addr) {
+        servers.spawn(run_serve_invoke(
+            addr,
+            runtime.clone(),
+            adapter,
+            Arc::clone(&auth),
+            shutdown_tx.subscribe(),
+        ));
+    }
+    if let (Some(adapter), Some(addr)) = (config.openai.clone(), openai_addr) {
+        servers.spawn(run_serve_openai(
+            addr,
+            runtime.clone(),
+            adapter,
+            Arc::clone(&auth),
+            shutdown_tx.subscribe(),
+        ));
+    }
+    if let (Some(adapter), Some(addr)) = (config.console.clone(), console_addr) {
+        servers.spawn(run_console_server(
+            addr,
+            runtime.clone(),
+            adapter,
             config.runtime_mode(),
             Arc::clone(&auth),
             shutdown_tx.subscribe(),
-        )))
-    } else {
-        None
-    };
+        ));
+    }
 
     print_startup_access_points(
         &grpc_addr,
@@ -227,56 +148,67 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         info!(console = %console_addr, "console api started");
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("listen for shutdown signal")?;
+    let failure = tokio::select! {
+        signal = shutdown_signal() => { signal?; None }
+        ended = servers.join_next() => Some(match ended {
+            Some(Ok(Err(error))) => error,
+            Some(Err(error)) => error.into(),
+            _ => anyhow::anyhow!("a configured server stopped unexpectedly"),
+        }),
+    };
     let _ = shutdown_tx.send(true);
-
-    grpc_task.await.context("join grpc task")??;
-    if let Some(openai_task) = openai_task {
-        openai_task.await.context("join openai task")??;
+    runtime.shutdown().await;
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(joined) = servers.join_next().await {
+            if let Ok(Err(error)) = joined {
+                warn!(%error, "server stopped during shutdown");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        servers.abort_all();
     }
-    if let Some(invoke_task) = invoke_task {
-        invoke_task.await.context("join invoke task")??;
-    }
-    if let Some(console_task) = console_task {
-        console_task.await.context("join console task")??;
+    if let Some(error) = failure {
+        return Err(error);
     }
     Ok(())
 }
 
-async fn acquire_postgres_memory_singleton_lock(dsn: &str) -> Result<PostgresMemorySingletonLock> {
-    sqlx::any::install_default_drivers();
-    let mut connection = AnyConnection::connect(dsn)
-        .await
-        .with_context(|| format!("connect postgres singleton lock session {dsn}"))?;
-    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-        .bind(POSTGRES_MEMORY_SINGLETON_LOCK_ID)
-        .fetch_one(&mut connection)
-        .await
-        .context("acquire postgres + memory singleton advisory lock")?;
-    if !acquired {
-        bail!("postgres + memory only supports a single control-plane instance");
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("install SIGTERM handler")?;
+        tokio::select! { signal = tokio::signal::ctrl_c() => { signal.context("listen for SIGINT")?; }, _ = terminate.recv() => {} }
     }
-    Ok(PostgresMemorySingletonLock {
-        _connection: connection,
-    })
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("listen for shutdown")?;
+    Ok(())
 }
 
 async fn run_grpc_server(
     addr: SocketAddr,
-    kernel: Arc<Kernel>,
+    runtime: Runtime,
     config: GrpcConfig,
     auth: AuthPolicy,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let service = ControlPlaneGrpcService::new(kernel);
-    let grpc_service = ControlPlaneServiceServer::new(service)
+    let client_service = ClientServer::new(ClientGrpcService::new(runtime.clone()))
+        .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
+    let worker_service = WorkerServer::new(WorkerGrpcService::new(runtime))
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
-        .set_serving::<ControlPlaneServiceServer<ControlPlaneGrpcService>>()
+        .set_serving::<ClientServer<ClientGrpcService>>()
+        .await;
+    health_reporter
+        .set_serving::<WorkerServer<WorkerGrpcService>>()
         .await;
 
     let mut builder = Server::builder();
@@ -304,13 +236,16 @@ async fn run_grpc_server(
 
     builder
         .tcp_nodelay(true)
+        .initial_stream_window_size(Some(4 * 1024 * 1024))
+        .initial_connection_window_size(Some(32 * 1024 * 1024))
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
-        // A draining worker cancels all its parked long-polls at once; the
+        // A draining worker cancels its attempt streams at once; the
         // default rapid-reset guard (20) would drop the whole connection.
         .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_RESET_STREAMS))
         .layer(AuthLayer::new(auth))
         .add_service(health_service)
-        .add_service(grpc_service)
+        .add_service(client_service)
+        .add_service(worker_service)
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;
         })

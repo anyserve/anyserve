@@ -16,7 +16,7 @@ export const TAB_PATHS: Record<ConsoleTab, string> = {
   history: "/history",
 };
 
-export const QUEUE_STATES: JobState[] = ["pending", "leased", "running"];
+export const QUEUE_STATES: JobState[] = ["queued", "running"];
 export const HISTORY_STATES: JobState[] = ["succeeded", "failed", "cancelled"];
 
 export const QUEUE_POLL_MS = 800;

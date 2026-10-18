@@ -5,8 +5,7 @@ use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use anyserve_core::kernel::Kernel;
-use anyserve_core::now_ms;
+use anyserve_core::runtime::Runtime;
 
 const BUCKETS_MS: &[f64] = &[
     5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 10000.0,
@@ -28,6 +27,12 @@ impl InvokeMetrics {
     pub(super) fn observe(&self, interface: &str, status: u16, elapsed: Duration) {
         let ms = elapsed.as_secs_f64() * 1000.0;
         let mut latency = self.latency.lock().expect("metrics poisoned");
+        let interface =
+            if latency.len() >= 1024 && !latency.contains_key(&(interface.to_owned(), status)) {
+                "__other__"
+            } else {
+                interface
+            };
         let histogram = latency
             .entry((interface.to_string(), status))
             .or_insert_with(|| Histogram {
@@ -43,53 +48,35 @@ impl InvokeMetrics {
         histogram.sum_ms += ms;
     }
 
-    pub(super) async fn render(&self, kernel: &Kernel) -> String {
+    pub(super) fn render(&self, runtime: &Runtime) -> String {
         let mut out = String::new();
-        if let Ok(counts) = kernel.job_state_counts().await {
-            out.push_str("# TYPE anyserve_jobs gauge\n");
-            for (state, value) in [
-                ("pending", counts.pending),
-                ("leased", counts.leased),
-                ("running", counts.running),
-                ("succeeded", counts.succeeded),
-                ("failed", counts.failed),
-                ("cancelled", counts.cancelled),
-            ] {
-                let _ = writeln!(out, "anyserve_jobs{{state=\"{state}\"}} {value}");
-            }
-        }
-        if let Ok(workers) = kernel.list_workers().await {
-            let now = now_ms();
-            let mut by_region: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-            for worker in workers.iter().filter(|worker| worker.expires_at_ms > now) {
-                let region = worker
-                    .spec
-                    .attributes
-                    .get("region")
-                    .cloned()
-                    .unwrap_or_default();
-                let entry = by_region.entry(region).or_default();
-                entry.0 += 1;
-                entry.1 += u64::from(worker.status.active_leases);
-            }
-            out.push_str(
-                "# TYPE anyserve_live_workers gauge\n# TYPE anyserve_active_leases gauge\n",
-            );
-            for (region, (live, leases)) in by_region {
-                let region = escape(&region);
-                let _ = writeln!(out, "anyserve_live_workers{{region=\"{region}\"}} {live}");
-                let _ = writeln!(
-                    out,
-                    "anyserve_active_leases{{region=\"{region}\"}} {leases}"
-                );
-            }
-        }
+        let stats = runtime.stats();
         let _ = writeln!(
             out,
-            "# TYPE anyserve_waiting_poll_loops gauge\nanyserve_waiting_poll_loops {}",
-            kernel.waiting_poll_loops()
+            "# TYPE anyserve_jobs gauge\nanyserve_jobs{{state=\"queued\"}} {}\nanyserve_jobs{{state=\"running\"}} {}",
+            stats.queued, stats.running
         );
-
+        let _ = writeln!(
+            out,
+            "# TYPE anyserve_live_workers gauge\nanyserve_live_workers {}",
+            runtime
+                .list_workers()
+                .iter()
+                .filter(|worker| worker.connected && !worker.draining)
+                .count()
+        );
+        if let Some(journal) = stats.journal {
+            let _ = writeln!(
+                out,
+                "# TYPE anyserve_journal_pending_ops gauge\nanyserve_journal_pending_ops {}",
+                journal.pending_ops
+            );
+            let _ = writeln!(
+                out,
+                "# TYPE anyserve_journal_committed_ops counter\nanyserve_journal_committed_ops {}",
+                journal.committed_ops
+            );
+        }
         out.push_str("# TYPE anyserve_invoke_duration_ms histogram\n");
         let latency = self.latency.lock().expect("metrics poisoned");
         for ((interface, status), histogram) in latency.iter() {

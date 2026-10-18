@@ -1,290 +1,378 @@
 from __future__ import annotations
 
+import json
+import threading
+import time
 import unittest
+from collections import deque
+from unittest.mock import patch
 
-from anyserve import get_handler_spec, serve, worker
-
-
-class StopServing(KeyboardInterrupt):
-    pass
-
-
-class FakeWorkerClient:
-    def __init__(self, grants, streams, frames) -> None:
-        self._grants = list(grants)
-        self._jobs = {grant["job"]["job_id"]: grant["job"] for grant in self._grants}
-        self._streams = dict(streams)
-        self._frames = dict(frames)
-        self.register_calls = []
-        self.heartbeat_calls = []
-        self.renew_calls = []
-        self.report_calls = []
-        self.open_calls = []
-        self.push_calls = []
-        self.close_calls = []
-        self.complete_calls = []
-        self.fail_calls = []
-
-    def register_worker(self, **kwargs):
-        self.register_calls.append(kwargs)
-        return {"worker_id": kwargs.get("worker_id") or "worker-1"}
-
-    def heartbeat_worker(self, worker_id, available_capacity=None, active_leases=0, metadata=None):
-        self.heartbeat_calls.append(
-            {
-                "worker_id": worker_id,
-                "available_capacity": dict(available_capacity or {}),
-                "active_leases": active_leases,
-                "metadata": dict(metadata or {}),
-            }
-        )
-        return {}
-
-    def renew_lease(self, worker_id, lease_id):
-        self.renew_calls.append({"worker_id": worker_id, "lease_id": lease_id})
-        return {"lease_id": lease_id}
-
-    def poll_lease(self, worker_id, wait_timeout_ms=0):
-        if self._grants:
-            return self._grants.pop(0)
-        raise StopServing()
-
-    def list_streams(self, job_id):
-        return list(self._streams.get(job_id, []))
-
-    def get_job(self, job_id):
-        return self._jobs[job_id]
-
-    def pull_frames(self, stream_id, after_sequence=0, follow=False):
-        return iter(self._frames.get(stream_id, []))
-
-    def report_event(self, worker_id, lease_id, kind, payload=None, metadata=None):
-        self.report_calls.append(
-            {
-                "worker_id": worker_id,
-                "lease_id": lease_id,
-                "kind": kind,
-                "payload": payload,
-                "metadata": dict(metadata or {}),
-            }
-        )
-
-    def open_stream(
-        self,
-        job_id,
-        stream_name,
-        scope="job",
-        direction="worker_to_client",
-        metadata=None,
-        attempt_id=None,
-        worker_id=None,
-        lease_id=None,
-    ):
-        record = {
-            "job_id": job_id,
-            "stream_name": stream_name,
-            "scope": scope,
-            "direction": direction,
-            "metadata": dict(metadata or {}),
-            "attempt_id": attempt_id,
-            "worker_id": worker_id,
-            "lease_id": lease_id,
-        }
-        self.open_calls.append(record)
-        return {"stream_id": f"{stream_name}-stream", "stream_name": stream_name}
-
-    def push_frames(self, stream_id, frames, worker_id=None, lease_id=None):
-        self.push_calls.append(
-            {
-                "stream_id": stream_id,
-                "frames": list(frames),
-                "worker_id": worker_id,
-                "lease_id": lease_id,
-            }
-        )
-        return {"stream": {"stream_id": stream_id}, "last_sequence": len(frames), "written_frames": len(frames)}
-
-    def close_stream(self, stream_id, worker_id=None, lease_id=None, metadata=None):
-        self.close_calls.append(
-            {
-                "stream_id": stream_id,
-                "worker_id": worker_id,
-                "lease_id": lease_id,
-                "metadata": dict(metadata or {}),
-            }
-        )
-        return {"stream_id": stream_id}
-
-    def complete_lease(self, worker_id, lease_id, outputs=None, metadata=None):
-        self.complete_calls.append(
-            {
-                "worker_id": worker_id,
-                "lease_id": lease_id,
-                "outputs": outputs,
-                "metadata": metadata,
-            }
-        )
-
-    def fail_lease(self, worker_id, lease_id, reason, retryable=False, metadata=None):
-        self.fail_calls.append(
-            {
-                "worker_id": worker_id,
-                "lease_id": lease_id,
-                "reason": reason,
-                "retryable": retryable,
-                "metadata": dict(metadata or {}),
-            }
-        )
+from anyserve import ExecutionClient, RpcError, ExecutionOptions, get_handler_spec, serve, worker
+from anyserve.execution import _terminal_outputs
+from anyserve.highlevel import _process_assignment
 
 
-def _grant(job_id="job-1", attempt_id="attempt-1", lease_id="lease-1"):
-    return {
-        "lease": {"lease_id": lease_id, "job_id": job_id, "worker_id": "worker-1"},
-        "attempt": {"attempt_id": attempt_id, "job_id": job_id, "worker_id": "worker-1", "lease_id": lease_id},
-        "job": {"job_id": job_id, "lease_id": lease_id, "spec": {}, "state": "leased"},
-    }
+class Assignment:
+    def __init__(self, lease_id="lease", payload=b"hello"):
+        self.lease_id = lease_id
+        self.job_id = lease_id
+        self.cancelled = False
+        self.reserved_capacity = {"slot": 1}
+        self.attempt = Attempt(self, payload)
+
+    def cancel(self):
+        self.cancelled = True
+
+    def open(self):
+        return self.attempt
+
+
+class Attempt:
+    def __init__(self, assignment, payload):
+        self.assignment = assignment
+        self.terminal_replay = False
+        self.inputs = [{"inline": payload, "metadata": {}}]
+        self.frames = []
+        self.outputs = None
+        self.failure = None
+        self.on_frame = None
+
+    @property
+    def cancelled(self):
+        return self.assignment.cancelled
+
+    def frame(self, data):
+        self.frames.append(data)
+        if self.on_frame:
+            self.on_frame()
+
+    def complete(self, outputs):
+        self.outputs = outputs
+
+    def fail(self, message, retryable=False):
+        self.failure = (message, retryable)
+
+
+class RPCFailure(RuntimeError):
+    def __init__(self, code):
+        super().__init__(f"test RPC status {code}")
+        self.status_code = code
+
+
+class Connection:
+    def __init__(self, messages=(), stop_when=lambda: False):
+        self.messages = deque(messages)
+        self.stop_when = stop_when
+        self.credits = []
+        self.acks = []
+        self.accepted = []
+        self.closed = False
+        self.closed_before_stop = None
+        self.session_id = "session"
+        self.resumed_lease_ids = []
+        self.deadline = time.monotonic() + 3
+
+    def credit(self, free):
+        self.credits.append(free)
+
+    def accept(self, lease_id, accepted, reason):
+        self.accepted.append((lease_id, accepted))
+
+    def receive(self, timeout):
+        if self.closed:
+            raise RPCFailure(14)
+        if self.messages:
+            message = self.messages.popleft()
+            if isinstance(message, BaseException):
+                raise message
+            return message
+        if self.stop_when():
+            self.closed_before_stop = self.closed
+            raise KeyboardInterrupt
+        if time.monotonic() >= self.deadline:
+            raise AssertionError("worker control loop did not reach the expected state")
+        time.sleep(0.001)
+        return None
+
+    def cancel_ack(self, lease_id):
+        self.acks.append(lease_id)
+
+    def close(self):
+        self.closed = True
+
+    def drain(self):
+        pass
 
 
 class HighLevelTests(unittest.TestCase):
-    def test_worker_decorator_preserves_local_call_and_spec(self):
-        @worker(
-            interface="demo.echo.v1",
-            attributes={"runtime": "python"},
-            capacity={"slot": 1},
-            codec="bytes",
-        )
-        def echo(payload: bytes) -> bytes:
-            return payload + b"!"
-
-        self.assertEqual(echo(b"hi"), b"hi!")
-        spec = get_handler_spec(echo)
-        self.assertEqual(spec.interface, "demo.echo.v1")
-        self.assertEqual(spec.attributes, {"runtime": "python"})
-        self.assertEqual(spec.capacity, {"slot": 1})
-        self.assertEqual(spec.codec, "bytes")
-
-    def test_async_handlers_are_rejected(self):
-        async def async_echo(payload):
-            return payload
-
-        with self.assertRaises(TypeError):
-            worker(interface="demo.echo.v1")(async_echo)
-
-    def test_worker_rejects_max_active_leases_other_than_one(self):
-        with self.assertRaises(ValueError):
-            worker(interface="demo.echo.v1", max_active_leases=2)
-
-    def test_serve_processes_bytes_handler(self):
-        @worker(interface="demo.echo.v1", attributes={"runtime": "python"}, capacity={"slot": 1})
-        def echo(payload: bytes) -> bytes:
+    def test_normal_handler_returns_a_terminal_result_without_a_second_stream(self):
+        @worker(interface="echo", max_active_leases=4)
+        def echo(payload):
             return payload.upper()
 
-        client = FakeWorkerClient(
-            grants=[_grant()],
-            streams={"job-1": [{"stream_id": "input-1", "stream_name": "input.default"}]},
-            frames={
-                "input-1": [
-                    {"kind": "data", "payload": b"hello "},
-                    {"kind": "data", "payload": b"world"},
-                ]
-            },
-        )
+        assignment = Assignment()
+        _process_assignment(echo, get_handler_spec(echo), assignment)
+        self.assertEqual(assignment.attempt.outputs, [{"inline": b"HELLO", "metadata": {}}])
+        self.assertEqual(assignment.attempt.frames, [])
+        self.assertEqual(echo.spec.capacity["slot"], 4)
 
-        with self.assertRaises(StopServing):
-            serve(
-                echo,
-                client=client,
-                heartbeat_interval_secs=0.01,
-                poll_interval_secs=0,
-            )
+    def test_invalid_json_and_handler_failure_end_with_one_non_retryable_failure(self):
+        @worker(interface="json", codec="json")
+        def identity(value):
+            return value
 
-        self.assertEqual(client.register_calls[0]["interfaces"], ["demo.echo.v1"])
-        self.assertEqual(client.report_calls[0]["kind"], "started")
-        self.assertEqual(client.report_calls[1]["kind"], "output_ready")
-        self.assertEqual(client.report_calls[1]["metadata"], {"stream_name": "output.default"})
-        self.assertEqual(
-            client.push_calls[0]["frames"],
-            [("data", b"HELLO WORLD", {})],
-        )
-        self.assertEqual(client.complete_calls[0]["lease_id"], "lease-1")
-        self.assertEqual(client.fail_calls, [])
+        assignment = Assignment(payload=b"not-json")
+        _process_assignment(identity, identity.spec, assignment)
+        self.assertIn("JSONDecodeError", assignment.attempt.failure[0])
+        self.assertFalse(assignment.attempt.failure[1])
+        self.assertIsNone(assignment.attempt.outputs)
 
-    def test_serve_processes_json_handler(self):
-        @worker(interface="demo.json.v1", codec="json")
-        def transform(payload):
-            return {"reply": payload["message"].upper()}
+        @worker(interface="failing")
+        def failing(_):
+            raise ValueError("bad input")
 
-        client = FakeWorkerClient(
-            grants=[_grant(job_id="job-json", attempt_id="attempt-json", lease_id="lease-json")],
-            streams={"job-json": [{"stream_id": "input-json", "stream_name": "input.default"}]},
-            frames={"input-json": [{"kind": "data", "payload": b'{"message":"hello"}'}]},
-        )
+        assignment = Assignment()
+        _process_assignment(failing, failing.spec, assignment)
+        self.assertEqual(assignment.attempt.failure, ("ValueError: bad input", False))
 
-        with self.assertRaises(StopServing):
-            serve(transform, client=client, heartbeat_interval_secs=0.01, poll_interval_secs=0)
+    def test_generator_cancellation_closes_the_generator_and_never_completes(self):
+        cleaned = threading.Event()
 
-        self.assertEqual(
-            client.push_calls[0]["frames"],
-            [("data", b'{"reply":"HELLO"}', {})],
-        )
-        self.assertEqual(client.fail_calls, [])
+        @worker(interface="stream", pass_context=True)
+        def stream(_, context):
+            try:
+                yield b"first"
+                yield b"second"
+            finally:
+                cleaned.set()
 
-    def test_serve_fails_lease_on_json_decode_error(self):
-        @worker(interface="demo.json.v1", codec="json")
-        def transform(payload):
+        assignment = Assignment()
+        assignment.attempt.on_frame = assignment.cancel
+        _process_assignment(stream, stream.spec, assignment)
+        self.assertEqual(assignment.attempt.frames, [b"first"])
+        self.assertTrue(cleaned.is_set())
+        self.assertIsNone(assignment.attempt.outputs)
+        self.assertIsNone(assignment.attempt.failure)
+
+    def test_known_cancellation_never_calls_the_handler(self):
+        called = []
+
+        @worker(interface="cancel")
+        def handler(_):
+            called.append(True)
+            return b"unused"
+
+        assignment = Assignment()
+        assignment.cancel()
+        _process_assignment(handler, handler.spec, assignment)
+        self.assertEqual(called, [])
+
+    def test_json_generator_has_record_boundaries(self):
+        @worker(interface="json-stream", codec="json")
+        def stream(_):
+            yield {"n": 1}
+            yield {"n": 2}
+
+        assignment = Assignment(payload=b"{}")
+        _process_assignment(stream, stream.spec, assignment)
+        values = [json.loads(line) for line in b"".join(assignment.attempt.frames).splitlines()]
+        self.assertEqual(values, [{"n": 1}, {"n": 2}])
+
+    def test_serve_runs_concurrently_and_reports_capacity_on_completion(self):
+        entered = threading.Barrier(2)
+        assignments = [Assignment("one"), Assignment("two")]
+
+        @worker(interface="concurrent", max_active_leases=2)
+        def handler(payload):
+            entered.wait(timeout=2)
             return payload
 
-        client = FakeWorkerClient(
-            grants=[_grant(job_id="job-json", attempt_id="attempt-json", lease_id="lease-json")],
-            streams={"job-json": [{"stream_id": "input-json", "stream_name": "input.default"}]},
-            frames={},
-        )
+        class Connection:
+            def __init__(self):
+                self.messages = deque(assignments)
+                self.credits = []
 
-        with self.assertRaises(StopServing):
-            serve(transform, client=client, heartbeat_interval_secs=0.01, poll_interval_secs=0)
+            def credit(self, free):
+                self.credits.append(free)
 
-        self.assertEqual(client.complete_calls, [])
-        self.assertEqual(len(client.fail_calls), 1)
-        self.assertIn("ValueError: json input stream was empty", client.fail_calls[0]["reason"])
+            def accept(self, lease_id, accepted, reason):
+                self.assert_accepted = accepted
 
-    def test_serve_requires_decorated_handler(self):
-        def raw_handler(payload):
+            def receive(self, timeout):
+                if self.messages:
+                    assignment = self.messages.popleft()
+                    return {"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}
+                if all(assignment.attempt.outputs is not None for assignment in assignments):
+                    raise KeyboardInterrupt
+                time.sleep(0.001)
+                return None
+
+            def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+            def cancel_ack(self, lease_id):
+                pass
+
+        connection = Connection()
+        with self.assertRaises(KeyboardInterrupt):
+            serve(handler, connection=connection)
+        self.assertTrue(all(assignment.attempt.outputs for assignment in assignments))
+        self.assertTrue(connection.assert_accepted)
+        self.assertTrue(all(0 <= credit <= 2 for credit in connection.credits))
+        self.assertIn(2, connection.credits)
+
+    def test_success_requires_a_terminal_event(self):
+        with self.assertRaisesRegex(RuntimeError, "without a terminal"):
+            _terminal_outputs(iter([{"type": "output", "data": b"partial"}]))
+        with self.assertRaisesRegex(RuntimeError, "output_interrupted"):
+            _terminal_outputs(iter([{"type": "finished", "state": "failed", "error": {"code": "output_interrupted", "message": "worker lost"}}]))
+
+    def test_execution_options_do_not_share_mutable_defaults(self):
+        first = ExecutionOptions()
+        first.metadata["tenant"] = "a"
+        self.assertEqual(ExecutionOptions().metadata, {})
+
+    def test_decorator_rejects_invalid_configuration(self):
+        for kwargs in [{"interface": ""}, {"interface": "x", "codec": "pickle"}, {"interface": "x", "max_active_leases": 0}]:
+            with self.assertRaises(ValueError):
+                worker(**kwargs)
+
+    def test_permanent_connection_errors_escape_without_retrying(self):
+        @worker(interface="permanent")
+        def handler(payload):
             return payload
 
-        client = FakeWorkerClient(grants=[], streams={}, frames={})
+        for code in [16, 7, 3]:
+            with self.subTest(code=code), patch("anyserve.highlevel.WorkerConnection", side_effect=[RPCFailure(code), AssertionError("permanent error was retried")]) as connect, patch("anyserve.highlevel.time.sleep") as sleep:
+                with self.assertRaises(RPCFailure):
+                    serve(handler, "http://unused")
+                self.assertEqual(connect.call_count, 1)
+                sleep.assert_not_called()
+            connection = Connection([RPCFailure(code)])
+            with self.subTest(control_code=code), patch("anyserve.highlevel.WorkerConnection", return_value=connection) as connect, patch("anyserve.highlevel.time.sleep") as sleep:
+                with self.assertRaises(RPCFailure):
+                    serve(handler, "http://unused")
+                self.assertEqual(connect.call_count, 1)
+                sleep.assert_not_called()
 
-        with self.assertRaises(TypeError):
-            serve(raw_handler, client=client)
-        self.assertEqual(client.register_calls, [])
-
-    def test_cancelled_job_does_not_run_handler_while_waiting_for_input(self):
-        calls = []
-
-        @worker(interface="demo.echo.v1")
-        def echo(payload):
-            calls.append(payload)
+    def test_transient_connection_errors_are_logged_before_retry(self):
+        @worker(interface="transient")
+        def handler(payload):
             return payload
 
-        client = FakeWorkerClient(grants=[_grant()], streams={}, frames={})
-        client._jobs["job-1"] = {"state": "cancelled", "lease_id": None}
-        with self.assertRaises(StopServing):
-            serve(echo, client=client)
-        self.assertEqual(calls, [])
-        self.assertEqual(client.complete_calls, [])
-        self.assertEqual(client.fail_calls, [])
+        connection = Connection([KeyboardInterrupt()])
+        with patch("anyserve.highlevel.WorkerConnection", side_effect=[RPCFailure(14), connection]) as connect, patch("anyserve.highlevel.time.sleep"), self.assertLogs("anyserve.highlevel", level="WARNING") as logs:
+            with self.assertRaises(KeyboardInterrupt):
+                serve(handler, "http://unused")
+        self.assertEqual(connect.call_count, 2)
+        self.assertTrue(any("reconnecting" in record for record in logs.output))
 
-    def test_uri_input_fails_explicitly(self):
-        @worker(interface="demo.echo.v1")
-        def echo(payload):
+    def test_fenced_cancellation_acknowledges_without_reconnecting_other_leases(self):
+        @worker(interface="fenced")
+        def handler(payload):
             return payload
 
-        grant = _grant()
-        grant["job"]["spec"]["inputs"] = [{"uri": "file:///tmp/example"}]
-        client = FakeWorkerClient(grants=[grant], streams={}, frames={})
-        with self.assertRaises(StopServing):
-            serve(echo, client=client)
-        self.assertEqual(client.complete_calls, [])
-        self.assertIn("only supports inline inputs or input streams", client.fail_calls[0]["reason"])
+        for code in [9, 10]:
+            assignment = Assignment()
+            def complete(_outputs, code=code):
+                assignment.cancel()
+                raise RPCFailure(code)
+            assignment.attempt.complete = complete
+            connection = Connection([{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}], stop_when=lambda: bool(connection.acks) and connection.credits[-1] == 1)
+            with self.subTest(code=code), self.assertRaises(KeyboardInterrupt):
+                serve(handler, connection=connection)
+            self.assertEqual(connection.acks, [assignment.lease_id])
+            self.assertFalse(connection.closed_before_stop)
+
+    def test_transport_failure_closes_the_session_and_reject_refreshes_credit(self):
+        @worker(interface="transport")
+        def handler(payload):
+            return payload
+
+        for code in [14, 4, 13, 2, 1]:
+            assignment = Assignment()
+            def complete(_outputs, code=code):
+                raise RPCFailure(code)
+            assignment.attempt.complete = complete
+            connection = Connection([{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}])
+            with self.subTest(code=code), self.assertRaises(RPCFailure):
+                serve(handler, connection=connection)
+            self.assertTrue(connection.closed)
+
+        assignment = Assignment()
+        assignment.reserved_capacity = {"gpu": 1}
+        connection = Connection([{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}, KeyboardInterrupt()])
+        with self.assertRaises(KeyboardInterrupt):
+            serve(handler, connection=connection)
+        self.assertEqual(connection.accepted, [(assignment.lease_id, False)])
+        self.assertEqual(connection.credits, [1, 1])
+
+    def test_drain_stops_new_work_without_stopping_or_cancelling_the_handler(self):
+        entered = threading.Event()
+        release = threading.Event()
+        assignment = Assignment()
+
+        @worker(interface="drain")
+        def handler(payload):
+            entered.set()
+            release.wait(timeout=0.5)
+            return payload
+
+        observed = []
+        def stop_when():
+            if entered.is_set() and not release.is_set():
+                observed.append(not assignment.cancelled and connection.credits[-1] == 0)
+                release.set()
+            return assignment.attempt.outputs is not None and len(connection.credits) >= 3
+        connection = Connection([{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}, {"type": "drain"}], stop_when=stop_when)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                serve(handler, connection=connection)
+        finally:
+            release.set()
+        self.assertEqual(observed, [True])
+        self.assertIsNotNone(assignment.attempt.outputs)
+        self.assertFalse(assignment.cancelled)
+        self.assertEqual(connection.credits[-1], 0)
+
+    def test_result_reads_once_then_watches_from_zero(self):
+        class Events:
+            def __init__(self, code=None):
+                self.code = code
+                self.closed = False
+            def __next__(self):
+                if self.code is not None:
+                    error = RpcError("test status")
+                    error.status_code = self.code
+                    raise error
+                return {"type": "finished", "state": "succeeded", "outputs": [{"inline": b"done"}]}
+            def close(self):
+                self.closed = True
+        class Transport:
+            def __init__(self, code=None):
+                self.calls = []
+                self.events = Events(code)
+            def get(self, job_id, include_outputs):
+                self.calls.append(("get", job_id, include_outputs))
+                return {"state": "queued"}
+            def watch(self, job_id, after_sequence):
+                self.calls.append(("watch", job_id, after_sequence))
+                return self.events
+        client = ExecutionClient.__new__(ExecutionClient)
+        client._transport = Transport()
+        self.assertEqual(client.result("job"), [{"inline": b"done"}])
+        self.assertEqual(client._transport.calls, [("get", "job", True), ("watch", "job", 0)])
+        self.assertTrue(client._transport.events.closed)
+        for code in (11, 14):
+            with self.subTest(code=code):
+                client._transport = Transport(code)
+                with self.assertRaises(RpcError):
+                    client.result("job")
+                self.assertEqual(client._transport.calls, [("get", "job", True), ("watch", "job", 0)])
+                self.assertTrue(client._transport.events.closed)
 
 
 if __name__ == "__main__":
