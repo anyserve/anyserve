@@ -106,6 +106,13 @@ current generation, after every live event. A zero cursor starts at the earliest
 retained event and never expires, including after recovery. An expired nonzero
 cursor across recovery is reported explicitly. List operations show jobs retained
 in the live Runtime.
+A finished ephemeral job keeps only its outcome, as an evicted durable job
+does. Readers that were following its log when it finished (an Invoke caller,
+a `Watch`) still receive every event; once the last of them is done, the log
+drops every event before Finished. After that, `Watch` and `events` from zero
+return Finished with its outputs, and an older nonzero cursor gets
+`CursorExpired`. Assignment history and frames of a finished ephemeral job are
+not kept for later readers.
 The console marks incomplete history and unavailable in-memory request specs;
 it does not invent attempt records. Terminal jobs release their retained inputs
 and params.

@@ -30,7 +30,7 @@ the removed retained-bytes key.
 |---|---|---|---|---|---|
 | input | `max_pending_bytes` | 2 GiB | 静态 inputs、params、流式输入（每块另计 64 B 开销和 metadata） | 从接受开始，到 job 终态释放 | Submit/Invoke 返回 `RESOURCE_EXHAUSTED`；流式输入的 `send` 返回 `RESOURCE_EXHAUSTED` |
 | result | `max_result_bytes` | 2 GiB | worker 上传的结果数据 | 从上传开始，到最后一份引用被丢弃（包括 journal 提交中、保留在内存里的终态结果、Finished 事件） | 先按从旧到新驱逐终态 job 一次，再重试；仍放不下时，Attempt 流以 `RESOURCE_EXHAUSTED` 结束，worker 退避后只重传结果 |
-| event | `max_event_bytes` | 1 GiB | 所有 job 的事件日志（每条另计 96 B 开销） | 写入日志到淘汰或 job 被驱逐 | 写入前先按需驱逐终态 job 一次。本 job 的 Streamed 消费者落后时反压 worker，`consumer_stall_timeout` 后 job 以 `consumer_stalled` 失败；全局预算不足时最多等待 `consumer_stall_timeout`，仍不足则 Attempt 流以 `RESOURCE_EXHAUSTED` 结束；没有主消费者的 job 丢弃最旧事件，读者收到 `CursorExpired{oldest}`。 |
+| event | `max_event_bytes` | 1 GiB | 所有 job 的事件日志（每条另计 96 B 开销） | 写入日志到淘汰、ephemeral job 终态压缩（只留 Finished；结束时仍在跟随的读者读完后才压缩）或 job 被驱逐 | 写入前先按需驱逐终态 job 一次。本 job 的 Streamed 消费者落后时反压 worker，`consumer_stall_timeout` 后 job 以 `consumer_stalled` 失败；全局预算不足时最多等待 `consumer_stall_timeout`，仍不足则 Attempt 流以 `RESOURCE_EXHAUSTED` 结束；没有主消费者的 job 丢弃最旧事件，读者收到 `CursorExpired{oldest}`。 |
 
 Output 帧的 payload 不允许 force_reserve。全局预算不足时每 250 ms 重试，
 消费者进度变化也触发重试；超时只结束本次 Attempt 流，服务端不直接判 job 失败。

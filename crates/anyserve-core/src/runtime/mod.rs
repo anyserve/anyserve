@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
     Delivery, Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health,
@@ -458,6 +458,9 @@ struct CancelOnDrop {
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.log.set_primary(false);
+        // The caller's own follower is already gone (the event stream drops
+        // before this guard); nothing it left unread is needed any more.
+        self.log.compact_if_unfollowed();
         // The usual case: the caller read through Finished. Nothing to cancel,
         // so the global lock is not needed.
         if self.log.is_finished() {
@@ -485,20 +488,56 @@ pub struct Runtime {
 /// Called for each event just before a follower yields it.
 type EventHook = Arc<dyn Fn(&ExecutionEvent) + Send + Sync>;
 
-/// Follows `log` from `after`. With `skip_gaps`, events dropped from the log
-/// are skipped instead of ending the stream with `CursorExpired`; a caller
-/// that only needs the outcome (`Delivery::Buffered`) uses this.
+/// One reader of a job log. Its receiver counts it as a follower; when the
+/// reader finishes or goes away, the last follower of a finished ephemeral job
+/// compacts the log.
+struct Follower {
+    log: Arc<JobLog>,
+    changes: Option<watch::Receiver<u64>>,
+}
+
+impl Follower {
+    fn mark_seen(&mut self) {
+        if let Some(changes) = self.changes.as_mut() {
+            changes.borrow_and_update();
+        }
+    }
+
+    async fn changed(&mut self) -> bool {
+        match self.changes.as_mut() {
+            Some(changes) => changes.changed().await.is_ok(),
+            None => false,
+        }
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        self.changes.take();
+        self.log.compact_if_unfollowed();
+    }
+}
+
+/// Follows `log` from `after` with a receiver subscribed by the caller (while
+/// it held the runtime lock, so a follower is counted before its first poll).
+/// With `skip_gaps`, events dropped from the log are skipped instead of ending
+/// the stream with `CursorExpired`; a caller that only needs the outcome
+/// (`Delivery::Buffered`) uses this.
 fn follow(
     log: Arc<JobLog>,
+    changes: watch::Receiver<u64>,
     after: u64,
     on_yield: Option<EventHook>,
     skip_gaps: bool,
 ) -> EventStream {
     EventStream::new(async_stream::stream! {
-        let mut changes = log.subscribe();
+        let mut follower = Follower {
+            log: Arc::clone(&log),
+            changes: Some(changes),
+        };
         let mut after = after;
         loop {
-            changes.borrow_and_update();
+            follower.mark_seen();
             match log.read_after(after) {
                 Err(oldest) if skip_gaps => {
                     after = oldest - 1;
@@ -525,7 +564,7 @@ fn follow(
                     }
                 }
             }
-            if changes.changed().await.is_err() {
+            if !follower.changed().await {
                 return;
             }
         }
@@ -865,7 +904,7 @@ impl Runtime {
             ))
         });
         let streamed = request.delivery == Delivery::Streamed;
-        let log = {
+        let (log, changes) = {
             let mut st = self.inner.lock();
             let now = now_ms();
             let input_permit = self.inner.admit(&st, &spec)?;
@@ -886,8 +925,9 @@ impl Runtime {
             if streamed {
                 log.set_primary(true);
             }
+            let changes = log.subscribe();
             self.inner.dispatch_locked(&mut st, now);
-            log
+            (log, changes)
         };
         // A streamed consumer's reading position releases back-pressure.
         let on_yield = streamed.then(|| {
@@ -896,7 +936,7 @@ impl Runtime {
         });
         Ok(Execution {
             job_id: job_id.clone(),
-            events: follow(Arc::clone(&log), 0, on_yield, !streamed),
+            events: follow(Arc::clone(&log), changes, 0, on_yield, !streamed),
             input: input.map(|log| InputSink { log }),
             _guard: Box::new(CancelOnDrop {
                 me: Arc::downgrade(&self.inner),
@@ -913,7 +953,14 @@ impl Runtime {
     pub fn watch(&self, job_id: &str, after_sequence: u64) -> Result<EventStream, RuntimeError> {
         let st = self.inner.lock();
         if let Some(job) = st.jobs.get(job_id) {
-            return Ok(follow(Arc::clone(&job.log), after_sequence, None, false));
+            let changes = job.log.subscribe();
+            return Ok(follow(
+                Arc::clone(&job.log),
+                changes,
+                after_sequence,
+                None,
+                false,
+            ));
         }
         if self.inner.journal.is_none() {
             return Err(RuntimeError::not_found("job", job_id));

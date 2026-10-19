@@ -1053,7 +1053,13 @@ impl Inner {
             },
             now,
         );
-        job.log.set_primary(false);
+        // A finished ephemeral job keeps only its outcome, as a durable job read
+        // back from the journal does, once its current readers are done.
+        if job.durability == Durability::Ephemeral {
+            job.log.finish_ephemeral();
+        } else {
+            job.log.set_primary(false);
+        }
         job.output_bytes = output_bytes;
         let view = job.view(false);
         for waiter in job.waiters.drain(..) {
