@@ -2,7 +2,7 @@
 //! always under the single runtime lock.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyserve_proto::v2 as pb;
@@ -205,7 +205,12 @@ pub(crate) struct Session {
     pub max_concurrency: u32,
     pub reported_free: u32,
     pub assigned_since_report: u32,
+    /// Leases holding this session's capacity; change only through
+    /// `attach` / `detach` so `reserved` stays their sum.
     pub active: BTreeSet<String>,
+    /// Capacity reserved by `active`, kept incrementally so dispatch does not
+    /// walk the leases.
+    pub reserved: Capacity,
     pub load: WorkerLoad,
     pub draining: bool,
     /// Current connection, bounded; `None` while disconnected (in grace).
@@ -230,6 +235,39 @@ impl Session {
         by_server.min(by_worker)
     }
 
+    pub(crate) fn attach(&mut self, lease_id: String, capacity: &Capacity) {
+        if self.active.insert(lease_id) {
+            for (name, value) in capacity {
+                let held = self.reserved.entry(name.clone()).or_insert(0);
+                *held = held.saturating_add(*value);
+            }
+        }
+    }
+
+    pub(crate) fn detach(&mut self, lease_id: &str, capacity: &Capacity) {
+        if self.active.remove(lease_id) {
+            for (name, value) in capacity {
+                if let Some(held) = self.reserved.get_mut(name) {
+                    *held = held.saturating_sub(*value);
+                    if *held == 0 {
+                        self.reserved.remove(name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the capacity not yet reserved covers `demand`. A resource the
+    /// session does not declare has none.
+    pub(crate) fn fits(&self, demand: &Capacity) -> bool {
+        demand.iter().all(|(name, needed)| {
+            *needed <= 0
+                || self.total_capacity.get(name).is_some_and(|total| {
+                    total.saturating_sub(self.reserved.get(name).copied().unwrap_or(0)) >= *needed
+                })
+        })
+    }
+
     /// Queues a control message without waiting. False means the worker is
     /// not reading its control stream; the caller must disconnect it.
     pub(crate) fn try_send(&self, message: pb::server_message::Msg) -> bool {
@@ -242,20 +280,17 @@ impl Session {
     }
 }
 
-/// Capacity of `session` not reserved by its active leases.
-pub(crate) fn unreserved(
-    session: &Session,
-    leases: &HashMap<String, Lease>,
-) -> BTreeMap<String, i64> {
-    let mut available = session.total_capacity.clone();
-    for lease_id in &session.active {
-        if let Some(lease) = leases.get(lease_id) {
-            for (name, value) in &lease.reserved {
-                if let Some(left) = available.get_mut(name) {
-                    *left = left.saturating_sub(*value);
-                }
+/// Test check: every session's `reserved` equals the sum over its leases.
+#[cfg(test)]
+pub(crate) fn assert_reservations(st: &State) {
+    for session in st.sessions.values() {
+        let mut expected = Capacity::new();
+        for lease_id in &session.active {
+            for (name, value) in &st.leases[lease_id].reserved {
+                *expected.entry(name.clone()).or_insert(0) += value;
             }
         }
+        expected.retain(|_, value| *value != 0);
+        assert_eq!(session.reserved, expected, "session {}", session.id);
     }
-    available
 }

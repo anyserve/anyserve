@@ -458,6 +458,11 @@ struct CancelOnDrop {
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.log.set_primary(false);
+        // The usual case: the caller read through Finished. Nothing to cancel,
+        // so the global lock is not needed.
+        if self.log.is_finished() {
+            return;
+        }
         if let Some(inner) = self.me.upgrade() {
             let mut st = inner.lock();
             if let Some(job) = st.jobs.get_mut(&self.job_id)

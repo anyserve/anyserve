@@ -353,6 +353,10 @@ impl JobLog {
         self.consumed.send_replace(sequence);
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.lock().finished
+    }
+
     pub(crate) fn bytes(&self) -> usize {
         self.lock().bytes
     }
