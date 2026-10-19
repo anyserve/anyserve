@@ -269,6 +269,8 @@ impl JobLog {
     /// is in the way the result is `ConsumerBehind`. Otherwise a full budget
     /// gives `BudgetFull`, except on the `last_try` of a log without a primary
     /// consumer, where the event is dropped and followers see a cursor gap.
+    /// Followers are not woken here: on `Ok` the caller passes the sequence to
+    /// `notify_appended` once it has let go of its own locks.
     pub(crate) fn append_output(
         &self,
         attempt_id: String,
@@ -309,9 +311,12 @@ impl JobLog {
             inner.last_sequence = sequence;
             inner.evicted_through = sequence;
         }
-        drop(inner);
-        self.changed.send_replace(sequence);
         Ok(sequence)
+    }
+
+    /// Wakes followers for output appended up to `sequence`.
+    pub(crate) fn notify_appended(&self, sequence: u64) {
+        self.changed.send_replace(sequence);
     }
 
     /// Events after `after`, and whether the log is finished. `after == 0`
@@ -355,7 +360,12 @@ impl JobLog {
             *consumed = sequence;
         }
         drop(inner);
-        self.consumed.send_replace(sequence);
+        // Only a writer that found this consumer behind waits for it, and it
+        // subscribes before retrying its append under the log lock: either
+        // that retry sees this progress, or the subscription is counted here.
+        if self.consumed.receiver_count() > 0 {
+            self.consumed.send_replace(sequence);
+        }
     }
 
     /// Removes what a finished log no longer needs to serve: every event
@@ -519,6 +529,20 @@ mod tests {
         assert_eq!(budget.used(), before + EVENT_OVERHEAD as u64);
         drop((a, b, g, caught_up));
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn consumer_progress_is_sent_only_to_a_waiting_writer() {
+        let log = log(4, 1 << 20, 1 << 20);
+        log.set_primary(true);
+        let before = *log.consumed.borrow();
+        // Nobody waits for this consumer: nothing to send.
+        log.mark_consumed(5);
+        assert_eq!(*log.consumed.borrow(), before);
+        let mut writer = log.subscribe_consumed();
+        log.mark_consumed(6);
+        assert!(writer.has_changed().unwrap());
+        assert_eq!(*writer.borrow_and_update(), 6);
     }
 
     #[test]

@@ -2328,3 +2328,68 @@ async fn an_unread_job_reclaims_room_before_dropping_output() {
         "the frame was dropped"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_back_pressured_writer_is_woken_by_every_read() {
+    // The caller's log holds four events, so most frames find it behind. A
+    // missed wake-up would leave a frame waiting out the stall timeout,
+    // which fails the job.
+    let mut cfg = config();
+    cfg.event_log_max_events = 4;
+    cfg.consumer_stall_timeout = Duration::from_secs(2);
+    let server = serve(cfg).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let (_job_id, reader) = invoke_read(&server).await;
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    // Frames go out without waiting for acknowledgements, so the writer keeps
+    // running ahead of the caller.
+    let sender = attempt.tx.clone();
+    let send = tokio::spawn(async move {
+        for sequence in 1..=1000u64 {
+            let frame = pb::Frame {
+                sequence,
+                data: Bytes::copy_from_slice(&sequence.to_le_bytes()),
+                ..Default::default()
+            };
+            sender
+                .send(up(pb::attempt_up::Msg::Frame(frame)))
+                .await
+                .unwrap();
+        }
+    });
+    let mut acknowledged = 0;
+    while acknowledged < 1000 {
+        let message = tokio::time::timeout(WAIT, attempt.rx.message())
+            .await
+            .expect("acknowledgement in time")
+            .unwrap()
+            .expect("attempt stream open");
+        match message.msg {
+            Some(pb::attempt_down::Msg::Ack(ack)) => acknowledged = ack.up_to_sequence,
+            Some(pb::attempt_down::Msg::Input(_)) => {}
+            other => panic!("expected ack, got {other:?}"),
+        }
+    }
+    send.await.unwrap();
+    attempt.succeed(b"done").await;
+    let kinds = reader.await.unwrap();
+    let frames: Vec<u64> = kinds
+        .iter()
+        .filter_map(|kind| match kind {
+            EventKind::Output { data, .. } => {
+                Some(u64::from_le_bytes(data[..].try_into().unwrap()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(frames, (1..=1000).collect::<Vec<_>>());
+    assert!(matches!(
+        kinds.last(),
+        Some(EventKind::Finished {
+            state: JobState::Succeeded,
+            ..
+        })
+    ));
+}
