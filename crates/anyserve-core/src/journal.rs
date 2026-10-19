@@ -49,11 +49,8 @@ pub(crate) struct AcceptRecord {
 #[derive(Debug)]
 pub(crate) struct AttemptStartRecord {
     pub job_id: String,
-    pub attempt_id: String,
-    pub lease_id: String,
+    /// The job's attempt count once this start is committed.
     pub attempt_number: u32,
-    pub worker_id: String,
-    pub generation: u64,
     pub at_ms: u64,
 }
 
@@ -164,18 +161,9 @@ const SCHEMA: &[&str] = &[
         metadata_json TEXT NOT NULL,
         PRIMARY KEY (job_id, role, idx)
     )",
-    "CREATE TABLE IF NOT EXISTS journal_attempts (
-        attempt_id TEXT PRIMARY KEY,
-        job_id TEXT NOT NULL,
-        lease_id TEXT NOT NULL,
-        attempt_number INTEGER NOT NULL,
-        worker_id TEXT NOT NULL,
-        generation INTEGER NOT NULL,
-        started_at_ms INTEGER NOT NULL,
-        finished_at_ms INTEGER,
-        outcome TEXT
-    )",
-    "CREATE INDEX IF NOT EXISTS journal_attempts_job ON journal_attempts(job_id)",
+    // Earlier versions kept a per-attempt table nothing read; recovery and
+    // receipts use the job row.
+    "DROP TABLE IF EXISTS journal_attempts",
 ];
 
 const ROLE_INPUT: &str = "input";
@@ -563,20 +551,6 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
             }
         }
         JournalOp::AttemptStart(record) => {
-            sqlx::query(
-                "INSERT INTO journal_attempts (attempt_id, job_id, lease_id, attempt_number,
-                    worker_id, generation, started_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&record.attempt_id)
-            .bind(&record.job_id)
-            .bind(&record.lease_id)
-            .bind(record.attempt_number as i64)
-            .bind(&record.worker_id)
-            .bind(record.generation as i64)
-            .bind(record.at_ms as i64)
-            .execute(&mut **tx)
-            .await?;
             let updated = sqlx::query(
                 "UPDATE journal_jobs SET attempt_count = attempt_count + 1, updated_at_ms = ?
                  WHERE job_id = ? AND state = 'queued'",
@@ -621,17 +595,6 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
                 ));
             }
             insert_objects(tx, &record.job_id, ROLE_OUTPUT, &record.outputs).await?;
-            if let Some(attempt_id) = &record.attempt_id {
-                sqlx::query(
-                    "UPDATE journal_attempts SET finished_at_ms = ?, outcome = ?
-                     WHERE attempt_id = ? AND finished_at_ms IS NULL",
-                )
-                .bind(record.at_ms as i64)
-                .bind(state_text(record.state))
-                .bind(attempt_id)
-                .execute(&mut **tx)
-                .await?;
-            }
         }
         JournalOp::Probe => {
             sqlx::query("UPDATE journal_meta SET value = value WHERE key = 'generation'")
@@ -652,14 +615,14 @@ async fn verify(conn: &mut SqliteConnection, op: &JournalOp) -> Result<bool> {
                 .await?
                 > 0
         }
+        // Only one start per job is ever in flight, and the count moves only
+        // when a start commits.
         JournalOp::AttemptStart(record) => {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM journal_attempts WHERE attempt_id = ?",
-            )
-            .bind(&record.attempt_id)
-            .fetch_one(&mut *conn)
-            .await?
-                > 0
+            sqlx::query_scalar::<_, i64>("SELECT attempt_count FROM journal_jobs WHERE job_id = ?")
+                .bind(&record.job_id)
+                .fetch_optional(&mut *conn)
+                .await?
+                .is_some_and(|count| count >= i64::from(record.attempt_number))
         }
         JournalOp::Terminal(record) => {
             sqlx::query_scalar::<_, String>("SELECT state FROM journal_jobs WHERE job_id = ?")
@@ -750,7 +713,7 @@ async fn purge(conn: &mut SqliteConnection, before_ms: u64) -> Result<usize> {
     .fetch_all(&mut *tx)
     .await?;
     for job_id in &removed {
-        for table in ["journal_objects", "journal_attempts", "journal_jobs"] {
+        for table in ["journal_objects", "journal_jobs"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE job_id = ?"))
                 .bind(job_id)
                 .execute(&mut *tx)
@@ -830,4 +793,84 @@ async fn writer(
         }
     }
     let _ = conn.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(name: &str) -> JournalConfig {
+        JournalConfig::new(
+            std::env::temp_dir()
+                .join(format!("anyserve-journal-{}", uuid::Uuid::new_v4()))
+                .join(format!("{name}.sqlite")),
+        )
+    }
+
+    async fn connect(config: &JournalConfig) -> SqliteConnection {
+        let options = SqliteConnectOptions::new()
+            .filename(&config.path)
+            .create_if_missing(true);
+        SqliteConnection::connect_with(&options).await.unwrap()
+    }
+
+    fn start(job_id: &str, attempt_number: u32) -> JournalOp {
+        JournalOp::AttemptStart(AttemptStartRecord {
+            job_id: job_id.to_string(),
+            attempt_number,
+            at_ms: 2,
+        })
+    }
+
+    async fn commit(journal: &Journal, op: JournalOp) -> CommitOutcome {
+        journal.enqueue(op).unwrap().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_attempt_start_is_verified_from_the_job_row() {
+        let config = config("verify");
+        let (journal, _) = Journal::open(&config).await.unwrap();
+        let accept = JournalOp::Accept(Box::new(AcceptRecord {
+            job_id: "j".to_string(),
+            spec_hash: String::new(),
+            spec: Arc::new(JobSpec::default()),
+            max_attempts: 3,
+            created_at_ms: 1,
+        }));
+        assert_eq!(commit(&journal, accept).await, CommitOutcome::Committed);
+        let mut conn = connect(&config).await;
+        assert!(!verify(&mut conn, &start("j", 1)).await.unwrap());
+        assert_eq!(
+            commit(&journal, start("j", 1)).await,
+            CommitOutcome::Committed
+        );
+        assert!(verify(&mut conn, &start("j", 1)).await.unwrap());
+        assert!(!verify(&mut conn, &start("j", 2)).await.unwrap());
+        assert!(!verify(&mut conn, &start("missing", 1)).await.unwrap());
+        conn.close().await.unwrap();
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn an_earlier_journal_loses_its_attempt_table() {
+        let config = config("earlier");
+        std::fs::create_dir_all(config.path.parent().unwrap()).unwrap();
+        let mut conn = connect(&config).await;
+        sqlx::query("CREATE TABLE journal_attempts (attempt_id TEXT PRIMARY KEY)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        let (journal, _) = Journal::open(&config).await.unwrap();
+        let mut conn = connect(&config).await;
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'journal_attempts%'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(tables, 0);
+        conn.close().await.unwrap();
+        journal.close().await;
+    }
 }

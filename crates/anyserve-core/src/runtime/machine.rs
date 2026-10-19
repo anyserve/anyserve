@@ -535,8 +535,8 @@ impl Inner {
             last_frame_seq: 0,
             exposed: false,
         });
-        job.last_attempt_id = Some(attempt_id.clone());
-        job.last_worker_id = Some(worker_id.clone());
+        job.last_attempt_id = Some(attempt_id);
+        job.last_worker_id = Some(worker_id);
         let durable = job.durability == Durability::Durable;
         let number = job.attempt_count;
         st.leases.insert(
@@ -555,11 +555,7 @@ impl Inner {
         st.jobs.get_mut(job_id).expect("job").phase = Phase::Starting;
         let op = JournalOp::AttemptStart(AttemptStartRecord {
             job_id: job_id.to_string(),
-            attempt_id,
-            lease_id: lease_id.clone(),
             attempt_number: number,
-            worker_id,
-            generation: st.generation,
             at_ms: now,
         });
         let (id, lease) = (job_id.to_string(), lease_id.clone());
