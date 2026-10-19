@@ -468,6 +468,7 @@ async fn a_retired_attempts_buffered_output_cannot_be_spliced_into_a_retry() {
 #[tokio::test]
 async fn reopening_an_attempt_continues_after_the_last_acknowledged_frame() {
     use anyserve_core::runtime::api::EventKind;
+    use futures::StreamExt;
     let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
     let mut worker = Worker::connect(&server, "resume-frames", vec!["test.resume".into()], 1).await;
     let mut client = client(&server).await;
@@ -486,17 +487,21 @@ async fn reopening_an_attempt_continues_after_the_last_acknowledged_frame() {
     )
     .await
     .unwrap();
+    let mut events = server.runtime.watch(&job.job_id, 0).unwrap();
     attempt
         .frame(b"first".as_slice().into(), HashMap::new(), false)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let (events, _) = server.runtime.events(&job.job_id, 0).await.unwrap();
-            if events.iter().any(|event| matches!(&event.kind, EventKind::Output { data, .. } if data.as_ref() == b"first")) { break; }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+    let first = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = events.next().await {
+            if let EventKind::Output { data, .. } = event.unwrap().kind {
+                return data;
+            }
         }
-    }).await.unwrap();
+        panic!("missing first frame")
+    })
+    .await
+    .unwrap();
     drop(attempt);
     let mut reopened = Attempt::open(
         &mut worker.session.data,
@@ -514,14 +519,22 @@ async fn reopening_an_attempt_continues_after_the_last_acknowledged_frame() {
         .finish(&[], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
         .await
         .unwrap();
-    let (events, _) = server.runtime.events(&job.job_id, 0).await.unwrap();
-    let frames: Vec<_> = events
-        .into_iter()
-        .filter_map(|event| match event.kind {
-            EventKind::Output { data, .. } => Some(data),
-            _ => None,
-        })
-        .collect();
+    let mut frames = vec![first];
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = events.next().await {
+            match event.unwrap().kind {
+                EventKind::Output { data, .. } => frames.push(data),
+                EventKind::Finished { state, .. } => {
+                    assert_eq!(state, anyserve_core::runtime::api::JobState::Succeeded);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        panic!("missing terminal event")
+    })
+    .await
+    .unwrap();
     assert_eq!(frames, [b"first".as_slice(), b"second".as_slice()]);
     server.stop().await;
 }
