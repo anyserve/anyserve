@@ -311,6 +311,9 @@ impl Attempt {
         outcome: v2::finish::Outcome,
     ) -> Result<(), Status> {
         let deadline = retry_deadline(self.heartbeat_timeout)?;
+        let last_frame = self.next_sequence - 1;
+        let mut outputs = outputs;
+        let mut outcome = outcome;
         self.discard_input = true;
         self.pending_input.clear();
         self.pending_input_bytes = 0;
@@ -331,6 +334,24 @@ impl Attempt {
                     .map_err(|_| retry_expired())?;
                     match result {
                         Ok(mut reopened) => {
+                            let resume_from = reopened.next_sequence - 1;
+                            // Frames are not buffered for replay. A live lease
+                            // missing a sent frame must not commit a truncated
+                            // success. A terminal replay already has a receipt
+                            // and must repeat the original outcome for its digest.
+                            if !reopened.terminal_replay
+                                && resume_from < last_frame
+                                && matches!(outcome, v2::finish::Outcome::Succeeded(_))
+                            {
+                                outcome = v2::finish::Outcome::Failed(v2::ErrorInfo {
+                                    code: "output_interrupted".into(),
+                                    message: format!(
+                                        "attempt reopened after frame {resume_from}, but sent through {last_frame}"
+                                    ),
+                                    retryable: true,
+                                });
+                                outputs = &[];
+                            }
                             reopened.discard_input = true;
                             *self = reopened;
                             break;
@@ -410,6 +431,9 @@ impl Attempt {
             .ok_or_else(|| Status::unavailable("attempt ended without a terminal acknowledgement"))
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;
 
 fn finish_status(message: v2::AttemptFinished) -> Status {
     match v2::attempt_finished::Status::try_from(message.status) {
