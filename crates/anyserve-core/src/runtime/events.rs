@@ -4,7 +4,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::watch;
@@ -113,6 +113,9 @@ pub(crate) struct JobLog {
     budget: Arc<EventBudget>,
     max_events: usize,
     max_bytes: usize,
+    /// Set once an ephemeral job finishes: the log may then shrink to its
+    /// outcome as soon as nobody follows it.
+    compactable: AtomicBool,
 }
 
 struct LogInner {
@@ -168,6 +171,7 @@ impl JobLog {
             budget,
             max_events: max_events.max(2),
             max_bytes,
+            compactable: AtomicBool::new(false),
         }
     }
 
@@ -353,6 +357,48 @@ impl JobLog {
         self.consumed.send_replace(sequence);
     }
 
+    /// Drops what a finished log no longer needs to serve: every event before
+    /// `Finished`, except those a primary consumer has not read yet. Only a
+    /// prefix goes, so a later reader with an older cursor gets
+    /// `CursorExpired`, never a silent gap.
+    pub(crate) fn compact_finished(&self) {
+        let mut inner = self.lock();
+        if !inner.finished {
+            return;
+        }
+        let finished_at = inner.last_sequence;
+        let keep_from = inner
+            .primary
+            .map_or(finished_at, |consumed| (consumed + 1).min(finished_at));
+        while inner
+            .events
+            .front()
+            .is_some_and(|(event, _)| event.sequence < keep_from)
+        {
+            self.evict_front(&mut inner);
+        }
+    }
+
+    /// Readers currently following this log; each holds a `changed` receiver.
+    pub(crate) fn follower_count(&self) -> usize {
+        self.changed.receiver_count()
+    }
+
+    /// An ephemeral job finished: its log keeps only the outcome once nobody
+    /// follows it any more (now, or when the last follower lets go). Writers
+    /// waiting on the consumer are woken to see the end.
+    pub(crate) fn finish_ephemeral(&self) {
+        self.compactable.store(true, Ordering::Release);
+        self.compact_if_unfollowed();
+        self.consumed.send_modify(|value| *value += 1);
+    }
+
+    pub(crate) fn compact_if_unfollowed(&self) {
+        if self.compactable.load(Ordering::Acquire) && self.follower_count() == 0 {
+            self.compact_finished();
+        }
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.lock().finished
     }
@@ -465,6 +511,90 @@ mod tests {
         assert_eq!(budget.used(), before + EVENT_OVERHEAD as u64);
         drop((a, b, g, caught_up));
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_finished_log_keeps_only_unread_events_and_its_outcome() {
+        let budget = Arc::new(EventBudget::new(1 << 20));
+        let finish = |log: &JobLog| {
+            log.append(
+                None,
+                EventKind::Finished {
+                    state: super::super::api::JobState::Succeeded,
+                    outputs: Vec::new(),
+                    error: None,
+                },
+                0,
+            )
+        };
+        // Without a primary consumer only Finished stays.
+        let log = JobLog::new("a".into(), 100, 100, 1 << 20, budget.clone());
+        log.append(None, EventKind::Accepted, 0);
+        let first = output(&log, 1_000).unwrap();
+        output(&log, 1_000).unwrap();
+        log.compact_finished();
+        assert_eq!(log.read_after(0).unwrap().0.len(), 3, "not finished yet");
+        let finished = finish(&log);
+        log.compact_finished();
+        let (events, done) = log.read_after(0).unwrap();
+        assert!(done);
+        assert_eq!(
+            events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![finished]
+        );
+        assert_eq!(log.read_after(first), Err(finished));
+        assert_eq!(budget.used(), EVENT_OVERHEAD as u64);
+
+        // A primary consumer keeps what it has not read, until it lets go.
+        let log = JobLog::new("b".into(), 100, 100, 1 << 20, budget.clone());
+        log.set_primary(true);
+        let read = output(&log, 1_000).unwrap();
+        let unread = output(&log, 1_000).unwrap();
+        log.mark_consumed(read);
+        let finished = finish(&log);
+        log.compact_finished();
+        let kept: Vec<u64> = log
+            .read_after(read)
+            .unwrap()
+            .0
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(kept, vec![unread, finished]);
+        log.set_primary(false);
+        log.compact_finished();
+        assert_eq!(log.read_after(0).unwrap().0.len(), 1);
+    }
+
+    #[test]
+    fn a_followed_log_is_compacted_by_its_last_follower() {
+        let budget = Arc::new(EventBudget::new(1 << 20));
+        let log = JobLog::new("f".into(), 100, 100, 1 << 20, budget);
+        let first = log.subscribe();
+        let second = log.subscribe();
+        log.append(None, EventKind::Accepted, 0);
+        output(&log, 100).unwrap();
+        log.append(
+            None,
+            EventKind::Finished {
+                state: super::super::api::JobState::Succeeded,
+                outputs: Vec::new(),
+                error: None,
+            },
+            0,
+        );
+        log.finish_ephemeral();
+        assert_eq!(
+            log.read_after(0).unwrap().0.len(),
+            3,
+            "followers still reading"
+        );
+        drop(first);
+        log.compact_if_unfollowed();
+        assert_eq!(log.read_after(0).unwrap().0.len(), 3, "one follower left");
+        drop(second);
+        log.compact_if_unfollowed();
+        assert_eq!(log.read_after(0).unwrap().0.len(), 1);
     }
 
     #[test]

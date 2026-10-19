@@ -567,11 +567,17 @@ async fn buffered_delivery_retries_transparently() {
     worker.reply(&retry.lease_id, true).await;
     let mut attempt = worker.attempt(&retry.lease_id, retry.generation).await;
     attempt.succeed(b"done").await;
+    // Read only after the end: the execution's own reader keeps every event.
     let kinds = collect(execution).await;
     assert!(
         kinds
             .iter()
             .any(|k| matches!(k, EventKind::AttemptRestarted { .. }))
+    );
+    assert!(
+        kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::Assigned { worker_id, .. } if worker_id == "w1"))
     );
     assert!(matches!(
         kinds.last().unwrap(),
@@ -1556,11 +1562,15 @@ async fn invoke_read(server: &Server) -> (String, tokio::task::JoinHandle<Vec<Ev
 
 #[tokio::test]
 async fn global_event_budget_evicts_terminal_jobs_before_waiting() {
-    let server = serve(event_budget_config()).await;
+    let server = serve(RuntimeConfig {
+        journal: Some(JournalConfig::new(journal_path("event-reclaim"))),
+        ..event_budget_config()
+    })
+    .await;
     let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
-    // A finished job keeps most of the event budget in its retained log.
-    let mut job = spec(b"z");
-    job.policy.durability = Some(Durability::Ephemeral);
+    // A finished durable job keeps most of the event budget in its log
+    // (ephemeral ones keep only their outcome).
+    let job = spec(b"z");
     let finished = server
         .runtime
         .submit(SubmitRequest {
@@ -1588,12 +1598,16 @@ async fn global_event_budget_evicts_terminal_jobs_before_waiting() {
         started.elapsed() < Duration::from_millis(600),
         "did not wait"
     );
-    assert!(
+    // Evicted from memory; the journal still answers for it.
+    assert_eq!(server.runtime.stats().retained_jobs, 0);
+    assert_eq!(
         server
             .runtime
             .get_job(&finished.job_id, false)
             .await
-            .is_err()
+            .unwrap()
+            .state,
+        JobState::Succeeded
     );
     assert!(server.runtime.stats().event_bytes <= EVENT_LIMIT);
 }
@@ -2114,4 +2128,151 @@ async fn the_terminal_job_bound_holds_as_jobs_finish() {
     }
     assert!(server.runtime.get_job(&ids[0], false).await.is_err());
     assert!(server.runtime.get_job(&ids[9], false).await.is_ok());
+}
+
+#[tokio::test]
+async fn finished_ephemeral_jobs_keep_only_their_outcome() {
+    let server = serve(config()).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let mut job = spec(b"x");
+    job.policy.durability = Some(Durability::Ephemeral);
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: job,
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    for sequence in 1..=8 {
+        attempt.try_frame(sequence, vec![1; 1024]).await.unwrap();
+    }
+    let (live, _) = server.runtime.events(&job.job_id, 0).await.unwrap();
+    let first_seen = live[0].sequence;
+    attempt.succeed(b"done").await;
+    wait_state(&server.runtime, &job.job_id, JobState::Succeeded).await;
+    let (events, finished) = server.runtime.events(&job.job_id, 0).await.unwrap();
+    assert!(finished);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0].kind,
+        EventKind::Finished { state: JobState::Succeeded, outputs, .. }
+            if outputs == &vec![Object::inline(&b"done"[..])]
+    ));
+    let error = server
+        .runtime
+        .events(&job.job_id, first_seen)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.kind,
+        anyserve_core::error::ErrorKind::CursorExpired {
+            oldest: events[0].sequence
+        }
+    );
+    assert!(
+        server.runtime.stats().event_bytes < 1024,
+        "frames were released"
+    );
+}
+
+#[tokio::test]
+async fn a_streamed_caller_still_reads_everything_after_completion() {
+    let server = serve(config()).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let execution = server
+        .runtime
+        .invoke(InvokeRequest {
+            spec: spec(b"x"),
+            delivery: Delivery::Streamed,
+            ..InvokeRequest::default()
+        })
+        .await
+        .unwrap();
+    let job_id = execution.job_id().to_string();
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    for sequence in 1..=64 {
+        attempt.try_frame(sequence, vec![1; 1024]).await.unwrap();
+    }
+    attempt.succeed(b"").await;
+    wait_state(&server.runtime, &job_id, JobState::Succeeded).await;
+    // The job finished before the caller read anything: nothing is lost.
+    let kinds = collect(execution).await;
+    let frames = kinds
+        .iter()
+        .filter(|k| matches!(k, EventKind::Output { .. }))
+        .count();
+    assert_eq!(frames, 64);
+    // Once the caller is done, only the outcome stays.
+    let (events, _) = server.runtime.events(&job_id, 0).await.unwrap();
+    assert_eq!(events.len(), 1);
+}
+
+#[tokio::test]
+async fn a_live_watcher_keeps_every_event_through_completion() {
+    let server = serve(config()).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let mut job = spec(b"x");
+    job.policy.durability = Some(Durability::Ephemeral);
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: job,
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    // The watcher has read only Accepted when the job runs and finishes.
+    let mut watch = server.runtime.watch(&job.job_id, 0).unwrap();
+    let first = tokio::time::timeout(WAIT, watch.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(first.kind, EventKind::Accepted));
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    for sequence in 1..=4 {
+        attempt.try_frame(sequence, vec![1; 64]).await.unwrap();
+    }
+    attempt.succeed(b"done").await;
+    wait_state(&server.runtime, &job.job_id, JobState::Succeeded).await;
+    // It still gets everything, in order, with no CursorExpired.
+    let rest = collect(watch).await;
+    assert!(matches!(rest.first(), Some(EventKind::Assigned { .. })));
+    assert_eq!(
+        rest.iter()
+            .filter(|k| matches!(k, EventKind::Output { .. }))
+            .count(),
+        4
+    );
+    assert!(matches!(
+        rest.last(),
+        Some(EventKind::Finished {
+            state: JobState::Succeeded,
+            ..
+        })
+    ));
+    // Its departure compacted the log: only the outcome is left, and a new
+    // watch from an older nonzero cursor is refused.
+    let (events, _) = server.runtime.events(&job.job_id, 0).await.unwrap();
+    assert_eq!(events.len(), 1);
+    let mut stale = server.runtime.watch(&job.job_id, first.sequence).unwrap();
+    let refused = tokio::time::timeout(WAIT, stale.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        refused.kind,
+        anyserve_core::error::ErrorKind::CursorExpired { .. }
+    ));
 }
