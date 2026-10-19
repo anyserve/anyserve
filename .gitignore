@@ -20,6 +20,7 @@ __pycache__/
 # local build / benchmark output
 /clients/python/python/anyserve/*.so
 /bench/edge/results/
+/bench/load/results/
 
 # Local runtime journal
 /.anyserve/

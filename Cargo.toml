@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "bench/load",
   "clients/python",
   "crates/anyserve-client",
   "crates/anyserve-cli",
