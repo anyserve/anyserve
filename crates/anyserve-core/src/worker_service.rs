@@ -6,6 +6,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyserve_proto::v2::{self as pb, worker_server::Worker};
 use bytes::{Bytes, BytesMut};
@@ -153,9 +154,13 @@ impl Worker for WorkerGrpcService {
                         error.message(),
                     )))
                     .await;
+                tokio::spawn(drain(inbound, timeout));
                 return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                tokio::spawn(drain(inbound, timeout));
+                return Err(error.into());
+            }
         };
         let _ = tx
             .send(Ok(down(pb::attempt_down::Msg::Opened(pb::AttemptOpened {
@@ -191,9 +196,23 @@ impl Worker for WorkerGrpcService {
             inbound,
             tx,
             limits,
+            timeout,
         ));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+}
+
+/// Reads what the worker still sends on an answered attempt stream until it
+/// closes its side. Dropping the stream earlier makes h2 reset it, and the
+/// worker's messages still in flight then arrive on a stream the server has
+/// forgotten: each counts against h2's limit of 1024 locally reset streams
+/// per connection, past which the server sends GOAWAY and every attempt on
+/// the worker's connection breaks. Bounded by `limit`.
+async fn drain(mut inbound: Streaming<pb::AttemptUp>, limit: Duration) {
+    let _ = tokio::time::timeout(limit, async {
+        while let Ok(Some(_)) = inbound.message().await {}
+    })
+    .await;
 }
 
 /// Streams the job's inputs: every object in chunks, then params, then each
@@ -451,6 +470,7 @@ async fn receive_uploads(
     mut inbound: Streaming<pb::AttemptUp>,
     tx: mpsc::Sender<Result<pb::AttemptDown, Status>>,
     limits: Limits,
+    idle: Duration,
 ) {
     let budget = runtime.result_budget();
     let mut results = ResultAssembler::new(limits.clone(), Arc::clone(&budget), runtime.clone());
@@ -492,7 +512,7 @@ async fn receive_uploads(
                                     error.message(),
                                 )))
                                 .await;
-                            return;
+                            break;
                         }
                         Err(error) => Err(error.into()),
                     }
@@ -518,12 +538,16 @@ async fn receive_uploads(
                     Err(status) => Err(status),
                 };
                 let _ = tx.send(reply).await;
-                return;
+                break;
             }
         };
         let failed = reply.is_err();
         if tx.send(reply).await.is_err() || failed {
-            return;
+            break;
         }
     }
+    // The answer is final: end the response and give back any partial
+    // result, then let the worker close its side.
+    drop((tx, results));
+    drain(inbound, idle).await;
 }

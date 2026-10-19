@@ -2393,3 +2393,130 @@ async fn a_back_pressured_writer_is_woken_by_every_read() {
         })
     ));
 }
+
+#[tokio::test]
+async fn an_answered_attempt_stream_is_read_until_the_worker_closes_it() {
+    let server = serve(config()).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let mut job = spec(b"x");
+    job.policy.durability = Some(Durability::Ephemeral);
+    server
+        .runtime
+        .submit(SubmitRequest {
+            spec: job,
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap();
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let late = || {
+        up(pb::attempt_up::Msg::Frame(pb::Frame {
+            sequence: 1,
+            ..Default::default()
+        }))
+    };
+
+    // After its answer the server ends the response but keeps reading: the
+    // stream is not reset under a worker still writing.
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    let finished = attempt.succeed(b"ok").await;
+    assert_eq!(status(&finished), pb::attempt_finished::Status::Committed);
+    assert!(attempt.rx.message().await.unwrap().is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    attempt.tx.send(late()).await.expect("request stream open");
+    drop(attempt);
+
+    // So does an attempt fenced as it opens.
+    let mut fenced = worker.attempt("no-such-lease", assign.generation).await;
+    assert!(fenced.fenced.is_some());
+    assert!(fenced.rx.message().await.unwrap().is_none());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fenced.tx.send(late()).await.expect("request stream open");
+}
+
+/// Manual stress check, timing dependent, not in the default suite:
+/// `cargo test -p anyserve-core --test runtime_v2 one_worker_connection -- --ignored`.
+/// Before the attempt streams were read to their end it reproduced the
+/// GOAWAY (1025 frames on forgotten streams, then "locally-reset streams
+/// reached limit (1024)") only while h2 debug logging slowed the connection;
+/// without logging it passed either way.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_worker_connection_carries_thousands_of_attempts() {
+    // An attempt stream must close cleanly even while the worker is still
+    // writing when the server answers its Finish. Every stream the server
+    // resets with the worker's data in flight counts against h2's limit of
+    // 1024 locally reset streams per connection; past it the server sends
+    // GOAWAY and breaks every stream on the worker's connection.
+    let server = serve(config()).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    for round in 0..3000 {
+        let mut job = spec(b"x");
+        job.policy.durability = Some(Durability::Ephemeral);
+        server
+            .runtime
+            .submit(SubmitRequest {
+                spec: job,
+                ..SubmitRequest::default()
+            })
+            .await
+            .unwrap();
+        let assign = worker.next_assign().await;
+        worker.reply(&assign.lease_id, true).await;
+        let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+        for message in [
+            pb::attempt_up::Msg::Result(pb::ResultChunk {
+                index: 0,
+                data: Bytes::from_static(b"ok"),
+                last: true,
+                ..Default::default()
+            }),
+            pb::attempt_up::Msg::Finish(pb::Finish {
+                outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+            }),
+        ] {
+            attempt.tx.send(up(message)).await.unwrap();
+        }
+        // The worker keeps writing after its Finish, a message every few
+        // microseconds: some is always in flight when the server answers.
+        let writer = attempt.tx.clone();
+        let filler = tokio::spawn(async move {
+            while writer.send(pb::AttemptUp { msg: None }).await.is_ok() {
+                let next = std::time::Instant::now() + Duration::from_micros(20);
+                while std::time::Instant::now() < next {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let finished = loop {
+            match tokio::time::timeout(WAIT, attempt.rx.message())
+                .await
+                .unwrap()
+            {
+                Ok(Some(pb::AttemptDown {
+                    msg: Some(pb::attempt_down::Msg::Finished(finished)),
+                })) => break finished,
+                Ok(Some(_)) => continue,
+                other => panic!("attempt {round}: expected AttemptFinished, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            status(&finished),
+            pb::attempt_finished::Status::Committed,
+            "attempt {round}"
+        );
+        // The response ends (or the stream is reset) before the worker
+        // stops writing and closes its side.
+        while let Ok(Some(_)) = attempt.rx.message().await {}
+        filler.abort();
+        drop(attempt);
+        worker
+            .tx
+            .send(msg(pb::worker_message::Msg::Credit(pb::Credit {
+                free_slots: 4,
+            })))
+            .await
+            .unwrap();
+    }
+}
