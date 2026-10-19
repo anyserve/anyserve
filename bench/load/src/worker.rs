@@ -161,9 +161,25 @@ async fn execute(
         Mode::Echo => attempt.inputs.clone(),
         Mode::Stream(frames, payload) => {
             for _ in 0..*frames {
-                attempt
+                if let Err(error) = attempt
                     .frame(payload.data.clone(), Default::default(), false)
-                    .await?;
+                    .await
+                {
+                    attempt
+                        .commit(
+                            data,
+                            assignment,
+                            limits,
+                            &[],
+                            v2::finish::Outcome::Failed(v2::ErrorInfo {
+                                code: "output_interrupted".into(),
+                                message: error.to_string(),
+                                retryable: true,
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
             }
             Vec::new()
         }
@@ -179,6 +195,9 @@ async fn execute(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
 
 async fn send(control: &mpsc::Sender<v2::WorkerMessage>, msg: v2::worker_message::Msg) -> Result {
     control.send(v2::WorkerMessage { msg: Some(msg) }).await?;
