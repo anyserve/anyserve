@@ -19,9 +19,7 @@ use super::api::{
 };
 use super::events::{JobLog, Permit};
 use super::input::InputLog;
-use super::state::{
-    Attempt, FinishStatus, Job, Lease, Phase, QueueKey, State, TerminalPlan, unreserved,
-};
+use super::state::{Attempt, FinishStatus, Job, Lease, Phase, QueueKey, State, TerminalPlan};
 use super::{Inner, JournalStatus, TimerKey};
 use crate::error::RuntimeError;
 use crate::journal::{AcceptRecord, AttemptStartRecord, CommitOutcome, JournalOp, TerminalRecord};
@@ -335,7 +333,7 @@ impl Inner {
             lease.cancelling = true;
             let session_id = lease.session_id.clone();
             if let Some(session) = st.sessions.get_mut(&session_id) {
-                session.active.remove(&lease_id);
+                session.detach(&lease_id, &lease.reserved);
             }
             self.send_locked(
                 st,
@@ -431,7 +429,7 @@ impl Inner {
     /// jobs behind many unmatchable ones are still reached; a pass that did
     /// not finish its rotation schedules the next one.
     pub(crate) fn dispatch_locked(&self, st: &mut State, now: u64) {
-        if st.shutting_down {
+        if st.shutting_down || st.queues.values().all(|queue| queue.is_empty()) {
             return;
         }
         let durable_ok = self.journal_writable();
@@ -505,11 +503,12 @@ impl Inner {
     fn begin_attempt_locked(&self, st: &mut State, job_id: &str, session_id: &str, now: u64) {
         self.dequeue_locked(st, job_id);
         let limit = self.config.limits.assign_inline_limit as u64;
+        let reserved = st.jobs[job_id].spec.demand.required_capacity.clone();
         let session = st.sessions.get_mut(session_id).expect("picked session");
         let worker_id = session.worker_id.clone();
         let lease_id = new_id();
         let attempt_id = new_id();
-        session.active.insert(lease_id.clone());
+        session.attach(lease_id.clone(), &reserved);
         session.assigned_since_report += 1;
         let job = st.jobs.get_mut(job_id).expect("queued job");
         job.attempt_count += 1;
@@ -535,7 +534,6 @@ impl Inner {
         });
         job.last_attempt_id = Some(attempt_id.clone());
         job.last_worker_id = Some(worker_id.clone());
-        let reserved = job.spec.demand.required_capacity.clone();
         let durable = job.durability == Durability::Durable;
         let number = job.attempt_count;
         st.leases.insert(
@@ -871,7 +869,7 @@ impl Inner {
         if let Some(lease) = st.leases.remove(lease_id)
             && let Some(session) = st.sessions.get_mut(&lease.session_id)
         {
-            session.active.remove(lease_id);
+            session.detach(lease_id, &lease.reserved);
         }
     }
 
@@ -1222,10 +1220,7 @@ fn pick_session(st: &State, job: &Job, now: u64, rng: &mut u64) -> Option<String
         if !spill_open && matches < demand.preferred_attributes.len() {
             continue;
         }
-        let available = unreserved(session, &st.leases);
-        if !demand.required_capacity.iter().all(|(name, needed)| {
-            *needed <= 0 || available.get(name).is_some_and(|left| left >= needed)
-        }) {
+        if !session.fits(&demand.required_capacity) {
             continue;
         }
         let rank = (!job.rejected_by.contains(&session.id), matches);

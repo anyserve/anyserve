@@ -2001,3 +2001,75 @@ async fn huge_timeouts_do_not_overflow() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_rejected_assignment_frees_its_slot_at_once() {
+    // With a long retry backoff only the reply itself can hand the freed slot
+    // to the job waiting behind it.
+    let server = serve(RuntimeConfig {
+        default_initial_backoff: Duration::from_secs(60),
+        default_max_backoff: Duration::from_secs(60),
+        ..config()
+    })
+    .await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let mut jobs = Vec::new();
+    for _ in 0..5 {
+        let mut job = spec(b"x");
+        job.policy.durability = Some(Durability::Ephemeral);
+        let job = server
+            .runtime
+            .submit(SubmitRequest {
+                spec: job,
+                ..SubmitRequest::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        jobs.push(job.job_id);
+    }
+    let mut assigns = Vec::new();
+    for _ in 0..4 {
+        assigns.push(worker.next_assign().await);
+    }
+    // The worker has room, so only the server's lease count holds the fifth
+    // job back.
+    worker
+        .tx
+        .send(msg(pb::worker_message::Msg::Credit(pb::Credit {
+            free_slots: 4,
+        })))
+        .await
+        .unwrap();
+    worker.reply(&assigns[0].lease_id, false).await;
+    assert_eq!(worker.next_assign().await.job_id, jobs[4]);
+}
+
+#[tokio::test]
+async fn a_rejected_assignment_is_dispatched_again() {
+    let server = serve(config()).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let mut job = spec(b"x");
+    job.policy.durability = Some(Durability::Ephemeral);
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: job,
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let first = worker.next_assign().await;
+    worker.reply(&first.lease_id, false).await;
+    // The only worker gets it again after the retry backoff.
+    let second = worker.next_assign().await;
+    assert_eq!(second.attempt_number, 2);
+    worker.reply(&second.lease_id, true).await;
+    worker
+        .attempt(&second.lease_id, second.generation)
+        .await
+        .succeed(b"ok")
+        .await;
+    wait_state(&server.runtime, &job.job_id, JobState::Succeeded).await;
+}

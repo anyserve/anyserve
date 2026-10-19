@@ -161,6 +161,7 @@ impl Runtime {
                     reported_free: max_concurrency,
                     assigned_since_report: 0,
                     active: BTreeSet::new(),
+                    reserved: Default::default(),
                     load: WorkerLoad::default(),
                     draining: false,
                     tx: Some(tx.clone()),
@@ -192,14 +193,14 @@ impl Runtime {
             let lease = st.leases.get_mut(lease_id).expect("lease");
             let previous = std::mem::replace(&mut lease.session_id, session_id.clone());
             let job_id = lease.job_id.clone();
+            let reserved = lease.reserved.clone();
             if let Some(old) = st.sessions.get_mut(&previous) {
-                old.active.remove(lease_id);
+                old.detach(lease_id, &reserved);
             }
             st.sessions
                 .get_mut(&session_id)
                 .expect("session")
-                .active
-                .insert(lease_id.clone());
+                .attach(lease_id.clone(), &reserved);
             if let Some(attempt) = st
                 .jobs
                 .get_mut(&job_id)
@@ -304,6 +305,8 @@ impl Runtime {
             .filter(|session| session.connection == connection && session.tx.is_some())
             .ok_or_else(|| RuntimeError::stale("session is no longer current"))?;
         session.last_seen_ms = now;
+        // Only messages that can open a slot are worth a dispatch pass.
+        let mut may_free_slot = false;
         match message {
             pb::worker_message::Msg::Hello(_) => {
                 return Err(RuntimeError::invalid("Hello may only open a session"));
@@ -311,6 +314,7 @@ impl Runtime {
             pb::worker_message::Msg::Credit(credit) => {
                 session.reported_free = credit.free_slots;
                 session.assigned_since_report = 0;
+                may_free_slot = true;
             }
             pb::worker_message::Msg::Heartbeat(heartbeat) => {
                 if let Some(load) = heartbeat.load {
@@ -332,6 +336,7 @@ impl Runtime {
                     .is_some_and(|lease| lease.session_id == session_id && lease.cancelling)
                 {
                     inner.release_lease_locked(&mut st, &ack.lease_id);
+                    may_free_slot = true;
                 }
             }
             pb::worker_message::Msg::AssignReply(reply) => {
@@ -366,10 +371,13 @@ impl Runtime {
                         None,
                         now,
                     );
+                    may_free_slot = true;
                 }
             }
         }
-        inner.dispatch_locked(&mut st, now);
+        if may_free_slot {
+            inner.dispatch_locked(&mut st, now);
+        }
         Ok(())
     }
 
@@ -777,6 +785,111 @@ mod tests {
             .expect("session open")
             .msg
             .expect("message body")
+    }
+
+    fn hello(worker_id: &str, resume: &str, held: Vec<String>) -> pb::Hello {
+        pb::Hello {
+            worker_id: worker_id.to_string(),
+            resume_session_id: resume.to_string(),
+            interfaces: vec!["echo".to_string()],
+            total_capacity: [("slot".to_string(), 2)].into(),
+            max_concurrency: 4,
+            held_lease_ids: held,
+            ..Default::default()
+        }
+    }
+
+    async fn submit_slot_job(runtime: &Runtime) -> String {
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".to_string();
+        spec.demand.required_capacity.insert("slot".to_string(), 1);
+        spec.policy.durability = Some(Durability::Ephemeral);
+        runtime
+            .submit(SubmitRequest {
+                spec,
+                ..SubmitRequest::default()
+            })
+            .await
+            .unwrap()
+            .job
+            .job_id
+    }
+
+    async fn next_assign(handle: &mut SessionHandle) -> pb::Assign {
+        loop {
+            if let pb::server_message::Msg::Assign(assign) = next_message(handle).await {
+                return assign;
+            }
+        }
+    }
+
+    fn check(runtime: &Runtime) -> Vec<(u32, i64)> {
+        let st = runtime.inner.lock();
+        super::super::state::assert_reservations(&st);
+        let mut held: Vec<(u32, i64)> = st
+            .sessions
+            .values()
+            .map(|s| {
+                (
+                    s.active.len() as u32,
+                    s.reserved.get("slot").copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        held.sort();
+        held
+    }
+
+    #[tokio::test]
+    async fn reservations_track_every_lease_change() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut first = runtime.open_session(hello("w", "", Vec::new())).unwrap();
+        let a = submit_slot_job(&runtime).await;
+        let b = submit_slot_job(&runtime).await;
+        let lease_a = next_assign(&mut first).await.lease_id;
+        let lease_b = next_assign(&mut first).await.lease_id;
+        assert_eq!(check(&runtime), vec![(2, 2)]);
+        // The session's two slots are reserved: a third job has to wait.
+        let c = submit_slot_job(&runtime).await;
+        assert_eq!(
+            runtime.get_job(&c, false).await.unwrap().state,
+            crate::runtime::api::JobState::Queued
+        );
+
+        // Finishing one releases its slot, which the queued job takes.
+        let (link, _) = runtime
+            .open_attempt(&pb::AttemptOpen {
+                lease_id: lease_a.clone(),
+                generation: runtime.generation(),
+                resume_after_sequence: 0,
+            })
+            .await
+            .unwrap();
+        runtime
+            .finish_attempt(&link, AttemptOutcome::Succeeded, Vec::new())
+            .await
+            .unwrap();
+        let lease_c = next_assign(&mut first).await.lease_id;
+        assert_eq!(check(&runtime), vec![(2, 2)]);
+        let _ = a;
+
+        // A new connection of the same worker takes the lease it reports, and
+        // its capacity, from the old session; the other stays there.
+        let session = first.session_id.clone();
+        drop(first);
+        runtime.session_closed(&session, 1);
+        let _second = runtime
+            .open_session(hello("w", "", vec![lease_b.clone()]))
+            .unwrap();
+        assert_eq!(check(&runtime), vec![(1, 1), (1, 1)]);
+        let _ = lease_c;
+
+        // Freezing returns the job's capacity.
+        {
+            let mut st = runtime.inner.lock();
+            runtime.inner.freeze_locked(&mut st, &b, "test");
+        }
+        assert_eq!(check(&runtime), vec![(0, 0), (1, 1)]);
     }
 
     #[tokio::test]
