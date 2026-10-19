@@ -187,11 +187,12 @@ impl JobLog {
         self.inner.lock().expect("job log poisoned")
     }
 
-    fn evict_front(&self, inner: &mut LogInner) {
+    fn evict_front(&self, inner: &mut LogInner) -> ExecutionEvent {
         let (event, size) = inner.events.pop_front().expect("front exists");
         inner.bytes -= size;
         self.budget.release(size);
         inner.evicted_through = event.sequence;
+        event
     }
 
     /// Whether the front event may be dropped: always without a primary
@@ -357,14 +358,16 @@ impl JobLog {
         self.consumed.send_replace(sequence);
     }
 
-    /// Drops what a finished log no longer needs to serve: every event before
-    /// `Finished`, except those a primary consumer has not read yet. Only a
-    /// prefix goes, so a later reader with an older cursor gets
-    /// `CursorExpired`, never a silent gap.
-    pub(crate) fn compact_finished(&self) {
+    /// Removes what a finished log no longer needs to serve: every event
+    /// before `Finished`, except those a primary consumer has not read yet.
+    /// Only a prefix goes, so a later reader with an older cursor gets
+    /// `CursorExpired`, never a silent gap. The removed events are returned
+    /// for the caller to free outside its locks.
+    pub(crate) fn compact_finished(&self) -> Vec<ExecutionEvent> {
         let mut inner = self.lock();
+        let mut removed = Vec::new();
         if !inner.finished {
-            return;
+            return removed;
         }
         let finished_at = inner.last_sequence;
         let keep_from = inner
@@ -375,8 +378,9 @@ impl JobLog {
             .front()
             .is_some_and(|(event, _)| event.sequence < keep_from)
         {
-            self.evict_front(&mut inner);
+            removed.push(self.evict_front(&mut inner));
         }
+        removed
     }
 
     /// Readers currently following this log; each holds a `changed` receiver.
@@ -386,16 +390,20 @@ impl JobLog {
 
     /// An ephemeral job finished: its log keeps only the outcome once nobody
     /// follows it any more (now, or when the last follower lets go). Writers
-    /// waiting on the consumer are woken to see the end.
-    pub(crate) fn finish_ephemeral(&self) {
+    /// waiting on the consumer are woken to see the end. Returns what was
+    /// compacted now.
+    pub(crate) fn finish_ephemeral(&self) -> Vec<ExecutionEvent> {
         self.compactable.store(true, Ordering::Release);
-        self.compact_if_unfollowed();
+        let removed = self.compact_if_unfollowed();
         self.consumed.send_modify(|value| *value += 1);
+        removed
     }
 
-    pub(crate) fn compact_if_unfollowed(&self) {
+    pub(crate) fn compact_if_unfollowed(&self) -> Vec<ExecutionEvent> {
         if self.compactable.load(Ordering::Acquire) && self.follower_count() == 0 {
-            self.compact_finished();
+            self.compact_finished()
+        } else {
+            Vec::new()
         }
     }
 

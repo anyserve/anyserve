@@ -947,4 +947,88 @@ mod tests {
         .unwrap_err();
         assert_eq!(refused.kind, ErrorKind::PersistenceUnavailable);
     }
+
+    /// Bytes whose last drop records whether the runtime lock was free then.
+    struct DropProbe {
+        inner: std::sync::Weak<super::super::Inner>,
+        lock_free: Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl AsRef<[u8]> for DropProbe {
+        fn as_ref(&self) -> &[u8] {
+            b"probe"
+        }
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let free = self
+                .inner
+                .upgrade()
+                .is_some_and(|inner| inner.state.try_lock().is_ok());
+            *self.lock_free.lock().unwrap() = Some(free);
+        }
+    }
+
+    #[tokio::test]
+    async fn released_jobs_and_events_are_freed_after_the_lock() {
+        let runtime = Runtime::start(RuntimeConfig {
+            max_terminal_jobs: 1,
+            ..RuntimeConfig::default()
+        })
+        .await
+        .unwrap();
+        let mut session = runtime.open_session(hello("w", "", Vec::new())).unwrap();
+        let probe = |lock_free: &Arc<std::sync::Mutex<Option<bool>>>| {
+            Bytes::from_owner(DropProbe {
+                inner: Arc::downgrade(&runtime.inner),
+                lock_free: Arc::clone(lock_free),
+            })
+        };
+        let frame_freed = Arc::new(std::sync::Mutex::new(None));
+        let result_freed = Arc::new(std::sync::Mutex::new(None));
+        for round in 0..2 {
+            submit_slot_job(&runtime).await;
+            let lease_id = next_assign(&mut session).await.lease_id;
+            let (link, _) = runtime
+                .open_attempt(&pb::AttemptOpen {
+                    lease_id: lease_id.clone(),
+                    generation: runtime.generation(),
+                    resume_after_sequence: 0,
+                })
+                .await
+                .unwrap();
+            let mut outputs = Vec::new();
+            if round == 0 {
+                runtime
+                    .push_frame(
+                        &lease_id,
+                        pb::Frame {
+                            sequence: 1,
+                            data: probe(&frame_freed),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                outputs.push(Object::Inline {
+                    data: probe(&result_freed),
+                    metadata: Metadata::new(),
+                });
+            }
+            runtime
+                .finish_attempt(&link, AttemptOutcome::Succeeded, outputs)
+                .await
+                .unwrap();
+            if round == 0 {
+                // Nobody follows the first job: finishing it compacted its
+                // log, frame included.
+                assert_eq!(*frame_freed.lock().unwrap(), Some(true));
+                assert_eq!(*result_freed.lock().unwrap(), None);
+            }
+        }
+        // Finishing the second job evicted the first, result included.
+        assert_eq!(*result_freed.lock().unwrap(), Some(true));
+        assert!(runtime.inner.lock().released.jobs.is_empty());
+    }
 }

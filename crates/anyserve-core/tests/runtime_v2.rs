@@ -2276,3 +2276,55 @@ async fn a_live_watcher_keeps_every_event_through_completion() {
         anyserve_core::error::ErrorKind::CursorExpired { .. }
     ));
 }
+
+#[tokio::test]
+async fn an_unread_job_reclaims_room_before_dropping_output() {
+    let server = serve(RuntimeConfig {
+        journal: Some(JournalConfig::new(journal_path("reclaim-unread"))),
+        ..event_budget_config()
+    })
+    .await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    // A finished durable job keeps most of the event budget in its log.
+    let finished = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: spec(b"z"),
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    attempt.try_frame(1, vec![1; 28 * 1024]).await.unwrap();
+    attempt.try_frame(2, vec![1; 28 * 1024]).await.unwrap();
+    attempt.succeed(b"z").await;
+    wait_state(&server.runtime, &finished.job_id, JobState::Succeeded).await;
+
+    // Nobody reads this job, so output that still does not fit after one
+    // eviction is dropped: the evicted job's bytes must be free by then.
+    let mut job = spec(b"x");
+    job.policy.durability = Some(Durability::Ephemeral);
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: job,
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
+    assert_eq!(attempt.try_frame(1, vec![2; 24 * 1024]).await.unwrap(), 1);
+    let (events, _) = server.runtime.events(&job.job_id, 0).await.unwrap();
+    assert!(
+        events.iter().any(
+            |event| matches!(&event.kind, EventKind::Output { data, .. } if data.len() == 24 * 1024)
+        ),
+        "the frame was dropped"
+    );
+}

@@ -12,6 +12,7 @@ pub(crate) mod worker;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -142,9 +143,37 @@ pub(crate) struct Inner {
     pub(crate) me: Weak<Inner>,
 }
 
+/// The runtime lock. What the holder moved to `State::released` is dropped
+/// after the lock is let go.
+pub(crate) struct StateGuard<'a>(Option<MutexGuard<'a, State>>);
+
+impl Deref for StateGuard<'_> {
+    type Target = State;
+
+    fn deref(&self) -> &State {
+        self.0.as_ref().expect("lock held")
+    }
+}
+
+impl DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.0.as_mut().expect("lock held")
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(mut st) = self.0.take() {
+            let released = std::mem::take(&mut st.released);
+            drop(st);
+            drop(released);
+        }
+    }
+}
+
 impl Inner {
-    pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().expect("runtime state poisoned")
+    pub(crate) fn lock(&self) -> StateGuard<'_> {
+        StateGuard(Some(self.state.lock().expect("runtime state poisoned")))
     }
 
     fn fire(&self, key: TimerKey) {
