@@ -172,6 +172,31 @@ worker_tokens=["worker"]
             terminal = [event for event in invocation if event["type"] == "finished"]
             self.assertEqual(terminal[0]["state"], "succeeded")
 
+    def test_finished_then_close_or_drop_keeps_invoke_and_watch_usable(self):
+        interface = "test.python.finished-drop"
+        self.start_worker(interface)
+        options = ExecutionOptions(total_timeout_ms=10_000)
+        # Both methods share one native channel. Cross h2's local reset limit
+        # without explicitly asking either iterator for EOF after Finished.
+        for index in range(2048):
+            payload = f"call-{index}".encode()
+            for route in ("invoke", "watch"):
+                if route == "invoke":
+                    events = self.client.invoke(interface, payload, options=options)
+                else:
+                    job = self.client.submit(interface, payload, durability="ephemeral", options=options)
+                    events = self.client.watch(job["job_id"])
+                for event in events:
+                    if event["type"] == "finished":
+                        self.assertEqual(event["state"], "succeeded")
+                        self.assertEqual(event["outputs"][0]["inline"], payload)
+                        break
+                else:
+                    self.fail(f"{route} {index} ended without Finished")
+                if index % 2 == 0:
+                    events.close()
+                del events
+
     def test_closing_an_invocation_cancels_a_handler_waiting_for_more_input(self):
         interface = "test.python.cancel"
         marker = self.path / "cancelled"

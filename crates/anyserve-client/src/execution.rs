@@ -20,6 +20,8 @@ use crate::{BearerAuth, TOKEN_ENV, connect_channel};
 
 mod attempt;
 pub use attempt::Attempt;
+mod events;
+pub use events::ExecutionEvents;
 
 const SEND_QUEUE: usize = 8;
 const CONTROL_MESSAGE_BYTES: usize = 256 * 1024;
@@ -64,22 +66,21 @@ impl ExecutionClient {
             .into_inner())
     }
 
-    /// An ephemeral invocation. Dropping its response stream cancels execution.
-    pub async fn invoke(
-        &mut self,
-        spec: v2::JobSpec,
-    ) -> Result<Streaming<v2::ExecutionEvent>, Status> {
+    /// An ephemeral invocation. Dropping before Finished cancels execution.
+    /// Finished is returned only after consuming the response trailer.
+    pub async fn invoke(&mut self, spec: v2::JobSpec) -> Result<ExecutionEvents, Status> {
         let request = v2::InvokeRequest {
             msg: Some(v2::invoke_request::Msg::Start(v2::InvokeStart {
                 spec: Some(spec),
                 streaming_input: false,
             })),
         };
-        Ok(self
-            .inner
-            .invoke(tokio_stream::iter([request]))
-            .await?
-            .into_inner())
+        Ok(ExecutionEvents::new(
+            self.inner
+                .invoke(tokio_stream::iter([request]))
+                .await?
+                .into_inner(),
+        ))
     }
 
     pub async fn invoke_stream(&mut self, spec: v2::JobSpec) -> Result<Invocation, Status> {
@@ -98,22 +99,26 @@ impl ExecutionClient {
             .invoke(ReceiverStream::new(requests))
             .await?
             .into_inner();
-        Ok(Invocation { input, events })
+        Ok(Invocation {
+            input,
+            events: ExecutionEvents::new(events),
+        })
     }
 
     pub async fn watch(
         &mut self,
         job_id: impl Into<String>,
         after_sequence: u64,
-    ) -> Result<Streaming<v2::ExecutionEvent>, Status> {
-        Ok(self
-            .inner
-            .watch(v2::WatchRequest {
-                job_id: job_id.into(),
-                after_sequence,
-            })
-            .await?
-            .into_inner())
+    ) -> Result<ExecutionEvents, Status> {
+        Ok(ExecutionEvents::new(
+            self.inner
+                .watch(v2::WatchRequest {
+                    job_id: job_id.into(),
+                    after_sequence,
+                })
+                .await?
+                .into_inner(),
+        ))
     }
 
     pub async fn get(
@@ -156,7 +161,7 @@ impl ExecutionClient {
 
 pub struct Invocation {
     pub input: mpsc::Sender<v2::InvokeRequest>,
-    pub events: Streaming<v2::ExecutionEvent>,
+    pub events: ExecutionEvents,
 }
 
 impl Invocation {
