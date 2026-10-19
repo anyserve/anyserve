@@ -30,8 +30,11 @@ the numeric gRPC status in `status_code`. `result()` reads the job once and, if 
 is still running, follows `watch(job_id, after_sequence=0)` until Finished.
 A zero cursor starts at the earliest retained event, including after recovery;
 expired nonzero cursors report cursor expiry. Use event streams as context managers
-when you may stop reading before Finished. Durable jobs require an enabled
-journal; live output history is bounded and does not survive restart.
+when you may stop reading before Finished.
+Invoke and Watch consume gRPC trailers before returning Finished, so stopping
+iteration or closing at that event safely releases the completed response.
+Durable jobs require an enabled journal; live output history is bounded and does
+not survive restart.
 
 ## Workers
 

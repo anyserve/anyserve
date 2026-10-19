@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyserve_client::execution::{ExecutionClient as Client, v2};
+use anyserve_client::execution::{ExecutionClient as Client, ExecutionEvents as ClientEvents, v2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use tonic::Streaming;
 
 use crate::{
     PyObjectRef, SharedRuntime, build_runtime, connection_error, lock_shared, status_error,
@@ -131,7 +130,7 @@ impl ExecutionTransport {
 pub struct InputInvocation {
     runtime: SharedRuntime,
     input: Arc<Mutex<Option<tokio::sync::mpsc::Sender<v2::InvokeRequest>>>>,
-    events: Arc<Mutex<Option<Streaming<v2::ExecutionEvent>>>>,
+    events: Arc<Mutex<Option<ClientEvents>>>,
     closed: tokio::sync::watch::Sender<bool>,
 }
 #[pymethods]
@@ -194,12 +193,12 @@ impl InputInvocation {
 #[pyclass(module = "anyserve._native")]
 pub struct ExecutionEvents {
     runtime: SharedRuntime,
-    events: Arc<Mutex<Option<Streaming<v2::ExecutionEvent>>>>,
+    events: Arc<Mutex<Option<ClientEvents>>>,
     closed: tokio::sync::watch::Sender<bool>,
 }
 
 impl ExecutionEvents {
-    fn new(runtime: SharedRuntime, events: Streaming<v2::ExecutionEvent>) -> Self {
+    fn new(runtime: SharedRuntime, events: ClientEvents) -> Self {
         Self {
             runtime,
             events: Arc::new(Mutex::new(Some(events))),
