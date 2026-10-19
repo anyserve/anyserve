@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyserve_proto::v2 as pb;
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::Runtime;
 use super::api::{ErrorInfo, Metadata, Object, WorkerLoad, codes};
@@ -513,17 +513,21 @@ impl Runtime {
         let deadline = tokio::time::Instant::now() + stall;
         // Terminal jobs are evicted for room at most once per frame.
         let mut reclaimed = false;
+        // Taken only once an append has failed, and followed by one more try:
+        // consumer progress after that try always wakes this writer.
+        let mut consumed: Option<watch::Receiver<u64>> = None;
         loop {
-            let (job_id, mut consumed, cause) = {
+            let now = now_ms();
+            let (job_id, cause) = {
                 let mut st = self.inner.lock();
-                let now = now_ms();
                 let lease = st
                     .leases
                     .get(lease_id)
                     .filter(|lease| !lease.cancelling)
                     .ok_or_else(|| RuntimeError::stale("lease is no longer active"))?;
                 let job_id = lease.job_id.clone();
-                let attempt = st.jobs[&job_id]
+                let mut job = st.jobs.get_mut(&job_id).expect("leased job");
+                let attempt = job
                     .attempt
                     .as_ref()
                     .filter(|attempt| attempt.lease_id == lease_id)
@@ -539,8 +543,6 @@ impl Runtime {
                 }
                 let attempt_id = attempt.attempt_id.clone();
                 loop {
-                    let job = st.jobs.get_mut(&job_id).expect("leased job");
-                    let consumed = job.log.subscribe_consumed();
                     match job.log.append_output(
                         attempt_id.clone(),
                         frame.data.clone(),
@@ -549,7 +551,7 @@ impl Runtime {
                         now,
                         reclaimed,
                     ) {
-                        Ok(_) => {
+                        Ok(sequence) => {
                             let streamed = job.streamed;
                             let attempt = job.attempt.as_mut().expect("attempt");
                             attempt.last_frame_seq = frame.sequence;
@@ -561,17 +563,26 @@ impl Runtime {
                             if matches!(job.phase, Phase::Assigned) {
                                 job.phase = Phase::Running;
                             }
+                            let log = Arc::clone(&job.log);
+                            drop(st);
+                            // Followers wake once the lock is free.
+                            log.notify_appended(sequence);
                             return Ok(frame.sequence);
                         }
                         Err(LogFull::BudgetFull) if !reclaimed => {
                             let needed = (frame.data.len() + metadata_size(&metadata) + 128) as u64;
                             self.inner.reclaim_locked(&mut st, needed, false);
                             reclaimed = true;
+                            job = st.jobs.get_mut(&job_id).expect("leased job");
                         }
-                        Err(cause) => break (job_id, consumed, cause),
+                        Err(_) if consumed.is_none() => {
+                            consumed = Some(job.log.subscribe_consumed());
+                        }
+                        Err(cause) => break (job_id, cause),
                     }
                 }
             };
+            let consumed = consumed.as_mut().expect("subscribed before waiting");
             // The frame stays unacknowledged meanwhile, so the worker's window
             // stops it from sending more.
             let woke = tokio::time::timeout_at(deadline, async {
