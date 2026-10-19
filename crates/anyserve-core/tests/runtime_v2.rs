@@ -2073,3 +2073,45 @@ async fn a_rejected_assignment_is_dispatched_again() {
         .await;
     wait_state(&server.runtime, &job.job_id, JobState::Succeeded).await;
 }
+
+#[tokio::test]
+async fn the_terminal_job_bound_holds_as_jobs_finish() {
+    let mut cfg = config();
+    cfg.max_terminal_jobs = 3;
+    let server = serve(cfg).await;
+    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
+    let mut ids = Vec::new();
+    for _ in 0..10 {
+        let mut job = spec(b"x");
+        job.policy.durability = Some(Durability::Ephemeral);
+        let job = server
+            .runtime
+            .submit(SubmitRequest {
+                spec: job,
+                ..SubmitRequest::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        let assign = worker.next_assign().await;
+        worker.reply(&assign.lease_id, true).await;
+        worker
+            .attempt(&assign.lease_id, assign.generation)
+            .await
+            .succeed(b"ok")
+            .await;
+        wait_state(&server.runtime, &job.job_id, JobState::Succeeded).await;
+        worker
+            .tx
+            .send(msg(pb::worker_message::Msg::Credit(pb::Credit {
+                free_slots: 4,
+            })))
+            .await
+            .unwrap();
+        ids.push(job.job_id);
+        // No maintenance pass is needed for the bound to hold.
+        assert!(server.runtime.stats().retained_jobs <= 3);
+    }
+    assert!(server.runtime.get_job(&ids[0], false).await.is_err());
+    assert!(server.runtime.get_job(&ids[9], false).await.is_ok());
+}

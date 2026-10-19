@@ -28,6 +28,9 @@ use crate::journal::{AcceptRecord, AttemptStartRecord, CommitOutcome, JournalOp,
 const DISPATCH_SCAN: usize = 256;
 /// Delay before retrying work after a journal rollback.
 const ROLLBACK_RETRY_MS: u64 = 1_000;
+/// Terminal jobs past their retention evicted per maintenance pass, so one
+/// pass never holds the lock for a whole backlog.
+const MAINTENANCE_EVICTIONS: usize = 1_024;
 
 /// Milliseconds of `duration`, saturating instead of wrapping.
 pub(crate) fn ms(duration: Duration) -> u64 {
@@ -1078,6 +1081,13 @@ impl Inner {
             self.cancel_lease_locked(st, &lease_id, &reason, now);
         }
         self.dispatch_locked(st, now);
+        // Keep the count bound as jobs finish, one eviction each, instead of
+        // leaving a second's worth to the maintenance pass.
+        while st.terminal_order.len() > self.config.max_terminal_jobs {
+            if self.evict_oldest_terminal_locked(st).is_none() {
+                break;
+            }
+        }
     }
 
     /// Cancels a job on behalf of a caller. Ephemeral jobs end at once; durable
@@ -1118,15 +1128,18 @@ impl Inner {
 
     // ------------------------------------------------------------ retention
 
-    /// Drops terminal jobs past their retention or beyond `max_terminal_jobs`.
+    /// Maintenance: drops terminal jobs past their retention, at most
+    /// `MAINTENANCE_EVICTIONS` per pass. `max_terminal_jobs` is enforced as
+    /// jobs finish.
     pub(crate) fn evict_terminal_locked(&self, st: &mut State, now: u64) {
         let retention = ms(self.config.terminal_retention);
-        while let Some((finished_at, _)) = st.terminal_order.front() {
-            let expired = now.saturating_sub(*finished_at) >= retention;
-            if !expired && st.terminal_order.len() <= self.config.max_terminal_jobs {
-                break;
+        for _ in 0..MAINTENANCE_EVICTIONS {
+            match st.terminal_order.front() {
+                Some((finished_at, _)) if now.saturating_sub(*finished_at) >= retention => {
+                    self.evict_oldest_terminal_locked(st);
+                }
+                _ => break,
             }
-            self.evict_oldest_terminal_locked(st);
         }
     }
 
