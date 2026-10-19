@@ -9,7 +9,8 @@ use anyserve_proto::v2 as pb;
 use tokio::sync::{mpsc, oneshot};
 
 use super::api::{
-    Capacity, Durability, ErrorInfo, JobSpec, JobState, JobView, Metadata, Object, WorkerLoad,
+    Capacity, Durability, ErrorInfo, ExecutionEvent, JobSpec, JobState, JobView, Metadata, Object,
+    WorkerLoad,
 };
 use super::events::{JobLog, Permit};
 use super::input::InputLog;
@@ -55,6 +56,17 @@ pub(crate) struct State {
     pub rng: u64,
     pub connection_seq: u64,
     pub shutting_down: bool,
+    /// Taken out under the lock, freed once it is released.
+    pub released: Released,
+}
+
+/// What lock holders set aside instead of freeing it in place: freeing an
+/// evicted job or a compacted log is work nobody else has to wait for. The
+/// runtime's lock guard drops it right after unlocking.
+#[derive(Default)]
+pub(crate) struct Released {
+    pub jobs: Vec<Job>,
+    pub events: Vec<ExecutionEvent>,
 }
 
 #[derive(Clone, Debug)]

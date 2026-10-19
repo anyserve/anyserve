@@ -1055,11 +1055,12 @@ impl Inner {
         );
         // A finished ephemeral job keeps only its outcome, as a durable job read
         // back from the journal does, once its current readers are done.
-        if job.durability == Durability::Ephemeral {
-            job.log.finish_ephemeral();
+        let mut compacted = if job.durability == Durability::Ephemeral {
+            job.log.finish_ephemeral()
         } else {
             job.log.set_primary(false);
-        }
+            Vec::new()
+        };
         job.output_bytes = output_bytes;
         let view = job.view(false);
         for waiter in job.waiters.drain(..) {
@@ -1069,6 +1070,7 @@ impl Inner {
             let _ = waiter.send(Ok(FinishStatus::Committed));
         }
         job.input_permit = None;
+        st.released.events.append(&mut compacted);
         st.unfinished_jobs -= 1;
         st.terminal_order.push_back((now, job_id.to_string()));
         if let Some((lease_id, digest)) = plan.finished {
@@ -1090,9 +1092,10 @@ impl Inner {
         // Keep the count bound as jobs finish, one eviction each, instead of
         // leaving a second's worth to the maintenance pass.
         while st.terminal_order.len() > self.config.max_terminal_jobs {
-            if self.evict_oldest_terminal_locked(st).is_none() {
+            let Some(evicted) = self.evict_oldest_terminal_locked(st) else {
                 break;
-            }
+            };
+            st.released.jobs.push(evicted);
         }
     }
 
@@ -1142,17 +1145,19 @@ impl Inner {
         for _ in 0..MAINTENANCE_EVICTIONS {
             match st.terminal_order.front() {
                 Some((finished_at, _)) if now.saturating_sub(*finished_at) >= retention => {
-                    self.evict_oldest_terminal_locked(st);
+                    if let Some(evicted) = self.evict_oldest_terminal_locked(st) {
+                        st.released.jobs.push(evicted);
+                    }
                 }
                 _ => break,
             }
         }
     }
 
-    /// Removes the oldest terminal job from memory; returns the result and
-    /// event bytes its references held. Durable jobs, their receipts
-    /// included, stay readable from the journal.
-    fn evict_oldest_terminal_locked(&self, st: &mut State) -> Option<(u64, u64)> {
+    /// Takes the oldest terminal job out of memory and returns it for the
+    /// caller to free. Durable jobs, their receipts included, stay readable
+    /// from the journal.
+    fn evict_oldest_terminal_locked(&self, st: &mut State) -> Option<Job> {
         loop {
             let (_, job_id) = st.terminal_order.pop_front()?;
             if !st.jobs.get(&job_id).is_some_and(|job| job.is_terminal()) {
@@ -1162,7 +1167,7 @@ impl Inner {
             for lease in &job.finished_leases {
                 st.finished_leases.remove(lease);
             }
-            return Some((job.output_bytes, job.log.bytes() as u64));
+            return Some(job);
         }
     }
 
@@ -1173,10 +1178,16 @@ impl Inner {
     pub(crate) fn reclaim_locked(&self, st: &mut State, needed: u64, results: bool) {
         let mut freed = 0u64;
         while freed < needed {
-            let Some((output_bytes, event_bytes)) = self.evict_oldest_terminal_locked(st) else {
+            let Some(evicted) = self.evict_oldest_terminal_locked(st) else {
                 return;
             };
-            freed += if results { output_bytes } else { event_bytes };
+            freed += if results {
+                evicted.output_bytes
+            } else {
+                evicted.log.bytes() as u64
+            };
+            // Freed here, not after the lock: the caller retries at once.
+            drop(evicted);
         }
     }
 }
