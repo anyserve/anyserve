@@ -1,8 +1,11 @@
-# Reference Architectures
+# Runtime Reference Review (2026-10-18)
 
 This note records what the Anyserve redesign borrows from four mature systems
-and what it deliberately leaves out. It is a research input to
-[the execution architecture](redesign.md), not a specification.
+and what it deliberately leaves out. **Status: historical design research.**
+The adoption notes below preserve the proposals evaluated on 2026-10-18; they
+do not specify the current storage schema, wire messages or available features.
+Read the [execution architecture](architecture.md) for the implemented behavior
+and the [redesign acceptance record](redesign.md) for that revision's checks.
 
 Every source link is pinned to the commit that was read on 2026-10-18, so line
 anchors stay valid:
@@ -226,7 +229,7 @@ Do not adopt:
 
 ## Summary
 
-| Concern | Borrowed from | Anyserve rule |
+| Concern | Borrowed from | Design input (2026-10-18) |
 |---|---|---|
 | Admission | Ray router, Triton queue policy, Knative breaker | Bounded per-interface queues with priority levels and queue timeouts; reject on overflow |
 | Executor capacity | Ray replica rejection, Knative breaker, Triton rate limiter | Worker credits and counted resources; a worker may reject an assignment; reservations are released exactly once |

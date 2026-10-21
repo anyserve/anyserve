@@ -1,8 +1,14 @@
-# Create Gateway
+# Hosted Gateway Proposal
 
-This page defines the production gateway shape for Anyserve.
+**Status: product proposal.** This page describes a possible hosted gateway
+experience. Workspace provisioning, issued API keys, managed worker pools and
+the dashboard flow below are not implemented capabilities of this checkout.
+The current server uses configured client/worker bearer roles. See
+[usage](usage.md), [deployment and recovery](deployment.md) and the
+[execution architecture](architecture.md) for supported behavior.
 
-Use it as the contract for the endpoint, worker connection flow, dashboard, and routing surface.
+The remaining sections preserve the proposed endpoint, worker connection,
+dashboard and routing product contract for future design work.
 
 ## The Point
 

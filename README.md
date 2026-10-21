@@ -83,7 +83,7 @@ pluggable storage/frame backend combinations. Old `[server.storage]` and
 The 0.4 protocol and databases are not upgraded in place. Deploy a matching 0.5
 binary and SDK with a fresh SQLite journal after draining older jobs. Keep the
 previous release and its original data for rollback. See
-[architecture and migration](docs/src/architecture.md) and the
+[deployment and migration](docs/src/deployment.md) and the
 [configuration reference](docs/src/configuration.md).
 
 For `anyserve job ls`, `job inspect` and `job cancel`, set `ANYSERVE_TOKEN` to
@@ -101,6 +101,18 @@ worker role and belong in the worker's `token` / `token_env` configuration.
 - `console`: web UI reading the same Runtime as the gateways.
 - `examples`: existing Rust/Python, Ollama and deployment walkthroughs.
 
-See [testing](docs/src/testing.md), [acceptance records](docs/src/redesign.md),
-[edge placement](docs/src/edge.md), and the source-backed
-[reference review](docs/src/reference-architectures.md).
+## Documentation
+
+Start with the [reading guide](docs/src/index.md). The
+[execution architecture](docs/src/architecture.md) describes the implemented
+runtime, and [deployment and recovery](docs/src/deployment.md) covers topology,
+persistence, readiness and migration. Use [configuration](docs/src/configuration.md),
+[edge placement](docs/src/edge.md) and [testing](docs/src/testing.md) for operation
+and validation.
+
+The [load benchmark results](bench/load/RESULTS.md) record the 2026-10-19 baseline
+and two optimization rounds. The [0.5 acceptance record](docs/src/redesign.md)
+and [reference reviews](docs/src/reference-architectures.md) are dated design
+history. The [hosted gateway document](docs/src/create-gateway.md) is a product
+proposal, including provisioning and workspace flows that are not implemented
+in this checkout.

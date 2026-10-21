@@ -1,9 +1,13 @@
 # Configuration
 
-This reference freezes the current Runtime, Limits and JournalConfig fields.
+This reference describes the current Runtime, Limits and JournalConfig fields.
 Defaults below come from `crates/anyserve-core/src/runtime/api.rs`; the tables
 also identify limits that are available only to an embedded Rust Runtime. No
 additional configuration knobs are implied by this document.
+
+Read [execution architecture](architecture.md) for the lifecycle behind these
+limits and [deployment and recovery](deployment.md) for listener and persistence
+choices.
 
 The CLI maps `[runtime]` keys `max_attempts` and `max_queue` to
 `default_max_attempts` and `default_max_queue`. Time keys use `_ms` for

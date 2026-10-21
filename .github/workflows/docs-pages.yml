@@ -5,6 +5,7 @@ on:
     branches: ["main"]
     paths:
       - "docs/**"
+      - "bench/load/RESULTS.md"
       - "examples/llm/**"
       - "README.md"
       - ".github/workflows/docs-pages.yml"
@@ -12,6 +13,7 @@ on:
     branches: ["main"]
     paths:
       - "docs/**"
+      - "bench/load/RESULTS.md"
       - "examples/llm/**"
       - "README.md"
       - ".github/workflows/docs-pages.yml"

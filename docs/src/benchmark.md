@@ -1,5 +1,9 @@
 # Benchmark Method
 
+For the recorded 2026-10-19 control-plane baseline and two optimization rounds,
+see [load benchmark results](benchmark-results.md). Those results identify the
+measured revisions and host; they are separate from the edge/GPU suite below.
+
 `bench/edge/bench.py` measures what anyserve adds on top of calling an edge
 backend directly, and fails when that cost regresses. Run it after any change
 to the runtime, workers, or gateways.
