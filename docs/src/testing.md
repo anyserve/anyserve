@@ -17,7 +17,7 @@ cargo test --workspace
 Core unit and `runtime_v2` integration tests cover capability matching, admission,
 attempt budgets, stream exposure, cancellation, three memory budgets, SQLite
 acceptance/terminal receipts, restart recovery and cold reads. CLI tests exercise
-real native TCP services, token roles, management reads/health checks, large
+real native TCP services, token roles, management reads/metrics/probes, large
 payloads and worker cancellation. SDK tests cover delivery backoff and negotiated retry windows.
 
 ## Python

@@ -29,7 +29,7 @@ the removed retained-bytes key.
 ## Native services and management
 
 `[server]` configures native Client/Worker gRPC. The optional `[console]` section
-configures the management API and `/healthz`.
+configures the management API, including `/healthz`, `/readyz` and `/metrics`.
 Its fields are `enabled` (true when the section exists), `listen` (default
 `127.0.0.1:3001`) and `allowed_origins` (default empty). See
 `examples/server.toml` and [usage](usage.md) for startup and authentication.

@@ -78,7 +78,7 @@ and the existing Python/Rust examples for native client and worker APIs.
 ## Authentication and job CLI
 
 Configure separate client and worker bearer-token lists in `[auth]`. The console
-API requires a client token when authentication is enabled. The
+API and metrics require a client token when authentication is enabled. The
 console keeps its token in the current browser tab's session storage; CORS
 `allowed_origins` controls browser origins independently of authentication.
 
@@ -93,14 +93,27 @@ anyserve --endpoint http://127.0.0.1:50052 job cancel JOB_ID
 The CLI has no token flag. Application workers pass their worker-role token to
 the SDK. Control-plane gRPC TLS is configured under `[server.tls]`.
 
-## Management health
+## Health and metrics
 
-The optional `[console]` listener hosts the console API and `/healthz`.
-The health check returns HTTP 204 while the Runtime accepts work and HTTP 503
-during shutdown or journal failure. It is public; console reads require a client
-token when authentication is enabled.
+The optional `[console]` listener hosts the management API:
+
+| Endpoint | Purpose | Authentication |
+|---|---|---|
+| `/healthz` | Process liveness; HTTP 204 while the Runtime is alive | Public probe |
+| `/readyz` | Runtime admission readiness; HTTP 503 during shutdown or journal failure | Public probe |
+| `/metrics` | Prometheus snapshots of jobs, worker capacity, byte budgets and journal | Client token when enabled |
+| `/api/overview`, `/api/jobs`, `/api/workers` | Console views of shared Runtime state | Client token when enabled |
 
 Runtime readiness does not require an available worker for every interface.
 Check worker connectivity, advertised capabilities and credits separately when
 assessing whether a particular application can execute work. gRPC health alone
 also does not establish backend readiness.
+
+Metrics apply to native traffic regardless of which SDK submits it. State gauges
+cover retained jobs; expired jobs leave those counts. The former HTTP-gateway
+latency histogram is removed with that gateway. The current management exporter
+does not provide per-request latency histograms or distributed trace export.
+
+The native client and server accept gRPC messages up to 64 MiB including protobuf
+overhead; separate per-object and job budgets are listed in
+[configuration](configuration.md). URI objects remain opaque references.
