@@ -9,16 +9,15 @@
 
 For the built-in OpenAI-compatible gateway and worker, follow the canonical walkthrough in [examples/ollama/README.md](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md). That is the single place with the full command sequence, config notes, and smoke tests.
 
-## Production Direction
+## Deployment and architecture
 
-If you want the clearest production-facing entry point for Anyserve, read [Create Gateway](create-gateway.md).
+Read [deployment and recovery](deployment.md) for the supported single-process
+topology, persistent journal, credentials, readiness and restart procedure. The
+[execution architecture](architecture.md) explains placement and retry semantics.
 
-That page defines the recommended first shape:
-
-- create a hosted endpoint
-- connect your own workers
-- send requests through Anyserve
-- expand to richer routing only after the first request succeeds
+The [hosted gateway proposal](create-gateway.md) describes a future product
+experience, including workspace provisioning and managed pools. Use the commands
+below to run the capabilities implemented in this checkout.
 
 ## Start the Control Plane
 
@@ -124,7 +123,7 @@ There are no named-stream creation or frame-push client APIs.
 
 `anyserve serve` enables `.anyserve/journal.sqlite`; use `serve --ephemeral` for
 memory-only execution. Configuration and the 0.4 migration boundary are documented
-in [architecture](architecture.md) and [configuration](configuration.md).
+in [deployment and recovery](deployment.md) and [configuration](configuration.md).
 
 ## Test the Workspace
 

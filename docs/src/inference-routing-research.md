@@ -1,8 +1,11 @@
-# Request-path reference review
+# Inference Routing Reference Review (2026-10-18)
 
 Reviewed on 2026-10-18. This companion to the
 [runtime reference review](reference-architectures.md) covers request routing.
-The mechanisms below are design inputs, not dependencies or copied source.
+**Status: historical design research.** The mechanisms below are design inputs,
+not dependencies, copied source or a current feature checklist. The
+[execution architecture](architecture.md) describes the implemented filtering,
+placement, retry and stream-completion rules.
 
 ## NVIDIA Dynamo
 
