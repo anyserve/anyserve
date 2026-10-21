@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyserve_core::runtime::Runtime;
 use anyserve_core::runtime::api::{
-    self, ConflictPolicy, Delivery, Durability, EventKind, ExecutionEvent, InputMode,
-    InvokeRequest, JobSpec, JobState, JournalConfig, Object, RuntimeConfig, SubmitRequest, codes,
+    self, ConflictPolicy, Durability, EventKind, ExecutionEvent, InputMode, InvokeRequest, JobSpec,
+    JobState, JournalConfig, Object, RuntimeConfig, SubmitRequest, codes,
 };
 use anyserve_core::worker_service::WorkerGrpcService;
 use anyserve_proto::v2::{self as pb, worker_client::WorkerClient};
@@ -499,7 +499,6 @@ async fn streamed_output_is_never_spliced_with_a_retry() {
         .runtime
         .invoke(InvokeRequest {
             spec: spec(b"x"),
-            delivery: Delivery::Streamed,
             ..InvokeRequest::default()
         })
         .await
@@ -536,14 +535,13 @@ async fn streamed_output_is_never_spliced_with_a_retry() {
 }
 
 #[tokio::test]
-async fn buffered_delivery_retries_transparently() {
+async fn unexposed_failures_retry_before_output() {
     let server = serve(config()).await;
     let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
     let execution = server
         .runtime
         .invoke(InvokeRequest {
             spec: spec(b"x"),
-            delivery: Delivery::Buffered,
             ..InvokeRequest::default()
         })
         .await
@@ -551,7 +549,6 @@ async fn buffered_delivery_retries_transparently() {
     let assign = worker.next_assign().await;
     worker.reply(&assign.lease_id, true).await;
     let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
-    attempt.frame(1, b"partial").await;
     attempt
         .finish(
             b"",
@@ -802,7 +799,6 @@ async fn streaming_input_reaches_the_worker() {
         .invoke(InvokeRequest {
             spec: spec(b"head"),
             input: InputMode::Streaming,
-            ..InvokeRequest::default()
         })
         .await
         .unwrap();
@@ -848,7 +844,6 @@ async fn reconnecting_worker_keeps_its_leases() {
         .runtime
         .invoke(InvokeRequest {
             spec: spec(b"x"),
-            delivery: Delivery::Buffered,
             ..InvokeRequest::default()
         })
         .await
@@ -1551,7 +1546,6 @@ async fn invoke_read(server: &Server) -> (String, tokio::task::JoinHandle<Vec<Ev
         .runtime
         .invoke(InvokeRequest {
             spec: spec(b"x"),
-            delivery: Delivery::Streamed,
             ..InvokeRequest::default()
         })
         .await
@@ -1621,7 +1615,6 @@ async fn a_full_global_event_budget_is_never_forced() {
         .runtime
         .invoke(InvokeRequest {
             spec: spec(b"x"),
-            delivery: Delivery::Streamed,
             ..InvokeRequest::default()
         })
         .await
@@ -1679,39 +1672,6 @@ async fn wait_attempts(runtime: &Runtime, job_id: &str, attempts: u32) {
             "attempt count never reached {attempts}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-#[tokio::test]
-async fn buffered_invocations_survive_dropped_output_events() {
-    let mut cfg = config();
-    cfg.event_log_max_events = 4;
-    let server = serve(cfg).await;
-    let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
-    let execution = server
-        .runtime
-        .invoke(InvokeRequest {
-            spec: spec(b"x"),
-            delivery: Delivery::Buffered,
-            ..InvokeRequest::default()
-        })
-        .await
-        .unwrap();
-    let assign = worker.next_assign().await;
-    worker.reply(&assign.lease_id, true).await;
-    let mut attempt = worker.attempt(&assign.lease_id, assign.generation).await;
-    for sequence in 1..=10 {
-        attempt.frame(sequence, b"progress").await;
-    }
-    attempt.succeed(b"answer").await;
-    // Read only now: most output events were dropped, the outcome was not.
-    let kinds = collect(execution).await;
-    match kinds.last().unwrap() {
-        EventKind::Finished { state, outputs, .. } => {
-            assert_eq!(*state, JobState::Succeeded);
-            assert_eq!(outputs, &vec![Object::inline(&b"answer"[..])]);
-        }
-        other => panic!("unexpected {other:?}"),
     }
 }
 
@@ -2188,7 +2148,6 @@ async fn a_streamed_caller_still_reads_everything_after_completion() {
         .runtime
         .invoke(InvokeRequest {
             spec: spec(b"x"),
-            delivery: Delivery::Streamed,
             ..InvokeRequest::default()
         })
         .await

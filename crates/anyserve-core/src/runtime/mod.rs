@@ -19,9 +19,9 @@ use std::time::Duration;
 use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
-    Delivery, Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health,
-    InputMode, InputSink, InterfaceStats, InvokeRequest, JobFilter, JobPage, JobSpec, JobState,
-    JobView, RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView, codes,
+    Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
+    InputSink, InterfaceStats, InvokeRequest, JobFilter, JobPage, JobSpec, JobState, JobView,
+    RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView, codes,
 };
 use self::events::{EventBudget, JobLog, Permit};
 use self::input::InputLog;
@@ -550,8 +550,7 @@ impl Drop for Follower {
 /// Follows `log` from `after` with a receiver subscribed by the caller (while
 /// it held the runtime lock, so a follower is counted before its first poll).
 /// With `skip_gaps`, events dropped from the log are skipped instead of ending
-/// the stream with `CursorExpired`; a caller that only needs the outcome
-/// (`Delivery::Buffered`) uses this.
+/// the stream with `CursorExpired`.
 fn follow(
     log: Arc<JobLog>,
     changes: watch::Receiver<u64>,
@@ -932,7 +931,6 @@ impl Runtime {
                 Arc::clone(&self.inner.input_budget),
             ))
         });
-        let streamed = request.delivery == Delivery::Streamed;
         let (log, changes) = {
             let mut st = self.inner.lock();
             let now = now_ms();
@@ -949,23 +947,21 @@ impl Runtime {
                 now,
             );
             let job = st.jobs.get_mut(&job_id).expect("job");
-            job.streamed = streamed;
+            job.streamed = true;
             let log = Arc::clone(&job.log);
-            if streamed {
-                log.set_primary(true);
-            }
+            log.set_primary(true);
             let changes = log.subscribe();
             self.inner.dispatch_locked(&mut st, now);
             (log, changes)
         };
         // A streamed consumer's reading position releases back-pressure.
-        let on_yield = streamed.then(|| {
+        let on_yield = Some({
             let log = Arc::clone(&log);
             Arc::new(move |event: &ExecutionEvent| log.mark_consumed(event.sequence)) as EventHook
         });
         Ok(Execution {
             job_id: job_id.clone(),
-            events: follow(Arc::clone(&log), changes, 0, on_yield, !streamed),
+            events: follow(Arc::clone(&log), changes, 0, on_yield, false),
             input: input.map(|log| InputSink { log }),
             _guard: Box::new(CancelOnDrop {
                 me: Arc::downgrade(&self.inner),
@@ -1243,14 +1239,6 @@ impl Runtime {
     pub fn health(&self) -> Health {
         let journal = self.inner.journal_health();
         let st = self.inner.lock();
-        let mut interfaces = BTreeMap::new();
-        for session in st.sessions.values() {
-            if session.tx.is_some() && !session.draining {
-                for interface in &session.interfaces {
-                    *interfaces.entry(interface.clone()).or_insert(0) += 1;
-                }
-            }
-        }
         Health {
             live: true,
             ready: !st.shutting_down
@@ -1259,7 +1247,6 @@ impl Runtime {
                     api::JournalHealth::Disabled | api::JournalHealth::Healthy
                 ),
             journal,
-            interfaces,
         }
     }
 

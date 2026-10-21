@@ -5,7 +5,6 @@ external database, Redis, or additional Python dependency is required.
 """
 from __future__ import annotations
 import multiprocessing
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import socket
@@ -234,45 +233,6 @@ worker_tokens=["worker"]
         self.start_server()
         self.assertEqual(self.client.execute(interface, b"after", options=ExecutionOptions(total_timeout_ms=10_000))[0]["inline"], b"after")
         self.assertTrue(process.is_alive())
-
-    def test_builtin_worker_survives_graceful_server_restart(self):
-        class Echo(BaseHTTPRequestHandler):
-            def do_POST(self):
-                body = self.rfile.read(int(self.headers["content-length"]))
-                self.send_response(200)
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            def log_message(self, *_):
-                pass
-        backend = ThreadingHTTPServer(("127.0.0.1", 0), Echo)
-        thread = threading.Thread(target=lambda: backend.serve_forever(poll_interval=0.02))
-        thread.start()
-        config = self.path / "builtin-worker.toml"
-        config.write_text(f"""kind='http'
-base_url='http://127.0.0.1:{backend.server_port}'
-token='worker'
-[routes]
-"test.builtin.graceful"='/echo'
-""")
-        process = subprocess.Popen([str(self.binary), "--endpoint", self.endpoint, "worker", "--config", str(config)], stdout=self.log, stderr=subprocess.STDOUT)
-        try:
-            options = ExecutionOptions(total_timeout_ms=10_000)
-            self.assertEqual(self.client.execute("test.builtin.graceful", b"before", options=options)[0]["inline"], b"before")
-            self.stop_server()
-            self.assertIsNone(process.poll(), "server Drain must not exit the built-in worker")
-            self.start_server()
-            self.assertEqual(self.client.execute("test.builtin.graceful", b"after", options=options)[0]["inline"], b"after")
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=2)
-            backend.shutdown()
-            backend.server_close()
-            thread.join(timeout=2)
 
     def test_closing_a_connection_releases_the_gil_while_receive_holds_the_lock(self):
         from anyserve import WorkerConnection

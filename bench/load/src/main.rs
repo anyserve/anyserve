@@ -5,7 +5,6 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 mod client;
-mod http;
 mod profile;
 mod worker;
 
@@ -22,11 +21,6 @@ struct Cli {
 enum Command {
     Worker(WorkerArgs),
     Client(ClientArgs),
-    /// A small HTTP/1.1 mock OpenAI upstream with persistent connections.
-    Upstream {
-        #[arg(long, default_value = "127.0.0.1:18090")]
-        listen: String,
-    },
     /// Profile the library runtime; normal baselines use the production binary.
     Serve {
         #[arg(long, default_value = "127.0.0.1:50052")]
@@ -58,7 +52,7 @@ struct ClientArgs {
     scenario: u8,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     concurrency: u32,
-    /// gRPC channels (default min(C, 8)); S6 needs one HTTP/1.1 socket per task.
+    /// Independent gRPC channels (default min(C, 8)).
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     connections: Option<u32>,
     #[arg(long, default_value = "20s", value_parser = duration)]
@@ -86,7 +80,6 @@ async fn main() -> Result {
     match Cli::parse().command {
         Command::Worker(args) => worker::run(args).await,
         Command::Client(args) => client::run(args).await,
-        Command::Upstream { listen } => http::upstream(&listen).await,
         Command::Serve {
             listen,
             journal,

@@ -372,7 +372,7 @@ async fn durable_acceptance_in_flight_consumes_queue_capacity() {
 
 #[tokio::test]
 async fn a_retired_attempts_buffered_output_cannot_be_spliced_into_a_retry() {
-    use anyserve_core::runtime::api::{Delivery, EventKind, InvokeRequest, JobState};
+    use anyserve_core::runtime::api::{EventKind, InvokeRequest, JobState};
     use futures::StreamExt;
     let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
     let mut worker = Worker::connect(&server, "exposure", vec!["test.exposure".into()], 1).await;
@@ -387,7 +387,6 @@ async fn a_retired_attempts_buffered_output_cannot_be_spliced_into_a_retry() {
                 false,
             ))
             .unwrap(),
-            delivery: Delivery::Streamed,
             ..Default::default()
         })
         .await
@@ -536,26 +535,5 @@ async fn reopening_an_attempt_continues_after_the_last_acknowledged_frame() {
     .await
     .unwrap();
     assert_eq!(frames, [b"first".as_slice(), b"second".as_slice()]);
-    server.stop().await;
-}
-
-#[tokio::test]
-async fn server_drain_does_not_exit_the_builtin_worker() {
-    use crate::test_support::{Backend, BuiltinWorker};
-    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
-    let backend = Backend::start(axum::Router::new()).await;
-    let worker = BuiltinWorker::start(
-        &server,
-        &backend,
-        "kind='http'\n[routes]\n'policy.v1'='/act'\n",
-    )
-    .await;
-    server.runtime.shutdown().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !worker.is_finished(),
-        "a server Drain must not exit the worker"
-    );
-    drop(worker);
     server.stop().await;
 }

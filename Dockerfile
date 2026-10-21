@@ -8,7 +8,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p anyserve && cp target/release/anyserve /usr/local/bin/anyserve
 
 FROM debian:bookworm-slim
-# iproute2 lets benchmark containers emulate WAN latency with tc netem.
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/anyserve /usr/local/bin/anyserve
 ENTRYPOINT ["anyserve"]

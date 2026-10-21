@@ -36,7 +36,7 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             auth,
-            crate::edge_routing::require_client_token,
+            crate::serve_auth::require_client_token,
         ))
         .layer(middleware::from_fn_with_state(
             middleware_state,

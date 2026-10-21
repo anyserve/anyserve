@@ -7,15 +7,14 @@ use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::{ClientArgs, Result, http::HttpConnection};
+use crate::{ClientArgs, Result};
 
-pub(super) const SCENARIOS: [&str; 6] = [
+pub(super) const SCENARIOS: [&str; 5] = [
     "invoke-buffered",
     "invoke-stream",
     "submit-durable",
     "submit-ephemeral",
     "mixed",
-    "openai-gateway",
 ];
 
 pub(super) fn parse_scenario(value: &str) -> std::result::Result<u8, String> {
@@ -26,13 +25,8 @@ pub(super) fn parse_scenario(value: &str) -> std::result::Result<u8, String> {
         .trim_start_matches(['S', 's'])
         .parse::<u8>()
         .ok()
-        .filter(|scenario| (1..=6).contains(scenario))
-        .ok_or_else(|| "expected S1..S6 or a scenario name".into())
-}
-
-enum Connection {
-    Native(ExecutionClient),
-    Http(HttpConnection),
+        .filter(|scenario| (1..=5).contains(scenario))
+        .ok_or_else(|| "expected S1..S5 or a scenario name".into())
 }
 
 #[derive(Default)]
@@ -48,35 +42,19 @@ pub(super) async fn run(args: ClientArgs) -> Result {
     if args.duration.is_zero() {
         return Err("measurement duration must be positive".into());
     }
-    if args.scenario == 6 && args.connections.is_some() {
-        return Err(
-            "--connections controls gRPC channels; S6 uses one HTTP/1.1 socket per task".into(),
-        );
-    }
-    let connection_count = if args.scenario == 6 {
-        args.concurrency
-    } else {
-        args.connections.unwrap_or(args.concurrency.min(8))
-    };
+    let connection_count = args.connections.unwrap_or(args.concurrency.min(8));
     if connection_count > args.concurrency {
         return Err("connections must not exceed concurrency".into());
     }
     // Each connect creates a distinct channel. Clones share that channel, so
     // tasks round-robin over this explicit pool before the warm-up clock.
     let mut channels = Vec::new();
-    if args.scenario != 6 {
-        for _ in 0..connection_count {
-            channels.push(ExecutionClient::connect_with_token(&args.endpoint, None).await?);
-        }
+    for _ in 0..connection_count {
+        channels.push(ExecutionClient::connect_with_token(&args.endpoint, None).await?);
     }
-    let mut clients = Vec::new();
-    for index in 0..args.concurrency {
-        clients.push(if args.scenario == 6 {
-            Connection::Http(HttpConnection::connect(&args.endpoint).await?)
-        } else {
-            Connection::Native(channels[(index % connection_count) as usize].clone())
-        });
-    }
+    let clients: Vec<_> = (0..args.concurrency)
+        .map(|index| channels[(index % connection_count) as usize].clone())
+        .collect();
     let payload = Arc::new(vec![b'x'; args.payload]);
     let barrier = Arc::new(Barrier::new(clients.len() + 1));
     let start = Instant::now();
@@ -184,8 +162,7 @@ pub(super) async fn run(args: ClientArgs) -> Result {
         "name": SCENARIOS[args.scenario as usize - 1],
         "concurrency": args.concurrency,
         "connections": connection_count,
-        "grpc_channels": if args.scenario == 6 { None } else { Some(connection_count) },
-        "http_connections": if args.scenario == 6 { Some(connection_count) } else { None },
+        "grpc_channels": connection_count,
         "by_path": by_path,
         "payload_bytes": args.payload,
         "warmup_seconds": args.warmup.as_secs_f64(),
@@ -224,13 +201,7 @@ pub(super) async fn run(args: ClientArgs) -> Result {
     Ok(())
 }
 
-async fn request(connection: &mut Connection, scenario: u8, payload: &[u8]) -> Result {
-    let Connection::Native(client) = connection else {
-        let Connection::Http(http) = connection else {
-            unreachable!()
-        };
-        return http.chat(payload).await;
-    };
+async fn request(client: &mut ExecutionClient, scenario: u8, payload: &[u8]) -> Result {
     let streamed = scenario == 2;
     let spec = v2::JobSpec {
         demand: Some(v2::Demand {

@@ -83,7 +83,6 @@ impl Client for ClientGrpcService {
                 } else {
                     api::InputMode::Complete
                 },
-                delivery: api::Delivery::Streamed,
             })
             .await?;
         let input = execution.take_input();

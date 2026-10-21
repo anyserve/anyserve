@@ -131,26 +131,6 @@ impl Worker {
     }
 }
 
-pub(crate) struct Backend {
-    pub url: String,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Backend {
-    pub async fn start(router: axum::Router) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let task = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Self { url, task }
-    }
-}
-impl Drop for Backend {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 pub(crate) fn temporary_path(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "anyserve-{label}-{}-{}",
@@ -160,63 +140,4 @@ pub(crate) fn temporary_path(label: &str) -> std::path::PathBuf {
             .unwrap()
             .as_nanos()
     ))
-}
-
-pub(crate) struct BuiltinWorker {
-    pub worker_id: String,
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
-    path: std::path::PathBuf,
-}
-impl BuiltinWorker {
-    pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
-    }
-
-    pub async fn start(server: &Server, backend: &Backend, config: &str) -> Self {
-        let path = temporary_path("worker.toml");
-        let worker_id = path.file_name().unwrap().to_string_lossy().into_owned();
-        std::fs::write(
-            &path,
-            format!(
-                "base_url = {:?}\nworker_id = {:?}\n{config}",
-                backend.url, worker_id
-            ),
-        )
-        .unwrap();
-        let endpoint = server.endpoint.clone();
-        let args = crate::worker::WorkerArgs {
-            config: path.clone(),
-            worker_id: None,
-        };
-        let task = tokio::spawn(async move { crate::worker::run(&endpoint, args).await });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if server
-                    .runtime
-                    .list_workers()
-                    .iter()
-                    .any(|worker| worker.worker_id == worker_id && worker.free_slots > 0)
-                {
-                    return;
-                }
-                if task.is_finished() {
-                    panic!("builtin worker exited before becoming ready");
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("builtin worker did not become ready");
-        Self {
-            worker_id,
-            task,
-            path,
-        }
-    }
-}
-impl Drop for BuiltinWorker {
-    fn drop(&mut self) {
-        self.task.abort();
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
