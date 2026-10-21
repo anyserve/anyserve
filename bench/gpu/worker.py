@@ -24,7 +24,7 @@ def emit(kind, **fields):
 
 
 def samples():
-    return np.random.default_rng(20261021).standard_normal((256, 288), dtype=np.float32)
+    return np.random.default_rng(20261021).random((256, 288), dtype=np.float32)
 
 
 def session(model):
