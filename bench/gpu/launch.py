@@ -1,4 +1,4 @@
-"""One approved run: Q1, detached reaper, one Spot B, Q2/Q3, unconditional cleanup."""
+"""One approved run: Q1, detached reaper, one worker B, Q2/Q3, cleanup."""
 from __future__ import annotations
 
 import argparse
@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shlex
 import signal
@@ -22,6 +23,92 @@ from teardown import (CONTROL_SG, LOCAL_INSTANCE, LOCAL_SGS, aws, canonical, cle
 BASE_SHA = "99f5db83a628dea5e5171342a81ebc50eacc74e0"
 MODEL_SHA = "c17eb830b28be4381ae141cf6eb477efeac424bfc18c867b964f5129e13ed083"
 HERE = Path(__file__).resolve().parent
+
+
+def capacity_candidates(nat_1c):
+    candidates = [
+        (1, "us-east-1c", "subnet-0e871bf10cecc2f3e", "g4dn.xlarge", "0.40"),
+        (2, "us-east-1c", "subnet-0e871bf10cecc2f3e", "g4dn.xlarge", None),
+        (3, "us-east-1c", "subnet-0e871bf10cecc2f3e", "g4dn.2xlarge", "0.45"),
+        (4, "us-east-1b", "subnet-029892b73a654b840", "g4dn.2xlarge", "0.45"),
+    ]
+    return candidates if nat_1c else candidates[3:]
+
+
+def check_1c_nat(root):
+    evidence = {}
+    try:
+        tables = aws("ec2", "describe-route-tables", filters=[dict(
+            Name="association.subnet-id", Values=["subnet-0e871bf10cecc2f3e"])])
+        if not tables["RouteTables"]:
+            tables = aws("ec2", "describe-route-tables", filters=[
+                dict(Name="vpc-id", Values=["vpc-0ea81bdde5fce6aa2"]),
+                dict(Name="association.main", Values=["true"]),
+            ])
+        evidence["route_tables"] = tables
+        routes = [route for table in tables["RouteTables"] for route in table["Routes"]
+                  if route.get("DestinationCidrBlock") == "0.0.0.0/0" and route.get("State") == "active"]
+        gateway = routes[0].get("NatGatewayId") if len(routes) == 1 else None
+        if gateway:
+            evidence["nat_gateway"] = aws("ec2", "describe-nat-gateways", nat_gateway_ids=[gateway])
+        ready = bool(gateway and evidence["nat_gateway"]["NatGateways"][0]["State"] == "available")
+    except Exception as exc:
+        evidence["error"] = str(exc)
+        ready = False
+    evidence["ready"] = ready
+    (root / "nat-1c-preflight.json").write_text(json.dumps(evidence, indent=2) + "\n")
+    return ready
+
+
+def request_worker(root, base_request, candidates):
+    assert 1 <= len(candidates) <= 4
+    assert not read(root).get("launch_attempted"), "capacity sequence already started for this run"
+    run_id = read(root)["run_id"]
+    history = []
+    for number, zone, subnet, instance_type, ceiling in candidates:
+        current = read(root)
+        assert not current.get("cleanup_complete") and time.time() < min(current["deadline"], current["t0"] + 3600), "run deadline reached"
+        request = dict(base_request, ClientToken=f"{run_id}-{number}",
+                       SubnetId=subnet, InstanceType=instance_type)
+        if ceiling:
+            request["InstanceMarketOptions"] = dict(MarketType="spot", SpotOptions=dict(
+                MaxPrice=ceiling, SpotInstanceType="one-time", InstanceInterruptionBehavior="terminate"))
+        request_file = root / f"launch-request-{number}.json"
+        request_file.write_text(json.dumps(request, indent=2) + "\n")
+        (root / "launch-request.json").write_text(request_file.read_text())
+        entry = dict(number=number, az=zone, subnet=subnet, instance_type=instance_type,
+                     purchase_mode="spot" if ceiling else "on-demand", ceiling=ceiling,
+                     client_token=request["ClientToken"], request=str(request_file), status="pending")
+        history.append(entry)
+        update(root, budget_usd=2.5, capacity_attempts=history, run_instances_attempts=len(history),
+               attempted_client_tokens=[item["client_token"] for item in history],
+               client_token=request["ClientToken"], launch_attempted=True, launch_resolved=False)
+        try:
+            launched = aws("ec2", "run-instances", cli_input_json="file://" + str(request_file))
+        except Exception as exc:
+            entry["error"] = str(exc)
+            match = re.search(r"An error occurred \(([^)]+)\).*?RunInstances", str(exc), re.S)
+            resolved = bool(match and match[1] not in {
+                "InternalError", "InternalFailure", "Server.InternalError", "ServiceUnavailable", "RequestTimeout"})
+            entry["status"] = "rejected" if resolved else "unknown"
+            (root / f"launch-error-{number}.txt").write_text(str(exc) + "\n")
+            update(root, capacity_attempts=history, launch_resolved=resolved)
+            if not resolved:
+                raise
+            # A definite rejection must leave no live instance before advancing.
+            found = aws("ec2", "describe-instances", filters=[dict(Name="tag:Experiment", Values=[run_id])])
+            assert not any(item["State"]["Name"] != "terminated" for reservation in found["Reservations"]
+                           for item in reservation["Instances"]), "instance exists after rejected launch"
+            print(f"申请 {number} 被拒绝：{zone} {instance_type} {entry['purchase_mode']} {match[1]}", flush=True)
+            continue
+        assert len(launched["Instances"]) == 1
+        instance = launched["Instances"][0]
+        entry.update(status="accepted", instance_id=instance["InstanceId"])
+        (root / f"launch-response-{number}.json").write_text(json.dumps(launched, indent=2) + "\n")
+        update(root, capacity_attempts=history, launch_resolved=True, instance_id=instance["InstanceId"],
+               purchase_mode=entry["purchase_mode"], b_az=zone, b_instance_type=instance_type)
+        return launched
+    raise RuntimeError("all authorized capacity attempts rejected; see launch-error-*.txt")
 
 
 def main():
@@ -140,6 +227,10 @@ def main():
 
     result = dict(status="INCOMPLETE")
     try:
+        nat_1c = check_1c_nat(root)
+        candidates = capacity_candidates(nat_1c)
+        update(root, capacity_candidates=candidates, budget_usd=2.5)
+        print("1c NAT 核验通过" if nat_1c else "1c NAT 未核验通过；仅执行第 4 项", flush=True)
         health()
         config = root / "server.toml"
         config.write_text(f'''[server]
@@ -191,12 +282,15 @@ worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
         assert identity["Account"] == "692744833360"
         image = aws("ec2", "describe-images", image_ids=["ami-0765437123d36eaa8"])["Images"][0]
         assert image["State"] == "available" and image["Architecture"] == "x86_64" and not image.get("ProductCodes")
-        prices = aws("ec2", "describe-spot-price-history", instance_types=["g4dn.xlarge"],
-            product_descriptions=["Linux/UNIX"], availability_zone="us-east-1b", max_items=1,
+        prices = aws("ec2", "describe-spot-price-history", instance_types=["g4dn.xlarge", "g4dn.2xlarge"],
+            product_descriptions=["Linux/UNIX"], max_items=50,
             start_time=datetime.now(timezone.utc).isoformat())
         (root / "spot-price.json").write_text(json.dumps(prices, indent=2) + "\n")
-        if prices["SpotPriceHistory"]:
-            assert float(prices["SpotPriceHistory"][0]["SpotPrice"]) <= .4
+        for instance_type in ["g4dn.xlarge", "g4dn.2xlarge"]:
+            scores = aws("ec2", "get-spot-placement-scores", cli_input_json=json.dumps(dict(
+                InstanceTypes=[instance_type], TargetCapacity=1, TargetCapacityUnitType="units", SingleAvailabilityZone=True,
+                RegionNames=["us-east-1"])))
+            (root / f"placement-{instance_type}.json").write_text(json.dumps(scores, indent=2) + "\n")
         subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(root / "ssh-key")], check=True)
         t0 = time.time()
         update(root, t0=t0, deadline=t0 + 165 * 60, client_token=run_id, launch_attempted=False)
@@ -217,21 +311,11 @@ worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
             IpProtocol="tcp", FromPort=22, ToPort=22, IpRanges=[dict(CidrIp="10.0.3.60/32", Description=run_id)])])
         public_key = (root / "ssh-key.pub").read_text().strip()
         user_data = "#!/bin/bash\nset -eu\nshutdown -h +180\ninstall -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh\necho " + shlex.quote(public_key) + " >> /home/ubuntu/.ssh/authorized_keys\nchown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys\nchmod 600 /home/ubuntu/.ssh/authorized_keys\n"
-        request = dict(ImageId=image["ImageId"], InstanceType="g4dn.xlarge", MinCount=1, MaxCount=1,
-            SubnetId="subnet-029892b73a654b840", SecurityGroupIds=[sg], ClientToken=run_id,
+        request = dict(ImageId=image["ImageId"], MinCount=1, MaxCount=1, SecurityGroupIds=[sg],
             InstanceInitiatedShutdownBehavior="terminate", UserData=user_data,
-            InstanceMarketOptions=dict(MarketType="spot", SpotOptions=dict(MaxPrice="0.40", SpotInstanceType="one-time", InstanceInterruptionBehavior="terminate")),
             BlockDeviceMappings=[dict(DeviceName=image["RootDeviceName"], Ebs=dict(VolumeSize=40, VolumeType="gp3", DeleteOnTermination=True))],
             TagSpecifications=[dict(ResourceType=kind, Tags=tags) for kind in ["instance", "volume"]])
-        request_file = root / "launch-request.json"
-        request_file.write_text(json.dumps(request, indent=2) + "\n")
-        update(root, launch_attempted=True, launch_resolved=False)
-        try:
-            launched = aws("ec2", "run-instances", cli_input_json="file://" + str(request_file))
-        except RuntimeError as exc:
-            if "An error occurred" in str(exc) and "RunInstances" in str(exc):
-                update(root, launch_resolved=True)
-            raise
+        launched = request_worker(root, request, candidates)
         instance = launched["Instances"][0]
         update(root, launch_resolved=True, instance_id=instance["InstanceId"],
                spot_request_ids=[instance["SpotInstanceRequestId"]] if instance.get("SpotInstanceRequestId") else [])
