@@ -192,7 +192,7 @@ worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
         image = aws("ec2", "describe-images", image_ids=["ami-0765437123d36eaa8"])["Images"][0]
         assert image["State"] == "available" and image["Architecture"] == "x86_64" and not image.get("ProductCodes")
         prices = aws("ec2", "describe-spot-price-history", instance_types=["g4dn.xlarge"],
-            product_descriptions=["Linux/UNIX"], availability_zone="us-east-1a", max_items=1,
+            product_descriptions=["Linux/UNIX"], availability_zone="us-east-1b", max_items=1,
             start_time=datetime.now(timezone.utc).isoformat())
         (root / "spot-price.json").write_text(json.dumps(prices, indent=2) + "\n")
         if prices["SpotPriceHistory"]:
@@ -218,7 +218,7 @@ worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
         public_key = (root / "ssh-key.pub").read_text().strip()
         user_data = "#!/bin/bash\nset -eu\nshutdown -h +180\ninstall -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh\necho " + shlex.quote(public_key) + " >> /home/ubuntu/.ssh/authorized_keys\nchown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys\nchmod 600 /home/ubuntu/.ssh/authorized_keys\n"
         request = dict(ImageId=image["ImageId"], InstanceType="g4dn.xlarge", MinCount=1, MaxCount=1,
-            SubnetId="subnet-014a9343d15e64a4c", SecurityGroupIds=[sg], ClientToken=run_id,
+            SubnetId="subnet-029892b73a654b840", SecurityGroupIds=[sg], ClientToken=run_id,
             InstanceInitiatedShutdownBehavior="terminate", UserData=user_data,
             InstanceMarketOptions=dict(MarketType="spot", SpotOptions=dict(MaxPrice="0.40", SpotInstanceType="one-time", InstanceInterruptionBehavior="terminate")),
             BlockDeviceMappings=[dict(DeviceName=image["RootDeviceName"], Ebs=dict(VolumeSize=40, VolumeType="gp3", DeleteOnTermination=True))],
