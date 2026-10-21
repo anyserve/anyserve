@@ -44,6 +44,7 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
         (Some("worker-secret"), 403),
     ] {
         for path in [
+            "/metrics",
             "/api/overview",
             "/api/jobs",
             "/api/workers",
@@ -372,4 +373,158 @@ fn test_job_spec(interface_name: &str) -> JobSpec {
         params: b"world".as_slice().into(),
         metadata: Metadata::from([("source".to_string(), "runtime".to_string())]),
     }
+}
+
+#[tokio::test]
+async fn management_metrics_follow_native_jobs_and_worker_reservations() {
+    use anyserve_client::execution::{Attempt, ExecutionClient, v2};
+
+    let path = crate::test_support::temporary_path("metrics.sqlite");
+    let server = Server::start(
+        RuntimeConfig {
+            journal: Some(anyserve_core::runtime::api::JournalConfig::new(&path)),
+            ..Default::default()
+        },
+        AuthPolicy::default(),
+    )
+    .await;
+    let (url, handle) = spawn_test_server(server.runtime.clone()).await;
+    let mut client = ExecutionClient::connect_with_token(&server.endpoint, None)
+        .await
+        .unwrap();
+    client
+        .submit(
+            None,
+            v2::JobSpec {
+                demand: Some(v2::Demand {
+                    interface: "demo.metrics.v1".into(),
+                    ..Default::default()
+                }),
+                inputs: vec![v2::Object {
+                    body: Some(v2::object::Body::Inline(b"payload".to_vec().into())),
+                    ..Default::default()
+                }],
+                policy: Some(v2::ExecutionPolicy {
+                    durability: v2::Durability::Durable as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let response = reqwest::get(format!("{url}/metrics")).await.unwrap();
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4"
+    );
+    let queued = response.text().await.unwrap();
+    assert!(queued.contains("anyserve_jobs{state=\"queued\"} 1\n"));
+    assert!(queued.contains("anyserve_live_workers 0\n"));
+    assert!(queued.contains("anyserve_budget_bytes{budget=\"input\"} 7\n"));
+    assert!(
+        queued.contains(
+            "anyserve_interface_jobs{interface=\"demo.metrics.v1\",state=\"queued\"} 1\n"
+        )
+    );
+
+    let mut worker =
+        Worker::connect(&server, "metrics-worker", vec!["demo.metrics.v1".into()], 2).await;
+    let assignment = worker.assignment().await;
+    let running = reqwest::get(format!("{url}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(running.contains("anyserve_jobs{state=\"running\"} 1\n"));
+    assert!(running.contains("anyserve_live_workers 1\n"));
+    assert!(running.contains("anyserve_active_leases 1\n"));
+    assert!(running.contains("anyserve_interface_free_slots{interface=\"demo.metrics.v1\"} 1\n"));
+    let mut attempt = Attempt::open(
+        &mut worker.session.data,
+        &assignment,
+        &worker.limits,
+        worker.heartbeat_timeout,
+    )
+    .await
+    .unwrap();
+    attempt
+        .finish(&[], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+        .await
+        .unwrap();
+    let terminal = reqwest::get(format!("{url}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(terminal.contains("anyserve_jobs{state=\"succeeded\"} 1\n"));
+    assert!(terminal.contains("anyserve_active_leases 0\n"));
+    assert!(terminal.contains("anyserve_budget_bytes{budget=\"input\"} 0\n"));
+    assert!(terminal.contains("# TYPE anyserve_journal_committed_ops_total counter\n"));
+    assert!(terminal.contains("anyserve_journal_committed_ops_total 3\n"));
+    assert!(terminal.contains("# TYPE anyserve_journal_committed_batches_total counter\n"));
+    assert!(terminal.contains("# TYPE anyserve_journal_last_commit_duration_seconds gauge\n"));
+    assert!(!terminal.contains("anyserve_journal_last_commit_seconds"));
+    for line in terminal.lines().filter(|line| line.starts_with("# TYPE ")) {
+        let family = line.split_whitespace().nth(2).unwrap();
+        assert!(
+            terminal
+                .lines()
+                .any(|line| line.starts_with(&format!("# HELP {family} "))),
+            "missing HELP for {family}"
+        );
+    }
+    handle.abort();
+    server.stop().await;
+    for suffix in ["", "-wal", "-shm", ".lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn management_liveness_and_readiness_are_separate() {
+    let runtime = test_runtime().await;
+    let (url, handle) = spawn_test_server_with_auth(
+        runtime.clone(),
+        AuthPolicy::new(["client".into()], ["worker".into()]),
+    )
+    .await;
+    assert_eq!(
+        reqwest::get(format!("{url}/readyz"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    runtime.shutdown().await;
+    assert_eq!(
+        reqwest::get(format!("{url}/healthz"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        204
+    );
+    assert_eq!(
+        reqwest::get(format!("{url}/readyz"))
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+    let metrics = reqwest::Client::new()
+        .get(format!("{url}/metrics"))
+        .bearer_auth("client")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("anyserve_runtime_ready 0\n"));
+    handle.abort();
 }

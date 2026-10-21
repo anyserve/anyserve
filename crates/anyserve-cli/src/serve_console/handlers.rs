@@ -28,6 +28,8 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
     let middleware_state = state.clone();
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/api/overview", get(overview))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:job_id", get(get_job))
@@ -44,11 +46,27 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
         ))
 }
 async fn healthz(State(state): State<AppState>) -> StatusCode {
+    if state.runtime.health().live {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+async fn readyz(State(state): State<AppState>) -> StatusCode {
     if state.runtime.health().ready {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
+}
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        super::metrics::render(&state.runtime),
+    )
 }
 async fn overview(State(state): State<AppState>) -> Json<serde_json::Value> {
     let stats = state.runtime.stats();

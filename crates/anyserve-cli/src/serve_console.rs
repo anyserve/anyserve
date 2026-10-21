@@ -1,5 +1,6 @@
 mod api;
 mod handlers;
+mod metrics;
 mod snapshot;
 #[cfg(test)]
 mod tests;

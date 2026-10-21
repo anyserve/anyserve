@@ -29,7 +29,7 @@ spillover are described in [workers across clusters](edge.md).
 | Surface | Default address | Enablement |
 |---|---|---|
 | Client/Worker gRPC and gRPC health | `127.0.0.1:50052` | Started by `anyserve serve` |
-| Management/console API and health check | `127.0.0.1:3001` | Configure `[console]` |
+| Management/console API, probes and metrics | `127.0.0.1:3001` | Configure `[console]` |
 
 CLI flags override file settings. Configure client and worker bearer tokens
 before exposing the service outside a trusted network. Client credentials cover
@@ -95,7 +95,7 @@ reconstruction.
 
 | Signal | Meaning and next check |
 |---|---|
-| Management `/healthz` fails | Check Runtime journal write availability and shutdown status |
+| Management `/readyz` fails | Check Runtime journal write availability and shutdown status |
 | All matching workers busy | They can still satisfy readiness; inspect free credits, queue age and admission limits for available capacity |
 | Journal lock failure on startup | Another process holds this path; verify the previous owner has exited |
 | Durable admission is unavailable | Check journal write failure, capacity and commit status; definite rollback can recover after a writable probe |
@@ -130,7 +130,8 @@ Clients use the native SDK or Client gRPC service. Application workers use the
 Worker SDK and keep backend-specific clients and model validation in their own
 code. The production CLI provides `serve` and `job` commands.
 
-Move management reads from the former invocation listener to the `[console]`
-listener (default `127.0.0.1:3001` when configured). Its API requires a client
-token if auth is enabled; `/healthz` remains public. The former HTTP-invocation
-duration histogram is removed with its gateway.
+Move monitoring from the former invocation listener to the `[console]` management
+listener (default `127.0.0.1:3001` when configured). `/metrics` covers shared
+Runtime state and requires a client token if auth is enabled. `/healthz` is a
+public liveness probe; `/readyz` is a public Runtime readiness probe. The former
+HTTP-invocation duration histogram is removed with its gateway.

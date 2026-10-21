@@ -223,12 +223,21 @@ at a percentage threshold. Compacted events and evicted jobs are freed after
 releasing the global state lock. See [configuration](configuration.md) for exact
 defaults and overflow behavior.
 
-## Management
+## Management and observability
 
-The optional `[console]` listener serves management views and `/healthz`.
-Application execution uses the native gRPC services. Application workers own
-backend protocol translation and validation. See [usage](usage.md) for console
-authentication and health semantics.
+The optional `[console]` listener serves management views, `/healthz`, `/readyz`
+and `/metrics`. It does not expose Submit/Invoke execution ingress. All clients
+use the native gRPC services; application workers own any backend protocol
+translation. Provider compatibility gateways and the built-in backend proxy are
+outside the core.
+
+Prometheus gauges expose the shared Runtime's retained job states, connected
+workers, active leases, per-interface queues/capacity and input/result/event byte
+budgets. Journal counters and last-commit statistics are included when enabled.
+These metrics cover native execution from either SDK. Retained terminal-state
+counts are gauges, not cumulative completed-request counters. There are currently
+no request-latency histograms or end-to-end trace exporters in the management
+API. See [usage](usage.md) for endpoint authentication and readiness semantics.
 
 ## Implementation map
 

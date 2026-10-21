@@ -24,7 +24,7 @@ backend-specific semantics to the control plane.
   cursors and three memory budgets. Exposed streamed output cannot silently
   switch attempts. `max_attempts` includes the first attempt.
 - **Operations** provides client/worker token roles, TLS for gRPC, a management
-  API, console, health checks and logs.
+  API, console, health probes, Runtime metrics and logs.
 
 ```text
 Rust / Python client -> native Client gRPC -> Execution Runtime
@@ -81,9 +81,12 @@ token. `job ls`, `job inspect <id>` and `job cancel <id>` use the native API.
 
 ## Management and compatibility boundary
 
-When `[console]` is enabled, its listener exposes the console API and
-`/healthz`. Console reads require a client token when authentication is enabled;
-the health check remains accessible without one.
+When `[console]` is enabled, its listener exposes the console API plus
+`/healthz`, `/readyz` and `/metrics`. Metrics describe the shared Runtime,
+interfaces, workers, byte budgets and journal. Job state gauges count entries
+currently retained in memory. They are not cumulative completion counters.
+With authentication enabled, `/metrics` and console reads require a client token;
+health probes remain accessible without one.
 
 The core exposes the native `anyserve.v2` Client and Worker services. Provider
 compatibility gateways, generic HTTP invocation/forwarding and the CLI's built-in

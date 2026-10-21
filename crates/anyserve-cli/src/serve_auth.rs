@@ -13,7 +13,7 @@ pub(crate) async fn require_client_token(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path() == "/healthz" {
+    if matches!(request.uri().path(), "/healthz" | "/readyz") {
         return next.run(request).await;
     }
     match policy.authorize_client_headers(request.headers()) {
