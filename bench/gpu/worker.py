@@ -16,6 +16,7 @@ import numpy as np
 MODEL_SHA = "c17eb830b28be4381ae141cf6eb477efeac424bfc18c867b964f5129e13ed083"
 INTERFACE = "experiment.holdem-spin.v1"
 _LOG_LOCK = threading.Lock()
+_RUN_LOCK = threading.Lock()
 
 
 def emit(kind, **fields):
@@ -43,7 +44,8 @@ def session(model):
 
 
 def infer(engine, value):
-    result = engine.run(None, {"input": value.reshape(1, 288)})
+    with _RUN_LOCK:
+        result = engine.run(None, {"input": value.reshape(1, 288)})
     assert all(np.isfinite(item).all() for item in result), "nonfinite model output"
     return result
 
