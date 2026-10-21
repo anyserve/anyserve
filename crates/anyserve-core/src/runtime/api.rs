@@ -1,4 +1,4 @@
-//! Stable types of the execution runtime API. Gateways and the client gRPC
+//! Stable types of the execution runtime API. Native clients and the client gRPC
 //! service depend only on these and on [`super::Runtime`].
 
 use std::collections::BTreeMap;
@@ -122,23 +122,10 @@ pub enum InputMode {
     Streaming,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Delivery {
-    /// Output events reach the caller as they arrive. Once an attempt's
-    /// output has been logged, a failure of that attempt fails the job
-    /// instead of retrying it.
-    #[default]
-    Streamed,
-    /// The caller only uses the final result, so a failed attempt may be
-    /// retried transparently.
-    Buffered,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct InvokeRequest {
     pub spec: JobSpec,
     pub input: InputMode,
-    pub delivery: Delivery,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,8 +365,6 @@ pub struct Health {
     /// unavailable.
     pub ready: bool,
     pub journal: JournalHealth,
-    /// Connected, non-draining sessions per interface.
-    pub interfaces: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

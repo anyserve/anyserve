@@ -6,7 +6,8 @@ on:
     paths:
       - "docs/**"
       - "bench/load/RESULTS.md"
-      - "examples/llm/**"
+      - "examples/python/**"
+      - "examples/rust/**"
       - "README.md"
       - ".github/workflows/docs-pages.yml"
   pull_request:
@@ -14,7 +15,8 @@ on:
     paths:
       - "docs/**"
       - "bench/load/RESULTS.md"
-      - "examples/llm/**"
+      - "examples/python/**"
+      - "examples/rust/**"
       - "README.md"
       - ".github/workflows/docs-pages.yml"
   workflow_dispatch:

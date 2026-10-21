@@ -1,5 +1,9 @@
 # Control-plane load benchmark results, 2026-10-19
 
+Historical measurements for the revisions listed below. The S6 compatibility
+gateway and HTTP-based edge suite have since been removed; the current runner
+measures native S1–S5. These numbers have not been rerun for the core-only tree.
+
 Host: one `ip-10-0-3-60` instance, Intel Xeon Platinum 8259CL, 16 logical CPUs,
 Linux 6.14 (aws), journal on local NVMe ext4. Release builds, production default
 Tokio threads for the control plane, mock workers with 2 threads each

@@ -1,97 +1,81 @@
-# Edge Inference
+# Workers Across Hosts and Clusters
 
-One central control plane, workers in many clusters. Workers dial out
-(streaming sessions), so edge clusters need no inbound connectivity, no service mesh,
-and no VPN to the center.
+Workers establish outbound native Session and Attempt connections. They may run
+in different hosts, networks or clusters, subject to network access to the
+control-plane listener. Application backends remain local to each worker or are
+called using application-owned clients.
 
 ```text
-caller ──HTTP──> center (invoke / OpenAI gateway, gRPC :50052)
-                    ▲            ▲
-          session │            │ session        (outbound only)
-              edge-a worker   edge-b worker
-                    │            │
-              local vLLM /    local Triton /
-              policy server   any HTTP service
+application -> native Client -> one control-plane Runtime
+                                      ^          ^
+                               Session/Attempt connections
+                                      |          |
+                                 worker A     worker B
+                                      |          |
+                                  backend A   backend B
 ```
 
-## Connection model
+Control and data use separate connections. Small inputs travel in Assign;
+larger or live input arrives over Attempt. Opening attempts, acknowledgements
+and optional journal commits add exchanges. The protocol makes no fixed
+one-RTT or WAN-overhead promise.
 
-Each worker holds a bidirectional Session for assignments, heartbeats and credits,
-and opens an Attempt data stream for each execution. Control and payload use
-separate connections. Small inputs travel in Assign; larger inputs arrive over
-Attempt. This protocol makes no fixed one-RTT promise: opening the attempt and
-acknowledging input/results add exchanges, and durable commits add storage work.
+## Advertise capabilities
 
-## Center
+For example, an application-owned Python worker can advertise its location and
+model version while keeping its handler generic:
 
-```toml
-[auth]                       # bearer tokens; worker and client roles are separate
-client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
-worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+```python
+from anyserve import serve, worker
 
-[invoke]                     # POST /v1/invoke/{interface}
-listen = "0.0.0.0:8090"
-default_timeout_ms = 5000
-forward_headers = ["x-tenant-id"]
+@worker(
+    interface="policy.evaluate.v1",
+    attributes={"region": "near", "model": "v1"},
+    capacity={"slot": 4},
+    max_active_leases=4,
+)
+def evaluate(payload: bytes) -> bytes:
+    # Replace this echo with the application's backend call.
+    return payload
 
-[invoke.policy]
-spillover_after_ms = 20      # default locality hold
+serve(evaluate, endpoint="https://center:50052", token="WORKER_TOKEN")
 ```
 
-## Edge worker
+The control plane must have matching TLS and worker-role credentials configured.
+Attributes are caller/worker-defined metadata. The Runtime does not load or
+validate a model based on the `model` attribute.
 
-```toml
-kind = "http"                # or "llm" for OpenAI-compatible backends
-base_url = "http://holdem-svc:8080"
-max_active_leases = 32       # concurrent attempts on one Session
-health_url = "http://holdem-svc:8080/healthz"   # unhealthy => stop leasing
-token_env = "ANYSERVE_WORKER_TOKEN"
+## Express placement through the native API
 
-[routes]
-"gameplay.holdem.act.v1" = "/strategy_act"
+```python
+from anyserve import AnyserveClient, ExecutionOptions
 
-[attributes]
-region = "ap-south-1"
-accelerator = "l4"
+client = AnyserveClient("https://center:50052", token="CLIENT_TOKEN")
+outputs = client.execute(
+    "policy.evaluate.v1", b"observation",
+    options=ExecutionOptions(
+        required_attributes={"model": "v1"},
+        preferred_attributes={"region": "near"},
+        required_capacity={"slot": 1},
+        spillover_after_ms=20,
+        queue_timeout_ms=100,
+        total_timeout_ms=1000,
+        max_attempts=3,
+    ),
+)
 ```
 
-`anyserve --endpoint https://center:50052 worker --config edge.toml`
+Required constraints always apply. Before the spillover hold expires, all
+preferences must match. After it expires, partially matching workers may serve
+the job, ranked by preference and load. With no hold interval, preferences rank
+eligible workers immediately. Queue and total timeouts bound waiting.
 
-For CLI job listing, inspection and cancellation, set `ANYSERVE_TOKEN` to a
-**client** bearer token, then use `anyserve --endpoint https://center:50052 job
-ls` (or `job inspect <id>` / `job cancel <id>`). This variable is distinct from
-the server's token-list variables and from `ANYSERVE_WORKER_TOKEN` selected by
-the worker config above. The job CLI has no token flag.
+A stable worker ID is an application routing attribute when the worker advertises
+it. The Python SDK includes `worker_id` automatically; other workers must include
+it in Hello attributes if callers need to prefer it. Reusing one worker does
+not make its local application state durable. If a new worker is selected,
+applications reconstruct any session state they require.
 
-## Placement headers
-
-| Header | Meaning |
-|---|---|
-| `x-anyserve-require: k=v,...` | hard constraint |
-| `x-anyserve-prefer: k=v,...` | soft preference |
-| `x-anyserve-spillover-ms` | hold for workers matching **all** preferences this long, then any eligible worker |
-| `x-anyserve-queue-timeout-ms` | fail with 503 `queue_timeout` if nobody leases it in time |
-| `x-anyserve-timeout-ms` | total wait; job is cancelled on timeout (504) |
-| `x-anyserve-priority` | higher first |
-
-Responses carry `x-anyserve-job-id`, `x-anyserve-worker-id`, `x-anyserve-attempts`.
-Upstream status and body pass through unchanged. The worker marks transport and
-configured upstream errors retryable. The runtime applies the shared attempt
-budget (default 3); an exposed streamed response cannot switch attempts.
-
-## Patterns
-
-**Nearest cluster with failover** — `prefer: region=<caller region>`,
-`spillover-ms` ≈ a few ms over the local p99 queue wait.
-
-**RL rollouts** — actors call one interface; pin a policy version with
-`require: model=<version>` while workers for several versions run side by side.
-Adding capacity in any cluster is starting a worker; no routing change.
-
-**Embodied / stateful sessions** — every worker advertises `worker_id`. After
-the first step, send `prefer: worker_id=<x-anyserve-worker-id>` with a small
-spillover: the episode stays on the worker holding its state (history, KV cache)
-and may spill over if that worker is unavailable. Worker-local model state does
-not migrate automatically; the application must reconstruct it when needed. Use
-`queue-timeout-ms` ≤ the control period so stale actions are dropped, not
-delivered late.
+Backend batching, GPU memory, model versions, health checks and autoscaling remain
+with the worker/backend and deployment platform. Use the management worker view
+for connectivity and capacity; it does not independently prove backend correctness.

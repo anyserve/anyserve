@@ -15,8 +15,6 @@ use tracing::{info, warn};
 
 use crate::serve_config::{GrpcConfig, ResolvedServeConfig, ServeOverrides};
 use crate::serve_console::run_server as run_console_server;
-use crate::serve_invoke::run_server as run_serve_invoke;
-use crate::serve_openai::run_server as run_serve_openai;
 
 #[cfg(test)]
 mod tests;
@@ -71,16 +69,6 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     }
 
     let grpc_addr = socket_addr(&grpc_config.host, grpc_config.port)?;
-    let openai_addr = config
-        .openai
-        .as_ref()
-        .map(|openai| socket_addr_from_bind(&openai.listen))
-        .transpose()?;
-    let invoke_addr = config
-        .invoke
-        .as_ref()
-        .map(|invoke| socket_addr_from_bind(&invoke.listen))
-        .transpose()?;
     let console_addr = config
         .console
         .as_ref()
@@ -96,24 +84,6 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         AuthPolicy::clone(&auth),
         shutdown_rx,
     ));
-    if let (Some(adapter), Some(addr)) = (config.invoke.clone(), invoke_addr) {
-        servers.spawn(run_serve_invoke(
-            addr,
-            runtime.clone(),
-            adapter,
-            Arc::clone(&auth),
-            shutdown_tx.subscribe(),
-        ));
-    }
-    if let (Some(adapter), Some(addr)) = (config.openai.clone(), openai_addr) {
-        servers.spawn(run_serve_openai(
-            addr,
-            runtime.clone(),
-            adapter,
-            Arc::clone(&auth),
-            shutdown_tx.subscribe(),
-        ));
-    }
     if let (Some(adapter), Some(addr)) = (config.console.clone(), console_addr) {
         servers.spawn(run_console_server(
             addr,
@@ -129,7 +99,6 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         &grpc_addr,
         config.grpc.tls_enabled,
         config.config_path.as_deref(),
-        openai_addr.as_ref(),
         console_addr.as_ref(),
     );
     if let Some(config_path) = config.config_path.as_ref() {
@@ -137,12 +106,6 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         info!(grpc = %grpc_addr, config = %config_path, "control plane started");
     } else {
         info!(grpc = %grpc_addr, "control plane started");
-    }
-    if let Some(openai_addr) = openai_addr {
-        info!(openai = %openai_addr, "openai gateway started");
-    }
-    if let Some(invoke_addr) = invoke_addr {
-        info!(invoke = %invoke_addr, auth = auth.is_enabled(), "invoke gateway started");
     }
     if let Some(console_addr) = console_addr {
         info!(console = %console_addr, "console api started");
@@ -257,7 +220,6 @@ fn print_startup_access_points(
     addr: &SocketAddr,
     tls_enabled: bool,
     config_path: Option<&Path>,
-    openai_addr: Option<&SocketAddr>,
     console_addr: Option<&SocketAddr>,
 ) {
     let scheme = if tls_enabled { "https" } else { "http" };
@@ -269,14 +231,6 @@ fn print_startup_access_points(
     ];
     if let Some(config_path) = config_path {
         entries.push(("config", config_path.display().to_string()));
-    }
-    if let Some(openai_addr) = openai_addr {
-        let access = access_points(openai_addr, "http")
-            .into_iter()
-            .map(|value| format!("{value}/v1"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        entries.push(("openai", access));
     }
     if let Some(console_addr) = console_addr {
         entries.push(("console", access_points(console_addr, "http").join(", ")));

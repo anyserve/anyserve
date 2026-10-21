@@ -30,7 +30,7 @@ fn defaults_enable_a_local_full_sync_journal() {
         std::path::Path::new(".anyserve/journal.sqlite")
     );
     assert!(journal.full_sync);
-    assert!(resolved.openai.is_none());
+    assert!(resolved.console.is_none());
 }
 
 #[test]
@@ -102,27 +102,6 @@ max_batch = 8
 }
 
 #[test]
-fn openai_placement_remains_engine_neutral() {
-    let resolved = config(
-        r#"
-[openai]
-enabled = true
-listen = "127.0.0.1:8081"
-models = ["demo"]
-request_timeout_secs = 15
-[openai.demand.required_attributes]
-provider = "ollama"
-"#,
-        ServeOverrides::default(),
-    )
-    .unwrap();
-    let openai = resolved.openai.unwrap();
-    assert_eq!(openai.models, vec!["demo"]);
-    assert_eq!(openai.request_timeout_secs, 15);
-    assert_eq!(openai.demand.required_attributes["provider"], "ollama");
-}
-
-#[test]
 fn obsolete_storage_configuration_requires_explicit_migration() {
     for raw in [
         "[server.storage]\nbackend='postgres'",
@@ -158,7 +137,7 @@ fn legacy_server_keys_point_to_the_existing_migration_section() {
     ] {
         let message = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
         assert!(
-            message.contains("docs/src/architecture.md#migration-from-04"),
+            message.contains("docs/src/deployment.md#migration-from-04"),
             "{message}"
         );
     }
@@ -174,7 +153,10 @@ fn all_repository_example_and_benchmark_toml_files_parse() -> anyhow::Result<()>
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules") {
+            // Benchmark output preserves configurations from older releases.
+            if name.starts_with('.')
+                || matches!(name.as_ref(), "target" | "node_modules" | "results")
+            {
                 continue;
             }
             let path = entry.path();
@@ -196,29 +178,27 @@ fn all_repository_example_and_benchmark_toml_files_parse() -> anyhow::Result<()>
     visit(&root.join("bench"), &mut files)?;
     files.sort();
     let mut servers = 0;
-    let mut workers = 0;
     for path in files {
         let raw = fs::read_to_string(&path)?;
-        let value: toml::Value =
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        toml::from_str::<toml::Value>(&raw).with_context(|| format!("parse {}", path.display()))?;
         if matches!(
             path.file_name().and_then(|name| name.to_str()),
             Some("Cargo.toml" | "pyproject.toml")
         ) {
             continue;
         }
-        // Deserialize the actual schemas without requiring host-specific auth
-        // environment variables or starting a backend.
-        if value.get("base_url").is_some() {
-            crate::worker::validate_config(&raw)
-                .with_context(|| format!("worker schema {}", path.display()))?;
-            workers += 1;
-        } else {
-            super::file::AnyserveConfigFile::load(&path)
-                .with_context(|| format!("server schema {}", path.display()))?;
-            servers += 1;
-        }
+        super::file::AnyserveConfigFile::load(&path)
+            .with_context(|| format!("server schema {}", path.display()))?;
+        servers += 1;
     }
-    assert!(servers > 0 && workers > 0);
+    assert!(servers > 0);
     Ok(())
+}
+
+#[test]
+fn removed_execution_gateway_sections_are_rejected() {
+    for raw in ["[openai]\nenabled=true", "[invoke]\nenabled=true"] {
+        let error = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
+        assert!(error.contains("unknown field"), "{error}");
+    }
 }

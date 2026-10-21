@@ -1,7 +1,7 @@
 # Execution Architecture
 
-This page describes Anyserve 0.5.0, reviewed against runtime source at `aa94ad9`
-on 2026-10-19. It is the current architecture reference. The
+Anyserve is a backend-independent execution and scheduling system. This page
+describes the native Client/Worker contract and the current Runtime. The
 [redesign acceptance record](redesign.md) and reference reviews preserve earlier
 decisions and evidence. For startup, restart and migration procedures, read
 [deployment and recovery](deployment.md).
@@ -14,15 +14,15 @@ they need no inbound listener. The supported deployment has one owner of the
 journal. Adding workers scales execution capacity; it does not create additional
 control-plane writers.
 
-![Anyserve execution architecture: SDK and HTTP ingress share one Runtime; the Runtime commits durable state to SQLite and exchanges control and data with outbound workers.](images/execution-architecture.svg)
+![Anyserve execution architecture: native clients and the management API share one Runtime, which commits durable state to SQLite and exchanges control and data with outbound workers.](images/execution-architecture.svg)
 
 | Component | Responsibility |
 |---|---|
 | Runtime | Admission, jobs, placement, capacity reservations, attempts, deadlines, cancellation and bounded event logs |
 | Journal | Durable recovery snapshots, complete inputs, final results and completion receipts through a bounded SQLite writer queue |
-| gRPC, HTTP/OpenAI and console adapters | Authentication, protocol translation and views of the same Runtime |
-| Rust/Python worker SDK and built-in HTTP worker | Outbound sessions, input/result transport, flow control, backend invocation and cancellation propagation |
-| Inference backend | Model loading, token batching, model memory and backend-specific execution |
+| Native gRPC services and management API | Client/worker authentication and views of the same Runtime |
+| Rust/Python worker SDK | Outbound sessions, input/result transport, flow control and cancellation signals for application handlers |
+| Application backend | Domain computation, data interpretation and any model loading, batching or model memory management |
 | Deployment platform | GPU assignment, worker replicas, networking, storage and process restart |
 
 The Runtime matches opaque objects and metadata. It does not interpret tokens,
@@ -38,18 +38,11 @@ console reads Runtime views and events directly; it has no separate job model.
 | Lifetime | Owned by the invocation; disconnect/drop cancels unfinished work | Independent of a Watch connection |
 | Output | Accepted, Assigned, Output and Finished events | GetJob and Watch; terminal outputs are available by ID while retained |
 | Restart | State and live output history are lost | Durable input, committed attempt count and final result survive; ephemeral Submit is lost |
-| Typical ingress | Native Invoke, HTTP invoke and OpenAI adapters | Native/Python asynchronous jobs |
+| Typical ingress | Native Rust/Python Invoke | Native Rust/Python asynchronous jobs |
 
-Durability and output delivery are separate choices. The embedded Runtime offers
-`Delivery::Buffered` and `Delivery::Streamed`. The native gRPC Invoke adapter
-always chooses Streamed, even if an SDK consumer collects the answer in memory.
-HTTP invoke uses Buffered; OpenAI chat selects delivery from its `stream` flag,
-and embeddings use Buffered.
-
-For Streamed delivery, an attempt becomes exposed when its first non-progress
+For Invoke, an attempt becomes exposed when its first non-progress
 output enters the event log, including while that output is still buffered in
-transport. An exposed attempt cannot be silently replaced. Buffered delivery
-keeps attempt output private until success and permits transparent retries.
+transport. An exposed attempt cannot be silently replaced.
 
 ## Job lifecycle and placement
 
@@ -204,9 +197,8 @@ receipt replay still retransmits the original outcome.
 
 A server Drain stops new assignments for that session. Workers can reconnect
 after a short control-plane restart; a new generation fences old unfinished
-attempts. Local stop signals shut down the worker. The built-in HTTP worker
-uses connect and read-inactivity timeouts, allowing active SSE responses to run
-longer than one inactivity interval.
+attempts. Application workers own their backend connection lifetimes, health,
+timeouts and propagation of cancellation to backend operations.
 
 ## Memory bounds and pressure
 
@@ -218,7 +210,7 @@ longer than one inactivity interval.
 
 An individual streamed consumer that stops reading can fail its job with
 `consumer_stalled`. Global event pressure instead ends the Attempt with
-`RESOURCE_EXHAUSTED` after bounded waiting; the built-in worker reports retryable
+`RESOURCE_EXHAUSTED` after bounded waiting. A worker can report a retryable
 failure, subject to the exposure rule. Jobs without a primary streamed consumer
 evict old history and report cursor expiry. Lifecycle events retain their bounded
 fixed-overhead exception; output payloads cannot bypass reservation.
@@ -230,6 +222,13 @@ references. Retention/count maintenance does not forcibly clear fresh results
 at a percentage threshold. Compacted events and evicted jobs are freed after
 releasing the global state lock. See [configuration](configuration.md) for exact
 defaults and overflow behavior.
+
+## Management
+
+The optional `[console]` listener serves management views and `/healthz`.
+Application execution uses the native gRPC services. Application workers own
+backend protocol translation and validation. See [usage](usage.md) for console
+authentication and health semantics.
 
 ## Implementation map
 
@@ -246,7 +245,7 @@ Paths below are relative to the repository root.
 | Recovery journal and commit verification | `crates/anyserve-core/src/journal.rs` |
 | gRPC adapters and stream completion | `crates/anyserve-core/src/client_service.rs`, `worker_service.rs` |
 | SDK result retransmission and event trailers | `crates/anyserve-client/src/execution/attempt.rs`, `events.rs` |
-| CLI configuration, HTTP/OpenAI, worker and console | `crates/anyserve-cli/src/` |
+| CLI startup/configuration, job commands and management API | `crates/anyserve-cli/src/` |
 | Python API and native binding | `clients/python/python/anyserve/`, `clients/python/src/` |
 
 Use [testing](testing.md) to validate implementation changes. The

@@ -17,8 +17,8 @@ cargo test --workspace
 Core unit and `runtime_v2` integration tests cover capability matching, admission,
 attempt budgets, stream exposure, cancellation, three memory budgets, SQLite
 acceptance/terminal receipts, restart recovery and cold reads. CLI tests exercise
-real TCP services, HTTP/OpenAI adapters, auth, console reads, large payloads and
-worker cancellation. SDK tests cover delivery backoff and negotiated retry windows.
+real native TCP services, token roles, management reads/health checks, large
+payloads and worker cancellation. SDK tests cover delivery backoff and negotiated retry windows.
 
 ## Python
 
@@ -50,6 +50,7 @@ npm run build
 This checks both TypeScript projects and builds the production assets. Backend
 console tests run as part of `cargo test --workspace`.
 
-The [acceptance record](redesign.md) records actual outcomes and limitations.
+The [acceptance record](redesign.md) records historical outcomes and limitations,
+including adapters that have since been removed.
 GPU demos and historical performance reports are separate from these gates; they
 must not be interpreted as current execution-protocol benchmark results.

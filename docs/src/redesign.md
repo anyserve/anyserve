@@ -3,7 +3,8 @@
 **Status: historical acceptance record.** These checks were recorded for the
 initial 0.5 runtime redesign at `22f0853` on 2026-10-18. Their counts and pending
 review status belong to that revision, not to the current checkout. This page
-is not a second implementation specification.
+is not a second implementation specification. HTTP/provider adapters and their
+checks below describe that historical revision and have since been removed.
 
 Read [execution architecture](architecture.md) for the current behavior,
 [deployment and recovery](deployment.md) for operating procedures, and

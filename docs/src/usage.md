@@ -1,133 +1,106 @@
 # Usage
 
-## Prerequisites
+Anyserve runs a native execution control plane. Applications implement workers
+using the Rust or Python SDK and keep backend-specific logic in those workers.
+Read [architecture](architecture.md) for the execution contract and
+[deployment and recovery](deployment.md) for operating boundaries.
 
-- an `anyserve` binary on `PATH`
-- Python 3.12+ if you want the Python bindings
+## Start the control plane
 
-## Fastest Local Workflow
-
-For the built-in OpenAI-compatible gateway and worker, follow the canonical walkthrough in [examples/ollama/README.md](https://github.com/anyserve/anyserve/blob/main/examples/ollama/README.md). That is the single place with the full command sequence, config notes, and smoke tests.
-
-## Deployment and architecture
-
-Read [deployment and recovery](deployment.md) for the supported single-process
-topology, persistent journal, credentials, readiness and restart procedure. The
-[execution architecture](architecture.md) explains placement and retry semantics.
-
-The [hosted gateway proposal](create-gateway.md) describes a future product
-experience, including workspace provisioning and managed pools. Use the commands
-below to run the capabilities implemented in this checkout.
-
-## Start the Control Plane
+Build from the repository root with Rust and `protoc` available:
 
 ```bash
-anyserve serve
+cargo build -p anyserve
+./target/debug/anyserve serve --config examples/server.toml
 ```
 
-Or use your own config file:
+CLI flags override file settings. The example starts native gRPC on
+`127.0.0.1:50052`, enables the management listener on `127.0.0.1:3001` and uses
+`.anyserve/journal.sqlite`. `serve --ephemeral` disables durable jobs.
+Endpoint strings such as `http://127.0.0.1:50052` are gRPC channel URIs.
+
+## Run an application worker
+
+Python 3.12+ is required. Install the SDK from the same checkout as the binary:
 
 ```bash
-anyserve serve --config path/to/anyserve.toml
-```
-
-CLI flags override the config file if you provide both.
-
-The gRPC health service is available on the same port as gRPC. Example endpoint strings like `http://127.0.0.1:50052` are gRPC channel URIs, not REST endpoints.
-
-When `[auth]` tokens are configured, the console API requires a client bearer
-token, just like the HTTP gateways. The console prompts for that token and keeps
-it in the current browser tab's session storage. CORS `allowed_origins` controls
-which browser origins may access the console; it does not replace authentication.
-
-The gRPC client and server both accept messages up to 64 MiB, including protobuf
-overhead. HTTP gateways may enforce a smaller request-body limit.
-
-## CLI authentication
-
-`anyserve job ls`, `anyserve job inspect <job-id>` and `anyserve job cancel
-<job-id>` read a single client bearer token from `ANYSERVE_TOKEN`. Set it to a
-client token accepted by the server's `[auth]`; there is no token flag. Native
-SDK clients use the same default environment variable. Worker credentials are
-separate and can be selected with `token_env` in the worker configuration.
-
-Gateway `/readyz` requires `Runtime::health().ready` and a connected, non-draining
-worker matching the configured required demand. OpenAI uses its chat interface
-as the primary readiness requirement; embeddings are reported separately. The
-invoke gateway accepts any matching interface. Busy workers still count as live;
-zero free credit does not itself mark a deployment unready.
-
-## Run the Built-In LLM Worker
-
-```bash
-anyserve worker --config examples/ollama/worker.toml
-```
-
-The worker proxies `llm.chat.v1` and `llm.embed.v1` jobs to the configured OpenAI-compatible upstream. For the end-to-end flow, use the canonical Ollama walkthrough above.
-
-Call the built-in OpenAI gateway with any OpenAI SDK or plain HTTP. Example:
-
-```bash
-curl http://127.0.0.1:8080/v1/models
-```
-
-## Python Examples
-
-You can run the Python examples after installing the bindings:
-
-```bash
-# clean venv from local source
 python -m venv .venv
 . .venv/bin/activate
 pip install ./clients/python
-
 python examples/python/worker.py
-python examples/python/submit.py
 ```
 
-## Install the Python Bindings from Local Source
-
-```bash
-pip install ./clients/python
-```
-
-## Python Worker Decorator
+The example owns its handler and connects outbound. The minimal worker shape is:
 
 ```python
 from anyserve import serve, worker
 
-
-@worker(
-    interface="demo.echo.v1",
-    attributes={"runtime": "python"},
-    capacity={"slot": 1},
-    codec="bytes",
-)
+@worker(interface="demo.echo.v1", max_active_leases=4)
 def echo(payload: bytes) -> bytes:
     return payload
-
 
 serve(echo, endpoint="http://127.0.0.1:50052")
 ```
 
-## Client execution API
+The handler may instead execute a model or call another service. Tensor encoding,
+model validation, engine/session lifetime and application-specific retry safety
+belong to the worker and its caller. The Runtime routes opaque bytes and metadata.
+There is no built-in backend proxy or provider protocol conversion.
 
-The installed SDK exposes `AnyserveClient.submit(interface, inputs, job_id=...)`,
-`invoke(interface, inputs)`, `invoke_stream(interface)`, `watch(job_id)` and `get(job_id)`.
-Inputs are bytes or object references; `ExecutionOptions` carries demand and policy;
-`max_attempts=0` selects the server default. Submit defaults to durable and needs
-an enabled journal. Invoke is ephemeral and closes when its caller disconnects.
-See the existing [submitter](https://github.com/anyserve/anyserve/blob/main/examples/python/submit.py)
-and [worker](https://github.com/anyserve/anyserve/blob/main/examples/python/worker.py).
-There are no named-stream creation or frame-push client APIs.
+## Submit or invoke
 
-`anyserve serve` enables `.anyserve/journal.sqlite`; use `serve --ephemeral` for
-memory-only execution. Configuration and the 0.4 migration boundary are documented
-in [deployment and recovery](deployment.md) and [configuration](configuration.md).
-
-## Test the Workspace
+From another terminal using the same Python environment:
 
 ```bash
-source "$HOME/.cargo/env"
-cargo test -p anyserve-core -p anyserve
+python examples/python/submit.py
 ```
+
+Or call the execution API directly:
+
+```python
+from anyserve import AnyserveClient, ExecutionOptions
+
+client = AnyserveClient("http://127.0.0.1:50052")
+outputs = client.execute(
+    "demo.echo.v1", b"hello",
+    options=ExecutionOptions(total_timeout_ms=5000),
+)
+print(outputs[0]["inline"])
+```
+
+`execute` collects an ephemeral Invoke. `submit` defaults to durable execution
+and returns an accepted job; `result`, `watch`, `get` and `cancel` operate by ID.
+`invoke_stream` supports live input and output. Use event streams as context
+managers when stopping before Finished so unfinished work is cancelled.
+See the [Python SDK guide](https://github.com/anyserve/anyserve/blob/main/clients/python/README.md)
+and the existing Python/Rust examples for native client and worker APIs.
+
+## Authentication and job CLI
+
+Configure separate client and worker bearer-token lists in `[auth]`. The console
+API requires a client token when authentication is enabled. The
+console keeps its token in the current browser tab's session storage; CORS
+`allowed_origins` controls browser origins independently of authentication.
+
+Set `ANYSERVE_TOKEN` to a client token for native clients and the job CLI:
+
+```bash
+anyserve --endpoint http://127.0.0.1:50052 job ls
+anyserve --endpoint http://127.0.0.1:50052 job inspect JOB_ID
+anyserve --endpoint http://127.0.0.1:50052 job cancel JOB_ID
+```
+
+The CLI has no token flag. Application workers pass their worker-role token to
+the SDK. Control-plane gRPC TLS is configured under `[server.tls]`.
+
+## Management health
+
+The optional `[console]` listener hosts the console API and `/healthz`.
+The health check returns HTTP 204 while the Runtime accepts work and HTTP 503
+during shutdown or journal failure. It is public; console reads require a client
+token when authentication is enabled.
+
+Runtime readiness does not require an available worker for every interface.
+Check worker connectivity, advertised capabilities and credits separately when
+assessing whether a particular application can execute work. gRPC health alone
+also does not establish backend readiness.

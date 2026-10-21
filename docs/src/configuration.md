@@ -26,6 +26,19 @@ an embedded API field. `serve --ephemeral` disables the journal,
 configuration keys are rejected, including the removed backend selectors and
 the removed retained-bytes key.
 
+## Native services and management
+
+`[server]` configures native Client/Worker gRPC. The optional `[console]` section
+configures the management API and `/healthz`.
+Its fields are `enabled` (true when the section exists), `listen` (default
+`127.0.0.1:3001`) and `allowed_origins` (default empty). See
+`examples/server.toml` and [usage](usage.md) for startup and authentication.
+
+Application execution uses native gRPC. Provider-compatible HTTP gateways,
+generic HTTP forwarding and built-in backend workers have been removed;
+`[openai]` and `[invoke]` are unknown configuration sections and fail parsing.
+Worker handlers and backend clients live in application code using the SDK.
+
 ## 三个全局字节预算
 
 三者对共享的 `Bytes` 存在重叠计量：同一份二进制数据可能同时被输入、结果或 Output 事件引用；Finished 仅按事件固定开销记入 event，结果数据仍由 result 计量。因此不能把三者相加当作 RSS 上限。
@@ -38,7 +51,7 @@ the removed retained-bytes key.
 
 Output 帧的 payload 不允许 force_reserve。全局预算不足时每 250 ms 重试，
 消费者进度变化也触发重试；超时只结束本次 Attempt 流，服务端不直接判 job 失败。
-内置 worker 将该传输失败作为 retryable 失败报告；已经暴露输出的 attempt 按既有
+应用 Worker 可以将该传输失败作为 retryable 失败报告；已经暴露输出的 attempt 按既有
 规则以 `output_interrupted` 结束。result 预算仍是驱逐后只重试一次，失败立即返回。
 
 生命周期事件（Accepted / Assigned / AttemptRestarted / Finished）始终写入，

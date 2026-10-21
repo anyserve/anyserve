@@ -1,118 +1,111 @@
 # Anyserve
 
-Serve Models Anywhere, Anytime, on Any Platform.
+Anyserve is a backend-independent execution and scheduling system. Clients send
+opaque inputs through the native execution protocol. One control-plane Runtime
+matches jobs to outbound workers by capability and available capacity, and owns
+admission, flow control, cancellation, retries and optional durable recovery.
 
-Anyserve routes inference requests to workers running on your own hosts or
-clusters. One runtime handles opaque inputs, capability matching, resource
-reservations, attempts, cancellation and output delivery. Workers own the models
-and inference engines.
+Workers own their application code and backends. An ONNX engine, a remote
+inference service or an ordinary function can implement a worker without adding
+backend-specific semantics to the control plane.
 
-The control plane is **one process**. Workers establish outbound gRPC sessions;
-they need no inbound endpoint. A short control-plane restart is supported.
-Multiple control-plane replicas sharing a database are outside this architecture.
+## Core contract
 
-## Execution and persistence
-
-- **Invoke** is ephemeral and supports live, duplex input/output. Disconnecting
-  cancels the invocation. HTTP invoke and OpenAI gateways use this path.
-- **Submit** defaults to durable. Complete input is committed to an optional
-  SQLite journal before acceptance. Jobs and final results survive restart;
-  unfinished work may run again within its attempt budget. External side effects
-  require application idempotency.
-- Live output events stay in bounded memory. A recovered durable job exposes its
-  accepted/final state, rather than replaying its former live output history.
-- Explicit submission IDs provide idempotency for the same canonical job spec.
-  `max_attempts` includes the first attempt; zero selects the server default.
-  After streamed output is exposed, retries cannot silently replace the attempt.
-
-The journal uses SQLite WAL with FULL synchronization by default and a bounded
-writer queue. PostgreSQL, Redis and a message broker are unnecessary for this
-single-instance control plane. Inference batching, model memory management and
-cluster orchestration belong to the worker engine or deployment platform.
+- **Invoke** is ephemeral and supports complete or live duplex input/output.
+  Dropping the invocation cancels unfinished work.
+- **Submit** accepts complete input and defaults to durable execution. The
+  optional SQLite journal commits input before acceptance and terminal results
+  before completion acknowledgement. External side effects need application
+  idempotency because unfinished work can execute again after a restart.
+- **Placement** matches interfaces, required/preferred attributes, resource
+  quantities, concurrency and worker credits. Workers establish outbound
+  Session/Attempt connections and need no inbound endpoint.
+- **Bounded delivery** provides output events, per-attempt byte windows, replay
+  cursors and three memory budgets. Exposed streamed output cannot silently
+  switch attempts. `max_attempts` includes the first attempt.
+- **Operations** provides client/worker token roles, TLS for gRPC, a management
+  API, console, health checks and logs.
 
 ```text
-Python / Rust SDK / HTTP / OpenAI / Console
-                     |
-              Execution Runtime
-       jobs · placement · attempts · deadlines
-           /                         \
- optional SQLite journal      Worker.Session (control)
- durable input and result     Worker.Attempt (data)
-                                      |
-                               inference backend
+Rust / Python client -> native Client gRPC -> Execution Runtime
+                                                |       |
+                                 optional SQLite       Worker.Session / Attempt
+                                     journal                  |
+                                                     application worker
+                                                              |
+                                                       application backend
 ```
+
+The supported control plane is one process. Its journal has one writer and
+survives a short restart when stored on a persistent volume. Adding workers
+scales execution capacity. Active control-plane replicas sharing a database
+are outside this architecture.
 
 ## Run from this checkout
 
-Build the binary with Rust and a `protoc` compiler on PATH:
+Rust and `protoc` are required to build the binary. Run from the repository root:
 
 ```bash
 cargo build -p anyserve
-./target/debug/anyserve serve
+./target/debug/anyserve serve --config examples/server.toml
 ```
 
-The default listener is `127.0.0.1:50052`; the journal is
-`.anyserve/journal.sqlite`. Use `serve --ephemeral` to disable durable jobs or
-`serve --journal /path/to/journal.sqlite` to select a persistent volume. Preserve
-that file and its SQLite sidecar files together. Configure client and worker
-bearer tokens before exposing listeners outside a trusted network.
+The example enables native gRPC on `127.0.0.1:50052` and the optional management
+API on `127.0.0.1:3001`. Its journal is `.anyserve/journal.sqlite` relative to the
+server's working directory. `serve --ephemeral` disables durable execution;
+`serve --journal /persistent/journal.sqlite` selects a persistent path.
 
-For the existing OpenAI-compatible worker and gateway:
+In another terminal, install the SDK with Python 3.12+ and start a native worker:
 
 ```bash
-./target/debug/anyserve serve --config examples/ollama/anyserve.toml
-./target/debug/anyserve worker --config examples/ollama/worker.toml
+python -m venv .venv
+. .venv/bin/activate
+pip install ./clients/python
+python examples/python/worker.py
 ```
 
-Follow [the Ollama walkthrough](examples/ollama/README.md) for the backend and
-request commands. [The Python examples](examples/python/README.md) use the same
-execution protocol after `pip install ./clients/python`. The Rust example is in
-[examples/rust](examples/rust).
+From a terminal with the same Python environment:
 
-Release installers remain available in [scripts](scripts). Released binaries and
-SDKs must be used with their matching protocol version; the current source is
-0.5 and does not retain a 0.4 compatibility service.
+```bash
+python examples/python/submit.py
+```
 
-## Configuration and migration
+The [Python examples](examples/python/README.md) include an echo worker and
+native duplex video processing. The [Rust example](examples/rust) uses the same
+protocol. Applications supply backend-specific worker code; the CLI starts the
+control plane and inspects/cancels jobs.
 
-The runtime always owns live state in memory. `[runtime]` controls admission,
-timeouts and memory budgets; `[journal]` controls durable recovery. There are no
-pluggable storage/frame backend combinations. Old `[server.storage]` and
-`[server.frames]` configuration is rejected with a migration error.
+Configure separate client and worker tokens before remote access. The job CLI
+and native clients read `ANYSERVE_TOKEN`; application workers use a worker-role
+token. `job ls`, `job inspect <id>` and `job cancel <id>` use the native API.
 
-The 0.4 protocol and databases are not upgraded in place. Deploy a matching 0.5
-binary and SDK with a fresh SQLite journal after draining older jobs. Keep the
-previous release and its original data for rollback. See
-[deployment and migration](docs/src/deployment.md) and the
-[configuration reference](docs/src/configuration.md).
+## Management and compatibility boundary
 
-For `anyserve job ls`, `job inspect` and `job cancel`, set `ANYSERVE_TOKEN` to
-one client bearer token configured in `[auth]`. The CLI has no token flag; this
-environment variable is also the native SDK default. Worker tokens use the
-worker role and belong in the worker's `token` / `token_env` configuration.
+When `[console]` is enabled, its listener exposes the console API and
+`/healthz`. Console reads require a client token when authentication is enabled;
+the health check remains accessible without one.
 
-## Repository
+The core exposes the native `anyserve.v2` Client and Worker services. Provider
+compatibility gateways, generic HTTP invocation/forwarding and the CLI's built-in
+backend worker have been removed. Old `[openai]` and `[invoke]` sections are
+rejected. Applications connect their own workers using the SDK instead.
 
-- `crates/anyserve-core`: memory runtime, optional journal and execution services.
-- `crates/anyserve-proto`: the Client and Worker execution protocol.
-- `crates/anyserve-client`: native client and bounded worker transport.
-- `crates/anyserve-cli`: server, HTTP/OpenAI adapters, console API and HTTP worker.
-- `clients/python`: Python bindings and function worker API.
-- `console`: web UI reading the same Runtime as the gateways.
-- `examples`: existing Rust/Python, Ollama and deployment walkthroughs.
+Use matching binary, SDK and protocol versions. The 0.4 protocol and databases
+are not upgraded in place: drain old work, preserve its data and start 0.5 with
+a fresh journal. See [deployment and recovery](docs/src/deployment.md).
 
-## Documentation
+## Repository and documentation
 
-Start with the [reading guide](docs/src/index.md). The
-[execution architecture](docs/src/architecture.md) describes the implemented
-runtime, and [deployment and recovery](docs/src/deployment.md) covers topology,
-persistence, readiness and migration. Use [configuration](docs/src/configuration.md),
-[edge placement](docs/src/edge.md) and [testing](docs/src/testing.md) for operation
-and validation.
+- `crates/anyserve-core`: execution state machine, journal, authentication and gRPC services.
+- `crates/anyserve-proto`: the native Client and Worker protocol.
+- `crates/anyserve-client`: native clients and bounded worker transport.
+- `crates/anyserve-cli`: control-plane startup, job CLI and management API.
+- `clients/python`: Python bindings and the application worker API.
+- `console`: views of jobs, workers and retained execution events.
+- `bench/load`: native execution workloads and separate CPU profiling.
 
-The [load benchmark results](bench/load/RESULTS.md) record the 2026-10-19 baseline
-and two optimization rounds. The [0.5 acceptance record](docs/src/redesign.md)
-and [reference reviews](docs/src/reference-architectures.md) are dated design
-history. The [hosted gateway document](docs/src/create-gateway.md) is a product
-proposal, including provisioning and workspace flows that are not implemented
-in this checkout.
+Start with the [reading guide](docs/src/index.md), [architecture](docs/src/architecture.md),
+[configuration](docs/src/configuration.md) and [testing](docs/src/testing.md).
+The [2026-10-19 benchmark report](bench/load/RESULTS.md) and
+[0.5 acceptance record](docs/src/redesign.md) preserve results for their recorded
+revisions, including adapters that have since been removed.

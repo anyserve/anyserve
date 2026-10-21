@@ -2,21 +2,16 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-mod edge_routing;
 mod job_commands;
+mod serve_auth;
 mod serve_config;
 mod serve_console;
-mod serve_execution;
-mod serve_invoke;
-mod serve_openai;
 mod serve_runtime;
 #[cfg(test)]
 mod test_support;
-mod worker;
 
 use job_commands::{JobCommands, run_job_command};
 use serve_runtime::{ServeArgs, run as run_serve};
-use worker::WorkerArgs;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50052";
 
@@ -24,7 +19,7 @@ const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:50052";
 #[command(
     name = "anyserve",
     version,
-    about = "A zero-dependency control plane for generic distributed execution."
+    about = "Backend-independent execution and scheduling with outbound workers."
 )]
 struct Cli {
     #[arg(short, long, global = true)]
@@ -40,7 +35,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Serve(ServeArgs),
-    Worker(WorkerArgs),
     Job {
         #[command(subcommand)]
         command: JobCommands,
@@ -59,7 +53,6 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Serve(args) => run_serve(args).await,
-        Commands::Worker(args) => worker::run(&endpoint, args).await,
         Commands::Job { command } => run_job_command(&endpoint, command).await,
     }
 }

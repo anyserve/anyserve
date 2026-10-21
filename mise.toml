@@ -19,7 +19,7 @@ run = "cargo test --workspace"
 
 [tasks.e2e]
 description = "Run the gRPC end-to-end test"
-run = "cargo test -p anyserve-core --test grpc_e2e -- --nocapture"
+run = "cargo test -p anyserve-core --test runtime_v2 -- --nocapture"
 
 [tasks.fmt]
 description = "Format workspace sources"
@@ -69,8 +69,8 @@ python scripts/install-python-wheel.py
 python - <<'PY'
 from anyserve import (
     AnyserveClient,
+    WorkerConnection,
     HandlerSpec,
-    FRAME_DATA,
     get_handler_spec,
     inline_object,
     serve,
@@ -82,11 +82,11 @@ from anyserve import (
 def echo(payload: bytes) -> bytes:
     return payload
 
-assert AnyserveClient.__module__ == "anyserve._native"
-for method in ("submit_job", "poll_lease", "complete_lease", "push_frames", "list_jobs"):
+assert AnyserveClient.__module__ == "anyserve.execution"
+assert WorkerConnection.__module__ == "anyserve._native"
+for method in ("submit", "invoke", "invoke_stream", "watch", "get", "cancel", "result"):
     assert callable(getattr(AnyserveClient, method)), method
 assert isinstance(get_handler_spec(echo), HandlerSpec)
-assert FRAME_DATA == "data"
 assert inline_object(b"hello")["inline"] == b"hello"
 assert uri_object("file:///tmp/example")["uri"] == "file:///tmp/example"
 assert callable(serve)

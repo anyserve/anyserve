@@ -92,7 +92,7 @@ def resources(samples, start, end):
     if not selected:
         raise RuntimeError("no process samples in the measurement window")
     result = {"sample_count": len(selected), "processes": {}}
-    for role in ("control", "worker", "client", "upstream"):
+    for role in ("control", "worker", "client"):
         totals = []
         for sample in selected:
             processes = [p for p in sample["processes"] if p["role"] == role]
@@ -175,11 +175,10 @@ class Run:
             "logical_cpus": os.cpu_count(), "cpu_affinity": sorted(os.sched_getaffinity(0)),
             "cpu_model": next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")), "unknown"),
             "load_start": os.getloadavg(),
-            "tokio_worker_threads": {"control": "default", "worker": 2, "client": 4, "upstream": 2},
+            "tokio_worker_threads": {"control": "default", "worker": 2, "client": 4},
             "control_thread_source": "production default; TOKIO_WORKER_THREADS unset",
             "worker_processes": "max(4, concurrency // 8)", "worker_concurrency": 16,
             "native_channel_default": "min(concurrency, 8); tasks round-robin over independently connected channels",
-            "http_connections": "one persistent HTTP/1.1 connection per S6 task",
             "duration_seconds": 20, "warmup_seconds": 5, "sample_interval_seconds": 0.5,
             "cpu_percent_unit": "100% is one fully used logical CPU; workers are summed",
             "latency_scope": "successful requests started after warmup; requests crossing the stop clock are drained",
@@ -225,28 +224,15 @@ class Run:
         self.processes.append(process)
         return role, process
 
-    def workers(self, directory, endpoint, scenario, upstream_port):
+    def workers(self, directory, endpoint, scenario):
         workers = []
         for index in range(self.workers_per_case):
             log = directory / f"worker-{index}.log"
-            if scenario == 6:
-                config = directory / f"worker-{index}.toml"
-                config.write_text(f'''base_url = "http://127.0.0.1:{upstream_port}/v1"
-provider = "bench"
-interfaces = ["llm.chat.v1"]
-worker_id = "bench-http-{index}"
-max_active_leases = 16
-[capacity]
-slot = 16
-''')
-                command = [self.server_bin, "--endpoint", endpoint, "worker", "--config", config]
-            else:
-                interface = "bench.stream.v1" if scenario == 2 else "bench.echo.v1"
-                mode = "stream:64:1024" if scenario == 2 else "echo"
-                command = [self.bin, "worker", "--endpoint", endpoint, "--interface", interface, "--concurrency", "16", "--mode", mode]
+            interface = "bench.stream.v1" if scenario == 2 else "bench.echo.v1"
+            mode = "stream:64:1024" if scenario == 2 else "echo"
+            command = [self.bin, "worker", "--endpoint", endpoint, "--interface", interface, "--concurrency", "16", "--mode", mode]
             item = self.spawn(command, log, "worker")
-            if scenario != 6:
-                wait_ready(item[1], log)
+            wait_ready(item[1], log)
             workers.append(item)
         return workers
 
@@ -255,10 +241,7 @@ slot = 16
         name = f"S{scenario}-c{concurrency}"
         directory = self.out / name
         directory.mkdir()
-        ports = set()
-        while len(ports) < 3:
-            ports.add(free_port())
-        grpc_port, gateway_port, upstream_port = sorted(ports)
+        grpc_port = free_port()
         endpoint = f"http://127.0.0.1:{grpc_port}"
         config = directory / "server.toml"
         config.write_text(f'''[server]
@@ -272,10 +255,6 @@ client_tokens = []
 worker_tokens = []
 [console]
 enabled = false
-[openai]
-enabled = {'true' if scenario == 6 else 'false'}
-listen = "127.0.0.1:{gateway_port}"
-models = ["bench"]
 ''')
         log = directory / "server.log"
         if self.profile:
@@ -285,30 +264,10 @@ models = ["bench"]
         control = self.spawn(command, log, "control")
         wait_ready(control[1], log, grpc_port)
         processes = [control]
-        if scenario == 6:
-            upstream = self.spawn([self.bin, "upstream", "--listen", f"127.0.0.1:{upstream_port}"], directory / "upstream.log", "upstream")
-            wait_ready(upstream[1], directory / "upstream.log", upstream_port)
-            processes.append(upstream)
-        workers = self.workers(directory, endpoint, scenario, upstream_port)
+        workers = self.workers(directory, endpoint, scenario)
         processes.extend(workers)
-        # S6 uses the existing gateway's public readiness endpoint. The native
-        # workers signal readiness only after Welcome and Credit.
-        if scenario == 6:
-            import urllib.request
-            deadline = time.monotonic() + 30
-            while True:
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{gateway_port}/readyz", timeout=1) as ready:
-                        if ready.status == 200:
-                            break
-                except OSError:
-                    pass
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("OpenAI gateway did not become ready")
-                time.sleep(0.05)
-        client_endpoint = f"http://127.0.0.1:{gateway_port}" if scenario == 6 else endpoint
         raw = directory / "client.json"
-        client = self.spawn([self.bin, "client", "--endpoint", client_endpoint, "--scenario", f"S{scenario}", "--concurrency", str(concurrency), "--duration", "20s", "--warmup", "5s", "--payload", "256", "--out", raw], directory / "client.log", "client")
+        client = self.spawn([self.bin, "client", "--endpoint", endpoint, "--scenario", f"S{scenario}", "--concurrency", str(concurrency), "--duration", "20s", "--warmup", "5s", "--payload", "256", "--out", raw], directory / "client.log", "client")
         sampler = Sampler(processes + [client])
         samples = [sampler.sample()]
         print(f"running {name}; control pid={control[1].pid}", flush=True)
@@ -334,15 +293,12 @@ models = ["bench"]
             raise RuntimeError(f"{name} failed: {result['first_error']}")
         if keep:
             # Leave this case's native echo workers for the next client task.
-            if scenario in (2, 6):
+            if scenario == 2:
                 for _, process in workers:
                     stop(process)
-                for role, process in processes:
-                    if role == "upstream":
-                        stop(process)
                 kept_directory = directory / "kept-workers"
                 kept_directory.mkdir()
-                workers = self.workers(kept_directory, endpoint, 1, upstream_port)
+                workers = self.workers(kept_directory, endpoint, 1)
             kept = {"control_plane_pid": control[1].pid, "worker_pids": [p.pid for _, p in workers], "endpoint": endpoint, "interface": "bench.echo.v1"}
             write_json(self.out / "processes.json", kept)
             self.meta["kept_processes"] = kept
@@ -352,9 +308,6 @@ models = ["bench"]
         else:
             for _, process in workers:
                 stop(process)
-            for role, process in processes:
-                if role == "upstream":
-                    stop(process)
             stop(control[1])
             if self.profile:
                 if control[1].returncode != 0:
@@ -368,7 +321,7 @@ models = ["bench"]
         write_json(self.out / "environment.json", self.meta)
         write_json(self.out / "summary.json", {"environment": self.meta, "results": self.rows})
         threads = self.meta["tokio_worker_threads"]
-        lines = ["# Control-plane load benchmark", "", f"Commit: `{self.sha}`. Mode: {'PROFILE (sampled; not a baseline)' if self.profile else 'BASELINE (no sampling)'}. CPU 100% = one logical CPU; worker values sum the case's worker processes.", "", f"Tokio threads: control={threads['control']} ({self.meta['control_thread_source']}; {len(self.meta['cpu_affinity'])} available logical CPUs), workers={threads['worker']} per process, client={threads['client']}, upstream={threads['upstream']}.", ""]
+        lines = ["# Control-plane load benchmark", "", f"Commit: `{self.sha}`. Mode: {'PROFILE (sampled; not a baseline)' if self.profile else 'BASELINE (no sampling)'}. CPU 100% = one logical CPU; worker values sum the case's worker processes.", "", f"Tokio threads: control={threads['control']} ({self.meta['control_thread_source']}; {len(self.meta['cpu_affinity'])} available logical CPUs), workers={threads['worker']} per process, client={threads['client']}.", ""]
         lines += summary_table(self.rows, threads)
         lines += ["", "S5 subrows share the parent workload and resource samples; their req/s uses the same elapsed measurement window. S5 gates use durable p50 and aggregate req/s; invoke is informational because its latency depends on the closed-loop clients' durable/fsync phases. Aggregate p50 is reference only."]
         (self.out / "summary.md").write_text("\n".join(lines) + "\n")
@@ -376,7 +329,7 @@ models = ["bench"]
     def run(self):
         try:
             self.build()
-            cases = [(1, 64), (2, 16), (3, 16)] if self.profile else [(s, c) for s in range(1, 7) for c in (1, 16, 64)]
+            cases = [(1, 64), (2, 16), (3, 16)] if self.profile else [(s, c) for s in range(1, 6) for c in (1, 16, 64)]
             for index, (scenario, concurrency) in enumerate(cases):
                 self.case(scenario, concurrency, self.keep and index == len(cases) - 1)
             self.summary()

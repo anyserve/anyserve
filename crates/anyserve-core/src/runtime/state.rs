@@ -134,7 +134,7 @@ pub(crate) struct Job {
     pub outputs: Option<Arc<Vec<Object>>>,
     pub error: Option<ErrorInfo>,
     pub log: Arc<JobLog>,
-    /// Output goes to a live caller as it arrives (`Delivery::Streamed`): an
+    /// Output goes to a live Invoke caller as it arrives: an
     /// attempt counts as exposed as soon as its first output is logged.
     pub streamed: bool,
     pub input: Option<Arc<InputLog>>,

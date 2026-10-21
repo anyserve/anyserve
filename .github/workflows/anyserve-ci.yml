@@ -5,6 +5,7 @@ on:
     branches: ["main"]
     paths:
       - "crates/**"
+      - "bench/load/**"
       - "clients/python/**"
       - "console/**"
       - "examples/**"
@@ -19,6 +20,7 @@ on:
     branches: ["main"]
     paths:
       - "crates/**"
+      - "bench/load/**"
       - "clients/python/**"
       - "console/**"
       - "examples/**"
@@ -56,6 +58,7 @@ jobs:
           filters: |
             rust:
               - "crates/**"
+              - "bench/load/**"
               - "clients/python/**/*.rs"
               - "clients/python/Cargo.toml"
               - "examples/**"
