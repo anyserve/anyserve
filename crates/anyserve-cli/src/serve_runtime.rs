@@ -1,6 +1,5 @@
-use std::collections::BTreeSet;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -95,17 +94,12 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         ));
     }
 
-    print_startup_access_points(
-        &grpc_addr,
-        config.grpc.tls_enabled,
-        config.config_path.as_deref(),
-        console_addr.as_ref(),
-    );
+    let tls = config.grpc.tls_enabled;
     if let Some(config_path) = config.config_path.as_ref() {
         let config_path = config_path.display().to_string();
-        info!(grpc = %grpc_addr, config = %config_path, "control plane started");
+        info!(grpc = %grpc_addr, tls, config = %config_path, "control plane started");
     } else {
-        info!(grpc = %grpc_addr, "control plane started");
+        info!(grpc = %grpc_addr, tls, "control plane started");
     }
     if let Some(console_addr) = console_addr {
         info!(console = %console_addr, "console api started");
@@ -216,35 +210,6 @@ async fn run_grpc_server(
         .context("run grpc server")
 }
 
-fn print_startup_access_points(
-    addr: &SocketAddr,
-    tls_enabled: bool,
-    config_path: Option<&Path>,
-    console_addr: Option<&SocketAddr>,
-) {
-    let scheme = if tls_enabled { "https" } else { "http" };
-    let grpc_access_points = access_points(addr, scheme);
-    let mut entries = vec![
-        ("grpc", addr.to_string()),
-        ("scheme", scheme.to_string()),
-        ("access", grpc_access_points.join(", ")),
-    ];
-    if let Some(config_path) = config_path {
-        entries.push(("config", config_path.display().to_string()));
-    }
-    if let Some(console_addr) = console_addr {
-        entries.push(("console", access_points(console_addr, "http").join(", ")));
-    }
-
-    println!("Control Plane Ready");
-    println!("{}", "=".repeat("Control Plane Ready".len()));
-    let width = entries.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
-    for (key, value) in entries {
-        println!("{key:width$} : {value}", width = width);
-    }
-    println!();
-}
-
 fn socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
     let mut addrs = (host, port)
         .to_socket_addrs()
@@ -261,45 +226,4 @@ fn socket_addr_from_bind(value: &str) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no socket addresses resolved for {value}"))
-}
-
-fn access_points(addr: &SocketAddr, scheme: &str) -> Vec<String> {
-    let mut access_points = BTreeSet::new();
-    match addr.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-            access_points.insert(format!("{scheme}://127.0.0.1:{}", addr.port()));
-            if let Some(local_ip) = detect_local_ipv4() {
-                access_points.insert(format!("{scheme}://{local_ip}:{}", addr.port()));
-            }
-        }
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
-            access_points.insert(format!("{scheme}://[::1]:{}", addr.port()));
-            if let Some(local_ip) = detect_local_ipv4() {
-                access_points.insert(format!("{scheme}://{local_ip}:{}", addr.port()));
-            }
-        }
-        std::net::IpAddr::V4(ip) if ip.is_loopback() => {
-            access_points.insert(format!("{scheme}://{ip}:{}", addr.port()));
-        }
-        std::net::IpAddr::V6(ip) if ip.is_loopback() => {
-            access_points.insert(format!("{scheme}://[{ip}]:{}", addr.port()));
-        }
-        std::net::IpAddr::V4(ip) => {
-            access_points.insert(format!("{scheme}://{ip}:{}", addr.port()));
-        }
-        std::net::IpAddr::V6(ip) => {
-            access_points.insert(format!("{scheme}://[{ip}]:{}", addr.port()));
-        }
-    }
-
-    access_points.into_iter().collect()
-}
-
-fn detect_local_ipv4() -> Option<std::net::Ipv4Addr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    match socket.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
-        _ => None,
-    }
 }
