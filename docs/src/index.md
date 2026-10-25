@@ -14,6 +14,7 @@ budget. Live output history and ephemeral jobs do not survive restart.
 
 | Goal | Read | Status |
 |---|---|---|
+| Decide whether anyserve fits an edge or embodied-AI deployment | [Positioning and roadmap](roadmap.md) | Current direction, with the measurements behind it |
 | Start a server and worker | [Usage](usage.md) | Current walkthroughs |
 | Understand jobs, placement, streams and persistence | [Execution architecture](architecture.md) | Current native execution implementation |
 | Choose a topology, restart or migrate | [Deployment and recovery](deployment.md), [workers across clusters](edge.md) | Current operating boundaries |
