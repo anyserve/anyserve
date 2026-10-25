@@ -13,12 +13,12 @@ use super::api::{EventKind, ExecutionEvent, Metadata};
 
 /// A byte budget shared by many owners; reservations never exceed the limit
 /// unless forced.
-pub(crate) struct EventBudget {
+pub(crate) struct ByteBudget {
     used: AtomicU64,
     limit: u64,
 }
 
-impl EventBudget {
+impl ByteBudget {
     pub(crate) fn new(limit: u64) -> Self {
         Self {
             used: AtomicU64::new(0),
@@ -52,17 +52,17 @@ impl EventBudget {
 
 /// Bytes reserved from a budget until dropped.
 pub(crate) struct Permit {
-    budget: Arc<EventBudget>,
+    budget: Arc<ByteBudget>,
     bytes: usize,
 }
 
 impl Permit {
-    pub(crate) fn new(budget: Arc<EventBudget>) -> Self {
+    pub(crate) fn new(budget: Arc<ByteBudget>) -> Self {
         Self { budget, bytes: 0 }
     }
 
     /// Reserves `bytes` even beyond the limit (for state recovered at startup).
-    pub(crate) fn forced(budget: Arc<EventBudget>, bytes: usize) -> Self {
+    pub(crate) fn forced(budget: Arc<ByteBudget>, bytes: usize) -> Self {
         budget.force_reserve(bytes);
         Self { budget, bytes }
     }
@@ -110,7 +110,7 @@ pub(crate) struct JobLog {
     changed: watch::Sender<u64>,
     /// Last sequence taken by the primary consumer, for back-pressured writers.
     consumed: watch::Sender<u64>,
-    budget: Arc<EventBudget>,
+    budget: Arc<ByteBudget>,
     max_events: usize,
     max_bytes: usize,
     /// Set once an ephemeral job finishes: the log may then shrink to its
@@ -154,7 +154,7 @@ impl JobLog {
         base_sequence: u64,
         max_events: usize,
         max_bytes: usize,
-        budget: Arc<EventBudget>,
+        budget: Arc<ByteBudget>,
     ) -> Self {
         Self {
             job_id,
@@ -443,7 +443,7 @@ mod tests {
             1 << 32,
             max_events,
             max_bytes,
-            Arc::new(EventBudget::new(global)),
+            Arc::new(ByteBudget::new(global)),
         )
     }
 
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn the_shared_budget_is_never_exceeded_by_output() {
         let limit = 700;
-        let budget = Arc::new(EventBudget::new(limit));
+        let budget = Arc::new(ByteBudget::new(limit));
         let a = JobLog::new("a".into(), 0, 100, 1 << 20, budget.clone());
         let b = JobLog::new("b".into(), 0, 100, 1 << 20, budget.clone());
         b.set_primary(true);
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn a_finished_log_keeps_only_unread_events_and_its_outcome() {
-        let budget = Arc::new(EventBudget::new(1 << 20));
+        let budget = Arc::new(ByteBudget::new(1 << 20));
         let finish = |log: &JobLog| {
             log.append(
                 None,
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn a_followed_log_is_compacted_by_its_last_follower() {
-        let budget = Arc::new(EventBudget::new(1 << 20));
+        let budget = Arc::new(ByteBudget::new(1 << 20));
         let log = JobLog::new("f".into(), 100, 100, 1 << 20, budget);
         let first = log.subscribe();
         let second = log.subscribe();
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn budgeted_bytes_hold_their_permit_until_the_last_clone() {
-        let budget = Arc::new(EventBudget::new(100));
+        let budget = Arc::new(ByteBudget::new(100));
         let mut permit = Permit::new(budget.clone());
         assert!(permit.grow(60));
         assert!(!permit.grow(60));
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn finished_outputs_do_not_count_against_event_budget() {
-        let budget = Arc::new(EventBudget::new(1_000));
+        let budget = Arc::new(ByteBudget::new(1_000));
         let log = JobLog::new("j".into(), 0, 100, 1_000, budget.clone());
         log.append(
             None,

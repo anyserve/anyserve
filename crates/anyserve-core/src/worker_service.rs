@@ -19,7 +19,7 @@ use crate::auth::Role;
 use crate::error::ErrorKind;
 use crate::runtime::Runtime;
 use crate::runtime::api::{ErrorInfo, Limits, Metadata, Object, codes};
-use crate::runtime::events::{EventBudget, Permit, budgeted_bytes};
+use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 use crate::runtime::input::InputStatus;
 use crate::runtime::state::FinishStatus;
 use crate::runtime::worker::{AttemptLink, AttemptOutcome, InputPlan};
@@ -324,7 +324,7 @@ struct PendingObject {
 /// then ends as `output_too_large`.
 struct ResultAssembler {
     limits: Limits,
-    budget: Arc<EventBudget>,
+    budget: Arc<ByteBudget>,
     /// Frees result budget held by terminal jobs; tried once per refusal.
     reclaim: Runtime,
     objects: Vec<Object>,
@@ -335,7 +335,7 @@ struct ResultAssembler {
 }
 
 impl ResultAssembler {
-    fn new(limits: Limits, budget: Arc<EventBudget>, reclaim: Runtime) -> Self {
+    fn new(limits: Limits, budget: Arc<ByteBudget>, reclaim: Runtime) -> Self {
         Self {
             limits,
             budget,

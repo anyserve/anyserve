@@ -11,7 +11,7 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -23,7 +23,7 @@ use self::api::{
     InputSink, InterfaceStats, InvokeRequest, JobFilter, JobPage, JobSpec, JobState, JobView,
     RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView, codes,
 };
-use self::events::{EventBudget, JobLog, Permit};
+use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
 use self::machine::{LeaseEnd, ms, new_id};
 use self::state::{Phase, State, TerminalPlan};
@@ -57,13 +57,22 @@ pub(crate) enum TimerKey {
     RetryTerminal { job_id: String },
 }
 
+/// Cancelled entries the heap may hold before it is rebuilt without them.
+const TIMER_COMPACT_SLACK: usize = 4_096;
+
 #[derive(Default)]
 struct TimerHeap {
+    /// Due time and id; an id missing from `keys` was cancelled or fired.
     heap: BinaryHeap<Reverse<(u64, u64)>>,
     keys: HashMap<u64, TimerKey>,
+    /// Cancelled ids whose heap entries are still in place.
+    cancelled: HashSet<u64>,
     next: u64,
 }
 
+/// Timers are scheduled and cancelled by lock holders in O(log n) and O(1);
+/// the timer loop alone pops them, and it alone rebuilds the heap when
+/// cancelled entries pile up, without the runtime lock.
 pub(crate) struct Timers {
     inner: Mutex<TimerHeap>,
     notify: Arc<Notify>,
@@ -77,8 +86,13 @@ impl Timers {
         }
     }
 
-    pub(crate) fn schedule(&self, at_ms: u64, key: TimerKey) {
-        let mut inner = self.inner.lock().expect("timers poisoned");
+    fn lock(&self) -> MutexGuard<'_, TimerHeap> {
+        self.inner.lock().expect("timers poisoned")
+    }
+
+    /// Schedules `key` and returns the id that `cancel` takes.
+    pub(crate) fn schedule(&self, at_ms: u64, key: TimerKey) -> u64 {
+        let mut inner = self.lock();
         inner.next += 1;
         let id = inner.next;
         let earliest = inner.heap.peek().map(|Reverse((at, _))| *at);
@@ -88,42 +102,63 @@ impl Timers {
         if earliest.is_none_or(|earliest| at_ms < earliest) {
             self.notify.notify_one();
         }
+        id
+    }
+
+    /// Forgets timers that can no longer have an effect. Ids that already
+    /// fired are ignored.
+    pub(crate) fn cancel(&self, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut inner = self.lock();
+        for id in ids {
+            if inner.keys.remove(id).is_some() {
+                inner.cancelled.insert(*id);
+            }
+        }
     }
 
     fn pop_due(&self, now: u64) -> Vec<TimerKey> {
-        let mut inner = self.inner.lock().expect("timers poisoned");
+        let mut inner = self.lock();
         let mut due = Vec::new();
         while let Some(Reverse((at, id))) = inner.heap.peek().copied() {
             if at > now {
                 break;
             }
             inner.heap.pop();
-            if let Some(key) = inner.keys.remove(&id) {
-                due.push(key);
+            match inner.keys.remove(&id) {
+                Some(key) => due.push(key),
+                None => {
+                    inner.cancelled.remove(&id);
+                }
             }
         }
         due
     }
 
     fn next_due(&self) -> Option<u64> {
-        let inner = self.inner.lock().expect("timers poisoned");
-        inner.heap.peek().map(|Reverse((at, _))| *at)
+        self.lock().heap.peek().map(|Reverse((at, _))| *at)
     }
 
-    fn len(&self) -> usize {
-        self.inner.lock().expect("timers poisoned").keys.len()
-    }
-
-    /// Drops timers for which `keep` is false and rebuilds the heap.
-    fn compact(&self, keep: impl Fn(&TimerKey) -> bool) {
-        let mut inner = self.inner.lock().expect("timers poisoned");
-        inner.keys.retain(|_, key| keep(key));
-        let entries: Vec<Reverse<(u64, u64)>> = inner.heap.drain().collect();
-        let heap: BinaryHeap<Reverse<(u64, u64)>> = entries
-            .into_iter()
-            .filter(|Reverse((_, id))| inner.keys.contains_key(id))
-            .collect();
-        inner.heap = heap;
+    /// Rebuilds the heap without cancelled entries once they outnumber the
+    /// live ones. The heap is filtered outside the timers lock so that lock
+    /// holders scheduling meanwhile are not held up; their entries land in a
+    /// fresh heap that is merged back afterwards. Ids cancelled meanwhile
+    /// stay in `cancelled` for the next rebuild.
+    fn compact(&self) {
+        let (mut heap, cancelled) = {
+            let mut inner = self.lock();
+            if inner.cancelled.len() <= inner.keys.len() + TIMER_COMPACT_SLACK {
+                return;
+            }
+            (
+                std::mem::take(&mut inner.heap),
+                std::mem::take(&mut inner.cancelled),
+            )
+        };
+        heap.retain(|Reverse((_, id))| !cancelled.contains(id));
+        self.lock().heap.append(&mut heap);
     }
 }
 
@@ -135,11 +170,11 @@ pub(crate) struct Inner {
     pub(crate) journal_status: Mutex<JournalStatus>,
     pub(crate) timers: Timers,
     /// Event log bytes across all jobs.
-    pub(crate) budget: Arc<EventBudget>,
+    pub(crate) event_budget: Arc<ByteBudget>,
     /// Streaming input bytes across all jobs.
-    pub(crate) input_budget: Arc<EventBudget>,
+    pub(crate) input_budget: Arc<ByteBudget>,
     /// Result payload bytes alive anywhere in the control plane.
-    pub(crate) result_budget: Arc<EventBudget>,
+    pub(crate) result_budget: Arc<ByteBudget>,
     pub(crate) me: Weak<Inner>,
 }
 
@@ -253,13 +288,8 @@ impl Inner {
             st,
             job_id,
             TerminalPlan {
-                state: JobState::Failed,
-                outputs: Vec::new(),
-                error: Some(ErrorInfo::new(code, message, false)),
-                release_lease: None,
                 cancel_lease: lease.map(|lease| (lease, code.to_string())),
-                finished: None,
-                previous: Box::new(Phase::Queued),
+                ..TerminalPlan::new(JobState::Failed, Some(ErrorInfo::new(code, message, false)))
             },
             now,
         );
@@ -277,13 +307,16 @@ impl Inner {
                 "job exceeded its total timeout",
                 now,
             ),
-            // A commit is in flight; look again shortly.
-            Phase::Accepting | Phase::Starting | Phase::Terminating(_) => self.timers.schedule(
-                now.saturating_add(1_000),
-                TimerKey::TotalDeadline {
-                    job_id: job_id.to_string(),
-                },
-            ),
+            // A commit is in flight; look again shortly. This retry is not
+            // tracked by the job: it fires or expires within a second.
+            Phase::Accepting | Phase::Starting | Phase::Terminating(_) => {
+                self.timers.schedule(
+                    now.saturating_add(1_000),
+                    TimerKey::TotalDeadline {
+                        job_id: job_id.to_string(),
+                    },
+                );
+            }
             Phase::Terminal(_) => {}
         }
     }
@@ -323,51 +356,9 @@ impl Inner {
         st.sessions.remove(session_id);
     }
 
-    /// Whether a timer can still have an effect.
-    fn timer_live(st: &State, key: &TimerKey) -> bool {
-        match key {
-            TimerKey::Dispatch => true,
-            TimerKey::QueueDeadline { job_id, since } => st.jobs.get(job_id).is_some_and(|job| {
-                matches!(job.phase, Phase::Queued) && job.queued_since_ms == *since
-            }),
-            TimerKey::ExecutionDeadline { job_id, attempt_id } => {
-                st.jobs.get(job_id).is_some_and(|job| {
-                    job.attempt
-                        .as_ref()
-                        .is_some_and(|a| &a.attempt_id == attempt_id)
-                })
-            }
-            TimerKey::TotalDeadline { job_id } => {
-                st.jobs.get(job_id).is_some_and(|job| !job.is_terminal())
-            }
-            TimerKey::RetryTerminal { job_id } => st
-                .jobs
-                .get(job_id)
-                .is_some_and(|job| matches!(job.phase, Phase::Terminating(_))),
-            TimerKey::SessionGrace {
-                session_id,
-                connection,
-            } => st
-                .sessions
-                .get(session_id)
-                .is_some_and(|s| s.tx.is_none() && s.connection == *connection),
-            TimerKey::CancelGrace { lease_id } => st
-                .leases
-                .get(lease_id)
-                .is_some_and(|lease| lease.cancelling),
-        }
-    }
-
     fn maintain(&self) {
         let now = now_ms();
-        {
-            let mut st = self.lock();
-            self.evict_terminal_locked(&mut st, now);
-            let live = st.jobs.len() * 3 + st.sessions.len() + st.leases.len() + 1_024;
-            if self.timers.len() > live * 2 {
-                self.timers.compact(|key| Self::timer_live(&st, key));
-            }
-        }
+        self.evict_terminal_locked(&mut self.lock(), now);
         if matches!(
             *self.journal_status.lock().expect("journal status poisoned"),
             JournalStatus::Degraded(_)
@@ -446,6 +437,7 @@ async fn timer_loop(me: Weak<Inner>) {
         for key in inner.timers.pop_due(now) {
             inner.fire(key);
         }
+        inner.timers.compact();
         let notify = Arc::clone(&inner.timers.notify);
         let wait = inner
             .timers
@@ -653,9 +645,9 @@ impl Runtime {
             journal,
             journal_status: Mutex::new(status),
             timers: Timers::new(),
-            budget: Arc::new(EventBudget::new(event_budget)),
-            input_budget: Arc::new(EventBudget::new(input_budget)),
-            result_budget: Arc::new(EventBudget::new(result_budget)),
+            event_budget: Arc::new(ByteBudget::new(event_budget)),
+            input_budget: Arc::new(ByteBudget::new(input_budget)),
+            result_budget: Arc::new(ByteBudget::new(result_budget)),
             me: me.clone(),
             config,
         });
@@ -675,7 +667,7 @@ impl Runtime {
         self.inner.generation
     }
 
-    pub(crate) fn result_budget(&self) -> Arc<EventBudget> {
+    pub(crate) fn result_budget(&self) -> Arc<ByteBudget> {
         Arc::clone(&self.inner.result_budget)
     }
 
@@ -1297,7 +1289,7 @@ impl Runtime {
             journal: self.inner.journal.as_ref().map(|journal| journal.stats()),
             input_bytes: self.inner.input_budget.used(),
             result_bytes: self.inner.result_budget.used(),
-            event_bytes: self.inner.budget.used(),
+            event_bytes: self.inner.event_budget.used(),
         }
     }
 
@@ -1321,5 +1313,36 @@ impl Runtime {
         if let Some(journal) = &self.inner.journal {
             journal.close().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_timers_leave_the_heap_without_firing() {
+        let timers = Timers::new();
+        timers.schedule(10, TimerKey::Dispatch);
+        let dead: Vec<u64> = (0..TIMER_COMPACT_SLACK + 2)
+            .map(|_| timers.schedule(5, TimerKey::Dispatch))
+            .collect();
+        timers.cancel(&dead);
+        timers.compact();
+        {
+            let inner = timers.lock();
+            assert_eq!(inner.heap.len(), 1);
+            assert_eq!(inner.keys.len(), 1);
+            assert!(inner.cancelled.is_empty());
+        }
+        // Cancelling again is harmless, and a cancelled entry still in the
+        // heap is skipped when its time comes.
+        let late = timers.schedule(7, TimerKey::Dispatch);
+        timers.cancel(&[late, dead[0]]);
+        assert_eq!(timers.lock().cancelled.len(), 1);
+        let due = timers.pop_due(10);
+        assert!(matches!(due.as_slice(), [TimerKey::Dispatch]), "{due:?}");
+        let inner = timers.lock();
+        assert!(inner.heap.is_empty() && inner.keys.is_empty() && inner.cancelled.is_empty());
     }
 }

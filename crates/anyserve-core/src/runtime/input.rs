@@ -7,7 +7,7 @@ use bytes::Bytes;
 use tokio::sync::watch;
 
 use super::api::Metadata;
-use super::events::EventBudget;
+use super::events::ByteBudget;
 use crate::error::RuntimeError;
 
 /// Accounted per chunk in addition to its data and metadata, so empty chunks
@@ -20,7 +20,7 @@ pub(crate) struct InputLog {
     /// Per-job limit on accounted bytes.
     limit: u64,
     /// Shared with every other streaming input and released on drop.
-    budget: Arc<EventBudget>,
+    budget: Arc<ByteBudget>,
 }
 
 #[derive(Default)]
@@ -32,7 +32,7 @@ struct InputInner {
 }
 
 impl InputLog {
-    pub(crate) fn new(limit: u64, budget: Arc<EventBudget>) -> Self {
+    pub(crate) fn new(limit: u64, budget: Arc<ByteBudget>) -> Self {
         Self {
             inner: Mutex::new(InputInner::default()),
             changed: watch::channel(0).0,
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn empty_chunks_and_metadata_are_accounted() {
-        let budget = Arc::new(EventBudget::new(1 << 20));
+        let budget = Arc::new(ByteBudget::new(1 << 20));
         let log = InputLog::new(CHUNK_OVERHEAD * 3, budget.clone());
         for _ in 0..3 {
             log.push(Bytes::new(), Metadata::new()).unwrap();

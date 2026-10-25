@@ -69,3 +69,20 @@ Notes:
 - Controls that were ruled out: client connection count (1 vs 8 channels,
   −1.5%), worker fleet size (4 vs 8 processes, +5%), control-plane thread cap
   (4 vs default, +4.4% throughput for +37% CPU).
+
+## 2026-10-23: timer compaction off the runtime lock
+
+Working tree on top of `c1de7ed` (measured before commit), same host and
+method as above, S1 at c=64 only, two runs per tree:
+
+| Tree | req/s | p50 ms | p99 ms | p99.9 ms | max ms | samples > 20 ms |
+|---|---:|---:|---:|---:|---:|---:|
+| `c1de7ed` | 11720 / 11772 | 5.34 / 5.32 | 9.20 / 9.15 | 26.4 / 25.7 | 33.6 / 35.5 | 256 / 256 |
+| with the change | 11796 / 11767 | 5.33 / 5.34 | 9.12 / 9.13 | 10.5 / 10.6 | 13.9 / 13.6 | 0 / 0 |
+
+The 256 slow samples per baseline run are four stalls of all 64 in-flight
+requests: about every 5 s the maintenance pass rebuilt the timer heap under the
+runtime lock, checking each of roughly 60k keys against the job table. Jobs now
+cancel their deadline timers when they end, and the timer loop rebuilds the heap
+under its own lock only. Throughput and p50 are unchanged, as expected for a
+change that touches only the tail.

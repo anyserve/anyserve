@@ -148,7 +148,7 @@ impl Inner {
             st.generation << 32,
             self.config.event_log_max_events,
             self.config.event_log_max_bytes,
-            Arc::clone(&self.budget),
+            Arc::clone(&self.event_budget),
         ))
     }
 
@@ -229,6 +229,7 @@ impl Inner {
             queue_key: None,
             queued_since_ms: now,
             not_before_ms: 0,
+            timers: Vec::new(),
             rejected_by: HashSet::new(),
             cancel_requested: None,
             indeterminate: false,
@@ -260,12 +261,13 @@ impl Inner {
         }
         job.log.append(None, EventKind::Accepted, now);
         if let Some(total) = job.spec.policy.total_timeout {
-            self.timers.schedule(
+            let timer = self.timers.schedule(
                 job.created_at_ms.saturating_add(ms(total)),
                 TimerKey::TotalDeadline {
                     job_id: job_id.to_string(),
                 },
             );
+            job.timers.push(timer);
         }
         self.enqueue_locked(st, job_id, now);
         if st.jobs[job_id].cancel_requested.is_some() {
@@ -394,17 +396,17 @@ impl Inner {
             .then_some(job.spec.policy.spillover_after)
             .flatten();
         let not_before = job.not_before_ms;
-        let queue_timeout = self.queue_timeout(job);
-        st.queues.entry(interface).or_default().insert(key);
-        if let Some(timeout) = queue_timeout {
-            self.timers.schedule(
+        if let Some(timeout) = self.queue_timeout(job) {
+            let timer = self.timers.schedule(
                 now.saturating_add(ms(timeout)),
                 TimerKey::QueueDeadline {
                     job_id: job_id.to_string(),
                     since: now,
                 },
             );
+            job.timers.push(timer);
         }
+        st.queues.entry(interface).or_default().insert(key);
         if let Some(spillover) = spillover {
             self.timers
                 .schedule(now.saturating_add(ms(spillover)), TimerKey::Dispatch);
@@ -640,54 +642,17 @@ impl Inner {
         self.dispatch_locked(&mut st, now);
     }
 
-    pub(crate) fn build_assign(&self, st: &State, job: &Job) -> pb::Assign {
-        let attempt = job.attempt.as_ref().expect("assigned attempt");
-        let spec = &job.spec;
-        let via = attempt.inputs_via_attempt;
-        pb::Assign {
-            lease_id: attempt.lease_id.clone(),
-            attempt_id: attempt.attempt_id.clone(),
-            job_id: job.id.clone(),
-            attempt_number: attempt.number,
-            generation: st.generation,
-            interface: spec.demand.interface.clone(),
-            params: if via {
-                Bytes::new()
-            } else {
-                spec.params.clone()
-            },
-            reserved_capacity: spec.demand.required_capacity.clone().into_iter().collect(),
-            metadata: spec.metadata.clone().into_iter().collect(),
-            inline_inputs: if via {
-                Vec::new()
-            } else {
-                spec.inputs.iter().map(object_to_proto).collect()
-            },
-            inputs_via_attempt: via,
-            streaming_input: job.input.is_some(),
-            execution_deadline_ms: spec
-                .policy
-                .execution_timeout
-                .map(|timeout| attempt.started_at_ms.saturating_add(ms(timeout)))
-                .unwrap_or(0),
-            total_deadline_ms: spec
-                .policy
-                .total_timeout
-                .map(|timeout| job.created_at_ms.saturating_add(ms(timeout)))
-                .unwrap_or(0),
-        }
-    }
-
     fn send_assign_locked(&self, st: &mut State, job_id: &str, now: u64) {
+        let generation = st.generation;
         let job = st.jobs.get_mut(job_id).expect("job");
         job.phase = Phase::Assigned;
         job.updated_at_ms = now;
-        let job = &st.jobs[job_id];
+        let assign = build_assign(generation, job);
         let attempt = job.attempt.as_ref().expect("attempt");
-        let assign = self.build_assign(st, job);
         let session_id = attempt.session_id.clone();
+        let attempt_id = attempt.attempt_id.clone();
         job.log.append(
-            Some(attempt.attempt_id.clone()),
+            Some(attempt_id.clone()),
             EventKind::Assigned {
                 worker_id: attempt.worker_id.clone(),
                 attempt_number: attempt.number,
@@ -695,13 +660,14 @@ impl Inner {
             now,
         );
         if let Some(timeout) = job.spec.policy.execution_timeout {
-            self.timers.schedule(
+            let timer = self.timers.schedule(
                 now.saturating_add(ms(timeout)),
                 TimerKey::ExecutionDeadline {
                     job_id: job_id.to_string(),
-                    attempt_id: attempt.attempt_id.clone(),
+                    attempt_id,
                 },
             );
+            job.timers.push(timer);
         }
         self.send_locked(
             st,
@@ -733,7 +699,47 @@ impl Inner {
             self.disconnect_locked(st, session_id, now);
         }
     }
+}
 
+fn build_assign(generation: u64, job: &Job) -> pb::Assign {
+    let attempt = job.attempt.as_ref().expect("assigned attempt");
+    let spec = &job.spec;
+    let via = attempt.inputs_via_attempt;
+    pb::Assign {
+        lease_id: attempt.lease_id.clone(),
+        attempt_id: attempt.attempt_id.clone(),
+        job_id: job.id.clone(),
+        attempt_number: attempt.number,
+        generation,
+        interface: spec.demand.interface.clone(),
+        params: if via {
+            Bytes::new()
+        } else {
+            spec.params.clone()
+        },
+        reserved_capacity: spec.demand.required_capacity.clone().into_iter().collect(),
+        metadata: spec.metadata.clone().into_iter().collect(),
+        inline_inputs: if via {
+            Vec::new()
+        } else {
+            spec.inputs.iter().map(object_to_proto).collect()
+        },
+        inputs_via_attempt: via,
+        streaming_input: job.input.is_some(),
+        execution_deadline_ms: spec
+            .policy
+            .execution_timeout
+            .map(|timeout| attempt.started_at_ms.saturating_add(ms(timeout)))
+            .unwrap_or(0),
+        total_deadline_ms: spec
+            .policy
+            .total_timeout
+            .map(|timeout| job.created_at_ms.saturating_add(ms(timeout)))
+            .unwrap_or(0),
+    }
+}
+
+impl Inner {
     /// Ends the session's current connection; its leases wait one heartbeat
     /// timeout for a reconnect.
     pub(crate) fn disconnect_locked(&self, st: &mut State, session_id: &str, now: u64) {
@@ -837,13 +843,10 @@ impl Inner {
             st,
             job_id,
             TerminalPlan {
-                state: JobState::Failed,
-                outputs: Vec::new(),
-                error: Some(error),
                 release_lease,
                 cancel_lease,
                 finished: receipt,
-                previous: Box::new(Phase::Running),
+                ..TerminalPlan::new(JobState::Failed, Some(error))
             },
             now,
         );
@@ -1022,6 +1025,7 @@ impl Inner {
     fn apply_terminal_locked(&self, st: &mut State, job_id: &str, plan: TerminalPlan, now: u64) {
         self.dequeue_locked(st, job_id);
         let job = st.jobs.get_mut(job_id).expect("job");
+        self.timers.cancel(&std::mem::take(&mut job.timers));
         job.phase = Phase::Terminal(plan.state);
         job.updated_at_ms = now;
         job.error = plan.error.clone();
@@ -1036,7 +1040,9 @@ impl Inner {
             job.last_attempt_id = Some(attempt.attempt_id);
             job.last_worker_id = Some(attempt.worker_id);
         }
-        job.spec = Arc::new(without_payload(&job.spec));
+        // Inputs and params leave with the full spec, freed after the lock.
+        let slim = Arc::new(without_payload(&job.spec));
+        let full_spec = std::mem::replace(&mut job.spec, slim);
         if let Some(input) = job.input.take() {
             input.abort();
         }
@@ -1067,6 +1073,7 @@ impl Inner {
         }
         job.input_permit = None;
         st.released.events.append(&mut compacted);
+        st.released.specs.push(full_spec);
         st.unfinished_jobs -= 1;
         st.terminal_order.push_back((now, job_id.to_string()));
         if let Some((lease_id, digest)) = plan.finished {
@@ -1108,13 +1115,9 @@ impl Inner {
             .unwrap_or_else(|| "cancelled".to_string());
         let error = Some(ErrorInfo::new(codes::CANCELLED, reason.clone(), false));
         let plan = |release_lease, cancel_lease| TerminalPlan {
-            state: JobState::Cancelled,
-            outputs: Vec::new(),
-            error: error.clone(),
             release_lease,
             cancel_lease,
-            finished: None,
-            previous: Box::new(Phase::Queued),
+            ..TerminalPlan::new(JobState::Cancelled, error.clone())
         };
         match &job.phase {
             Phase::Queued => self.finish_job_locked(st, job_id, plan(None, None), now),

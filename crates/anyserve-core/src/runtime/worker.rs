@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::Runtime;
-use super::api::{ErrorInfo, Metadata, Object, WorkerLoad, codes};
+use super::api::{ErrorInfo, JobState, Metadata, Object, WorkerLoad, codes};
 use super::events::LogFull;
 use super::identity::outcome_digest;
 use super::input::InputLog;
@@ -621,21 +621,17 @@ impl Runtime {
             !job.is_terminal() && job.attempt.as_ref().is_some_and(|a| a.lease_id == lease_id)
         });
         if current {
+            let error = ErrorInfo::new(
+                codes::CONSUMER_STALLED,
+                format!("consumer did not read output for {}s", stall.as_secs()),
+                false,
+            );
             inner.finish_job_locked(
                 &mut st,
                 job_id,
                 TerminalPlan {
-                    state: super::api::JobState::Failed,
-                    outputs: Vec::new(),
-                    error: Some(ErrorInfo::new(
-                        codes::CONSUMER_STALLED,
-                        format!("consumer did not read output for {}s", stall.as_secs()),
-                        false,
-                    )),
-                    release_lease: None,
                     cancel_lease: Some((lease_id.to_string(), codes::CONSUMER_STALLED.to_string())),
-                    finished: None,
-                    previous: Box::new(Phase::Running),
+                    ..TerminalPlan::new(JobState::Failed, Some(error))
                 },
                 now,
             );
@@ -730,13 +726,10 @@ impl Runtime {
                                 &mut st,
                                 &job_id,
                                 TerminalPlan {
-                                    state: super::api::JobState::Succeeded,
                                     outputs,
-                                    error: None,
                                     release_lease: Some(lease_id.clone()),
-                                    cancel_lease: None,
                                     finished: receipt,
-                                    previous: Box::new(Phase::Running),
+                                    ..TerminalPlan::new(JobState::Succeeded, None)
                                 },
                                 now,
                             );
@@ -901,6 +894,44 @@ mod tests {
             runtime.inner.freeze_locked(&mut st, &b, "test");
         }
         assert_eq!(check(&runtime), vec![(0, 0), (1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn finished_jobs_leave_no_timers_behind() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut session = runtime.open_session(hello("w", "", Vec::new())).unwrap();
+        for _ in 0..3 {
+            let mut spec = JobSpec::default();
+            spec.demand.interface = "echo".to_string();
+            spec.policy.durability = Some(Durability::Ephemeral);
+            spec.policy.queue_timeout = Some(Duration::from_secs(60));
+            spec.policy.execution_timeout = Some(Duration::from_secs(60));
+            spec.policy.total_timeout = Some(Duration::from_secs(60));
+            runtime
+                .submit(SubmitRequest {
+                    spec,
+                    ..SubmitRequest::default()
+                })
+                .await
+                .unwrap();
+            let lease_id = next_assign(&mut session).await.lease_id;
+            let (link, _) = runtime
+                .open_attempt(&pb::AttemptOpen {
+                    lease_id,
+                    generation: runtime.generation(),
+                    resume_after_sequence: 0,
+                })
+                .await
+                .unwrap();
+            runtime
+                .finish_attempt(&link, AttemptOutcome::Succeeded, Vec::new())
+                .await
+                .unwrap();
+        }
+        // Every deadline of a finished job is cancelled, whichever kind it is.
+        let timers = runtime.inner.timers.lock();
+        assert!(timers.keys.is_empty(), "{:?}", timers.keys.values());
+        assert_eq!(timers.cancelled.len(), 9);
     }
 
     #[tokio::test]

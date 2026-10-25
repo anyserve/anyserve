@@ -67,6 +67,8 @@ pub(crate) struct State {
 pub(crate) struct Released {
     pub jobs: Vec<Job>,
     pub events: Vec<ExecutionEvent>,
+    /// Full specifications of jobs that just ended; their inputs go with them.
+    pub specs: Vec<Arc<JobSpec>>,
 }
 
 #[derive(Clone, Debug)]
@@ -94,8 +96,24 @@ pub(crate) struct TerminalPlan {
     pub cancel_lease: Option<(String, String)>,
     /// Lease and digest of the completion that produced this outcome.
     pub finished: Option<(String, String)>,
-    /// Phase to restore if the commit is definitely rolled back.
+    /// Phase the job was in when the plan was made; `finish_job_locked` sets
+    /// it, so the public state stays the same while the commit is in flight.
     pub previous: Box<Phase>,
+}
+
+impl TerminalPlan {
+    /// A plan with no outputs, receipt or lease to end.
+    pub(crate) fn new(state: JobState, error: Option<ErrorInfo>) -> Self {
+        Self {
+            state,
+            outputs: Vec::new(),
+            error,
+            release_lease: None,
+            cancel_lease: None,
+            finished: None,
+            previous: Box::new(Phase::Queued),
+        }
+    }
 }
 
 pub(crate) struct Attempt {
@@ -126,6 +144,8 @@ pub(crate) struct Job {
     pub queue_key: Option<QueueKey>,
     pub queued_since_ms: u64,
     pub not_before_ms: u64,
+    /// Deadline timers scheduled for this job; cancelled when it ends.
+    pub timers: Vec<u64>,
     pub rejected_by: HashSet<String>,
     pub cancel_requested: Option<String>,
     /// A commit for this job had an unknown outcome; the id stays reserved
