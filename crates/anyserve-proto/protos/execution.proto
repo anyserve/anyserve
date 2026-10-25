@@ -1,8 +1,8 @@
 syntax = "proto3";
 package anyserve.v2;
 
-// ---------- 共用 ----------
-message Object {                       // 小对象 inline；大对象由调用方给出 uri，控制面只透传
+// ---------- Shared ----------
+message Object {                       // small objects inline; large ones by caller-provided URI, passed through opaquely
   oneof body { bytes inline = 1; string uri = 2; }
   map<string, string> metadata = 3;
 }
@@ -15,19 +15,19 @@ message Demand {
 enum Durability { DURABILITY_UNSPECIFIED = 0; EPHEMERAL = 1; DURABLE = 2; }
 message ExecutionPolicy {
   Durability durability = 1;
-  uint32 priority = 2;                 // 0..levels-1，超出范围会被服务端截断
+  uint32 priority = 2;                 // 0..levels-1; the server clamps larger values
   uint64 queue_timeout_ms = 3;         // schedule_to_start
   uint64 execution_timeout_ms = 4;     // start_to_close
   uint64 total_timeout_ms = 5;         // schedule_to_close
   uint64 spillover_after_ms = 6;
-  uint32 max_attempts = 7;             // 0 = 使用服务端默认
+  uint32 max_attempts = 7;             // 0 = server default
 }
 message JobSpec {
   Demand demand = 1;
   repeated Object inputs = 2;
   bytes params = 3;
   ExecutionPolicy policy = 4;
-  map<string, string> metadata = 5;    // 除约定的 trace/request-context 键外都计入 spec_hash
+  map<string, string> metadata = 5;    // counts toward spec_hash, except the documented trace/request-context keys
 }
 enum JobState { JOB_STATE_UNSPECIFIED = 0; QUEUED = 1; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 5; }
 message ErrorInfo { string code = 1; string message = 2; bool retryable = 3; }
@@ -35,7 +35,7 @@ message Job {
   string job_id = 1; JobState state = 2; Durability durability = 3; string interface = 4;
   uint32 attempt_count = 5; string current_attempt_id = 6; string current_worker_id = 7;
   uint64 created_at_ms = 8; uint64 updated_at_ms = 9; ErrorInfo error = 10;
-  repeated Object outputs = 11;        // 只在 include_outputs 且已终态时填充
+  repeated Object outputs = 11;        // filled only when include_outputs is set and the job is terminal
   map<string, string> metadata = 12; string spec_hash = 13;
 }
 
@@ -44,10 +44,10 @@ enum ConflictPolicy { CONFLICT_POLICY_UNSPECIFIED = 0; FAIL = 1; USE_EXISTING = 
 message SubmitRequest { string job_id = 1; ConflictPolicy conflict_policy = 2; JobSpec spec = 3; }
 message SubmitResponse { Job job = 1; bool created = 2; }
 
-message InvokeRequest {                // 第一条必须是 start；之后可选输入块
+message InvokeRequest {                // the first message must be start; input chunks may follow
   oneof msg { InvokeStart start = 1; InputChunk input = 2; InputEnd input_end = 3; }
 }
-message InvokeStart { JobSpec spec = 1; bool streaming_input = 2; }  // durability 强制为 EPHEMERAL
+message InvokeStart { JobSpec spec = 1; bool streaming_input = 2; }  // durability is always EPHEMERAL
 message InputChunk { bytes data = 1; map<string, string> metadata = 2; }
 message InputEnd {}
 
@@ -61,7 +61,7 @@ message ExecutionEvent {
 message Accepted {}
 message Assigned { string worker_id = 1; uint32 attempt_number = 2; }
 message Output { bytes data = 1; map<string, string> metadata = 2; bool progress = 3; }
-message AttemptRestarted { string previous_attempt_id = 1; ErrorInfo reason = 2; }  // 只会在没有对外暴露过输出时出现
+message AttemptRestarted { string previous_attempt_id = 1; ErrorInfo reason = 2; }  // only before any output was exposed
 message ExecutionFinished { JobState state = 1; repeated Object outputs = 2; ErrorInfo error = 3; }
 
 message WatchRequest {
@@ -76,14 +76,14 @@ message ListJobsResponse { repeated Job jobs = 1; string next_page_token = 2; }
 
 service Client {
   rpc Submit(SubmitRequest) returns (SubmitResponse);
-  rpc Invoke(stream InvokeRequest) returns (stream ExecutionEvent);  // 连接断开即取消
+  rpc Invoke(stream InvokeRequest) returns (stream ExecutionEvent);  // disconnecting cancels
   rpc Watch(WatchRequest) returns (stream ExecutionEvent);
   rpc GetJob(GetJobRequest) returns (Job);
   rpc Cancel(CancelRequest) returns (Job);
   rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
 }
 
-// ---------- Worker：控制面 ----------
+// ---------- Worker: control ----------
 message WorkerMessage {
   oneof msg {
     Hello hello = 1; Credit credit = 2; Heartbeat heartbeat = 3;
@@ -101,7 +101,7 @@ message Credit { uint32 free_slots = 1; }
 message Heartbeat { Load load = 1; }
 message Load {
   uint32 queued = 1; uint32 running = 2;
-  double utilization = 3;             // 0..1，具体含义由 worker 定义
+  double utilization = 3;             // 0..1; the worker defines what it measures
   map<string, double> custom = 4;
 }
 message AssignReply { string lease_id = 1; bool accepted = 2; string reject_reason = 3; }
@@ -118,22 +118,22 @@ message Limits {
 message Welcome {
   string session_id = 1; uint64 generation = 2;
   uint32 heartbeat_interval_ms = 3; uint32 heartbeat_timeout_ms = 4; Limits limits = 5;
-  repeated string resumed_lease_ids = 6;   // 其余 held_lease_ids 会逐个收到 Fence
+  repeated string resumed_lease_ids = 6;   // every other held lease receives a Fence
 }
 message Assign {
   string lease_id = 1; string attempt_id = 2; string job_id = 3; uint32 attempt_number = 4;
   uint64 generation = 5; string interface = 6; bytes params = 7;
   map<string, int64> reserved_capacity = 8; map<string, string> metadata = 9;
-  repeated Object inline_inputs = 10;  // 总大小不超过 assign_inline_limit 时内联
-  bool inputs_via_attempt = 11;        // 否则需在 Attempt 流上拉取
+  repeated Object inline_inputs = 10;  // inline when the total stays within assign_inline_limit
+  bool inputs_via_attempt = 11;        // otherwise fetched over the Attempt stream
   bool streaming_input = 12;
   uint64 execution_deadline_ms = 13; uint64 total_deadline_ms = 14;
 }
 message Cancel { string lease_id = 1; string reason = 2; }
-message Fence { string lease_id = 1; string reason = 2; }  // 例如 stale_generation、lease_expired
+message Fence { string lease_id = 1; string reason = 2; }  // e.g. stale_generation, lease_expired
 message Drain {}
 
-// ---------- Worker：数据面（每个 attempt 一条） ----------
+// ---------- Worker: data, one stream per attempt ----------
 message AttemptUp {
   oneof msg {
     AttemptOpen open = 1; Frame frame = 2; ResultChunk result = 3;
@@ -144,7 +144,7 @@ message AttemptOpen { string lease_id = 1; uint64 generation = 2; uint64 resume_
 message Frame { uint64 sequence = 1; bytes data = 2; map<string, string> metadata = 3; bool progress = 4; }
 message ResultChunk {
   uint32 index = 1; bytes data = 2; bool last = 3;
-  map<string, string> metadata = 4; string uri = 5;   // 设置了 uri 时 data 为空
+  map<string, string> metadata = 4; string uri = 5;   // data is empty when uri is set
 }
 message Finish {
   oneof outcome { Succeeded succeeded = 1; ErrorInfo failed = 2; Cancelled cancelled = 3; }
@@ -181,6 +181,6 @@ message AttemptFinished {
 }
 
 service Worker {
-  rpc Session(stream WorkerMessage) returns (stream ServerMessage);  // 控制 channel
-  rpc Attempt(stream AttemptUp) returns (stream AttemptDown);        // 数据 channel
+  rpc Session(stream WorkerMessage) returns (stream ServerMessage);  // control channel
+  rpc Attempt(stream AttemptUp) returns (stream AttemptDown);        // data channel
 }

@@ -81,9 +81,7 @@ and `stats.json`; startup and warm-up are included in profile sampling. Profile
 latency is kept separate from baseline results. `pprof` is a benchmark-only
 dependency.
 
-The [2026-10-19 report](benchmark-results.md) preserves historical measurements,
-including the now-removed S6 compatibility gateway. The former HTTP/LLM edge
-suite has been removed. Current protocol overhead on real backends or WAN links
-requires a separate paired direct/native test using the same inputs, batch,
-concurrency, topology and backend configuration; mock results do not establish
-that overhead or model throughput.
+Protocol overhead on real backends or WAN links requires a separate paired
+direct/native test using the same inputs, batch, concurrency, topology and
+backend configuration; mock results do not establish that overhead or model
+throughput.

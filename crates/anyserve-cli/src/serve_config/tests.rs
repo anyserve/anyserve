@@ -102,17 +102,6 @@ max_batch = 8
 }
 
 #[test]
-fn obsolete_storage_configuration_requires_explicit_migration() {
-    for raw in [
-        "[server.storage]\nbackend='postgres'",
-        "[server.frames]\nbackend='redis'",
-    ] {
-        let error = config(raw, ServeOverrides::default()).unwrap_err();
-        assert!(error.to_string().contains("replaced by [journal]"));
-    }
-}
-
-#[test]
 fn invalid_journal_limits_are_rejected() {
     for raw in [
         "[journal]\nqueue_capacity=0",
@@ -129,17 +118,14 @@ fn invalid_journal_limits_are_rejected() {
 }
 
 #[test]
-fn legacy_server_keys_point_to_the_existing_migration_section() {
+fn unknown_keys_and_sections_are_rejected() {
     for raw in [
         "[server]\nheartbeat_ttl_secs=30",
-        "[server]\ndefault_lease_ttl_secs=30",
         "[server.storage]\nbackend='sqlite'",
+        "[gateway]\nenabled=true",
     ] {
         let message = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
-        assert!(
-            message.contains("docs/src/deployment.md#migration-from-04"),
-            "{message}"
-        );
+        assert!(message.contains("unknown field"), "{message}");
     }
 }
 
@@ -193,12 +179,4 @@ fn all_repository_example_and_benchmark_toml_files_parse() -> anyhow::Result<()>
     }
     assert!(servers > 0);
     Ok(())
-}
-
-#[test]
-fn removed_execution_gateway_sections_are_rejected() {
-    for raw in ["[openai]\nenabled=true", "[invoke]\nenabled=true"] {
-        let error = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
-        assert!(error.contains("unknown field"), "{error}");
-    }
 }

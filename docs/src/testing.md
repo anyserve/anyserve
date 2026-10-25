@@ -1,6 +1,6 @@
 # Testing
 
-The acceptance gates use the workspace sources, the rebuilt Python wheel and the
+The gates use the workspace sources, the rebuilt Python wheel and the
 console lockfile. No GPU, external database or broker is required for these
 checks.
 
@@ -49,8 +49,3 @@ npm run build
 
 This checks both TypeScript projects and builds the production assets. Backend
 console tests run as part of `cargo test --workspace`.
-
-The [acceptance record](redesign.md) records historical outcomes and limitations,
-including adapters that have since been removed.
-GPU demos and historical performance reports are separate from these gates; they
-must not be interpreted as current execution-protocol benchmark results.

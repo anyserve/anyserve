@@ -1,10 +1,8 @@
 # Execution Architecture
 
 Anyserve is a backend-independent execution and scheduling system. This page
-describes the native Client/Worker contract and the current Runtime. The
-[redesign acceptance record](redesign.md) and reference reviews preserve earlier
-decisions and evidence. For startup, restart and migration procedures, read
-[deployment and recovery](deployment.md).
+describes the native Client/Worker contract and the Runtime. For startup,
+restart and recovery procedures, read [deployment and recovery](deployment.md).
 
 ## System boundary
 
@@ -228,8 +226,7 @@ defaults and overflow behavior.
 The optional `[console]` listener serves management views, `/healthz`, `/readyz`
 and `/metrics`. It does not expose Submit/Invoke execution ingress. All clients
 use the native gRPC services; application workers own any backend protocol
-translation. Provider compatibility gateways and the built-in backend proxy are
-outside the core.
+translation.
 
 Prometheus gauges expose the shared Runtime's retained job states, connected
 workers, active leases, per-interface queues/capacity and input/result/event byte
@@ -257,7 +254,5 @@ Paths below are relative to the repository root.
 | CLI startup/configuration, job commands and management API | `crates/anyserve-cli/src/` |
 | Python API and native binding | `clients/python/python/anyserve/`, `clients/python/src/` |
 
-Use [testing](testing.md) to validate implementation changes. The
-[2026-10-19 load results](benchmark-results.md) record mock-backend measurements
-for specific revisions and a single host; they do not establish GPU throughput,
-WAN latency or a universal capacity limit.
+Use [testing](testing.md) to validate implementation changes and the
+[benchmark method](benchmark.md) to measure the control plane with mock workers.

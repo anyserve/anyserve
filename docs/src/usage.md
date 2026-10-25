@@ -45,7 +45,6 @@ serve(echo, endpoint="http://127.0.0.1:50052")
 The handler may instead execute a model or call another service. Tensor encoding,
 model validation, engine/session lifetime and application-specific retry safety
 belong to the worker and its caller. The Runtime routes opaque bytes and metadata.
-There is no built-in backend proxy or provider protocol conversion.
 
 ## Submit or invoke
 
@@ -108,8 +107,7 @@ assessing whether a particular application can execute work. gRPC health alone
 also does not establish backend readiness.
 
 Metrics apply to native traffic regardless of which SDK submits it. State gauges
-cover retained jobs; expired jobs leave those counts. The former HTTP-gateway
-latency histogram is removed with that gateway. The current management exporter
+cover retained jobs; expired jobs leave those counts. The management exporter
 does not provide per-request latency histograms or distributed trace export.
 
 The native client and server accept gRPC messages up to 64 MiB including protobuf

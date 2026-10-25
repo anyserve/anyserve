@@ -1,8 +1,7 @@
 # Anyserve Python SDK
 
 The package uses the native Rust transport for the current execution protocol.
-Use the SDK and control-plane binary from the same release. Python 3.12+ is
-required; the 0.4 control-plane protocol is not supported by this source tree.
+Use the SDK and control-plane binary from the same release. Python 3.12+ is required.
 
 Install from this checkout with `pip install ./clients/python`. Build and test
 instructions are in [the workspace testing guide](../../docs/src/testing.md).

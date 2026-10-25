@@ -161,9 +161,6 @@ const SCHEMA: &[&str] = &[
         metadata_json TEXT NOT NULL,
         PRIMARY KEY (job_id, role, idx)
     )",
-    // Earlier versions kept a per-attempt table nothing read; recovery and
-    // receipts use the job row.
-    "DROP TABLE IF EXISTS journal_attempts",
 ];
 
 const ROLE_INPUT: &str = "input";
@@ -847,29 +844,6 @@ mod tests {
         assert!(verify(&mut conn, &start("j", 1)).await.unwrap());
         assert!(!verify(&mut conn, &start("j", 2)).await.unwrap());
         assert!(!verify(&mut conn, &start("missing", 1)).await.unwrap());
-        conn.close().await.unwrap();
-        journal.close().await;
-    }
-
-    #[tokio::test]
-    async fn an_earlier_journal_loses_its_attempt_table() {
-        let config = config("earlier");
-        std::fs::create_dir_all(config.path.parent().unwrap()).unwrap();
-        let mut conn = connect(&config).await;
-        sqlx::query("CREATE TABLE journal_attempts (attempt_id TEXT PRIMARY KEY)")
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        conn.close().await.unwrap();
-        let (journal, _) = Journal::open(&config).await.unwrap();
-        let mut conn = connect(&config).await;
-        let tables: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'journal_attempts%'",
-        )
-        .fetch_one(&mut conn)
-        .await
-        .unwrap();
-        assert_eq!(tables, 0);
         conn.close().await.unwrap();
         journal.close().await;
     }

@@ -1,7 +1,6 @@
 # Deployment and Recovery
 
-This page applies to the current 0.5.0 execution architecture. Start with
-[usage](usage.md) for a local walkthrough and [configuration](configuration.md)
+Start with [usage](usage.md) for a local walkthrough and [configuration](configuration.md)
 for field defaults. The [architecture](architecture.md) explains job and commit
 semantics.
 
@@ -108,30 +107,3 @@ progress. It does not require available workers. Check the management worker
 view for connectivity, advertised interfaces and capacity, and let application
 workers enforce backend health. Journal failure can make readiness false while
 unrelated ephemeral work continues.
-
-## Migration from 0.4
-
-Use matching 0.5 binary, Rust/Python SDKs and protocol. Package version 0.5.0
-uses the `anyserve.v2` wire namespace. The old control-plane protocol, generic
-named streams and worker polling RPCs are removed.
-
-Drain the old deployment, preserve its original data for rollback and start the
-new release with a fresh journal. Replace `[server.storage]` and
-`[server.frames]` with `[runtime]` and optional `[journal]`; obsolete keys are
-rejected. There is no in-place upgrade of the 0.4 SQL schema. Rollback uses the
-previous binary/SDK with its corresponding original data.
-
-## Removed compatibility adapters
-
-OpenAI-compatible HTTP endpoints, generic HTTP invocation/forwarding and the
-CLI's built-in backend worker have been removed. `[openai]` and `[invoke]` are
-rejected configuration sections; there is no disabled compatibility mode.
-Clients use the native SDK or Client gRPC service. Application workers use the
-Worker SDK and keep backend-specific clients and model validation in their own
-code. The production CLI provides `serve` and `job` commands.
-
-Move monitoring from the former invocation listener to the `[console]` management
-listener (default `127.0.0.1:3001` when configured). `/metrics` covers shared
-Runtime state and requires a client token if auth is enabled. `/healthz` is a
-public liveness probe; `/readyz` is a public Runtime readiness probe. The former
-HTTP-invocation duration histogram is removed with its gateway.

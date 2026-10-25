@@ -1,7 +1,6 @@
 # Summary
 
 - [Overview](index.md)
-- [Positioning and Roadmap](roadmap.md)
 
 # Run Anyserve
 
@@ -18,10 +17,3 @@
 
 - [Testing](testing.md)
 - [Benchmark Method](benchmark.md)
-- [Load Benchmark Results (2026-10-19)](benchmark-results.md)
-
-# Design history
-
-- [0.5 Redesign Acceptance (2026-10-18)](redesign.md)
-- [Runtime Reference Review](reference-architectures.md)
-- [Inference Routing Reference Review](inference-routing-research.md)

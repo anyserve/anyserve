@@ -7,23 +7,15 @@ connect outbound and own their backends.
 
 The control plane is a single process. Invoke handles ephemeral live requests;
 Submit defaults to recoverable execution with complete input in an optional
-SQLite journal. A short restart can recover durable jobs within their attempt
-budget. Live output history and ephemeral jobs do not survive restart.
+SQLite journal. A short restart recovers durable jobs within their attempt
+budget. Live output history and ephemeral jobs do not survive a restart.
 
 ## Reading guide
 
-| Goal | Read | Status |
-|---|---|---|
-| Decide whether anyserve fits an edge or embodied-AI deployment | [Positioning and roadmap](roadmap.md) | Current direction, with the measurements behind it |
-| Start a server and worker | [Usage](usage.md) | Current walkthroughs |
-| Understand jobs, placement, streams and persistence | [Execution architecture](architecture.md) | Current native execution implementation |
-| Choose a topology, restart or migrate | [Deployment and recovery](deployment.md), [workers across clusters](edge.md) | Current operating boundaries |
-| Set admission, memory and journal limits | [Configuration](configuration.md) | Current defaults and overflow behavior |
-| Validate a code change | [Testing](testing.md), [benchmark method](benchmark.md) | Commands to run against the checkout being changed |
-| Read historical control-plane measurements | [Load benchmark results](benchmark-results.md) | Recorded on 2026-10-19; includes subsequently removed adapters |
-| Trace the redesign and its evidence | [0.5 acceptance record](redesign.md), [runtime references](reference-architectures.md), [routing references](inference-routing-research.md) | Historical records from 2026-10-18 |
-
-The architecture and configuration pages describe the running system. Historical
-acceptance results apply to their recorded revision; rerun the testing commands
-to establish the status of another checkout. Reference reviews explain design
-inputs and do not expand the supported API or deployment topology.
+| Goal | Read |
+|---|---|
+| Start a server and worker | [Usage](usage.md) |
+| Understand jobs, placement, streams and persistence | [Execution architecture](architecture.md) |
+| Choose a topology, restart or migrate | [Deployment and recovery](deployment.md), [workers across clusters](edge.md) |
+| Set admission, memory and journal limits | [Configuration](configuration.md) |
+| Validate a code change | [Testing](testing.md), [benchmark method](benchmark.md) |

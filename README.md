@@ -79,23 +79,19 @@ Configure separate client and worker tokens before remote access. The job CLI
 and native clients read `ANYSERVE_TOKEN`; application workers use a worker-role
 token. `job ls`, `job inspect <id>` and `job cancel <id>` use the native API.
 
-## Management and compatibility boundary
+## Management
 
 When `[console]` is enabled, its listener exposes the console API plus
 `/healthz`, `/readyz` and `/metrics`. Metrics describe the shared Runtime,
 interfaces, workers, byte budgets and journal. Job state gauges count entries
-currently retained in memory. They are not cumulative completion counters.
-With authentication enabled, `/metrics` and console reads require a client token;
-health probes remain accessible without one.
+currently retained in memory, not cumulative completions. With authentication
+enabled, `/metrics` and console reads require a client token; health probes
+remain accessible without one.
 
-The core exposes the native `anyserve.v2` Client and Worker services. Provider
-compatibility gateways, generic HTTP invocation/forwarding and the CLI's built-in
-backend worker have been removed. Old `[openai]` and `[invoke]` sections are
-rejected. Applications connect their own workers using the SDK instead.
-
-Use matching binary, SDK and protocol versions. The 0.4 protocol and databases
-are not upgraded in place: drain old work, preserve its data and start 0.5 with
-a fresh journal. See [deployment and recovery](docs/src/deployment.md).
+The core exposes the native `anyserve.v2` Client and Worker services only.
+Applications connect their own workers with the SDK and keep backend protocols,
+model loading and batching in worker code. Use matching binary, SDK and protocol
+versions; see [deployment and recovery](docs/src/deployment.md).
 
 ## Repository and documentation
 
@@ -109,6 +105,3 @@ a fresh journal. See [deployment and recovery](docs/src/deployment.md).
 
 Start with the [reading guide](docs/src/index.md), [architecture](docs/src/architecture.md),
 [configuration](docs/src/configuration.md) and [testing](docs/src/testing.md).
-The [2026-10-19 benchmark report](bench/load/RESULTS.md) and
-[0.5 acceptance record](docs/src/redesign.md) preserve results for their recorded
-revisions, including adapters that have since been removed.

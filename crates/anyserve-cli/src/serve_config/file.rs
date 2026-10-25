@@ -63,16 +63,7 @@ impl AnyserveConfigFile {
     pub(super) fn load(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("read config file {}", path.display()))?;
-        let value: toml::Value = toml::from_str(&raw).context("parse TOML")?;
-        if value
-            .get("server")
-            .is_some_and(|server| server.get("storage").is_some() || server.get("frames").is_some())
-        {
-            anyhow::bail!(
-                "server.storage and server.frames were replaced by [journal]; see docs/src/deployment.md#migration-from-04"
-            );
-        }
-        toml::from_str(&raw).with_context(|| format!("parse config file {}; for 0.4 configuration migration see docs/src/deployment.md#migration-from-04", path.display()))
+        toml::from_str(&raw).with_context(|| format!("parse config file {}", path.display()))
     }
 }
 

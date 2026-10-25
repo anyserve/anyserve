@@ -2,7 +2,6 @@
 dump.rdb
 
 /target
-/.mise
 /.direnv
 /docs/book
 **/*.rs.bk

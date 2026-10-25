@@ -139,7 +139,7 @@ export function JobInspector(props: {
         meta="Attempts and retained execution events"
       >
         <InspectorSection title="Attempts">
-          {detail.history_incomplete ? <p role="status">历史不完整 / Incomplete history: earlier execution events are no longer retained.</p> : null}
+          {detail.history_incomplete ? <p role="status">Incomplete history: earlier execution events are no longer retained.</p> : null}
           <AttemptsTimeline attempts={detail.attempts} />
         </InspectorSection>
 
