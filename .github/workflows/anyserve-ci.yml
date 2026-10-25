@@ -56,3 +56,36 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bench/load/run.sh --cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-summary
+          path: bench/load/results/*/summary.md
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/anyserve
+      - run: helm template anyserve deploy/helm/anyserve --set worker.enabled=true --set worker.image=example/worker --set auth.clientTokens[0]=c --set auth.workerTokens[0]=w > /dev/null

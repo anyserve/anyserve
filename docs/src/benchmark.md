@@ -10,7 +10,11 @@ bench/load/run.sh
 ```
 
 Each run builds release `anyserve` and `anyserve-bench` binaries, then executes
-S1–S5 at concurrency 1, 16 and 64. Each case has a fresh production control-plane
+S1–S5 at concurrency 1, 16 and 64. `--cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2`
+runs a subset with short windows twice and fails when a gated p50 drifts 10% or
+more between the repeats; CI runs exactly that to keep the harness and the
+runtime's repeatability in check. Such numbers are not comparable with full
+runs on another host. Each case has a fresh production control-plane
 process, fresh FULL-sync SQLite journal, authentication disabled and management
 HTTP disabled. Native worker processes number `max(4, C/8)`, with 16 slots each.
 
@@ -47,7 +51,8 @@ logical CPU; worker resource figures sum all worker processes. RSS peaks are
 sampling maxima rather than continuous peak measurements.
 
 Compare matching rows using `abs(second.p50_ms / first.p50_ms - 1) * 100`;
-every gated row must differ by less than 10%. S5 uses durable-subrow p50 and
+every gated row must differ by less than 10%. `--repeat 2` applies that gate
+automatically within one invocation. S5 uses durable-subrow p50 and
 aggregate throughput as gates. Its Invoke latency and bimodal aggregate p50 are
 informational because closed-loop clients switch between Invoke and fsync-bound
 Submit. Preserve both runs when a gate fails.

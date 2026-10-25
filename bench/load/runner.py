@@ -146,9 +146,20 @@ def summary_table(rows, threads=None):
     return lines
 
 
+def gated_p50(row):
+    if row["scenario"] == "S5" and row.get("by_path"):
+        return row["by_path"]["S3"]["p50_ms"]
+    return row["p50_ms"]
+
+
+def seconds(value):
+    return float(value[:-2]) / 1000 if value.endswith("ms") else float(value.rstrip("s"))
+
+
 class Run:
-    def __init__(self, profile, keep):
-        self.profile, self.keep = profile, keep
+    def __init__(self, profile, keep, cases=None, duration="20s", warmup="5s", repeat=1):
+        self.profile, self.keep, self.cases = profile, keep, cases
+        self.duration, self.warmup, self.repeat = duration, warmup, repeat
         self.env = dict(os.environ, RUST_LOG="warn")
         # The control plane must use the production default even if the shell
         # running this script has a Tokio override. Load roles are sized below.
@@ -179,7 +190,7 @@ class Run:
             "control_thread_source": "production default; TOKIO_WORKER_THREADS unset",
             "worker_processes": "max(4, concurrency // 8)", "worker_concurrency": 16,
             "native_channel_default": "min(concurrency, 8); tasks round-robin over independently connected channels",
-            "duration_seconds": 20, "warmup_seconds": 5, "sample_interval_seconds": 0.5,
+            "duration_seconds": seconds(duration), "warmup_seconds": seconds(warmup), "repeat": repeat, "sample_interval_seconds": 0.5,
             "cpu_percent_unit": "100% is one fully used logical CPU; workers are summed",
             "latency_scope": "successful requests started after warmup; requests crossing the stop clock are drained",
             "runtime_scope": "fresh process and FULL SQLite journal per case; default runtime limits",
@@ -236,9 +247,9 @@ class Run:
             workers.append(item)
         return workers
 
-    def case(self, scenario, concurrency, keep):
+    def case(self, scenario, concurrency, keep, suffix=""):
         self.workers_per_case = max(4, concurrency // 8)
-        name = f"S{scenario}-c{concurrency}"
+        name = f"S{scenario}-c{concurrency}{suffix}"
         directory = self.out / name
         directory.mkdir()
         grpc_port = free_port()
@@ -267,7 +278,7 @@ enabled = false
         workers = self.workers(directory, endpoint, scenario)
         processes.extend(workers)
         raw = directory / "client.json"
-        client = self.spawn([self.bin, "client", "--endpoint", endpoint, "--scenario", f"S{scenario}", "--concurrency", str(concurrency), "--duration", "20s", "--warmup", "5s", "--payload", "256", "--out", raw], directory / "client.log", "client")
+        client = self.spawn([self.bin, "client", "--endpoint", endpoint, "--scenario", f"S{scenario}", "--concurrency", str(concurrency), "--duration", self.duration, "--warmup", self.warmup, "--payload", "256", "--out", raw], directory / "client.log", "client")
         sampler = Sampler(processes + [client])
         samples = [sampler.sample()]
         print(f"running {name}; control pid={control[1].pid}", flush=True)
@@ -329,9 +340,25 @@ enabled = false
     def run(self):
         try:
             self.build()
-            cases = [(1, 64), (2, 16), (3, 16)] if self.profile else [(s, c) for s in range(1, 6) for c in (1, 16, 64)]
-            for index, (scenario, concurrency) in enumerate(cases):
-                self.case(scenario, concurrency, self.keep and index == len(cases) - 1)
+            if self.cases:
+                cases = [(int(s[1:]), int(c[1:])) for s, c in (case.split("-") for case in self.cases)]
+            else:
+                cases = [(1, 64), (2, 16), (3, 16)] if self.profile else [(s, c) for s in range(1, 6) for c in (1, 16, 64)]
+            for round_index in range(self.repeat):
+                suffix = f"-r{round_index + 1}" if self.repeat > 1 else ""
+                for index, (scenario, concurrency) in enumerate(cases):
+                    last = round_index == self.repeat - 1 and index == len(cases) - 1
+                    self.case(scenario, concurrency, self.keep and last, suffix)
+            if self.repeat > 1:
+                # The method's repeatability gate: paired runs must agree on every gated p50.
+                groups = {}
+                for row in self.rows:
+                    groups.setdefault((row["scenario"], row["concurrency"]), []).append(gated_p50(row))
+                drift = max(max(values) / min(values) - 1 for values in groups.values())
+                self.meta["repeat_p50_drift"] = drift
+                print(f"p50 drift between repeats: {drift:.1%}", flush=True)
+                if drift >= 0.10:
+                    raise RuntimeError(f"p50 drifted {drift:.1%} between repeats; the method requires under 10%")
             self.summary()
             print(self.out / "summary.md", flush=True)
         except BaseException as error:
@@ -348,12 +375,16 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--keep", action="store_true", help="leave the final production server and echo workers; print their PIDs")
     mode.add_argument("--profile", action="store_true", help="separately sample S1/c64, S2/c16 and S3/c16; emit per-case flamegraphs")
+    parser.add_argument("--cases", help="comma-separated cases such as S1-c16,S3-c16; default is the full matrix")
+    parser.add_argument("--duration", default="20s", help="measurement window per case")
+    parser.add_argument("--warmup", default="5s", help="warm-up before each measurement")
+    parser.add_argument("--repeat", type=int, default=1, help="run the cases this many times and fail if a gated p50 drifts 10%% or more")
     args = parser.parse_args()
     # Python must run cleanup on SIGTERM as well as Ctrl-C.
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
-    Run(args.profile, args.keep).run()
+    Run(args.profile, args.keep, args.cases.split(",") if args.cases else None, args.duration, args.warmup, args.repeat).run()
 
 
 if __name__ == "__main__":
