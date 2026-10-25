@@ -92,7 +92,7 @@ remain accessible without one.
 The core exposes the native `anyserve.v2` Client and Worker services only.
 Applications connect their own workers with the SDK and keep backend protocols,
 model loading and batching in worker code. Use matching binary, SDK and protocol
-versions; see [deployment and recovery](docs/src/deployment.md).
+versions; see [deployment and recovery](docs/deployment.md).
 
 ## Repository and documentation
 
@@ -105,5 +105,7 @@ versions; see [deployment and recovery](docs/src/deployment.md).
 - `bench/load`: native execution workloads and separate CPU profiling.
 - `deploy/helm/anyserve`: Helm chart for one control plane, its journal volume and an optional worker fleet.
 
-Start with the [reading guide](docs/src/index.md), [architecture](docs/src/architecture.md),
-[configuration](docs/src/configuration.md) and [testing](docs/src/testing.md).
+Start with [getting started](docs/getting-started.md). References cover
+[configuration](docs/configuration.md), the [Python SDK](docs/python-sdk.md),
+[architecture](docs/architecture.md), [deployment](docs/deployment.md) and
+[contributing and benchmarks](docs/contributing.md).
