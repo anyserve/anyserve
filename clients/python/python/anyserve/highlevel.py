@@ -23,6 +23,19 @@ _CODEC_BYTES = "bytes"
 _CODEC_JSON = "json"
 
 
+class WorkerError(Exception):
+    """A failure the handler reports for its attempt.
+
+    ``retryable=True`` lets the control plane start another attempt, possibly
+    on another worker, within the job's attempt budget. Any other exception
+    raised by a handler fails the attempt without a retry.
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 @dataclass(frozen=True)
 class HandlerSpec:
     interface: str
@@ -260,7 +273,8 @@ def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -
         if code in _TRANSPORT_RPC_CODES or code in _RETIRED_RPC_CODES:
             raise
         if not attempt.cancelled:
-            attempt.fail(_failure_reason(exc), retryable=code == 8)
+            retryable = getattr(exc, "retryable", code == 8)
+            attempt.fail(_failure_reason(exc), retryable=bool(retryable))
 
 
 def _input_fragments(attempt: Any):
@@ -295,6 +309,8 @@ def _encode_payload(codec: str, value: Any) -> bytes:
 
 
 def _failure_reason(exc: Exception) -> str:
+    if isinstance(exc, WorkerError):
+        return str(exc)
     return f"{exc.__class__.__name__}: {exc}"
 
 

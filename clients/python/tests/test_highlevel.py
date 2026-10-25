@@ -7,7 +7,7 @@ import unittest
 from collections import deque
 from unittest.mock import patch
 
-from anyserve import ExecutionClient, RpcError, ExecutionOptions, get_handler_spec, serve, worker
+from anyserve import ExecutionClient, RpcError, ExecutionOptions, WorkerError, get_handler_spec, serve, worker
 from anyserve.execution import _terminal_outputs
 from anyserve.highlevel import _process_assignment
 
@@ -134,6 +134,23 @@ class HighLevelTests(unittest.TestCase):
         assignment = Assignment()
         _process_assignment(failing, failing.spec, assignment)
         self.assertEqual(assignment.attempt.failure, ("ValueError: bad input", False))
+
+    def test_worker_error_sets_the_failure_message_and_retryability(self):
+        @worker(interface="flaky")
+        def flaky(_):
+            raise WorkerError("backend unreachable", retryable=True)
+
+        assignment = Assignment()
+        _process_assignment(flaky, flaky.spec, assignment)
+        self.assertEqual(assignment.attempt.failure, ("backend unreachable", True))
+
+        @worker(interface="strict")
+        def strict(_):
+            raise WorkerError("malformed request")
+
+        assignment = Assignment()
+        _process_assignment(strict, strict.spec, assignment)
+        self.assertEqual(assignment.attempt.failure, ("malformed request", False))
 
     def test_generator_cancellation_closes_the_generator_and_never_completes(self):
         cleaned = threading.Event()

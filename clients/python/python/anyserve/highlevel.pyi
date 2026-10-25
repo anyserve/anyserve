@@ -14,6 +14,10 @@ class HandlerSpec:
     pass_context: bool
     streaming_input: bool
 
+class WorkerError(Exception):
+    retryable: bool
+    def __init__(self, message: str, *, retryable: bool = ...) -> None: ...
+
 class WorkerHandler:
     spec: HandlerSpec
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...

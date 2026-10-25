@@ -1,6 +1,6 @@
 from typing import Any, TypedDict
 from .execution import ExecutionClient as ExecutionClient, ExecutionClient as AnyserveClient, ExecutionOptions as ExecutionOptions, ExecutionEvents as ExecutionEvents
-from .highlevel import HandlerSpec as HandlerSpec, WorkerHandler as WorkerHandler, get_handler_spec as get_handler_spec, serve as serve, worker as worker
+from .highlevel import HandlerSpec as HandlerSpec, WorkerError as WorkerError, WorkerHandler as WorkerHandler, get_handler_spec as get_handler_spec, serve as serve, worker as worker
 
 class ObjectRef(TypedDict, total=False):
     inline: bytes

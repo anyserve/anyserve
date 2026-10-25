@@ -52,7 +52,9 @@ PermissionDenied, Unauthenticated) propagate to the caller. Transport failures
 are logged and reconnect; a server Drain stops this session's new assignments,
 and the worker reconnects when the session ends. It keeps in-flight handlers
 until completion or cancellation/fencing from the server. Python callbacks cancel
-cooperatively. A local interrupt stops serving.
+cooperatively. A local interrupt stops serving. Raise `WorkerError(message,
+retryable=True)` when the backend is unreachable so the control plane can run
+another attempt elsewhere; any other exception fails the attempt without a retry.
 
 The native attempt transport retries delivery with exponential backoff and
 jitter, bounded by four negotiated heartbeat timeouts per open/commit operation.
