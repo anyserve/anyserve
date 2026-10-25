@@ -6,3 +6,4 @@ docs/book
 clients/python/dist
 **/__pycache__
 **/.venv
+bench/load/results

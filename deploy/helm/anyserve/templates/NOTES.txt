@@ -1,0 +1,16 @@
+Control plane: {{ include "anyserve.fullname" . }}.{{ .Release.Namespace }}.svc
+  gRPC (clients and workers)  http://{{ include "anyserve.fullname" . }}:{{ .Values.service.grpcPort }}
+  management API and metrics  http://{{ include "anyserve.fullname" . }}:{{ .Values.service.httpPort }}
+{{- if include "anyserve.authEnabled" . }}
+Tokens: Secret {{ include "anyserve.secretName" . }} (ANYSERVE_CLIENT_TOKENS, ANYSERVE_WORKER_TOKENS, ANYSERVE_WORKER_TOKEN).
+Clients set ANYSERVE_TOKEN to a client token; workers to a worker token.
+{{- else }}
+Authentication is off: set auth.clientTokens and auth.workerTokens before exposing the service.
+{{- end }}
+{{- if .Values.worker.enabled }}
+Workers: Deployment {{ include "anyserve.fullname" . }}-worker ({{ .Values.worker.replicas }} replicas) connects outbound to the control plane.
+{{- end }}
+
+Try it from your machine:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "anyserve.fullname" . }} {{ .Values.service.grpcPort }} {{ .Values.service.httpPort }}
+  curl -s http://127.0.0.1:{{ .Values.service.httpPort }}/readyz -o /dev/null -w '%{http_code}\n'

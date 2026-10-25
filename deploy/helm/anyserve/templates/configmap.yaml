@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "anyserve.fullname" . }}
+  labels:
+    {{- include "anyserve.labels" . | nindent 4 }}
+data:
+  server.toml: |
+    [server]
+    grpc_host = "0.0.0.0"
+    grpc_port = {{ .Values.service.grpcPort }}
+
+    [console]
+    listen = "0.0.0.0:{{ .Values.service.httpPort }}"
+
+    [journal]
+    enabled = {{ .Values.journal.enabled }}
+    path = "/data/journal.sqlite"
+    {{- if include "anyserve.authEnabled" . }}
+
+    [auth]
+    client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
+    worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+    {{- end }}
+    {{- with .Values.runtime }}
+
+    [runtime]
+    {{- range $key, $value := . }}
+    {{ $key }} = {{ $value | toJson }}
+    {{- end }}
+    {{- end }}

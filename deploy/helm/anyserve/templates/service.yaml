@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "anyserve.fullname" . }}
+  labels:
+    {{- include "anyserve.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "anyserve.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http

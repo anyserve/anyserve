@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "anyserve.fullname" . }}
+  labels:
+    {{- include "anyserve.labels" . | nindent 4 }}
+    app.kubernetes.io/component: control-plane
+spec:
+  # One execution domain is one process: the journal has a single owner.
+  replicas: 1
+  serviceName: {{ include "anyserve.fullname" . }}
+  selector:
+    matchLabels:
+      {{- include "anyserve.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: control-plane
+  template:
+    metadata:
+      labels:
+        {{- include "anyserve.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: control-plane
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: anyserve
+          image: {{ include "anyserve.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/anyserve/server.toml"]
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+          {{- if include "anyserve.authEnabled" . }}
+          envFrom:
+            - secretRef:
+                name: {{ include "anyserve.secretName" . }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          volumeMounts:
+            - name: config
+              mountPath: /etc/anyserve
+              readOnly: true
+            {{- if .Values.journal.enabled }}
+            - name: journal
+              mountPath: /data
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "anyserve.fullname" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.journal.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: journal
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.journal.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.journal.size }}
+  {{- end }}

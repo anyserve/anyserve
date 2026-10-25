@@ -11,17 +11,47 @@ configured admission/session limits allow. Workers may run on the same host,
 other hosts or separate clusters. They establish outbound gRPC connections to
 the control plane and own their backend calls.
 
-Use a persistent filesystem for the SQLite journal when durable jobs must
-survive process replacement. The journal has an exclusive process lock. A
-second active control plane cannot share it. Worker replicas scale backend
-capacity; placing several control planes behind a load balancer does not provide
-shared jobs, sessions or recovery. Any independent control plane owns a separate
-journal and execution domain.
+A control plane and its journal form one execution domain: jobs, sessions and
+recovery are scoped to it. Add workers to scale execution capacity. Scale out
+by running more domains, one per site, cluster or tenant, each with its own
+journal and endpoint; a client talks to one domain and a worker connects to
+one. No shared database is involved. An active control plane keeps its whole
+state in memory under one lock and recovers durable jobs from the journal after
+a short restart, so a shared store would add a round trip to every transition
+without adding a guarantee the journal does not already give. Several control
+planes behind one load balancer do not form a single domain.
 
-For Kubernetes, keep the control-plane replica count at one and ensure the old
-process has exited before its replacement opens the journal. GPU scheduling and
+Use a persistent filesystem for the SQLite journal when durable jobs must
+survive process replacement. The journal has an exclusive process lock; the
+replacement starts after the previous owner has exited. GPU scheduling and
 worker autoscaling belong to the deployment platform. Cross-cluster locality and
 spillover are described in [workers across clusters](edge.md).
+
+## Kubernetes
+
+The Helm chart in `deploy/helm/anyserve` deploys one execution domain:
+
+- a one-replica StatefulSet running `anyserve serve`, with the journal on a
+  PersistentVolumeClaim, HTTP liveness and readiness probes on the management
+  listener, and a termination grace period for draining workers;
+- a Service exposing gRPC and the management API;
+- a Secret with client and worker tokens, read through `client_tokens_env` and
+  `worker_tokens_env`, or an existing Secret of your own;
+- an optional worker Deployment for an application image that receives
+  `ANYSERVE_ENDPOINT` and `ANYSERVE_TOKEN`.
+
+Application clients inside the cluster use the Service name as their endpoint
+and a client token from the same Secret. Keep the StatefulSet at one replica; a
+rolling update replaces the pod after the old one has exited, which is the
+restart procedure below.
+
+```bash
+helm install anyserve deploy/helm/anyserve \
+  --set auth.clientTokens[0]=CLIENT_TOKEN --set auth.workerTokens[0]=WORKER_TOKEN
+```
+
+Container images are published to `ghcr.io/anyserve/anyserve` by the release
+workflow; the chart defaults to the tag matching its `appVersion`.
 
 ## Listeners and credentials
 

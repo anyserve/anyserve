@@ -70,9 +70,9 @@ From a terminal with the same Python environment:
 python examples/python/submit.py
 ```
 
-The [Python examples](examples/python/README.md) include an echo worker and
-native duplex video processing. The [Rust example](examples/rust) uses the same
-protocol. Applications supply backend-specific worker code; the CLI starts the
+The [Python examples](examples/python/README.md) include an echo worker, a
+worker that fronts a Triton Inference Server model and native duplex video
+processing. The [Rust example](examples/rust) uses the same protocol. Applications supply backend-specific worker code; the CLI starts the
 control plane and inspects/cancels jobs.
 
 Configure separate client and worker tokens before remote access. The job CLI
@@ -100,8 +100,9 @@ versions; see [deployment and recovery](docs/src/deployment.md).
 - `crates/anyserve-client`: native clients and bounded worker transport.
 - `crates/anyserve-cli`: control-plane startup, job CLI and management API.
 - `clients/python`: Python bindings and the application worker API.
-- `console`: views of jobs, workers and retained execution events.
+- `console`: views of interfaces, jobs, workers and retained execution events.
 - `bench/load`: native execution workloads and separate CPU profiling.
+- `deploy/helm/anyserve`: Helm chart for one control plane, its journal volume and an optional worker fleet.
 
 Start with the [reading guide](docs/src/index.md), [architecture](docs/src/architecture.md),
 [configuration](docs/src/configuration.md) and [testing](docs/src/testing.md).

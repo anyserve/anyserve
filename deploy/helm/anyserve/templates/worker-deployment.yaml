@@ -1,0 +1,62 @@
+{{- if .Values.worker.enabled }}
+{{- if not .Values.worker.image }}
+{{- fail "worker.image is required when worker.enabled is true" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "anyserve.fullname" . }}-worker
+  labels:
+    {{- include "anyserve.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      {{- include "anyserve.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "anyserve.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.worker.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.worker.args }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: ANYSERVE_ENDPOINT
+              value: http://{{ include "anyserve.fullname" . }}:{{ .Values.service.grpcPort }}
+            {{- if include "anyserve.authEnabled" . }}
+            - name: ANYSERVE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "anyserve.secretName" . }}
+                  key: ANYSERVE_WORKER_TOKEN
+            {{- end }}
+            {{- with .Values.worker.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.worker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

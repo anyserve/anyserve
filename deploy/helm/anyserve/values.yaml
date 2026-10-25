@@ -1,0 +1,50 @@
+image:
+  repository: ghcr.io/anyserve/anyserve
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Bearer tokens for the two roles. With both lists empty the control plane
+# accepts any caller; do that only on a trusted network. Set existingSecret to
+# a Secret that carries ANYSERVE_CLIENT_TOKENS and ANYSERVE_WORKER_TOKENS
+# (comma-separated) and ANYSERVE_WORKER_TOKEN (the token the worker fleet
+# uses) instead of putting tokens in values.
+auth:
+  clientTokens: []
+  workerTokens: []
+  existingSecret: ""
+
+# The durable journal lives on a PersistentVolumeClaim. Disabling it keeps
+# execution in memory: durable Submit is rejected and nothing survives restart.
+journal:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+# Scalar [runtime] keys written into server.toml, for example
+# max_attempts: 5 or consumer_stall_timeout_ms: 10000.
+runtime: {}
+
+service:
+  type: ClusterIP
+  grpcPort: 50052
+  httpPort: 3001
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# An optional application worker fleet. The image carries your handler and the
+# anyserve SDK; the pod receives ANYSERVE_ENDPOINT and ANYSERVE_TOKEN, so a
+# Python worker can run with args such as ["--endpoint", "$(ANYSERVE_ENDPOINT)"].
+worker:
+  enabled: false
+  replicas: 1
+  image: ""
+  command: []
+  args: []
+  env: []
+  resources: {}
+  nodeSelector: {}
+  tolerations: []

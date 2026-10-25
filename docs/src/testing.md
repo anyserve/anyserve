@@ -49,3 +49,14 @@ npm run build
 
 This checks both TypeScript projects and builds the production assets. Backend
 console tests run as part of `cargo test --workspace`.
+
+## Deployment
+
+```bash
+helm lint deploy/helm/anyserve
+docker build -t anyserve .
+```
+
+CI runs the same checks, builds the container image and runs a short
+[benchmark](benchmark.md) subset on every change; tagged releases publish
+binaries, the Python package and the image.
