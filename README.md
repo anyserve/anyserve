@@ -101,7 +101,7 @@ versions; see [deployment and recovery](docs/src/deployment.md).
 - `crates/anyserve-client`: native clients and bounded worker transport.
 - `crates/anyserve-cli`: control-plane startup, job CLI and management API.
 - `clients/python`: Python bindings and the application worker API.
-- `console`: views of interfaces, jobs, workers and events, and a Setup page that generates `server.toml`.
+- `console`: views of interfaces, jobs, workers and retained execution events.
 - `bench/load`: native execution workloads and separate CPU profiling.
 - `deploy/helm/anyserve`: Helm chart for one control plane, its journal volume and an optional worker fleet.
 

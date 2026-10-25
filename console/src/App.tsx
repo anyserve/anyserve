@@ -49,6 +49,7 @@ export default function App() {
     }
   }
 
+  const polling = !authRequired;
   const activeSelectedJobId =
     activeTab === "history"
       ? selectedHistoryJobId
@@ -86,7 +87,7 @@ export default function App() {
     },
     activeTab === "queue" ? OVERVIEW_POLL_MS : 2_000,
     [activeTab],
-    !authRequired,
+    polling,
   );
 
   usePollingEffect(
@@ -101,7 +102,7 @@ export default function App() {
     },
     activeTab === "queue" ? QUEUE_POLL_MS : 3_000,
     [activeTab],
-    !authRequired,
+    polling,
   );
 
   usePollingEffect(
@@ -116,7 +117,7 @@ export default function App() {
     },
     activeTab === "history" ? 2_000 : HISTORY_POLL_MS,
     [activeTab],
-    !authRequired,
+    polling,
   );
 
   usePollingEffect(
@@ -131,7 +132,7 @@ export default function App() {
     },
     activeTab === "workers" ? 2_000 : WORKERS_POLL_MS,
     [activeTab],
-    !authRequired,
+    polling,
   );
 
   useEffect(() => {
@@ -158,7 +159,7 @@ export default function App() {
     },
     activeTab === "queue" ? DETAIL_POLL_MS : 2_000,
     [activeTab, activeSelectedJobId],
-    !authRequired && activeSelectedJobId !== null,
+    polling && activeSelectedJobId !== null,
   );
 
   const queueSelection = useMemo(
@@ -310,35 +311,27 @@ export default function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <div className="topbar__row">
-          <div className="topbar__brand">
-            <div className="topbar__title">Anyserve Console</div>
-            <div className="topbar__meta">
-              <span>Mode</span>
-              <strong>{overview?.runtime.label ?? "Loading"}</strong>
-            </div>
-          </div>
-
-          <div className="topbar__status">
-            <span className="topbar__live">Live</span>
-            <span>Refreshed</span>
-            <strong>{formatTimestamp(overview?.refreshed_at_ms ?? null)}</strong>
-          </div>
+        <div className="topbar__brand">
+          <span className="topbar__mark" aria-hidden="true" />
+          Anyserve
         </div>
-
-        <div className="topbar__row topbar__row--nav">
-          <nav className="tabs" aria-label="Console sections">
-            {CONSOLE_TABS.map((tab) => (
-              <button
-                key={tab}
-                type="button"
-                className={`tabs__item${activeTab === tab ? " is-active" : ""}`}
-                onClick={() => handleTabChange(tab)}
-              >
-                {TAB_LABELS[tab]}
-              </button>
-            ))}
-          </nav>
+        <nav className="tabs" aria-label="Console sections">
+          {CONSOLE_TABS.map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              className={`tabs__item${activeTab === tab ? " is-active" : ""}`}
+              onClick={() => handleTabChange(tab)}
+            >
+              {TAB_LABELS[tab]}
+            </button>
+          ))}
+        </nav>
+        <div className="topbar__status">
+          <span className={`chip${overview ? " chip--live" : ""}`}>
+            {overview?.runtime.label ?? "Not connected"}
+          </span>
+          {overview ? <span className="topbar__refreshed">{formatTimestamp(overview.refreshed_at_ms)}</span> : null}
         </div>
       </header>
 

@@ -19,6 +19,10 @@ CLI flags override file settings. The example starts native gRPC on
 `.anyserve/journal.sqlite`. `serve --ephemeral` disables durable jobs.
 Endpoint strings such as `http://127.0.0.1:50052` are gRPC channel URIs.
 
+The [setup page](https://github.com/anyserve/anyserve.universe/tree/main/setup)
+in anyserve.universe writes a `server.toml` and the matching `anyserve serve`
+command from a form, with the client and worker snippets that connect to it.
+
 ## Run an application worker
 
 Python 3.12+ is required. Install the SDK from the same checkout as the binary:
