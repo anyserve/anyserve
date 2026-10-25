@@ -227,11 +227,11 @@ worker_tokens=["worker"]
     def test_worker_survives_graceful_server_restart(self):
         interface = "test.python.graceful"
         process = self.start_worker(interface)
-        self.assertEqual(self.client.execute(interface, b"before")[0]["inline"], b"before")
+        self.assertEqual(self.client.call(interface, b"before"), b"before")
         self.stop_server()
         self.assertTrue(process.is_alive(), "server Drain must not exit the Python worker")
         self.start_server()
-        self.assertEqual(self.client.execute(interface, b"after", options=ExecutionOptions(total_timeout_ms=10_000))[0]["inline"], b"after")
+        self.assertEqual(self.client.call(interface, b"after", options=ExecutionOptions(total_timeout_ms=10_000)), b"after")
         self.assertTrue(process.is_alive())
 
     def test_closing_a_connection_releases_the_gil_while_receive_holds_the_lock(self):

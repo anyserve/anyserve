@@ -338,6 +338,33 @@ class HighLevelTests(unittest.TestCase):
         self.assertFalse(assignment.cancelled)
         self.assertEqual(connection.credits[-1], 0)
 
+    def test_call_returns_the_single_inline_result(self):
+        class Events:
+            def __init__(self, outputs):
+                self.outputs = outputs
+            def __iter__(self):
+                return self
+            def __next__(self):
+                return {"type": "finished", "state": "succeeded", "outputs": self.outputs}
+            def close(self):
+                pass
+        class Transport:
+            def __init__(self, outputs):
+                self.outputs = outputs
+                self.specs = []
+            def invoke(self, spec):
+                self.specs.append(spec)
+                return Events(self.outputs)
+        client = ExecutionClient.__new__(ExecutionClient)
+        client._transport = Transport([{"inline": b"HELLO", "metadata": {}}])
+        self.assertEqual(client.call("echo", b"hello"), b"HELLO")
+        self.assertEqual(client._transport.specs[0]["inputs"], [{"inline": b"hello", "metadata": {}}])
+        self.assertEqual(client._transport.specs[0]["durability"], "ephemeral")
+        for outputs in ([], [{"uri": "s3://x", "metadata": {}}], [{"inline": b"a"}, {"inline": b"b"}]):
+            client._transport = Transport(outputs)
+            with self.subTest(outputs=outputs), self.assertRaisesRegex(RuntimeError, "expects one inline result"):
+                client.call("echo", b"hello")
+
     def test_result_reads_once_then_watches_from_zero(self):
         class Events:
             def __init__(self, code=None):

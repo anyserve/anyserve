@@ -17,7 +17,9 @@ instructions are in [the workspace testing guide](../../docs/src/testing.md).
 - `invoke_stream(interface, options=...)`: duplex invocation; call `send` and
   `finish_input`, and iterate the returned execution events. Closing the context
   cancels unfinished execution and closes both transport directions.
-- `execute(...)`: collect an ephemeral invocation's terminal outputs.
+- `call(interface, payload, options=...)`: run a bytes-in, bytes-out handler and
+  return its single inline result; the client side of a `@worker` returning bytes.
+- `execute(...)`: collect an ephemeral invocation's terminal outputs as objects.
 - `get`, `watch`, `cancel` and `result`: inspect or follow an accepted job.
 
 Inputs are bytes or object dictionaries from `inline_object` / `uri_object`.

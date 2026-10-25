@@ -51,7 +51,7 @@ validate a model based on the `model` attribute.
 from anyserve import AnyserveClient, ExecutionOptions
 
 client = AnyserveClient("https://center:50052", token="CLIENT_TOKEN")
-outputs = client.execute(
+action = client.call(
     "policy.evaluate.v1", b"observation",
     options=ExecutionOptions(
         required_attributes={"model": "v1"},

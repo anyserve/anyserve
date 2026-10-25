@@ -61,14 +61,12 @@ Or call the execution API directly:
 from anyserve import AnyserveClient, ExecutionOptions
 
 client = AnyserveClient("http://127.0.0.1:50052")
-outputs = client.execute(
-    "demo.echo.v1", b"hello",
-    options=ExecutionOptions(total_timeout_ms=5000),
-)
-print(outputs[0]["inline"])
+print(client.call("demo.echo.v1", b"hello", options=ExecutionOptions(total_timeout_ms=5000)))
 ```
 
-`execute` collects an ephemeral Invoke. `submit` defaults to durable execution
+`call` runs a bytes-in, bytes-out handler as an ephemeral Invoke and returns
+its single inline result; `execute` returns the result objects of any handler.
+`submit` defaults to durable execution
 and returns an accepted job; `result`, `watch`, `get` and `cancel` operate by ID.
 `invoke_stream` supports live input and output. Use event streams as context
 managers when stopping before Finished so unfinished work is cancelled.

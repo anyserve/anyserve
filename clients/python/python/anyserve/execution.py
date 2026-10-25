@@ -95,6 +95,22 @@ class ExecutionClient:
         with self.invoke(interface, inputs, options=options) as events:
             return _terminal_outputs(events)
 
+    def call(
+        self, interface: str, payload: bytes = b"", *, options: ExecutionOptions | None = None,
+    ) -> bytes:
+        """Run a bytes-in, bytes-out handler and return its one inline result.
+
+        This is the client side of a ``@worker`` handler that returns bytes.
+        Handlers that stream frames or return several objects need ``invoke``
+        or ``execute``.
+        """
+        outputs = self.execute(interface, payload, options=options)
+        if len(outputs) != 1 or "inline" not in outputs[0]:
+            raise RuntimeError(
+                f"{interface} returned {len(outputs)} result objects; call() expects one inline result"
+            )
+        return outputs[0]["inline"]
+
     def get(self, job_id: str, *, include_outputs: bool = True) -> dict[str, Any]:
         return self._transport.get(job_id, include_outputs)
 
