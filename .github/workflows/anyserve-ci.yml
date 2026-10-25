@@ -5,50 +5,73 @@ on:
     branches: ["main"]
   pull_request:
     branches: ["main"]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Source ref to validate
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
   cancel-in-progress: true
 
 jobs:
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
 
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: cargo build -p anyserve
-      - run: python -m pip install ./clients/python
+          python-version: ${{ matrix.python }}
+      - run: cargo build --locked -p anyserve
+      - run: python -m pip install build twine
+      - run: python -m build clients/python --sdist --outdir dist
+      - run: python -m twine check dist/*
+      - run: python -m pip install dist/*.tar.gz
       - run: python -m unittest discover -s clients/python/tests -p 'test_*.py'
       - run: python clients/python/tests/sdk_e2e.py
 
   console:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: console
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -59,33 +82,84 @@ jobs:
 
   bench:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - run: bench/load/run.sh --cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: bench-summary
-          path: bench/load/results/*/summary.md
+          name: benchmark
+          path: |
+            bench/load/results/*/summary.*
+            bench/load/results/*/environment.json
+            bench/load/results/**/*.log
+            bench/load/results/**/client.json
+            bench/load/results/**/process-samples.jsonl
+          retention-days: 14
 
   container:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
+          load: true
+          tags: anyserve:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Check container startup
+        run: |
+          docker run --rm anyserve:ci --version
+          mkdir -p "$RUNNER_TEMP/anyserve-smoke"
+          cat > "$RUNNER_TEMP/anyserve-smoke/server.toml" <<'TOML'
+          [server]
+          grpc_host = "0.0.0.0"
+          [console]
+          listen = "0.0.0.0:3001"
+          [journal]
+          path = "/data/journal.sqlite"
+          TOML
+          trap 'docker logs anyserve-ci; docker rm -f anyserve-ci' EXIT
+          docker run -d --name anyserve-ci -p 127.0.0.1:3001:3001 \
+            -v "$RUNNER_TEMP/anyserve-smoke/server.toml:/etc/anyserve/server.toml:ro" \
+            anyserve:ci serve --config /etc/anyserve/server.toml
+          curl --fail --retry 15 --retry-delay 1 --retry-connrefused http://127.0.0.1:3001/readyz
 
   helm:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - uses: azure/setup-helm@v4
       - run: helm lint deploy/helm/anyserve
-      - run: helm template anyserve deploy/helm/anyserve --set worker.enabled=true --set worker.image=example/worker --set auth.clientTokens[0]=c --set auth.workerTokens[0]=w > /dev/null
+      - run: helm template anyserve deploy/helm/anyserve --set worker.enabled=true --set worker.image=example/worker --set 'auth.clientTokens[0]=c' --set 'auth.workerTokens[0]=w' > /dev/null
+      - run: helm template anyserve deploy/helm/anyserve --set journal.enabled=false --set auth.existingSecret=tokens > /dev/null
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check workflows
+        uses: docker://rhysd/actionlint:1.7.12
+      - run: python scripts/check-doc-links.py
+      - run: python scripts/check-release-version.py

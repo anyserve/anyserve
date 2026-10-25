@@ -52,9 +52,11 @@ impl ExecutionTransport {
         let spec = parse_spec(spec)?;
         let runtime = Arc::clone(&self.runtime);
         let mut client = self.client.clone();
-        let response = py
-            .detach(move || runtime.block_on(client.submit(job_id, spec)))
-            .map_err(status_error)?;
+        let response = py.detach(move || {
+            runtime
+                .block_on(client.submit(job_id, spec))
+                .map_err(status_error)
+        })?;
         let dict = job_to_py(
             py,
             response
@@ -69,9 +71,8 @@ impl ExecutionTransport {
         let spec = parse_spec(spec)?;
         let runtime = Arc::clone(&self.runtime);
         let mut client = self.client.clone();
-        let events = py
-            .detach(move || runtime.block_on(client.invoke(spec)))
-            .map_err(status_error)?;
+        let events =
+            py.detach(move || runtime.block_on(client.invoke(spec)).map_err(status_error))?;
         Ok(ExecutionEvents::new(Arc::clone(&self.runtime), events))
     }
 
@@ -79,9 +80,11 @@ impl ExecutionTransport {
         let spec = parse_spec(spec)?;
         let runtime = Arc::clone(&self.runtime);
         let mut client = self.client.clone();
-        let invocation = py
-            .detach(move || runtime.block_on(client.invoke_stream(spec)))
-            .map_err(status_error)?;
+        let invocation = py.detach(move || {
+            runtime
+                .block_on(client.invoke_stream(spec))
+                .map_err(status_error)
+        })?;
         Ok(InputInvocation {
             input: Arc::new(Mutex::new(Some(invocation.input))),
             runtime: Arc::clone(&self.runtime),
@@ -99,9 +102,11 @@ impl ExecutionTransport {
     ) -> PyResult<ExecutionEvents> {
         let runtime = Arc::clone(&self.runtime);
         let mut client = self.client.clone();
-        let events = py
-            .detach(move || runtime.block_on(client.watch(job_id, after_sequence)))
-            .map_err(status_error)?;
+        let events = py.detach(move || {
+            runtime
+                .block_on(client.watch(job_id, after_sequence))
+                .map_err(status_error)
+        })?;
         Ok(ExecutionEvents::new(Arc::clone(&self.runtime), events))
     }
 
@@ -109,9 +114,11 @@ impl ExecutionTransport {
     fn get(&self, py: Python<'_>, job_id: String, include_outputs: bool) -> PyResult<Py<PyDict>> {
         let runtime = Arc::clone(&self.runtime);
         let mut client = self.client.clone();
-        let job = py
-            .detach(move || runtime.block_on(client.get(job_id, include_outputs)))
-            .map_err(status_error)?;
+        let job = py.detach(move || {
+            runtime
+                .block_on(client.get(job_id, include_outputs))
+                .map_err(status_error)
+        })?;
         job_to_py(py, job)
     }
 
@@ -119,9 +126,11 @@ impl ExecutionTransport {
     fn cancel(&self, py: Python<'_>, job_id: String, reason: String) -> PyResult<Py<PyDict>> {
         let runtime = Arc::clone(&self.runtime);
         let mut client = self.client.clone();
-        let job = py
-            .detach(move || runtime.block_on(client.cancel(job_id, reason)))
-            .map_err(status_error)?;
+        let job = py.detach(move || {
+            runtime
+                .block_on(client.cancel(job_id, reason))
+                .map_err(status_error)
+        })?;
         job_to_py(py, job)
     }
 }

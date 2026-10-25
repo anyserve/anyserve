@@ -1026,6 +1026,10 @@ async fn durable_cancel_returns_the_committed_state() {
 impl Attempt {
     /// Sends result chunks and a successful Finish; returns the final reply,
     /// or the stream's error status.
+    #[allow(
+        clippy::result_large_err,
+        reason = "test helpers preserve gRPC status codes"
+    )]
     async fn upload(
         &mut self,
         chunks: Vec<pb::ResultChunk>,
@@ -1508,6 +1512,10 @@ async fn an_upload_that_does_not_fit_evicts_old_results_once() {
 
 impl Attempt {
     /// Sends one frame and returns its acknowledgement, or the stream's error.
+    #[allow(
+        clippy::result_large_err,
+        reason = "test helpers preserve gRPC status codes"
+    )]
     async fn try_frame(&mut self, sequence: u64, data: Vec<u8>) -> Result<u64, tonic::Status> {
         self.tx
             .send(up(pb::attempt_up::Msg::Frame(pb::Frame {

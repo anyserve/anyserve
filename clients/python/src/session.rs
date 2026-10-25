@@ -216,8 +216,11 @@ impl WorkerConnection {
     fn send(&self, py: Python<'_>, msg: v2::worker_message::Msg) -> PyResult<()> {
         let control = self.control.clone();
         let runtime = Arc::clone(&self.runtime);
-        py.detach(move || runtime.block_on(control.send(v2::WorkerMessage { msg: Some(msg) })))
-            .map_err(error)
+        py.detach(move || {
+            runtime
+                .block_on(control.send(v2::WorkerMessage { msg: Some(msg) }))
+                .map_err(error)
+        })
     }
 }
 impl Drop for WorkerConnection {

@@ -31,6 +31,7 @@ impl ByteBudget {
     }
 
     /// Reserves `bytes` only if they fit under the limit.
+    #[allow(deprecated, reason = "AtomicU64::try_update is still unstable")]
     pub(crate) fn try_reserve(&self, bytes: usize) -> bool {
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {

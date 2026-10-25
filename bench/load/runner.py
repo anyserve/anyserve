@@ -334,7 +334,7 @@ enabled = false
         threads = self.meta["tokio_worker_threads"]
         lines = ["# Control-plane load benchmark", "", f"Commit: `{self.sha}`. Mode: {'PROFILE (sampled; not a baseline)' if self.profile else 'BASELINE (no sampling)'}. CPU 100% = one logical CPU; worker values sum the case's worker processes.", "", f"Tokio threads: control={threads['control']} ({self.meta['control_thread_source']}; {len(self.meta['cpu_affinity'])} available logical CPUs), workers={threads['worker']} per process, client={threads['client']}.", ""]
         lines += summary_table(self.rows, threads)
-        lines += ["", "S5 subrows share the parent workload and resource samples; their req/s uses the same elapsed measurement window. S5 gates use durable p50 and aggregate req/s; invoke is informational because its latency depends on the closed-loop clients' durable/fsync phases. Aggregate p50 is reference only."]
+        lines += ["", "S5 subrows share the parent workload and resource samples; their req/s uses the same elapsed measurement window. The repeat gate uses durable p50; compare aggregate req/s separately. Invoke latency depends on the closed-loop clients' durable/fsync phases. Aggregate p50 is reference only."]
         (self.out / "summary.md").write_text("\n".join(lines) + "\n")
 
     def run(self):
