@@ -5,7 +5,7 @@ from anyserve import AnyserveClient, ExecutionOptions
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Submit a recoverable job with complete input.")
-    parser.add_argument("--endpoint", default="http://127.0.0.1:50052")
+    parser.add_argument("--endpoint", help="default: ANYSERVE_ENDPOINT or http://127.0.0.1:50052")
     parser.add_argument("--job-id")
     parser.add_argument("--payload", default="hello from Python")
     parser.add_argument("--ephemeral", action="store_true")

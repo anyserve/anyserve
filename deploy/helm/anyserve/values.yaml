@@ -36,8 +36,8 @@ tolerations: []
 affinity: {}
 
 # An optional application worker fleet. The image carries your handler and the
-# anyserve SDK; the pod receives ANYSERVE_ENDPOINT and ANYSERVE_TOKEN, so a
-# Python worker can run with args such as ["--endpoint", "$(ANYSERVE_ENDPOINT)"].
+# anyserve SDK; the pod receives ANYSERVE_ENDPOINT and ANYSERVE_TOKEN, which the
+# Python SDK reads when serve() is given no endpoint or token.
 worker:
   enabled: false
   replicas: 1

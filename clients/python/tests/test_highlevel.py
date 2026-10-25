@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import unittest
@@ -274,6 +275,24 @@ class HighLevelTests(unittest.TestCase):
                     serve(handler, "http://unused")
                 self.assertEqual(connect.call_count, 1)
                 sleep.assert_not_called()
+
+    def test_endpoint_falls_back_to_the_environment_then_the_local_default(self):
+        @worker(interface="env")
+        def handler(payload):
+            return payload
+
+        for env, explicit, expected in [
+            ({}, None, "http://127.0.0.1:50052"),
+            ({"ANYSERVE_ENDPOINT": "http://cp:50052"}, None, "http://cp:50052"),
+            ({"ANYSERVE_ENDPOINT": "http://cp:50052"}, "http://explicit:1", "http://explicit:1"),
+        ]:
+            with self.subTest(env=env, explicit=explicit), patch.dict(os.environ, env, clear=False), \
+                    patch("anyserve.highlevel.WorkerConnection", side_effect=RPCFailure(3)) as connect:
+                if "ANYSERVE_ENDPOINT" not in env:
+                    os.environ.pop("ANYSERVE_ENDPOINT", None)
+                with self.assertRaises(RPCFailure):
+                    serve(handler, explicit)
+                self.assertEqual(connect.call_args.args[0], expected)
 
     def test_transient_connection_errors_are_logged_before_retry(self):
         @worker(interface="transient")

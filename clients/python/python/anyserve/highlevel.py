@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from ._native import WorkerConnection
+from .execution import resolve_endpoint
 
 _LOG = logging.getLogger(__name__)
 _PERMANENT_RPC_CODES = {3, 7, 16}
@@ -111,8 +112,7 @@ def serve(
     spec = get_handler_spec(handler)
     if reconnect_interval_secs <= 0:
         raise ValueError("reconnect_interval_secs must be positive")
-    if connection is None and endpoint is None:
-        raise ValueError("endpoint is required")
+    endpoint = resolve_endpoint(endpoint)
     worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
     active: dict[str, tuple[Any, Future]] = {}
     active_lock = threading.Lock()

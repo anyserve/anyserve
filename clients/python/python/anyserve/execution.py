@@ -1,10 +1,18 @@
 """Execution API for live inference and recoverable asynchronous jobs."""
 from __future__ import annotations
 
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterator
 
 from ._native import ExecutionTransport
+
+DEFAULT_ENDPOINT = "http://127.0.0.1:50052"
+
+
+def resolve_endpoint(endpoint: str | None) -> str:
+    """The explicit endpoint, else ``ANYSERVE_ENDPOINT``, else the local default."""
+    return endpoint or os.environ.get("ANYSERVE_ENDPOINT") or DEFAULT_ENDPOINT
 
 
 @dataclass(frozen=True)
@@ -60,8 +68,8 @@ class StreamingInvocation(ExecutionEvents):
 
 
 class ExecutionClient:
-    def __init__(self, endpoint: str, *, token: str | None = None) -> None:
-        self._transport = ExecutionTransport(endpoint, token)
+    def __init__(self, endpoint: str | None = None, *, token: str | None = None) -> None:
+        self._transport = ExecutionTransport(resolve_endpoint(endpoint), token)
 
     def submit(
         self, interface: str, inputs: bytes | list[dict[str, Any]] = b"", *,
