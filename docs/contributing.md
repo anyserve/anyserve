@@ -93,7 +93,8 @@ rendering. Benchmark artifacts are uploaded even when a gate fails.
 
 Version tags build platform archives, container images and Python distributions.
 Release workflows validate that the tag matches the Rust, Python and chart
-application versions. Manual runs build and check artifacts; publication requires
-a version tag. Manual release runs check the selected ref, or an existing tag
-when supplied. PyPI publication uses the repository's `pypi` environment and
-trusted publisher configuration.
+application versions. Manual runs without a tag build and check the selected
+ref without publishing. Supplying an existing version tag republishes its
+artifacts after the same checks; PyPI skips files already uploaded. PyPI
+publication uses the repository's `pypi` environment and trusted publisher
+configuration.
