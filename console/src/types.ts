@@ -35,11 +35,21 @@ export interface WorkerRollup {
   last_seen_at_ms: number | null;
 }
 
+export interface InterfaceSummary {
+  name: string;
+  queued: number;
+  running: number;
+  oldest_queued_age_ms: number;
+  sessions: number;
+  free_slots: number;
+}
+
 export interface OverviewResponse {
   runtime: RuntimeModeSummary;
   queue: QueueSummary;
   history: HistorySummary;
   workers: WorkerRollup;
+  interfaces: InterfaceSummary[];
   refreshed_at_ms: number;
 }
 

@@ -160,6 +160,11 @@ async fn overview_reports_runtime_queue_history_and_workers() {
     assert_eq!(body["queue"]["queued"], 1);
     assert_eq!(body["history"]["cancelled"], 1);
     assert_eq!(body["workers"]["healthy"], 1);
+    let interfaces = body["interfaces"].as_array().unwrap();
+    let find = |name: &str| interfaces.iter().find(|i| i["name"] == name).unwrap();
+    assert_eq!(find("demo.queue.v1")["queued"], 1);
+    assert_eq!(find("demo.worker.v1")["sessions"], 1);
+    assert_eq!(find("demo.worker.v1")["free_slots"], 4);
 
     handle.abort();
 }

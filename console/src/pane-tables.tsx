@@ -1,5 +1,5 @@
-import { formatCapacityMap, formatTimestamp, truncateMiddle } from "./format";
-import type { JobState, JobSummary, WorkerSummary } from "./types";
+import { formatCapacityMap, formatDuration, formatNumber, formatTimestamp, truncateMiddle } from "./format";
+import type { InterfaceSummary, JobState, JobSummary, WorkerSummary } from "./types";
 
 export function JobsTable(props: {
   jobs: JobSummary[];
@@ -135,5 +135,42 @@ function WorkerBadge(props: { healthy: boolean }) {
     <span className={`badge ${props.healthy ? "badge--healthy" : "badge--expired"}`}>
       {props.healthy ? "healthy" : "unavailable"}
     </span>
+  );
+}
+
+export function InterfacesTable(props: { interfaces: InterfaceSummary[] }) {
+  const { interfaces } = props;
+
+  if (interfaces.length === 0) {
+    return <EmptyState message="No interfaces with queued jobs or connected workers" />;
+  }
+
+  return (
+    <div className="table-wrap">
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Interface</th>
+            <th>Queued</th>
+            <th>Running</th>
+            <th>Oldest wait</th>
+            <th>Workers</th>
+            <th>Free slots</th>
+          </tr>
+        </thead>
+        <tbody>
+          {interfaces.map((item) => (
+            <tr key={item.name}>
+              <td className="table__mono">{item.name}</td>
+              <td>{formatNumber(item.queued)}</td>
+              <td>{formatNumber(item.running)}</td>
+              <td>{formatDuration(item.oldest_queued_age_ms)}</td>
+              <td>{formatNumber(item.sessions)}</td>
+              <td>{formatNumber(item.free_slots)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }

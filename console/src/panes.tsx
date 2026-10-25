@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { type PaneStat } from "./app-constants";
 import { formatCapacityMap, formatNumber } from "./format";
 import type { JobDetailResponse, JobSummary, OverviewResponse, WorkerSummary } from "./types";
-import { JobsTable, WorkersTable } from "./pane-tables";
+import { InterfacesTable, JobsTable, WorkersTable } from "./pane-tables";
 import { JobInspector as JobInspectorPanel } from "./pane-inspector";
 
 export function JobsPane(props: {
@@ -72,6 +72,13 @@ export function WorkersPane(props: {
       />
 
       <div className="workers-stack">
+        <WorkerSection
+          title="Interfaces"
+          meta={overview ? `${overview.interfaces.length} interfaces with queued jobs or workers` : "Loading"}
+        >
+          <InterfacesTable interfaces={overview?.interfaces ?? []} />
+        </WorkerSection>
+
         <WorkerSection
           title="Healthy workers"
           meta={

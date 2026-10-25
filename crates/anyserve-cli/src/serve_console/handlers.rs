@@ -92,6 +92,14 @@ async fn overview(State(state): State<AppState>) -> Json<serde_json::Value> {
             "total_capacity": aggregate_capacity(healthy.iter().map(|worker| &worker.total_capacity)),
             "last_seen_at_ms": workers.iter().map(|worker| worker.last_seen_at_ms).max()
         },
+        "interfaces": stats.interfaces.iter().map(|(name, interface)| json!({
+            "name": name,
+            "queued": interface.queued,
+            "running": interface.running,
+            "oldest_queued_age_ms": interface.oldest_queued_age_ms,
+            "sessions": interface.sessions,
+            "free_slots": interface.free_slots
+        })).collect::<Vec<_>>(),
         "refreshed_at_ms": now_ms()
     }))
 }
