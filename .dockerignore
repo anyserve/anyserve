@@ -1,8 +1,10 @@
 target
 .git
-console/node_modules
-console/dist
-docs/book
+.github
+console
+docs
+deploy
+scripts
 clients/python/dist
 **/__pycache__
 **/.venv
