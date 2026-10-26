@@ -94,6 +94,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
 
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2

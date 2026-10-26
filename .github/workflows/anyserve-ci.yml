@@ -50,6 +50,8 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -89,6 +91,8 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: bench/load/run.sh --cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2
       - uses: actions/upload-artifact@v4

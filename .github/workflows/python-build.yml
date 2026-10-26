@@ -21,6 +21,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -68,6 +70,8 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc --no-progress -y
       - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: wheel-${{ matrix.target }}
