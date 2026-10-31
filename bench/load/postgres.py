@@ -29,6 +29,13 @@ from console import ROOT, digest, free_port, get, percentile, sample_resources, 
 from runner import wait_ready
 
 
+def positive_seconds(value):
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number of seconds")
+    return seconds
+
+
 def postgres_env(url):
     parsed = urlsplit(url)
     if parsed.scheme not in {"postgres", "postgresql"} or not parsed.hostname:
@@ -211,13 +218,13 @@ def queue_sample(sql, schema):
                        ("queued", "running", "succeeded", "failed", "cancelled")}}
 
 
-def queue_summary(samples, results):
+def queue_summary(samples, results, sample_interval=1):
     start = min(result["submission_started_unix_s"] for result in results)
     finish = max(result["measurement_finished_unix_s"] for result in results)
     during = [sample for sample in samples if start <= sample["unix_s"] <= finish]
     before = [sample for sample in samples if sample["unix_s"] <= finish]
     after = [sample for sample in samples if sample["unix_s"] >= finish]
-    summary = {"sample_interval_target_seconds": 1, "submission_started_unix_s": start,
+    summary = {"sample_interval_target_seconds": sample_interval, "submission_started_unix_s": start,
             "submission_finished_unix_s": finish,
             "sampled_peak_queued_running_during_submission": max(
                 (sample["states"]["queued"] + sample["states"]["running"] for sample in during), default=None),
@@ -402,7 +409,7 @@ def run_case(args, url, sql, concurrency, payload, repetition):
             workers.append(worker)
         if args.scenario == "S6":
             queues.append(queue_sample(sql, schema))
-        next_queue_sample = time.monotonic() + 1
+        next_queue_sample = time.monotonic() + args.queue_sample_interval
         for index, (_, endpoint) in enumerate(controls):
             output = directory / f"client-{index}.json"
             command = [args.bench_bin, "client", "--endpoint", endpoint,
@@ -430,7 +437,7 @@ def run_case(args, url, sql, concurrency, payload, repetition):
             resources.append(sample)
             if args.scenario == "S6" and time.monotonic() >= next_queue_sample:
                 queues.append(queue_sample(sql, schema))
-                next_queue_sample = time.monotonic() + 1
+                next_queue_sample = time.monotonic() + args.queue_sample_interval
             time.sleep(0.5)
         if any(process.poll() is not None for role, process in processes if role != "client"):
             raise RuntimeError(f"service exited during {name}; see {directory}")
@@ -454,7 +461,7 @@ def run_case(args, url, sql, concurrency, payload, repetition):
             write_json(directory / "id-reconciliation.json", reconciliation)
             summary["id_reconciliation"] = {key: value for key, value in reconciliation.items() if not isinstance(value, list)}
             summary["id_reconciliation"]["artifact"] = "id-reconciliation.json"
-            summary["queue"] = queue_summary(queues, results)
+            summary["queue"] = queue_summary(queues, results, args.queue_sample_interval)
             summary["resources"] = resource_summary(resources, summary["submit_windows"])
             summary["resources_whole_run"] = resource_summary(resources, [
                 (summary["run_started_unix_s"], summary["run_finished_unix_s"])])
@@ -590,6 +597,16 @@ def self_check():
                "succeeded": 0, "failed": 0, "cancelled": 0}}
               for timestamp, queued in ((9, 0), (11, 2), (13, 7), (18, 50), (101, 0))]
     queue = queue_summary(queues, submit_rows)
+    assert queue["sample_interval_target_seconds"] == 1
+    assert queue_summary(queues, submit_rows, 10)["sample_interval_target_seconds"] == 10
+    assert positive_seconds("10") == 10
+    for invalid in ("0", "-1", "nan", "inf", "-inf"):
+        try:
+            positive_seconds(invalid)
+        except argparse.ArgumentTypeError:
+            pass
+        else:
+            raise AssertionError(f"invalid queue sample interval accepted: {invalid}")
     assert queue["sampled_peak_queued_running_during_submission"] == 7
     assert queue["last_sample_before_submission_end"]["unix_s"] == 13
     assert queue["first_sample_after_submission_end"]["unix_s"] == 18
@@ -716,6 +733,8 @@ def main():
                         help="S6 result drain deadline in seconds, excluded from Submit throughput")
     parser.add_argument("--submit-rate", type=int,
                         help="S6 target sends per second per client; bounded concurrency, missed sends are counted and skipped")
+    parser.add_argument("--queue-sample-interval", type=positive_seconds, default=1,
+                        help="S6 shared PG queue sampling interval in seconds (positive and finite; default 1)")
     parser.add_argument("--cases", default="64:256,256:256,4:1048576", help="per-replica concurrency:payload bytes")
     parser.add_argument("--payload-pattern", choices=("repeat", "random"), default="random",
                         help="random avoids optimistic compression of large payloads; repeat reproduces historical x payloads")
@@ -767,7 +786,7 @@ def main():
         "throughput_window": ("pooled successes divided by earliest client measurement start to latest finish, including drain"
                               if args.scenario == "S3" else
                               "pooled measured ACKs / union of actual Submit windows including in-flight Submit responses, excluding result drain"),
-        "queue_sampling": "S6: shared PG jobs grouped by state approximately every 1s through submission and drain; raw query start/end times retained",
+        "queue_sampling": f"S6: shared PG jobs grouped by state approximately every {args.queue_sample_interval:g}s through submission and drain; initial/final states and raw query start/end times retained",
         "resource_windows": "S3: measurement window; S6: Submit-window union and whole run separately; CPU is over observed sample spans, with coverage seconds recorded; client samples stop when any client exits",
         "tokio_worker_threads": {"control": "production default", "worker": 2, "client": 4},
         "cpu_unit": "100% = one logical CPU; role sums exclude PostgreSQL; ps samples every 0.5s",

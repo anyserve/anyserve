@@ -164,8 +164,13 @@ during the full measurement window. The shared queue samples use only queries
 wholly within all clients' overlapping sending windows; completions may include
 warmup jobs, so this is not a per-job completion latency measurement.
 
-S6 samples all five job states from the shared PG schema approximately once per
-second through submission and drain. Artifacts retain the queue timeline, sampled
+S6 samples all five job states from the shared PG schema approximately every
+`--queue-sample-interval` seconds (default 1; positive and finite) through submission
+and drain. This is a target interval after the previous query finishes; resource
+sampling and the runner's 0.5-second polling loop add delay. Increasing it,
+for example to `10`, reduces count-query overhead but makes queue peaks and
+completion-rate estimates coarser. The initial state and final full ID/state
+reconciliation are always collected. Artifacts retain the queue timeline, sampled
 peaks, samples immediately before/after submission ends, and final ID reconciliation.
 ACKed jobs must exist, committed jobs must have verified results, and the final
 queued/running count must be zero. `resources` covers the Submit windows;
