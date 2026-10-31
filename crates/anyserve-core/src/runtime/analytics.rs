@@ -36,7 +36,23 @@ impl Runtime {
                 Ok(cursor)
             })
             .transpose()?;
-        let mut jobs = if scan.archived {
+        let mut jobs = if let Some(pg) = &self.inner.postgres {
+            let states = if scan.archived {
+                vec![
+                    super::api::JobState::Succeeded,
+                    super::api::JobState::Failed,
+                    super::api::JobState::Cancelled,
+                ]
+            } else {
+                vec![super::api::JobState::Queued, super::api::JobState::Running]
+            };
+            pg.scan_jobs(scan.from_ms, scan.to_ms, before, &states, None, limit + 1)
+                .await
+                .map_err(super::distributed::read_error)?
+                .into_iter()
+                .map(|job| view_from_stored(job, false))
+                .collect::<Vec<_>>()
+        } else if scan.archived {
             let journal = self
                 .inner
                 .journal

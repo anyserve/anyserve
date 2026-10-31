@@ -252,7 +252,7 @@ pub struct JobPreview {
     pub outputs: Vec<ObjectPreview>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionEvent {
     pub job_id: String,
     /// Strictly increasing per job, also across control-plane restarts.
@@ -262,7 +262,7 @@ pub struct ExecutionEvent {
     pub kind: EventKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     Accepted,
     Assigned {
@@ -591,6 +591,9 @@ impl Default for RuntimeConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalConfig {
+    /// When set, use the shared PostgreSQL scheduler instead of SQLite.
+    pub postgres: Option<PostgresConfig>,
+    /// SQLite only; ignored when `postgres` is set.
     pub path: PathBuf,
     /// `synchronous=FULL` when true (default), `NORMAL` otherwise.
     pub full_sync: bool,
@@ -606,6 +609,7 @@ pub struct JournalConfig {
 impl JournalConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
+            postgres: None,
             path: path.into(),
             full_sync: true,
             queue_capacity: 4_096,
@@ -613,5 +617,47 @@ impl JournalConfig {
             retention: Duration::from_secs(7 * 24 * 3600),
             max_bytes: None,
         }
+    }
+
+    pub fn postgres(url: impl Into<String>) -> Self {
+        Self {
+            postgres: Some(PostgresConfig::new(url)),
+            ..Self::new(PathBuf::new())
+        }
+    }
+}
+
+/// All replicas of an execution domain use the same database and schema.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PostgresConfig {
+    pub url: String,
+    pub schema: String,
+    /// Database-clock node lease. An expired node must restart to rejoin.
+    pub lease_duration: Duration,
+    pub poll_interval: Duration,
+    pub max_connections: u32,
+}
+
+impl PostgresConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            schema: "anyserve".to_string(),
+            lease_duration: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(100),
+            max_connections: 16,
+        }
+    }
+}
+
+impl std::fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("url", &"[redacted]")
+            .field("schema", &self.schema)
+            .field("lease_duration", &self.lease_duration)
+            .field("poll_interval", &self.poll_interval)
+            .field("max_connections", &self.max_connections)
+            .finish()
     }
 }

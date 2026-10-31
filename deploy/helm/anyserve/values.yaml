@@ -14,12 +14,25 @@ auth:
   workerTokens: []
   existingSecret: ""
 
-# The durable journal lives on a PersistentVolumeClaim. Disabling it keeps
+# PostgreSQL supports multiple active control-plane replicas. SQLite requires 1.
+replicaCount: 1
+
+# SQLite uses a PersistentVolumeClaim; PostgreSQL uses an external database.
+# Disabling the journal keeps
 # execution in memory: durable Submit is rejected and nothing survives restart.
 journal:
   enabled: true
+  backend: sqlite
   size: 1Gi
   storageClass: ""
+  postgres:
+    # Existing Secret containing the connection URL. No database is installed.
+    existingSecret: ""
+    secretKey: ANYSERVE_DATABASE_URL
+    schema: anyserve
+    leaseDurationMs: 15000
+    pollIntervalMs: 100
+    maxConnections: 16
 
 # Scalar [runtime] keys written into server.toml, for example
 # max_attempts: 5 or consumer_stall_timeout_ms: 10000.

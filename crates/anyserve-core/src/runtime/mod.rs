@@ -1,9 +1,10 @@
 //! The execution runtime: one in-memory state machine for ephemeral and
-//! durable jobs, worker sessions and attempt streams, with an optional SQLite
-//! journal for durable jobs.
+//! durable jobs, worker sessions and attempt streams. Durable jobs use either
+//! a local SQLite journal or a shared PostgreSQL queue.
 
 mod analytics;
 pub mod api;
+mod distributed;
 pub(crate) mod events;
 mod identity;
 mod index;
@@ -28,11 +29,12 @@ use self::api::{
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
-use self::machine::{LeaseEnd, ms, new_id};
+use self::machine::{LeaseEnd, ms};
 use self::state::{Phase, State, TerminalPlan};
 use crate::error::RuntimeError;
 use crate::journal::{Journal, Recovery, StoredJob};
 use crate::now_ms;
+use crate::postgres::ReadMode;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const PURGE_INTERVAL_MS: u64 = 3_600_000;
@@ -170,6 +172,8 @@ pub(crate) struct Inner {
     pub(crate) generation: u64,
     state: Mutex<State>,
     pub(crate) journal: Option<Journal>,
+    pub(crate) postgres: Option<Arc<crate::postgres::Postgres>>,
+    pub(crate) cluster_wakeup: Arc<Notify>,
     pub(crate) journal_status: Mutex<JournalStatus>,
     pub(crate) timers: Timers,
     /// Event log bytes across all jobs.
@@ -371,6 +375,16 @@ impl Inner {
     }
 
     async fn purge(&self) {
+        if let Some(pg) = &self.postgres {
+            if let Some(config) = &self.config.journal
+                && let Err(error) = pg
+                    .purge(now_ms().saturating_sub(ms(config.retention)))
+                    .await
+            {
+                tracing::warn!(%error, "PostgreSQL retention cleanup failed");
+            }
+            return;
+        }
         let Some(journal) = &self.journal else {
             return;
         };
@@ -617,21 +631,26 @@ impl Runtime {
     /// Starts the runtime, recovering durable jobs when a journal is
     /// configured.
     pub async fn start(config: RuntimeConfig) -> anyhow::Result<Runtime> {
-        let (journal, recovery) = match &config.journal {
+        let postgres = match config.journal.as_ref().filter(|c| c.postgres.is_some()) {
+            Some(config) => Some(crate::postgres::Postgres::open(config).await?),
+            None => None,
+        };
+        let (journal, recovery) = match config.journal.as_ref().filter(|c| c.postgres.is_none()) {
             Some(journal_config) => {
                 let (journal, recovery) = Journal::open(journal_config).await?;
                 (Some(journal), Some(recovery))
             }
             None => (None, None),
         };
-        let generation = recovery
+        let generation = postgres
             .as_ref()
-            .map(|recovery| recovery.generation)
+            .map(|pg| pg.generation)
+            .or_else(|| recovery.as_ref().map(|recovery| recovery.generation))
             // Without a journal nothing survives a restart; a timestamp in
             // seconds still distinguishes this process from the previous one
             // and keeps event sequences (`generation << 32`) in range.
             .unwrap_or_else(|| now_ms() / 1000);
-        let status = if journal.is_some() {
+        let status = if journal.is_some() || postgres.is_some() {
             JournalStatus::Healthy
         } else {
             JournalStatus::Disabled
@@ -647,6 +666,8 @@ impl Runtime {
                 ..State::default()
             }),
             journal,
+            postgres,
+            cluster_wakeup: Arc::new(Notify::new()),
             journal_status: Mutex::new(status),
             timers: Timers::new(),
             event_budget: Arc::new(ByteBudget::new(event_budget)),
@@ -660,6 +681,10 @@ impl Runtime {
         }
         tokio::spawn(timer_loop(Arc::downgrade(&inner)));
         tokio::spawn(maintenance_loop(Arc::downgrade(&inner)));
+        if inner.postgres.is_some() {
+            tokio::spawn(distributed::cluster_loop(Arc::downgrade(&inner)));
+            tokio::spawn(distributed::heartbeat_loop(Arc::downgrade(&inner)));
+        }
         Ok(Runtime { inner })
     }
 
@@ -786,7 +811,27 @@ impl Runtime {
         // A caller-chosen id may belong to a durable job that already left
         // memory; generated ids cannot.
         let mut cold_checked = requested.is_none() || self.inner.journal.is_none();
-        let job_id = requested.unwrap_or_else(new_id);
+        if self.inner.postgres.is_some()
+            && requested.as_ref().is_some_and(|id| {
+                durability == Durability::Ephemeral || id.starts_with(distributed::EPHEMERAL_PREFIX)
+            })
+        {
+            return Err(RuntimeError::invalid(
+                "PG caller-chosen IDs require durable Submit and cannot start with ephemeral:",
+            ));
+        }
+        let job_id = requested.unwrap_or_else(|| self.generated_job_id(durability));
+        if durability == Durability::Durable && self.inner.postgres.is_some() {
+            return self
+                .submit_postgres(
+                    job_id,
+                    spec.take().expect("spec"),
+                    spec_hash,
+                    max_attempts,
+                    request.conflict,
+                )
+                .await;
+        }
         let conflict = |existing: &str| -> Result<(), RuntimeError> {
             if existing.is_empty() {
                 return Err(RuntimeError::conflict(format!(
@@ -913,7 +958,7 @@ impl Runtime {
     /// Starts an ephemeral execution whose events the caller follows.
     pub async fn invoke(&self, request: InvokeRequest) -> Result<Execution, RuntimeError> {
         let (spec, max_attempts) = self.normalize(request.spec, Durability::Ephemeral)?;
-        let job_id = new_id();
+        let job_id = self.generated_job_id(Durability::Ephemeral);
         let limits = &self.inner.config.limits;
         let input = (request.input == InputMode::Streaming).then(|| {
             let used = spec
@@ -972,6 +1017,23 @@ impl Runtime {
     /// reports `CursorExpired`; a non-zero sequence older than what is held
     /// ends the stream with `CursorExpired{oldest}`.
     pub fn watch(&self, job_id: &str, after_sequence: u64) -> Result<EventStream, RuntimeError> {
+        if self.is_postgres_job(job_id) {
+            let runtime = self.clone();
+            let id = job_id.to_string();
+            return Ok(EventStream::new(async_stream::stream! {
+                let mut after = after_sequence;
+                loop {
+                    match runtime.events(&id, after).await {
+                        Err(error) => { yield Err(error); break; }
+                        Ok((events, done)) => {
+                            for event in events { after = event.sequence; yield Ok(event); }
+                            if done { break; }
+                        }
+                    }
+                    tokio::time::sleep(runtime.inner.postgres.as_ref().expect("PG").config.poll_interval).await;
+                }
+            }));
+        }
         let st = self.inner.lock();
         if let Some(job) = st.jobs.get(job_id) {
             let changes = job.log.subscribe();
@@ -1012,6 +1074,12 @@ impl Runtime {
         job_id: &str,
         after_sequence: u64,
     ) -> Result<(Vec<ExecutionEvent>, bool), RuntimeError> {
+        if self.is_postgres_job(job_id) {
+            let snapshot = self
+                .postgres_snapshot(job_id, ReadMode::Full, Some(after_sequence))
+                .await?;
+            return Ok((snapshot.events, snapshot.job.state.is_terminal()));
+        }
         let log = {
             let st = self.inner.lock();
             match st.jobs.get(job_id) {
@@ -1079,6 +1147,15 @@ impl Runtime {
         job_id: &str,
         include_outputs: bool,
     ) -> Result<JobView, RuntimeError> {
+        if self.is_postgres_job(job_id) {
+            let mode = if include_outputs {
+                ReadMode::Full
+            } else {
+                ReadMode::Metadata
+            };
+            let snapshot = self.postgres_snapshot(job_id, mode, None).await?;
+            return Ok(view_from_stored(snapshot.job, include_outputs));
+        }
         {
             let st = self.inner.lock();
             if let Some(job) = st.jobs.get(job_id) {
@@ -1135,6 +1212,16 @@ impl Runtime {
     /// Reads a detail view without loading a cold result twice for its view
     /// and replayed events. Event cloning happens outside the runtime lock.
     pub async fn inspect_job(&self, job_id: &str) -> Result<JobInspection, RuntimeError> {
+        if self.is_postgres_job(job_id) {
+            let snapshot = self
+                .postgres_snapshot(job_id, ReadMode::Full, Some(0))
+                .await?;
+            return Ok(JobInspection {
+                job: view_from_stored(snapshot.job, true),
+                spec: None,
+                events: snapshot.events,
+            });
+        }
         loop {
             if let Some(retained) = self.inspect_retained_job(job_id)? {
                 return Ok(retained);
@@ -1156,6 +1243,17 @@ impl Runtime {
     /// Management inspection: cold inline outputs are read as bounded prefixes
     /// directly in storage and never consume the business result-byte budget.
     pub async fn inspect_job_preview(&self, job_id: &str) -> Result<JobPreview, RuntimeError> {
+        if self.is_postgres_job(job_id) {
+            let snapshot = self
+                .postgres_snapshot(job_id, ReadMode::Preview, Some(0))
+                .await?;
+            return Ok(JobPreview {
+                job: view_from_stored(snapshot.job, false),
+                spec: None,
+                events: snapshot.events,
+                outputs: snapshot.previews,
+            });
+        }
         loop {
             if let Some(JobInspection {
                 mut job,
@@ -1207,6 +1305,16 @@ impl Runtime {
     /// Cancels a job and returns its final view. Durable jobs return once the
     /// cancellation is committed.
     pub async fn cancel(&self, job_id: &str, reason: String) -> Result<JobView, RuntimeError> {
+        if self.is_postgres_job(job_id) {
+            self.inner
+                .postgres
+                .as_ref()
+                .expect("PG")
+                .cancel(job_id, reason)
+                .await
+                .map_err(distributed::read_error)?;
+            return self.get_job(job_id, false).await;
+        }
         let receiver = {
             let mut st = self.inner.lock();
             let now = now_ms();
@@ -1261,6 +1369,9 @@ impl Runtime {
     }
 
     pub async fn list_jobs(&self, filter: JobFilter) -> Result<JobPage, RuntimeError> {
+        if self.inner.postgres.is_some() {
+            return self.list_postgres_jobs(filter).await;
+        }
         let offset = match filter.page_token.as_deref().filter(|t| !t.is_empty()) {
             Some(token) => token
                 .parse::<usize>()
@@ -1316,7 +1427,7 @@ impl Runtime {
         let journal = self.inner.journal_health();
         let st = self.inner.lock();
         Health {
-            live: true,
+            live: self.inner.postgres.as_ref().is_none_or(|pg| pg.healthy()),
             ready: !st.shutting_down
                 && matches!(
                     journal,
@@ -1348,7 +1459,12 @@ impl Runtime {
             retained_jobs: st.terminal_order.len(),
             sessions: st.sessions.len(),
             interfaces,
-            journal: self.inner.journal.as_ref().map(|journal| journal.stats()),
+            journal: self
+                .inner
+                .postgres
+                .as_ref()
+                .map(|pg| pg.stats())
+                .or_else(|| self.inner.journal.as_ref().map(|journal| journal.stats())),
             input_bytes: self.inner.input_budget.used(),
             result_bytes: self.inner.result_budget.used(),
             event_bytes: self.inner.event_budget.used(),
@@ -1374,6 +1490,9 @@ impl Runtime {
         }
         if let Some(journal) = &self.inner.journal {
             journal.close().await;
+        }
+        if let Some(pg) = &self.inner.postgres {
+            let _ = tokio::time::timeout(Duration::from_secs(10), pg.close()).await;
         }
     }
 }

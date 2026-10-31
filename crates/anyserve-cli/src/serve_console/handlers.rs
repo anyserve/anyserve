@@ -144,7 +144,12 @@ async fn list_jobs(
         .list_jobs(JobFilter {
             states: parse_states(query.states.as_deref())?,
             limit: query.limit.unwrap_or(50).clamp(1, 200),
-            page_token: query.offset.map(|offset| offset.to_string()),
+            page_token: query.page_token.or_else(|| {
+                query
+                    .offset
+                    .filter(|o| *o > 0)
+                    .map(|offset| offset.to_string())
+            }),
             ..Default::default()
         })
         .await

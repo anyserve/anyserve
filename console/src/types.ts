@@ -8,9 +8,10 @@ export type MetadataMap = Record<string, string>;
 export interface RuntimeModeSummary {
   code:
     | "memory"
-    | "memory_plus_sqlite";
+    | "memory_plus_sqlite"
+    | "postgres_cluster";
   label: string;
-  journal: "disabled" | "sqlite";
+  journal: "disabled" | "sqlite" | "postgres";
 }
 
 export interface QueueSummary {

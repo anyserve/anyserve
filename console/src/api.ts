@@ -74,11 +74,11 @@ export function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
   return request("/api/overview", { signal });
 }
 
-export function getJobs(states: string[], limit = 50, offset = 0, signal?: AbortSignal): Promise<JobsResponse> {
+export function getJobs(states: string[], limit = 50, offset: number | string = 0, signal?: AbortSignal): Promise<JobsResponse> {
   const params = new URLSearchParams({
     states: states.join(","),
     limit: String(limit),
-    offset: String(offset),
+    [typeof offset === "string" ? "page_token" : "offset"]: String(offset),
   });
   return request(`/api/jobs?${params.toString()}`, { signal });
 }

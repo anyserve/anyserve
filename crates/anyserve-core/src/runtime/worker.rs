@@ -251,6 +251,7 @@ impl Runtime {
             });
         }
         inner.dispatch_locked(&mut st, now);
+        inner.cluster_wakeup.notify_one();
         Ok(SessionHandle {
             session_id,
             connection,
@@ -431,6 +432,12 @@ impl Runtime {
         &self,
         lease_id: &str,
     ) -> Result<Option<(String, String)>, RuntimeError> {
+        if let Some(pg) = &self.inner.postgres {
+            return pg
+                .receipt(lease_id)
+                .await
+                .map_err(super::distributed::read_error);
+        }
         match &self.inner.journal {
             None => Ok(None),
             Some(journal) => journal
@@ -501,7 +508,7 @@ impl Runtime {
     pub(crate) async fn push_frame(
         &self,
         lease_id: &str,
-        frame: pb::Frame,
+        mut frame: pb::Frame,
     ) -> Result<u64, RuntimeError> {
         let limits = &self.inner.config.limits;
         if frame.data.len() > limits.max_chunk_bytes as usize {
@@ -511,9 +518,46 @@ impl Runtime {
                 limits.max_chunk_bytes
             )));
         }
-        let metadata = to_metadata(frame.metadata);
+        let metadata = to_metadata(std::mem::take(&mut frame.metadata));
         if metadata_size(&metadata) > limits.max_metadata_bytes as usize {
             return Err(RuntimeError::invalid("frame metadata is too large"));
+        }
+        if let Some(pg) = &self.inner.postgres {
+            let owned = {
+                let st = self.inner.lock();
+                st.leases
+                    .get(lease_id)
+                    .filter(|l| !l.cancelling)
+                    .and_then(|l| st.jobs.get(&l.job_id))
+                    .and_then(|j| j.ownership_epoch.zip(j.attempt.as_ref()))
+                    .map(|(epoch, a)| {
+                        (
+                            st.leases[lease_id].job_id.clone(),
+                            epoch,
+                            a.attempt_id.clone(),
+                        )
+                    })
+            };
+            if let Some((id, epoch, attempt)) = owned {
+                let sequence = pg
+                    .append_frame(
+                        &id,
+                        epoch,
+                        &attempt,
+                        &frame,
+                        metadata,
+                        self.inner.config.event_log_max_events,
+                        self.inner.config.event_log_max_bytes,
+                    )
+                    .await
+                    .map_err(super::distributed::read_error)?;
+                if let Some(job) = self.inner.lock().jobs.get_mut(&id)
+                    && let Some(a) = job.attempt.as_mut().filter(|a| a.lease_id == lease_id)
+                {
+                    a.last_frame_seq = a.last_frame_seq.max(sequence);
+                }
+                return Ok(sequence);
+            }
         }
         let stall = self.inner.config.consumer_stall_timeout;
         let deadline = tokio::time::Instant::now() + stall;

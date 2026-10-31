@@ -31,7 +31,7 @@ reqwest = { version = "0.12.15", default-features = false, features = ["json"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 # The preview function uses SQLx's locked SQLite handle; upgrade these together.
-sqlx = { version = "=0.8.6", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
+sqlx = { version = "=0.8.6", default-features = false, features = ["sqlite", "postgres", "json", "runtime-tokio-rustls"] }
 libsqlite3-sys = { version = "=0.30.1", default-features = false }
 tokio = { version = "1.45.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }

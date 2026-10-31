@@ -58,18 +58,21 @@ pub struct ResolvedServeConfig {
 pub enum RuntimeMode {
     Memory,
     MemoryPlusSqlite,
+    PostgresCluster,
 }
 impl RuntimeMode {
     pub fn code(self) -> &'static str {
         match self {
             Self::Memory => "memory",
             Self::MemoryPlusSqlite => "memory_plus_sqlite",
+            Self::PostgresCluster => "postgres_cluster",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::Memory => "Memory",
             Self::MemoryPlusSqlite => "Memory + SQLite journal",
+            Self::PostgresCluster => "PostgreSQL active-active",
         }
     }
 }
@@ -146,7 +149,14 @@ impl ResolvedServeConfig {
     }
 
     pub fn runtime_mode(&self) -> RuntimeMode {
-        if self.runtime.journal.is_some() {
+        if self
+            .runtime
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.postgres.is_some())
+        {
+            RuntimeMode::PostgresCluster
+        } else if self.runtime.journal.is_some() {
             RuntimeMode::MemoryPlusSqlite
         } else {
             RuntimeMode::Memory

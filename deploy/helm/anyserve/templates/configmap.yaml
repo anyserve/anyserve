@@ -15,7 +15,16 @@ data:
 
     [journal]
     enabled = {{ .Values.journal.enabled }}
+    backend = {{ .Values.journal.backend | quote }}
+    {{- if eq .Values.journal.backend "postgres" }}
+    url_env = "ANYSERVE_DATABASE_URL"
+    schema = {{ .Values.journal.postgres.schema | quote }}
+    lease_duration_ms = {{ .Values.journal.postgres.leaseDurationMs }}
+    poll_interval_ms = {{ .Values.journal.postgres.pollIntervalMs }}
+    max_connections = {{ .Values.journal.postgres.maxConnections }}
+    {{- else }}
     path = "/data/journal.sqlite"
+    {{- end }}
     {{- if include "anyserve.authEnabled" . }}
 
     [auth]

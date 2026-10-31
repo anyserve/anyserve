@@ -1,3 +1,11 @@
+{{- $postgres := and .Values.journal.enabled (eq .Values.journal.backend "postgres") -}}
+{{- $sqlite := and .Values.journal.enabled (eq .Values.journal.backend "sqlite") -}}
+{{- if not (has .Values.journal.backend (list "sqlite" "postgres")) }}
+{{- fail "journal.backend must be sqlite or postgres" }}
+{{- end }}
+{{- if or (lt (int .Values.replicaCount) 1) (and (gt (int .Values.replicaCount) 1) (not $postgres)) }}
+{{- fail "replicaCount must be 1 unless journal.backend=postgres and journal.enabled=true" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -6,8 +14,8 @@ metadata:
     {{- include "anyserve.labels" . | nindent 4 }}
     app.kubernetes.io/component: control-plane
 spec:
-  # One execution domain is one process: the journal has a single owner.
-  replicas: 1
+  replicas: {{ .Values.replicaCount }}
+  podManagementPolicy: {{ if $postgres }}Parallel{{ else }}OrderedReady{{ end }}
   serviceName: {{ include "anyserve.fullname" . }}
   selector:
     matchLabels:
@@ -33,6 +41,14 @@ spec:
               containerPort: {{ .Values.service.grpcPort }}
             - name: http
               containerPort: {{ .Values.service.httpPort }}
+          {{- if $postgres }}
+          env:
+            - name: ANYSERVE_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "journal.postgres.existingSecret is required for PostgreSQL" .Values.journal.postgres.existingSecret | quote }}
+                  key: {{ .Values.journal.postgres.secretKey | quote }}
+          {{- end }}
           {{- if include "anyserve.authEnabled" . }}
           envFrom:
             - secretRef:
@@ -50,7 +66,7 @@ spec:
             - name: config
               mountPath: /etc/anyserve
               readOnly: true
-            {{- if .Values.journal.enabled }}
+            {{- if $sqlite }}
             - name: journal
               mountPath: /data
             {{- end }}
@@ -74,7 +90,7 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-  {{- if .Values.journal.enabled }}
+  {{- if $sqlite }}
   volumeClaimTemplates:
     - metadata:
         name: journal

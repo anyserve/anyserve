@@ -195,24 +195,31 @@ pub struct WorkerSession {
 
 impl WorkerSession {
     pub async fn connect(endpoint: &str, token: Option<&str>, hello: v2::Hello) -> Result<Self> {
-        // Two connect() calls are intentional: cloned channels share a connection.
-        let mut control_client = WorkerClient::with_interceptor(
-            connect_channel(endpoint).await?,
-            BearerAuth::new(token)?,
-        )
-        .max_decoding_message_size(CONTROL_MESSAGE_BYTES)
-        .max_encoding_message_size(CONTROL_MESSAGE_BYTES);
-        let data = AttemptClient::connect(endpoint, token).await?;
+        let channel = connect_channel(endpoint).await?;
+        let mut control_client =
+            WorkerClient::with_interceptor(channel.clone(), BearerAuth::new(token)?)
+                .max_decoding_message_size(CONTROL_MESSAGE_BYTES)
+                .max_encoding_message_size(CONTROL_MESSAGE_BYTES);
         let (control, requests) = mpsc::channel(SEND_QUEUE);
         control
             .send(v2::WorkerMessage {
                 msg: Some(v2::worker_message::Msg::Hello(hello)),
             })
             .await?;
-        let messages = control_client
+        let response = control_client
             .session(ReceiverStream::new(requests))
-            .await?
-            .into_inner();
+            .await?;
+        let data = if response
+            .metadata()
+            .get("anyserve-worker-affinity")
+            .is_some_and(|v| v == "connection")
+        {
+            AttemptClient::from_channel(channel, token)?
+        } else {
+            // Single-instance servers retain separate control/data transports.
+            AttemptClient::connect(endpoint, token).await?
+        };
+        let messages = response.into_inner();
         Ok(Self {
             control,
             messages,
@@ -228,12 +235,13 @@ pub struct AttemptClient {
 
 impl AttemptClient {
     pub async fn connect(endpoint: &str, token: Option<&str>) -> Result<Self> {
-        let inner = WorkerClient::with_interceptor(
-            connect_channel(endpoint).await?,
-            BearerAuth::new(token)?,
-        )
-        .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
+        Self::from_channel(connect_channel(endpoint).await?, token)
+    }
+
+    fn from_channel(channel: Channel, token: Option<&str>) -> Result<Self> {
+        let inner = WorkerClient::with_interceptor(channel, BearerAuth::new(token)?)
+            .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
         Ok(Self { inner })
     }
 

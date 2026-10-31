@@ -37,6 +37,19 @@ docker build -t anyserve .
 
 ## Benchmarks
 
+The multi-replica integration suite uses real PostgreSQL, isolated schemas and
+a TCP load balancer. It covers competing submissions/claims, cancellation,
+takeover fencing, attempt limits, shared progress cursors, receipts and bounded
+result reads. Run it with Docker (the script removes only its own test container):
+
+```bash
+python3 scripts/test-postgres.py
+```
+
+Alternatively, set `ANYSERVE_TEST_POSTGRES_URL` to a disposable PostgreSQL database
+whose user can create schemas. The same tests can be run directly with
+`cargo test --locked -p anyserve-core postgres_cluster_ -- --ignored`.
+
 Core measurements cover queries over 10,000 jobs, dispatch with 129 workers and
 256 unmatched queued jobs, and recovery of 2,048 durable jobs. They also run on
 macOS without external services:

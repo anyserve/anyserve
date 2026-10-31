@@ -107,6 +107,9 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
 
     let failure = tokio::select! {
         signal = shutdown_signal() => { signal?; None }
+        _ = postgres_membership_lost(runtime.clone()), if config.runtime.journal.as_ref().is_some_and(|j| j.postgres.is_some()) => {
+            Some(anyhow::anyhow!("PostgreSQL node lease lost; exiting so the supervisor can restart this replica"))
+        }
         ended = servers.join_next() => Some(match ended {
             Some(Ok(Err(error))) => error,
             Some(Err(error)) => error.into(),
@@ -130,6 +133,15 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+async fn postgres_membership_lost(runtime: Runtime) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if !runtime.health().live {
+            return;
+        }
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {

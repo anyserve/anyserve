@@ -1,6 +1,6 @@
 apiVersion: v2
 name: anyserve
-description: One anyserve execution domain - a control plane with its SQLite journal, and optionally a fleet of application workers.
+description: Anyserve execution domain with a PostgreSQL active-active control plane or a single SQLite instance, and an optional worker fleet.
 type: application
 version: 0.1.0
 appVersion: "0.5.0"

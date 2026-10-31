@@ -1,7 +1,7 @@
 # Anyserve
 
 Anyserve is a backend-independent execution and scheduling system. Clients send
-opaque inputs through the native execution protocol. One control-plane Runtime
+opaque inputs through the native execution protocol. The control plane
 matches jobs to outbound workers by capability and available capacity, and owns
 admission, flow control, cancellation, retries and optional durable recovery.
 
@@ -14,7 +14,7 @@ backend-specific semantics to the control plane.
 - **Invoke** is ephemeral and supports complete or live duplex input/output.
   Dropping the invocation cancels unfinished work.
 - **Submit** accepts complete input and defaults to durable execution. The
-  optional SQLite journal commits input before acceptance and terminal results
+  optional SQLite or PostgreSQL backend commits input before acceptance and terminal results
   before completion acknowledgement. External side effects need application
   idempotency because unfinished work can execute again after a restart.
 - **Placement** matches interfaces, required/preferred attributes, resource
@@ -36,10 +36,12 @@ Rust / Python client -> native Client gRPC -> Execution Runtime
                                                        application backend
 ```
 
-The supported control plane is one process. Its journal has one writer and
-survives a short restart when stored on a persistent volume. Adding workers
-scales execution capacity. Active control-plane replicas sharing a database
-are outside this architecture.
+PostgreSQL supports multiple active control-plane replicas sharing a durable
+queue. Each replica claims work for its connected workers; database-clock node
+leases and per-job fencing epochs protect takeover and terminal commits.
+Submit, GetJob, Watch and Cancel can reach any replica. SQLite remains the
+single-process option. See [deployment](docs/deployment.md#postgresql-active-active)
+for configuration, load balancing and failure recovery.
 
 ## Run from this checkout
 
@@ -110,7 +112,7 @@ versions; see [deployment and recovery](docs/deployment.md).
 - `clients/python`: Python bindings and the application worker API.
 - `console`: views of interfaces, jobs, workers and retained execution events.
 - `bench/load`: native execution workloads and separate CPU profiling.
-- `deploy/helm/anyserve`: Helm chart for one control plane, its journal volume and an optional worker fleet.
+- `deploy/helm/anyserve`: Helm chart for PostgreSQL replicas or one SQLite control plane, and an optional worker fleet.
 
 References cover [configuration](docs/configuration.md), the
 [Python SDK](docs/python-sdk.md), [deployment and recovery](docs/deployment.md)

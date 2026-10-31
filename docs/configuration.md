@@ -35,6 +35,7 @@ allowed_origins = []
 
 [journal]
 enabled = true
+backend = "sqlite"
 path = ".anyserve/journal.sqlite"
 full_sync = true
 queue_capacity = 4096
@@ -101,10 +102,21 @@ Each job also has `event_log_max_events` and `event_log_max_bytes` limits.
 the event byte budget; admission, attempt and retained-job limits bound them.
 
 `terminal_retention_secs` and `max_terminal_jobs` limit terminal jobs in memory.
-Durable results remain readable by ID until journal retention expires; ListJobs
-only lists jobs still in memory. `full_sync=false` selects SQLite NORMAL sync,
+Durable results remain readable by ID until journal retention expires. SQLite
+ListJobs lists jobs still in memory; PostgreSQL lists shared durable jobs and
+local ephemeral jobs. `full_sync=false` selects SQLite NORMAL sync,
 which weakens durability under power loss. Journal queue capacity bounds pending
 operations; `max_batch` controls group commits.
+
+For multiple active replicas, select `backend="postgres"`, omit `path`, and set
+`url_env="ANYSERVE_DATABASE_URL"`. Optional PG keys are `schema="anyserve"`,
+`lease_duration_ms=15000` (3–300 seconds), `poll_interval_ms=100` (at least 10 ms
+and at most one quarter of the lease), and `max_connections=16` (at least 2).
+Each replica also opens one dedicated heartbeat connection. `full_sync=false`
+and the embedded SQLite `max_bytes` cap are rejected for PG. `max_batch` is
+SQLite-only; PG commits independent transactions concurrently. `--journal PATH`
+explicitly selects SQLite and `--ephemeral` disables persistence. See
+[PG deployment](deployment.md#postgresql-active-active) for ownership and load balancing.
 
 For evicted durable jobs, Console previews read at most 4 KiB per inline output
 directly from the journal, preserving the original size without reserving
@@ -127,6 +139,8 @@ evicted jobs) or current retained jobs, and a creation-time window of at most
 and job-id cursors, with at most 250 rows per page. A new partial history index
 is built on first journal open; its startup cost depends on retained history.
 Pages are independent observations, so job states can change during a load.
+In PG mode, the current-work dataset covers shared queued/running durable jobs;
+completed durable jobs are available from the history source.
 
 Explore loads data manually, with a default of 10,000 jobs and upper bounds of
 100,000 jobs and 32 MiB of serialized metadata. It marks partial datasets;

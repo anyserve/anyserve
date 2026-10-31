@@ -74,6 +74,9 @@ pub(crate) fn object_to_proto(object: &Object) -> pb::Object {
 
 impl Inner {
     pub(crate) fn journal_writable(&self) -> bool {
+        if let Some(pg) = &self.postgres {
+            return pg.healthy();
+        }
         matches!(
             *self.journal_status.lock().expect("journal status poisoned"),
             JournalStatus::Healthy
@@ -81,6 +84,15 @@ impl Inner {
     }
 
     pub(crate) fn journal_health(&self) -> JournalHealth {
+        if let Some(pg) = &self.postgres {
+            return if pg.healthy() {
+                JournalHealth::Healthy
+            } else {
+                JournalHealth::Unavailable(
+                    "PostgreSQL node lease lost; restart this replica".into(),
+                )
+            };
+        }
         match &*self.journal_status.lock().expect("journal status poisoned") {
             JournalStatus::Disabled => JournalHealth::Disabled,
             JournalStatus::Healthy => JournalHealth::Healthy,
@@ -91,8 +103,15 @@ impl Inner {
     }
 
     fn record_commit(&self, outcome: &CommitOutcome) {
+        if let Some(pg) = &self.postgres {
+            if matches!(outcome, CommitOutcome::Unknown(_)) {
+                pg.fence();
+            }
+            return;
+        }
         let mut status = self.journal_status.lock().expect("journal status poisoned");
         match outcome {
+            CommitOutcome::Fenced(_) => {}
             CommitOutcome::Committed => {
                 if matches!(*status, JournalStatus::Degraded(_)) {
                     tracing::info!("journal writes succeed again");
@@ -124,11 +143,15 @@ impl Inner {
         op: JournalOp,
         then: impl FnOnce(&Arc<Inner>, CommitOutcome) + Send + 'static,
     ) -> Result<(), RuntimeError> {
-        let journal = self
-            .journal
-            .as_ref()
-            .ok_or_else(|| RuntimeError::unavailable("durable execution requires a journal"))?;
-        let receiver = journal.enqueue(op)?;
+        let receiver = if let Some(pg) = &self.postgres {
+            pg.enqueue(op)?
+        } else {
+            let journal = self
+                .journal
+                .as_ref()
+                .ok_or_else(|| RuntimeError::unavailable("durable execution requires a journal"))?;
+            journal.enqueue(op)?
+        };
         let me = self.me.clone();
         tokio::spawn(async move {
             let outcome = receiver
@@ -215,6 +238,7 @@ impl Inner {
         let log = self.new_log(st, &job_id);
         let job = Job {
             id: job_id.clone(),
+            ownership_epoch: None,
             spec: Arc::new(spec),
             durability,
             spec_hash,
@@ -300,6 +324,7 @@ impl Inner {
             return;
         }
         match outcome {
+            CommitOutcome::Fenced(reason) => self.forget_owned_locked(&mut st, job_id, &reason),
             CommitOutcome::Committed => {
                 self.accepted_locked(&mut st, job_id, now);
                 let job = st.jobs.get_mut(job_id).expect("job exists");
@@ -418,7 +443,7 @@ impl Inner {
         }
     }
 
-    fn dequeue_locked(&self, st: &mut State, job_id: &str) {
+    pub(crate) fn dequeue_locked(&self, st: &mut State, job_id: &str) {
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
@@ -561,6 +586,9 @@ impl Inner {
             job_id: job_id.to_string(),
             attempt_number: number,
             at_ms: now,
+            ownership_epoch: st.jobs[job_id].ownership_epoch,
+            attempt_id: st.jobs[job_id].last_attempt_id.clone(),
+            worker_id: st.jobs[job_id].last_worker_id.clone(),
         });
         let (id, lease) = (job_id.to_string(), lease_id.clone());
         if let Err(error) = self.commit(op, move |inner, outcome| {
@@ -610,7 +638,12 @@ impl Inner {
             self.release_lease_locked(&mut st, lease_id);
             return;
         }
+        if self.postgres.as_ref().is_some_and(|pg| !pg.healthy()) {
+            self.forget_owned_locked(&mut st, job_id, "replica lease expired before assignment");
+            return;
+        }
         match outcome {
+            CommitOutcome::Fenced(reason) => self.forget_owned_locked(&mut st, job_id, &reason),
             CommitOutcome::Committed => {
                 if st.jobs[job_id].cancel_requested.is_some() {
                     self.cancel_locked(&mut st, job_id, now);
@@ -797,6 +830,27 @@ impl Inner {
             && !st.shutting_down
             && job.attempt_count < job.max_attempts;
         if retry {
+            if job.ownership_epoch.is_some() {
+                let retry_at = now.saturating_add(self.backoff(job));
+                st.jobs.get_mut(job_id).expect("job").not_before_ms = retry_at;
+                let (release_lease, cancel_lease) = match lease_end {
+                    LeaseEnd::Release => (Some(lease_id), None),
+                    LeaseEnd::Cancel(reason) => (None, Some((lease_id, reason))),
+                };
+                self.finish_job_locked(
+                    st,
+                    job_id,
+                    TerminalPlan {
+                        release_lease,
+                        cancel_lease,
+                        finished: receipt,
+                        ..TerminalPlan::new(JobState::Queued, Some(error))
+                    },
+                    now,
+                );
+                // The worker waits until the retry and its receipt commit.
+                return false;
+            }
             let job = st.jobs.get_mut(job_id).expect("job");
             let attempt = job.attempt.take().expect("attempt");
             let backoff = self.backoff(job);
@@ -872,6 +926,9 @@ impl Inner {
     }
 
     pub(crate) fn release_lease_locked(&self, st: &mut State, lease_id: &str) {
+        if self.postgres.is_some() {
+            self.cluster_wakeup.notify_one();
+        }
         if let Some(lease) = st.leases.remove(lease_id)
             && let Some(session) = st.sessions.get_mut(&lease.session_id)
         {
@@ -960,25 +1017,32 @@ impl Inner {
             winning_lease_id: plan.finished.as_ref().map(|(lease, _)| lease.clone()),
             outcome_digest: plan.finished.as_ref().map(|(_, digest)| digest.clone()),
             at_ms: now,
+            ownership_epoch: job.ownership_epoch,
+            retry_at_ms: (plan.state == JobState::Queued).then_some(job.not_before_ms),
         }));
         let id = job_id.to_string();
+        let epoch = job.ownership_epoch;
         if let Err(error) = self.commit(op, move |inner, outcome| {
-            inner.on_terminal_committed(&id, outcome)
+            inner.on_terminal_committed(&id, epoch, outcome)
         }) {
             self.terminal_rolled_back_locked(st, job_id, &error.to_string(), now);
         }
     }
 
-    fn on_terminal_committed(&self, job_id: &str, outcome: CommitOutcome) {
+    fn on_terminal_committed(&self, job_id: &str, epoch: Option<i64>, outcome: CommitOutcome) {
         let mut st = self.lock();
         let now = crate::now_ms();
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
+        if job.ownership_epoch != epoch {
+            return;
+        }
         let Phase::Terminating(plan) = &job.phase else {
             return;
         };
         match outcome {
+            CommitOutcome::Fenced(reason) => self.forget_owned_locked(&mut st, job_id, &reason),
             CommitOutcome::Committed => {
                 // Taking the plan must preserve the public state so the terminal
                 // transition removes the original entry from the read indexes.
@@ -986,7 +1050,26 @@ impl Inner {
                 let Phase::Terminating(plan) = std::mem::replace(&mut job.phase, previous) else {
                     unreachable!()
                 };
-                self.apply_terminal_locked(&mut st, job_id, *plan, now);
+                if plan.state == JobState::Queued {
+                    for waiter in st
+                        .jobs
+                        .get_mut(job_id)
+                        .expect("job")
+                        .finish_waiters
+                        .drain(..)
+                    {
+                        let _ = waiter.send(Ok(FinishStatus::Committed));
+                    }
+                    if let Some(lease) = &plan.release_lease {
+                        self.release_lease_locked(&mut st, lease);
+                    }
+                    if let Some((lease, reason)) = &plan.cancel_lease {
+                        self.cancel_lease_locked(&mut st, lease, reason, now);
+                    }
+                    self.forget_owned_locked(&mut st, job_id, "retry returned to shared queue");
+                } else {
+                    self.apply_terminal_locked(&mut st, job_id, *plan, now);
+                }
             }
             CommitOutcome::RolledBack(reason) => {
                 self.terminal_rolled_back_locked(&mut st, job_id, &reason, now);

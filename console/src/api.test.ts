@@ -26,12 +26,14 @@ it("encodes custom job IDs and metadata cursors while preserving authorization",
   await getJob("trace/job?x#y", signal);
   await cancelJob("trace/job?x#y");
   await getAnalyticsJobs("archive", 10, 20, 250, '[15,"trace/job"]', signal);
+  await getJobs(["queued"], 100, '[15,"trace/job"]', signal);
   expect(fetch.mock.calls[0][0]).toBe("/api/jobs/trace%2Fjob%3Fx%23y");
   expect(fetch.mock.calls[1][0]).toBe("/api/jobs/trace%2Fjob%3Fx%23y/cancel");
   const url = new URL(fetch.mock.calls[2][0], "http://localhost");
   expect(url.searchParams.get("cursor")).toBe('[15,"trace/job"]');
   expect(fetch.mock.calls[2][1].signal).toBe(signal);
   expect(fetch.mock.calls[2][1].headers.Authorization).toBe("Bearer client-token");
+  expect(new URL(fetch.mock.calls[3][0], "http://localhost").searchParams.get("page_token")).toBe('[15,"trace/job"]');
 });
 
 it("preserves authentication errors for active requests", async () => {

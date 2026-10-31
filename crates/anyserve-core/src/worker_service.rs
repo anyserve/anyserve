@@ -120,9 +120,23 @@ impl Worker for WorkerGrpcService {
             }
             runtime.session_closed(&session_id, connection);
         });
-        Ok(Response::new(Box::pin(
-            ReceiverStream::new(handle.messages).map(Ok),
-        )))
+        let stream: Self::SessionStream = Box::pin(ReceiverStream::new(handle.messages).map(Ok));
+        let mut response = Response::new(stream);
+        if self
+            .runtime
+            .config()
+            .journal
+            .as_ref()
+            .is_some_and(|j| j.postgres.is_some())
+        {
+            // The SDK keeps Session and Attempt on this HTTP/2 connection so
+            // a TCP load balancer sends both to the worker's owning replica.
+            response.metadata_mut().insert(
+                "anyserve-worker-affinity",
+                "connection".parse().expect("static metadata"),
+            );
+        }
+        Ok(response)
     }
 
     async fn attempt(

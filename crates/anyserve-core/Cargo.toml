@@ -26,4 +26,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+anyserve-client = { path = "../anyserve-client" }
 tokio-stream = { workspace = true, features = ["net"] }

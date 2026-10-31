@@ -187,6 +187,7 @@ pub(crate) struct Attempt {
 
 pub(crate) struct Job {
     pub id: String,
+    pub ownership_epoch: Option<i64>,
     pub spec: Arc<JobSpec>,
     pub durability: Durability,
     pub spec_hash: String,

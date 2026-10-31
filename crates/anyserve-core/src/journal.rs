@@ -20,7 +20,7 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
-    SqliteRow, SqliteSynchronous,
+    SqliteSynchronous,
 };
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, Transaction};
 use tokio::sync::{mpsc, oneshot};
@@ -56,6 +56,9 @@ pub(crate) struct AttemptStartRecord {
     /// The job's attempt count once this start is committed.
     pub attempt_number: u32,
     pub at_ms: u64,
+    pub ownership_epoch: Option<i64>,
+    pub attempt_id: Option<String>,
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -70,11 +73,16 @@ pub(crate) struct TerminalRecord {
     /// Server-computed digest of the winning outcome (`result_digest` column).
     pub outcome_digest: Option<String>,
     pub at_ms: u64,
+    pub ownership_epoch: Option<i64>,
+    /// PostgreSQL retries are committed before returning the job to the queue.
+    pub retry_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommitOutcome {
     Committed,
+    /// Another replica/cancellation owns the row now; discard local state.
+    Fenced(String),
     /// Definitely not written.
     RolledBack(String),
     /// The commit failed and its effect could not be verified.
@@ -106,10 +114,10 @@ pub(crate) struct Recovery {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredSpec {
-    demand: Demand,
-    policy: ExecutionPolicy,
-    metadata: Metadata,
+pub(crate) struct StoredSpec {
+    pub demand: Demand,
+    pub policy: ExecutionPolicy,
+    pub metadata: Metadata,
 }
 
 enum Request {
@@ -582,9 +590,10 @@ async fn load_recovery(conn: &mut SqliteConnection, generation: u64) -> Result<R
     Ok(Recovery { generation, active })
 }
 
-fn state_text(state: JobState) -> &'static str {
+pub(crate) fn state_text(state: JobState) -> &'static str {
     match state {
-        JobState::Queued | JobState::Running => "queued",
+        JobState::Queued => "queued",
+        JobState::Running => "running",
         JobState::Succeeded => "succeeded",
         JobState::Failed => "failed",
         JobState::Cancelled => "cancelled",
@@ -594,6 +603,7 @@ fn state_text(state: JobState) -> &'static str {
 fn state_from_text(text: &str) -> Result<JobState> {
     Ok(match text {
         "queued" => JobState::Queued,
+        "running" => JobState::Running,
         "succeeded" => JobState::Succeeded,
         "failed" => JobState::Failed,
         "cancelled" => JobState::Cancelled,
@@ -601,7 +611,13 @@ fn state_from_text(text: &str) -> Result<JobState> {
     })
 }
 
-fn job_from_row(row: &SqliteRow) -> Result<StoredJob> {
+pub(crate) fn job_from_row<'r, R: Row>(row: &'r R) -> Result<StoredJob>
+where
+    for<'c> &'c str: sqlx::ColumnIndex<R>,
+    String: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
+    i64: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
+    Option<String>: sqlx::Decode<'r, R::Database>,
+{
     let spec_json: String = row.try_get("spec_json")?;
     let stored: StoredSpec = serde_json::from_str(&spec_json).context("decode journal spec")?;
     let error_json: Option<String> = row.try_get("error_json")?;
@@ -616,8 +632,8 @@ fn job_from_row(row: &SqliteRow) -> Result<StoredJob> {
             metadata: stored.metadata,
         },
         spec_hash: row.try_get("spec_hash")?,
-        attempt_count: row.try_get::<i64, _>("attempt_count")? as u32,
-        max_attempts: row.try_get::<i64, _>("max_attempts")? as u32,
+        attempt_count: row.try_get::<i64, _>("attempt_count")?.try_into()?,
+        max_attempts: row.try_get::<i64, _>("max_attempts")?.try_into()?,
         created_at_ms: row.try_get::<i64, _>("created_at_ms")? as u64,
         updated_at_ms: row.try_get::<i64, _>("updated_at_ms")? as u64,
         error: error_json
@@ -630,7 +646,14 @@ fn job_from_row(row: &SqliteRow) -> Result<StoredJob> {
     })
 }
 
-fn object_from_row(row: &SqliteRow) -> Result<Object> {
+pub(crate) fn object_from_row<'r, R: Row>(row: &'r R) -> Result<Object>
+where
+    for<'c> &'c str: sqlx::ColumnIndex<R>,
+    String: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
+    Vec<u8>: sqlx::Type<R::Database> + sqlx::Decode<'r, R::Database>,
+    Option<String>: sqlx::Decode<'r, R::Database>,
+    Option<Vec<u8>>: sqlx::Decode<'r, R::Database>,
+{
     let metadata: Metadata = serde_json::from_str(&row.try_get::<String, _>("metadata_json")?)?;
     Ok(match row.try_get::<Option<String>, _>("uri")? {
         Some(uri) => Object::Uri { uri, metadata },
@@ -974,6 +997,9 @@ mod tests {
             job_id: job_id.to_string(),
             attempt_number,
             at_ms: 2,
+            ownership_epoch: None,
+            attempt_id: None,
+            worker_id: None,
         })
     }
 
@@ -1042,6 +1068,8 @@ mod tests {
                     winning_lease_id: None,
                     outcome_digest: None,
                     at_ms: 2,
+                    ownership_epoch: None,
+                    retry_at_ms: None,
                 }))
             )
             .await,
@@ -1322,6 +1350,8 @@ mod tests {
                         winning_lease_id: None,
                         outcome_digest: None,
                         at_ms: 3,
+                        ownership_epoch: None,
+                        retry_at_ms: None,
                     })),
                 )
                 .await

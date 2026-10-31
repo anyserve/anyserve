@@ -153,6 +153,7 @@ pub(crate) struct JobsQuery {
     pub(crate) states: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
+    pub(crate) page_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -191,6 +192,7 @@ pub(crate) fn runtime_mode_summary(mode: RuntimeMode) -> RuntimeModeSummary {
         journal: match mode {
             RuntimeMode::Memory => "disabled",
             RuntimeMode::MemoryPlusSqlite => "sqlite",
+            RuntimeMode::PostgresCluster => "postgres",
         },
     }
 }

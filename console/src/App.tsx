@@ -320,6 +320,10 @@ export default function App() {
         </div>
       </header>
 
+      {overview?.runtime.code === "postgres_cluster" ? (
+        <div className="banner">Job lists cover the cluster. Counters and workers show this replica.</div>
+      ) : null}
+
       {error ? (
         <div className="banner" role="alert">
           {error}
@@ -328,7 +332,7 @@ export default function App() {
 
       <main className="layout">
         {activeTab === "explore" ? <Suspense fallback={<section className="panel">Loading Explore…</section>}>
-          <ExplorePane journalEnabled={overview ? overview.runtime.journal === "sqlite" : null} onAuthenticationError={handleError} />
+          <ExplorePane journalEnabled={overview ? overview.runtime.journal !== "disabled" : null} distributed={overview?.runtime.code === "postgres_cluster"} onAuthenticationError={handleError} />
         </Suspense> : null}
         {activeTab === "queue" ? (
           <JobsPane

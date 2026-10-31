@@ -119,22 +119,123 @@ pub(super) struct TlsConfigFile {
 #[serde(deny_unknown_fields)]
 pub(super) struct JournalConfigFile {
     enabled: Option<bool>,
+    backend: Option<JournalBackend>,
+    url_env: Option<String>,
+    schema: Option<String>,
+    lease_duration_ms: Option<u64>,
+    poll_interval_ms: Option<u64>,
+    max_connections: Option<u32>,
     path: Option<PathBuf>,
     full_sync: Option<bool>,
     queue_capacity: Option<usize>,
     max_batch: Option<usize>,
     retention_secs: Option<u64>,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum JournalBackend {
+    Sqlite,
+    Postgres,
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    use super::*;
+
+    #[test]
+    fn postgres_config_uses_environment_and_redacts_the_url() {
+        let file: JournalConfigFile =
+            toml::from_str("backend='postgres'\nschema='cluster_a'\nlease_duration_ms=9000")
+                .unwrap();
+        let config = file
+            .resolve_with_env(None, |name| {
+                assert_eq!(name, "ANYSERVE_DATABASE_URL");
+                Some("postgresql://user:secret@localhost/anyserve".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.postgres.as_ref().unwrap().schema, "cluster_a");
+        assert_eq!(
+            config.postgres.as_ref().unwrap().lease_duration,
+            Duration::from_secs(9)
+        );
+        assert!(!format!("{config:?}").contains("secret"));
+    }
+
+    #[test]
+    fn postgres_needs_an_explicit_url_but_overrides_do_not() {
+        let file: JournalConfigFile = toml::from_str("backend='postgres'").unwrap();
+        assert!(
+            file.clone()
+                .resolve_with_env(None, |_| None)
+                .unwrap_err()
+                .to_string()
+                .contains("ANYSERVE_DATABASE_URL")
+        );
+        assert!(
+            file.resolve_with_env(Some("local.sqlite".into()), |_| panic!(
+                "must not read PG env"
+            ))
+            .unwrap()
+            .unwrap()
+            .postgres
+            .is_none()
+        );
+        let file: JournalConfigFile = toml::from_str("backend='postgres'\nenabled=false").unwrap();
+        assert!(
+            file.resolve_with_env(None, |_| panic!("disabled"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(toml::from_str::<JournalConfigFile>("backend='unknown'").is_err());
+    }
+}
+
 impl JournalConfigFile {
     pub(super) fn resolve(self, path_override: Option<PathBuf>) -> Result<Option<JournalConfig>> {
+        self.resolve_with_env(path_override, |name| std::env::var(name).ok())
+    }
+
+    fn resolve_with_env(
+        self,
+        path_override: Option<PathBuf>,
+        env: impl FnOnce(&str) -> Option<String>,
+    ) -> Result<Option<JournalConfig>> {
         if !self.enabled.unwrap_or(true) && path_override.is_none() {
             return Ok(None);
         }
-        let mut config = JournalConfig::new(
-            path_override
-                .or(self.path)
-                .unwrap_or_else(|| PathBuf::from(".anyserve/journal.sqlite")),
-        );
+        let postgres = path_override.is_none() && self.backend == Some(JournalBackend::Postgres);
+        let mut config = if postgres {
+            if self.path.is_some() || self.full_sync == Some(false) {
+                anyhow::bail!("journal.path and full_sync=false cannot be used with PostgreSQL");
+            }
+            let name = self.url_env.as_deref().unwrap_or("ANYSERVE_DATABASE_URL");
+            let url = env(name)
+                .filter(|url| !url.trim().is_empty())
+                .with_context(|| format!("PostgreSQL requires connection URL in env var {name}"))?;
+            let mut config = JournalConfig::postgres(url);
+            let pg = config.postgres.as_mut().expect("PostgreSQL config");
+            if let Some(schema) = self.schema {
+                pg.schema = schema;
+            }
+            if let Some(value) = self.lease_duration_ms {
+                pg.lease_duration = Duration::from_millis(value);
+            }
+            if let Some(value) = self.poll_interval_ms {
+                pg.poll_interval = Duration::from_millis(value);
+            }
+            if let Some(value) = self.max_connections {
+                pg.max_connections = value;
+            }
+            config
+        } else {
+            JournalConfig::new(
+                path_override
+                    .or(self.path)
+                    .unwrap_or_else(|| PathBuf::from(".anyserve/journal.sqlite")),
+            )
+        };
         if let Some(value) = self.full_sync {
             config.full_sync = value;
         }
@@ -147,7 +248,9 @@ impl JournalConfigFile {
         if let Some(value) = self.retention_secs {
             config.retention = Duration::from_secs(value);
         }
-        if config.path.as_os_str().is_empty() || config.queue_capacity == 0 || config.max_batch == 0
+        if (!postgres && config.path.as_os_str().is_empty())
+            || config.queue_capacity == 0
+            || config.max_batch == 0
         {
             anyhow::bail!("journal path, queue_capacity and max_batch must be non-empty/positive");
         }
