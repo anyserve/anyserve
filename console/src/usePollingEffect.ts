@@ -1,39 +1,49 @@
 import { useEffect, useRef } from "react";
 
-export function usePollingEffect(
-  task: () => Promise<void>,
+export function usePollingEffect<T>(
+  task: (signal: AbortSignal) => Promise<T>,
+  onSuccess: (value: T) => void,
+  onError: (error: unknown) => void,
   pollMs: number,
   deps: readonly unknown[],
   enabled = true,
 ) {
-  const taskRef = useRef(task);
+  const callbacks = useRef({ task, onSuccess, onError });
 
   useEffect(() => {
-    taskRef.current = task;
-  }, [task]);
+    callbacks.current = { task, onSuccess, onError };
+  }, [task, onSuccess, onError]);
 
   useEffect(() => {
     if (!enabled) {
       return;
     }
 
-    let cancelled = false;
+    const controller = new AbortController();
+    let timeoutId: number | undefined;
 
     async function refresh() {
-      if (cancelled) {
-        return;
+      try {
+        const value = await callbacks.current.task(controller.signal);
+        if (!controller.signal.aborted) {
+          callbacks.current.onSuccess(value);
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          callbacks.current.onError(error);
+        }
+      } finally {
+        // Schedule from completion so a slow request cannot overlap the next.
+        if (!controller.signal.aborted) {
+          timeoutId = window.setTimeout(() => void refresh(), pollMs);
+        }
       }
-      await taskRef.current();
     }
 
     void refresh();
-    const intervalId = window.setInterval(() => {
-      void refresh();
-    }, pollMs);
-
     return () => {
-      cancelled = true;
-      window.clearInterval(intervalId);
+      controller.abort();
+      window.clearTimeout(timeoutId);
     };
   }, [enabled, pollMs, ...deps]);
 }

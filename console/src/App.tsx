@@ -76,86 +76,68 @@ export default function App() {
   }, []);
 
   usePollingEffect(
-    async () => {
-      try {
-        const nextOverview = await getOverview();
-        setOverview(nextOverview);
-        setError(null);
-      } catch (nextError) {
-        handleError(nextError);
-      }
+    getOverview,
+    (nextOverview) => {
+      setOverview(nextOverview);
+      setError(null);
     },
+    handleError,
     activeTab === "queue" ? OVERVIEW_POLL_MS : 2_000,
     [activeTab],
     polling,
   );
 
   usePollingEffect(
-    async () => {
-      try {
-        const response = await getJobs(QUEUE_STATES, 100, 0);
-        setQueueJobs(sortJobs(response.jobs));
-        setError(null);
-      } catch (nextError) {
-        handleError(nextError);
-      }
+    (signal) => getJobs(QUEUE_STATES, 100, 0, signal),
+    (response) => {
+      setQueueJobs(sortJobs(response.jobs));
+      setError(null);
     },
+    handleError,
     activeTab === "queue" ? QUEUE_POLL_MS : 3_000,
     [activeTab],
     polling,
   );
 
   usePollingEffect(
-    async () => {
-      try {
-        const response = await getJobs(HISTORY_STATES, 100, 0);
-        setHistoryJobs(sortJobs(response.jobs));
-        setError(null);
-      } catch (nextError) {
-        handleError(nextError);
-      }
+    (signal) => getJobs(HISTORY_STATES, 100, 0, signal),
+    (response) => {
+      setHistoryJobs(sortJobs(response.jobs));
+      setError(null);
     },
+    handleError,
     activeTab === "history" ? 2_000 : HISTORY_POLL_MS,
     [activeTab],
     polling,
   );
 
   usePollingEffect(
-    async () => {
-      try {
-        const response = await getWorkers();
-        setWorkers(sortWorkers(response.workers));
-        setError(null);
-      } catch (nextError) {
-        handleError(nextError);
-      }
+    getWorkers,
+    (response) => {
+      setWorkers(sortWorkers(response.workers));
+      setError(null);
     },
+    handleError,
     activeTab === "workers" ? 2_000 : WORKERS_POLL_MS,
     [activeTab],
     polling,
   );
 
   useEffect(() => {
-    if (!activeSelectedJobId) {
-      setJobDetail(null);
-    }
+    setJobDetail(null);
   }, [activeSelectedJobId]);
 
-  usePollingEffect(
-    async () => {
-      if (!activeSelectedJobId) {
-        setJobDetail(null);
-        return;
-      }
+  const selectedJobDetail = jobDetail?.job.job_id === activeSelectedJobId ? jobDetail : null;
 
-      try {
-        const nextDetail = await getJob(activeSelectedJobId);
-        setJobDetail(nextDetail);
-        setError(null);
-      } catch (nextError) {
-        setJobDetail(null);
-        handleError(nextError);
-      }
+  usePollingEffect(
+    (signal) => getJob(activeSelectedJobId!, signal),
+    (nextDetail) => {
+      setJobDetail(nextDetail);
+      setError(null);
+    },
+    (nextError) => {
+      setJobDetail(null);
+      handleError(nextError);
     },
     activeTab === "queue" ? DETAIL_POLL_MS : 2_000,
     [activeTab, activeSelectedJobId],
@@ -358,7 +340,7 @@ export default function App() {
             inspector={
               queueSelection ? (
                 <JobInspector
-                  detail={jobDetail}
+                  detail={selectedJobDetail}
                   isCancelling={isCancelling}
                   onCancel={handleCancel}
                 />
@@ -377,7 +359,7 @@ export default function App() {
             jobs={filteredHistoryJobs}
             totalJobs={historyJobs.length}
             selectedJobId={historySelection?.job_id ?? null}
-            detail={historySelection ? jobDetail : null}
+            detail={historySelection ? selectedJobDetail : null}
             workerFilter={historyWorkerFilter}
             workerOptions={historyWorkerOptions}
             onWorkerFilterChange={setHistoryWorkerFilter}

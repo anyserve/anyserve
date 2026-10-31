@@ -59,21 +59,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function getOverview(): Promise<OverviewResponse> {
-  return request("/api/overview");
+export function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
+  return request("/api/overview", { signal });
 }
 
-export function getJobs(states: string[], limit = 50, offset = 0): Promise<JobsResponse> {
+export function getJobs(states: string[], limit = 50, offset = 0, signal?: AbortSignal): Promise<JobsResponse> {
   const params = new URLSearchParams({
     states: states.join(","),
     limit: String(limit),
     offset: String(offset),
   });
-  return request(`/api/jobs?${params.toString()}`);
+  return request(`/api/jobs?${params.toString()}`, { signal });
 }
 
-export function getJob(jobId: string): Promise<JobDetailResponse> {
-  return request(`/api/jobs/${jobId}`);
+export function getJob(jobId: string, signal?: AbortSignal): Promise<JobDetailResponse> {
+  return request(`/api/jobs/${jobId}`, { signal });
 }
 
 export function cancelJob(jobId: string): Promise<CancelJobResponse> {
@@ -82,6 +82,6 @@ export function cancelJob(jobId: string): Promise<CancelJobResponse> {
   });
 }
 
-export function getWorkers(): Promise<WorkersResponse> {
-  return request("/api/workers");
+export function getWorkers(signal?: AbortSignal): Promise<WorkersResponse> {
+  return request("/api/workers", { signal });
 }
