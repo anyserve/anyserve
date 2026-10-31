@@ -53,7 +53,7 @@ jobs:
       - name: Test PostgreSQL multi-replica integration
         run: cargo test --locked -p anyserve-core postgres_cluster -- --ignored --test-threads=1
         env:
-          ANYSERVE_TEST_POSTGRES_URL: postgresql://anyserve_ci:anyserve_ci@127.0.0.1:${{ job.services.postgres.ports[5432] }}/anyserve_ci
+          ANYSERVE_TEST_POSTGRES_URL: postgresql://anyserve_ci:anyserve_ci@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anyserve_ci
 
   python:
     runs-on: ubuntu-latest
@@ -162,7 +162,8 @@ jobs:
           docker run -d --name anyserve-ci -p 127.0.0.1:3001:3001 \
             -v "$RUNNER_TEMP/anyserve-smoke/server.toml:/etc/anyserve/server.toml:ro" \
             anyserve:ci serve --config /etc/anyserve/server.toml
-          curl --fail --retry 15 --retry-delay 1 --retry-connrefused http://127.0.0.1:3001/readyz
+          curl --fail --max-time 5 --retry 15 --retry-delay 1 --retry-max-time 60 \
+            --retry-all-errors http://127.0.0.1:3001/readyz
 
   helm:
     runs-on: ubuntu-latest
