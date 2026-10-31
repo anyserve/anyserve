@@ -38,6 +38,7 @@ struct InterfaceIndex {
 pub(crate) struct JobIndex {
     jobs: ByState,
     interfaces: BTreeMap<String, InterfaceIndex>,
+    created: BTreeSet<(u64, String)>,
 }
 
 impl JobIndex {
@@ -46,6 +47,11 @@ impl JobIndex {
     }
 
     pub(crate) fn insert(&mut self, job: &Job) {
+        self.created.insert((job.created_at_ms, job.id.clone()));
+        self.insert_state(job);
+    }
+
+    pub(crate) fn insert_state(&mut self, job: &Job) {
         let state = slot(job.state());
         let key = (Reverse(job.updated_at_ms), job.id.clone());
         self.jobs[state].insert(key.clone());
@@ -62,7 +68,29 @@ impl JobIndex {
     }
 
     pub(crate) fn remove(&mut self, job: &Job, prune: bool) {
+        self.created.remove(&(job.created_at_ms, job.id.clone()));
         self.remove_position(job, Self::position(job), prune);
+    }
+
+    pub(crate) fn scan(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        before: Option<(u64, String)>,
+        limit: usize,
+    ) -> Vec<&str> {
+        use std::ops::Bound::{Excluded, Included};
+        let lower = (from_ms, String::new());
+        let upper = before.unwrap_or((to_ms, String::new()));
+        if upper <= lower {
+            return Vec::new();
+        }
+        self.created
+            .range((Included(lower), Excluded(upper)))
+            .rev()
+            .take(limit)
+            .map(|(_, id)| id.as_str())
+            .collect()
     }
 
     pub(crate) fn remove_position(&mut self, job: &Job, position: Position, prune: bool) {
@@ -147,6 +175,13 @@ impl JobIndex {
 
 #[cfg(test)]
 pub(crate) fn assert_matches_jobs(st: &super::state::State) {
+    assert_eq!(
+        st.job_index.created,
+        st.jobs
+            .values()
+            .map(|job| (job.created_at_ms, job.id.clone()))
+            .collect()
+    );
     let mut expected_counts = [0; 5];
     let now = crate::now_ms();
     let mut expected_interfaces: BTreeMap<String, InterfaceStats> = BTreeMap::new();

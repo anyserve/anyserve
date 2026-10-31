@@ -120,6 +120,32 @@ attempt result (including associated metadata), 32 KiB metadata, 1,024 objects,
 The gRPC message cap is 64 MiB including protobuf overhead. URI objects are opaque
 references; applications fetch them.
 
+Console's **Explore** page loads task metadata into an in-memory DuckDB-WASM
+database in a dedicated Worker. Choose completed durable history (including
+evicted jobs) or current retained jobs, and a creation-time window of at most
+31 days. The authenticated `/api/analytics/jobs` endpoint uses creation-time
+and job-id cursors, with at most 250 rows per page. A new partial history index
+is built on first journal open; its startup cost depends on retained history.
+Pages are independent observations, so job states can change during a load.
+
+Explore loads data manually, with a default of 10,000 jobs and upper bounds of
+100,000 jobs and 32 MiB of serialized metadata. It marks partial datasets;
+aggregations cover only the loaded data. `jobs` contains summary columns and
+`job_metadata(job_id, key, value)` supports tag filters and joins. Durations
+include queue time. Request/result bodies and media are excluded. Query results
+are capped at 1,000 rows / 100 columns / 4 MiB, large cells are shortened, and tables render
+50 rows per page. CSV exports contain the displayed, filtered results.
+
+SQL runs locally with a 256 MB DuckDB memory limit and a 15-second deadline.
+Cancellation or timeout terminates the Worker and requires reloading the data.
+External access and extension installation are disabled; queries are prepared
+as a single SELECT relation. Leaving Explore releases its Worker and dataset.
+The WASM and Worker assets are served with the Console (no runtime CDN). Only
+Explore loads them; the EH WASM asset is about 36 MB before HTTP compression.
+Use a browser with WebAssembly exception handling. Serve the production assets
+with compression and immutable caching for hashed filenames; no cross-origin
+isolation headers are required by this single-threaded bundle.
+
 ## CLI
 
 Global flags: `--endpoint URL` (job commands; default

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 
 import {
   AuthenticationError,
@@ -26,6 +26,8 @@ import { asErrorMessage, formatTimestamp, readTabFromLocation, sortJobs, sortWor
 import { HistoryPane, JobsPane, JobInspector, WorkersPane } from "./panes";
 import { usePollingEffect } from "./usePollingEffect";
 import type { JobDetailResponse, JobSummary, OverviewResponse, WorkerSummary } from "./types";
+
+const ExplorePane = lazy(() => import("./ExplorePane"));
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<ConsoleTab>(() => readTabFromLocation());
@@ -191,7 +193,7 @@ export default function App() {
   }, [historyWorkerFilter, historyWorkerOptions]);
 
   useEffect(() => {
-    if (activeTab === "workers") {
+    if (activeTab === "workers" || activeTab === "explore") {
       return;
     }
 
@@ -325,6 +327,9 @@ export default function App() {
       ) : null}
 
       <main className="layout">
+        {activeTab === "explore" ? <Suspense fallback={<section className="panel">Loading Explore…</section>}>
+          <ExplorePane journalEnabled={overview ? overview.runtime.journal === "sqlite" : null} onAuthenticationError={handleError} />
+        </Suspense> : null}
         {activeTab === "queue" ? (
           <JobsPane
             title="Queue"

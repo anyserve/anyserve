@@ -7,9 +7,12 @@
     "dev": "vite",
     "build": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "bench:analytics": "node --experimental-strip-types bench/analytics.ts"
   },
   "dependencies": {
+    "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
+    "apache-arrow": "17.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

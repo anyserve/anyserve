@@ -1,6 +1,6 @@
 use super::api::{
-    ApiError, AppState, CancelJobResponse, JobDetail, JobDetailResponse, JobsQuery, JobsResponse,
-    WorkersResponse,
+    AnalyticsJob, AnalyticsQuery, AnalyticsResponse, AnalyticsSource, ApiError, AppState,
+    CancelJobResponse, JobDetail, JobDetailResponse, JobsQuery, JobsResponse, WorkersResponse,
 };
 use super::snapshot::{
     INLINE_PREVIEW_LIMIT_BYTES, aggregate_capacity, attempts_from_events, event_summary,
@@ -10,7 +10,7 @@ use super::snapshot::{
 use anyserve_core::auth::AuthPolicy;
 use anyserve_core::error::{ErrorKind, RuntimeError};
 use anyserve_core::now_ms;
-use anyserve_core::runtime::api::{JobFilter, JobPreview, JobState};
+use anyserve_core::runtime::api::{Durability, JobFilter, JobPreview, JobScan, JobState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -33,6 +33,7 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
         .route("/metrics", get(metrics))
         .route("/api/overview", get(overview))
         .route("/api/jobs", get(list_jobs))
+        .route("/api/analytics/jobs", get(analytics_jobs))
         .route("/api/jobs/:job_id", get(get_job))
         .route("/api/jobs/:job_id/cancel", post(cancel_job))
         .route("/api/workers", get(list_workers))
@@ -45,6 +46,36 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
             middleware_state,
             cors_middleware,
         ))
+}
+async fn analytics_jobs(
+    State(state): State<AppState>,
+    Query(query): Query<AnalyticsQuery>,
+) -> Result<Json<AnalyticsResponse>, ApiError> {
+    let page = state
+        .runtime
+        .scan_job_metadata(JobScan {
+            archived: matches!(query.source, AnalyticsSource::Archive),
+            from_ms: query.from_ms,
+            to_ms: query.to_ms,
+            limit: query.limit.unwrap_or(250),
+            cursor: query.cursor,
+        })
+        .await
+        .map_err(api_error)?;
+    Ok(Json(AnalyticsResponse {
+        jobs: page
+            .jobs
+            .iter()
+            .map(|job| AnalyticsJob {
+                summary: job_summary(job),
+                durability: match job.durability {
+                    Durability::Durable => "durable",
+                    Durability::Ephemeral => "ephemeral",
+                },
+            })
+            .collect(),
+        next_cursor: page.next_page_token,
+    }))
 }
 async fn healthz(State(state): State<AppState>) -> StatusCode {
     if state.runtime.health().live {

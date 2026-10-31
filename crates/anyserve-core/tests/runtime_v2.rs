@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyserve_core::runtime::Runtime;
 use anyserve_core::runtime::api::{
-    self, ConflictPolicy, Durability, EventKind, ExecutionEvent, InputMode, InvokeRequest, JobSpec,
-    JobState, JournalConfig, Object, RuntimeConfig, SubmitRequest, codes,
+    self, ConflictPolicy, Durability, EventKind, ExecutionEvent, InputMode, InvokeRequest, JobScan,
+    JobSpec, JobState, JournalConfig, Object, RuntimeConfig, SubmitRequest, codes,
 };
 use anyserve_core::worker_service::WorkerGrpcService;
 use anyserve_proto::v2::{self as pb, worker_client::WorkerClient};
@@ -709,10 +709,28 @@ async fn durable_jobs_survive_restart_and_completion_is_idempotent() {
     server.runtime.shutdown().await;
     drop(server);
 
+    // Recovery must index the original creation time, not the restart time.
+    while anyserve_core::now_ms() <= job.created_at_ms {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let server = serve(durable_config()).await;
     assert!(server.runtime.generation() > first_generation);
     let recovered = server.runtime.get_job("durable-1", false).await.unwrap();
     assert_eq!(recovered.state, JobState::Queued);
+    assert_eq!(recovered.created_at_ms, job.created_at_ms);
+    let page = server
+        .runtime
+        .scan_job_metadata(JobScan {
+            archived: false,
+            from_ms: job.created_at_ms,
+            to_ms: job.created_at_ms + 1,
+            limit: 1,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.jobs, vec![recovered]);
+    assert!(page.next_page_token.is_none());
     let mut worker = TestWorker::connect(&server.url, "w1", &[]).await;
     let assign = worker.next_assign().await;
     assert_eq!(assign.inline_inputs.len(), 1);

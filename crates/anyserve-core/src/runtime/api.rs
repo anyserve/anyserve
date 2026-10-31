@@ -375,6 +375,19 @@ pub struct JobPage {
     pub next_page_token: Option<String>,
 }
 
+/// Bounded metadata scan in descending (creation time, job id) order.
+/// Archived scans include completed durable jobs; retained scans include live
+/// and recently completed jobs. Neither reads request or result bodies.
+#[derive(Clone, Debug)]
+pub struct JobScan {
+    pub archived: bool,
+    pub from_ms: u64,
+    /// Exclusive upper bound, fixed across pages by the caller.
+    pub to_ms: u64,
+    pub limit: usize,
+    pub cursor: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorkerLoad {
     pub queued: u32,

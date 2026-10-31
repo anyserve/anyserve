@@ -158,6 +158,8 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS journal_jobs_recovery
         ON journal_jobs(created_at_ms, job_id) WHERE state = 'queued'",
     "CREATE INDEX IF NOT EXISTS journal_jobs_winner ON journal_jobs(winning_lease_id)",
+    "CREATE INDEX IF NOT EXISTS journal_jobs_history ON journal_jobs(created_at_ms, job_id)
+        WHERE state IN ('succeeded', 'failed', 'cancelled')",
     "CREATE TABLE IF NOT EXISTS journal_objects (
         job_id TEXT NOT NULL,
         role TEXT NOT NULL,
@@ -180,6 +182,36 @@ const ROLE_PARAMS: &str = "params";
 const ROLE_OUTPUT: &str = "output";
 
 impl Journal {
+    pub(crate) async fn scan_jobs(
+        &self,
+        from_ms: u64,
+        to_ms: u64,
+        before: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>> {
+        let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
+        query
+            .push(" INDEXED BY journal_jobs_history WHERE state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
+            .push_bind(from_ms as i64)
+            .push(" AND created_at_ms < ")
+            .push_bind(to_ms as i64);
+        if let Some((at, id)) = before {
+            query
+                .push(" AND (created_at_ms, job_id) < (")
+                .push_bind(at as i64)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        let rows = query
+            .push(" ORDER BY created_at_ms DESC, job_id DESC LIMIT ")
+            .push_bind(limit as i64)
+            .build()
+            .fetch_all(&self.read_pool)
+            .await?;
+        rows.iter().map(job_from_row).collect()
+    }
+
     /// Opens (creating if needed) the journal, starts a new generation and
     /// loads what recovery needs. Only one process may hold a journal.
     pub(crate) async fn open(config: &JournalConfig) -> Result<(Journal, Recovery)> {
@@ -1160,6 +1192,63 @@ mod tests {
         assert_eq!(outputs[0].size_bytes, Some(8192));
         assert_eq!(outputs[1].size_bytes, Some(60));
         assert!(matches!(&outputs[2].prefix, Object::Uri { uri, .. } if uri == "s3://result"));
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn archive_scan_uses_creation_cursor_and_never_loads_objects() {
+        let config = config("archive-scan");
+        let journal = finished_fixture(&config).await;
+        let mut conn = connect(&config).await;
+        sqlx::query("UPDATE journal_objects SET content = ? WHERE job_id = 'result' AND role = 'output' AND idx = 0")
+            .bind(vec![7u8; 5 * 1024 * 1024]).execute(&mut conn).await.unwrap();
+        for (id, at, state) in [
+            ("z", 2, "failed"),
+            ("y", 2, "cancelled"),
+            ("x", 2, "succeeded"),
+            ("queued", 2, "queued"),
+            ("future", 3, "succeeded"),
+        ] {
+            sqlx::query("INSERT INTO journal_jobs(job_id, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+                SELECT ?, ?, spec_hash, spec_json, max_attempts, ?, 99 FROM journal_jobs WHERE job_id = 'result'")
+                .bind(id).bind(state).bind(at).execute(&mut conn).await.unwrap();
+        }
+        let page = journal.scan_jobs(1, 3, None, 2).await.unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "y"]
+        );
+        sqlx::query("DELETE FROM journal_jobs WHERE job_id = 'y'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let page = journal
+            .scan_jobs(1, 3, Some((2, "y".into())), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "result"]
+        );
+        assert!(page.iter().all(|job| job.outputs.is_empty()
+            && job.spec.inputs.is_empty()
+            && job.spec.params.is_empty()));
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT job_id FROM journal_jobs INDEXED BY journal_jobs_history WHERE state IN ('succeeded','failed','cancelled') AND created_at_ms >= 1 AND created_at_ms < 3 ORDER BY created_at_ms DESC, job_id DESC LIMIT 2")
+            .fetch_all(&mut conn).await.unwrap();
+        assert!(
+            plan.iter()
+                .any(|row| row.3.contains("journal_jobs_history")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|row| row.3.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+        conn.close().await.unwrap();
         journal.close().await;
     }
 

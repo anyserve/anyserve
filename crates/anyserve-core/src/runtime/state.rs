@@ -78,7 +78,7 @@ impl State {
             // timestamp. Their identity and interface never change.
             if previous != JobIndex::position(job) {
                 self.job_index.remove_position(job, previous, false);
-                self.job_index.insert(job);
+                self.job_index.insert_state(job);
             }
         }
     }

@@ -2,6 +2,7 @@
 //! durable jobs, worker sessions and attempt streams, with an optional SQLite
 //! journal for durable jobs.
 
+mod analytics;
 pub mod api;
 pub(crate) mod events;
 mod identity;
@@ -406,13 +407,14 @@ impl Inner {
                 stored.max_attempts,
                 None,
                 input_permit,
-                now,
+                // Creation time is immutable once the read index is populated.
+                // accepted_locked below resets queue and update time to now.
+                stored.created_at_ms,
             );
             let job = st.jobs.get_mut(&job_id).expect("recovered job");
             // Events of earlier generations are gone: older cursors get
             // `CursorExpired` rather than this generation's events.
             job.log.mark_lost_before_base();
-            job.created_at_ms = stored.created_at_ms;
             job.attempt_count = stored.attempt_count;
             job.last_attempt_id = stored.last_attempt_id;
             job.last_worker_id = stored.last_worker_id;

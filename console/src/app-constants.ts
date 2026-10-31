@@ -1,19 +1,21 @@
 import type { JobState } from "./types";
 
-export type ConsoleTab = "queue" | "workers" | "history";
+export type ConsoleTab = "queue" | "workers" | "history" | "explore";
 
-export const CONSOLE_TABS: ConsoleTab[] = ["queue", "workers", "history"];
+export const CONSOLE_TABS: ConsoleTab[] = ["queue", "workers", "history", "explore"];
 
 export const TAB_LABELS: Record<ConsoleTab, string> = {
   queue: "Queue",
   workers: "Workers",
   history: "History",
+  explore: "Explore",
 };
 
 export const TAB_PATHS: Record<ConsoleTab, string> = {
   queue: "/queue",
   workers: "/workers",
   history: "/history",
+  explore: "/explore",
 };
 
 export const QUEUE_STATES: JobState[] = ["queued", "running"];

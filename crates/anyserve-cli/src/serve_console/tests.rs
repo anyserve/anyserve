@@ -48,6 +48,7 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
             "/api/overview",
             "/api/jobs",
             "/api/workers",
+            "/api/analytics/jobs?source=retained&from_ms=0&to_ms=1",
             &format!("/api/jobs/{}", job.job_id),
         ] {
             let mut request = client.get(format!("{base_url}{path}"));
@@ -120,6 +121,89 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
         runtime.get_job(&job.job_id, false).await.unwrap().state,
         JobState::Cancelled
     );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn analytics_pages_metadata_and_validates_ranges_and_sources() {
+    let runtime = test_runtime().await;
+    let before = anyserve_core::now_ms().saturating_sub(1000);
+    let mut expected = Vec::new();
+    for index in 0..5 {
+        let mut spec = test_job_spec("analytics.v1");
+        spec.metadata.insert("tag".into(), format!("value-{index}"));
+        spec.params = b"private request body".to_vec().into();
+        let job = runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        expected.push(job.job_id);
+    }
+    runtime
+        .cancel(&expected[0], "failed selection".into())
+        .await
+        .unwrap();
+    let end = anyserve_core::now_ms() + 1;
+    let (base, handle) = spawn_test_server(runtime).await;
+    let client = reqwest::Client::new();
+    let mut cursor = None;
+    let mut received = Vec::new();
+    loop {
+        let mut query = vec![
+            ("source", "retained".to_string()),
+            ("from_ms", before.to_string()),
+            ("to_ms", end.to_string()),
+            ("limit", "2".to_string()),
+        ];
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor));
+        }
+        let response = client
+            .get(format!("{base}/api/analytics/jobs"))
+            .query(&query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        let rows = body["jobs"].as_array().unwrap();
+        assert!(rows.len() <= 2);
+        for row in rows {
+            assert_eq!(row["interface_name"], "analytics.v1");
+            assert_eq!(row["durability"], "ephemeral");
+            assert!(row["metadata"]["tag"].is_string());
+            assert!(row.get("params").is_none() && row.get("outputs").is_none());
+            received.push(row["job_id"].as_str().unwrap().to_owned());
+        }
+        cursor = body["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    expected.sort();
+    received.sort();
+    assert_eq!(received, expected);
+    for query in [
+        "source=archive&from_ms=0&to_ms=100",
+        "source=retained&from_ms=10&to_ms=10",
+        "source=retained&from_ms=0&to_ms=9999999999",
+        "source=retained&from_ms=0&to_ms=100&cursor=invalid",
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{base}/api/analytics/jobs?{query}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            400
+        );
+    }
     handle.abort();
 }
 

@@ -93,6 +93,21 @@ processes are stopped automatically. The HTTP load is held constant, so these
 comparisons exclude frontend polling savings. These are short, closed-loop
 local measurements, not a production capacity or large-media transfer test.
 
+Explore's tests run actual DuckDB-WASM queries, Arrow IPC imports, query bounds,
+error recovery and cancellation through a real Worker transport under Node.
+The browser UI is tested separately for paging, partial loads and stale responses.
+Measure the same engine over 10,000 and 100,000 synthetic metadata rows with
+Node 24+, three repetitions per size:
+
+```bash
+npm --prefix console run bench:analytics -- /tmp/anyserve-analytics.json
+```
+
+This records initialization, 250-row batch imports, SQL timings and Node RSS.
+It excludes network transfer, browser rendering and browser Worker messaging;
+the 100,000-row engine case is independent of the UI's 32 MiB JSON input cap.
+Validate production asset loading in a browser when changing the Worker setup.
+
 ## CI and releases
 
 The [CI workflow](../.github/workflows/anyserve-ci.yml) runs these checks and

@@ -1,4 +1,6 @@
 import type {
+  AnalyticsResponse,
+  AnalyticsSource,
   CancelJobResponse,
   JobDetailResponse,
   JobsResponse,
@@ -13,6 +15,15 @@ export class AuthenticationError extends Error {}
 
 export function setConsoleToken(token: string): void {
   sessionStorage.setItem(tokenKey, token.trim());
+}
+
+export function getAnalyticsJobs(
+  source: AnalyticsSource, fromMs: number, toMs: number, limit: number,
+  cursor: string | null, signal: AbortSignal,
+): Promise<AnalyticsResponse> {
+  const params = new URLSearchParams({ source, from_ms: String(fromMs), to_ms: String(toMs), limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  return request(`/api/analytics/jobs?${params}`, { signal });
 }
 
 interface ApiErrorPayload {
@@ -73,11 +84,11 @@ export function getJobs(states: string[], limit = 50, offset = 0, signal?: Abort
 }
 
 export function getJob(jobId: string, signal?: AbortSignal): Promise<JobDetailResponse> {
-  return request(`/api/jobs/${jobId}`, { signal });
+  return request(`/api/jobs/${encodeURIComponent(jobId)}`, { signal });
 }
 
 export function cancelJob(jobId: string): Promise<CancelJobResponse> {
-  return request(`/api/jobs/${jobId}/cancel`, {
+  return request(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {
     method: "POST",
   });
 }

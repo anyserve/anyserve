@@ -154,6 +154,36 @@ pub(crate) struct JobsQuery {
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
 }
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AnalyticsSource {
+    Archive,
+    #[default]
+    Retained,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AnalyticsQuery {
+    pub(crate) source: AnalyticsSource,
+    pub(crate) from_ms: u64,
+    pub(crate) to_ms: u64,
+    pub(crate) limit: Option<usize>,
+    pub(crate) cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AnalyticsJob {
+    #[serde(flatten)]
+    pub(crate) summary: JobSummary,
+    pub(crate) durability: &'static str,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AnalyticsResponse {
+    pub(crate) jobs: Vec<AnalyticsJob>,
+    pub(crate) next_cursor: Option<String>,
+}
 pub(crate) fn runtime_mode_summary(mode: RuntimeMode) -> RuntimeModeSummary {
     RuntimeModeSummary {
         code: mode.code(),

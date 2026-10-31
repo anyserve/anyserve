@@ -73,6 +73,15 @@ export interface JobsResponse {
   next_page_token: string | null;
 }
 
+export type AnalyticsSource = "archive" | "retained";
+export interface AnalyticsJob extends JobSummary {
+  durability: "durable" | "ephemeral";
+}
+export interface AnalyticsResponse {
+  jobs: AnalyticsJob[];
+  next_cursor: string | null;
+}
+
 export interface ObjectRefSummary {
   kind: "inline" | "uri";
   size_bytes: number | null;
