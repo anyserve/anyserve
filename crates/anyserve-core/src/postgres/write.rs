@@ -171,7 +171,6 @@ impl Postgres {
             .try_acquire_owned()
             .map_err(|_| RuntimeError::exhausted("PostgreSQL submission queue is full"))?;
         let mut tx = self.pool.begin().await?;
-        let now = db_now(&mut tx).await?;
         let spec = &record.spec;
         let slim = StoredSpec {
             demand: spec.demand.clone(),
@@ -180,21 +179,28 @@ impl Postgres {
         };
         let input_bytes =
             spec.inputs.iter().map(Object::inline_len).sum::<usize>() + spec.params.len();
-        let inserted = sqlx::query("INSERT INTO jobs(job_id,state,spec_hash,spec_json,interface,
+        let now: Option<i64> = sqlx::query_scalar("WITH stamp AS MATERIALIZED (
+            SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms)
+            INSERT INTO jobs(job_id,state,spec_hash,spec_json,interface,
             required_attributes,preferred_attributes,required_capacity,priority,input_bytes,max_attempts,
             created_at_ms,updated_at_ms,queued_at_ms,queue_timeout_ms,total_deadline_ms,spillover_ms,event_sequence)
-            VALUES($1,'queued',$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8,$9,$10,$11,$11,$11,$12,$13,$14,1)
-            ON CONFLICT(job_id) DO NOTHING")
+            SELECT $1,'queued',$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8,$9,$10,
+                now_ms,now_ms,now_ms,$11,
+                CASE WHEN $12::bigint IS NULL THEN NULL
+                     WHEN now_ms>9223372036854775807-$12 THEN 9223372036854775807
+                     ELSE now_ms+$12 END,$13,1 FROM stamp
+            ON CONFLICT(job_id) DO NOTHING RETURNING created_at_ms")
             .bind(&record.job_id).bind(&record.spec_hash).bind(serde_json::to_string(&slim)?)
             .bind(&spec.demand.interface).bind(serde_json::to_string(&spec.demand.required_attributes)?)
             .bind(serde_json::to_string(&spec.demand.preferred_attributes)?)
             .bind(serde_json::to_string(&spec.demand.required_capacity)?)
             .bind(spec.policy.priority as i64).bind(input_bytes as i64).bind(record.max_attempts as i64)
-            .bind(now).bind(queue_timeout_ms)
-            .bind(spec.policy.total_timeout.map(|d| now.saturating_add(d.as_millis().min(i64::MAX as u128) as i64)))
+            .bind(queue_timeout_ms)
+            .bind(spec.policy.total_timeout.map(|d| d.as_millis().min(i64::MAX as u128) as i64))
             .bind(spec.policy.spillover_after.map(|d| d.as_millis().min(i64::MAX as u128) as i64))
-            .execute(&mut *tx).await?.rows_affected() == 1;
-        if inserted {
+            .fetch_optional(&mut *tx).await?;
+        let inserted = now.is_some();
+        if let Some(now) = now {
             insert_objects(&mut tx, &record.job_id, "input", &spec.inputs).await?;
             if !spec.params.is_empty() {
                 insert_objects(
@@ -248,11 +254,15 @@ impl Postgres {
                   SELECT 1 FROM nodes WHERE node_id=owner_id AND expires_at>clock_timestamp()))
               AND (not_before_ms<=$1 OR total_deadline_ms<=$1) AND (
                 attempt_count>=max_attempts OR total_deadline_ms<=$1 OR
-                (state='queued' AND queued_at_ms+queue_timeout_ms<=$1) OR
+                (state='queued' AND CASE
+                    WHEN queued_at_ms>9223372036854775807-queue_timeout_ms THEN 9223372036854775807
+                    ELSE queued_at_ms+queue_timeout_ms END<=$1) OR
                 EXISTS (SELECT 1 FROM jsonb_array_elements($2::jsonb) w
                     WHERE w->'interfaces' ? jobs.interface
                       AND (w->'attributes') @> required_attributes
-                      AND (spillover_ms IS NULL OR queued_at_ms+spillover_ms<=$1
+                      AND (spillover_ms IS NULL OR CASE
+                           WHEN queued_at_ms>9223372036854775807-spillover_ms THEN 9223372036854775807
+                           ELSE queued_at_ms+spillover_ms END<=$1
                            OR (w->'attributes') @> preferred_attributes)
                       AND NOT EXISTS(SELECT 1 FROM jsonb_each_text(required_capacity) r
                           WHERE r.value::bigint>COALESCE((w->'capacity'->>r.key)::bigint,0))))
@@ -403,23 +413,27 @@ impl Postgres {
 
     async fn apply_in_tx(&self, tx: &mut Transaction<'_, Pg>, op: &JournalOp) -> Result<bool> {
         self.ensure_healthy()?;
-        let now = db_now(tx).await?;
         match op {
-            JournalOp::Probe => Ok(true),
+            JournalOp::Probe => {
+                db_now(tx).await?;
+                Ok(true)
+            }
             JournalOp::Accept(_) => {
                 anyhow::bail!("PostgreSQL acceptance uses atomic idempotent submission")
             }
             JournalOp::AttemptStart(record) => {
-                let seq: Option<i64> = sqlx::query_scalar("UPDATE jobs SET state='running',
-                    attempt_count=$4,last_attempt_id=$5,last_worker_id=$6,updated_at_ms=$7,event_sequence=event_sequence+1,last_frame_seq=0
+                let updated: Option<(i64, i64)> = sqlx::query_as("UPDATE jobs SET state='running',
+                    attempt_count=$4,last_attempt_id=$5,last_worker_id=$6,
+                    updated_at_ms=(extract(epoch FROM clock_timestamp())*1000)::bigint,
+                    event_sequence=event_sequence+1,last_frame_seq=0
                     WHERE job_id=$1 AND owner_id=$2 AND ownership_epoch=$3
                       AND state='queued' AND attempt_count=$4-1
                       AND EXISTS (SELECT 1 FROM nodes WHERE node_id=$2 AND expires_at>clock_timestamp())
-                    RETURNING event_sequence")
+                    RETURNING event_sequence,updated_at_ms")
                     .bind(&record.job_id).bind(&self.node_id).bind(record.ownership_epoch)
                     .bind(record.attempt_number as i64).bind(&record.attempt_id).bind(&record.worker_id)
-                    .bind(now).fetch_optional(&mut **tx).await?;
-                let Some(seq) = seq else {
+                    .fetch_optional(&mut **tx).await?;
+                let Some((seq, now)) = updated else {
                     return Ok(false);
                 };
                 event(
@@ -439,17 +453,22 @@ impl Postgres {
             JournalOp::Terminal(record) => {
                 let retry = record.state == JobState::Queued;
                 let state = state_text(record.state);
-                let seq: Option<i64> = sqlx::query_scalar("UPDATE jobs SET state=$4,error_json=$5,
-                    updated_at_ms=$6,owner_id=NULL,event_sequence=event_sequence+1,
-                    queued_at_ms=$6,not_before_ms=$7
+                let updated: Option<(i64, i64)> = sqlx::query_as("WITH stamp AS MATERIALIZED (
+                    SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms)
+                    UPDATE jobs SET state=$4,error_json=$5,
+                    updated_at_ms=stamp.now_ms,owner_id=NULL,event_sequence=event_sequence+1,
+                    queued_at_ms=stamp.now_ms,not_before_ms=CASE WHEN $6::bigint IS NULL THEN 0
+                        WHEN stamp.now_ms>9223372036854775807-$6 THEN 9223372036854775807
+                        ELSE stamp.now_ms+$6 END
+                    FROM stamp
                     WHERE job_id=$1 AND owner_id=$2 AND ownership_epoch=$3 AND state IN ('queued','running')
                       AND EXISTS (SELECT 1 FROM nodes WHERE node_id=$2 AND expires_at>clock_timestamp())
-                    RETURNING event_sequence")
+                    RETURNING event_sequence,updated_at_ms")
                     .bind(&record.job_id).bind(&self.node_id).bind(record.ownership_epoch).bind(state)
                     .bind(if retry { None } else { record.error.as_ref().map(serde_json::to_string).transpose()? })
-                    .bind(now).bind(record.retry_at_ms.map(|at| now.saturating_add(at.saturating_sub(record.at_ms).min(i64::MAX as u64) as i64)).unwrap_or_default())
+                    .bind(record.retry_at_ms.map(|at| at.saturating_sub(record.at_ms).min(i64::MAX as u64) as i64))
                     .fetch_optional(&mut **tx).await?;
-                let Some(seq) = seq else {
+                let Some((seq, now)) = updated else {
                     return Ok(false);
                 };
                 if record.state == JobState::Succeeded {

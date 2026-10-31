@@ -103,9 +103,18 @@ CPU/RSS, PG settings, source revision and binary hashes are retained; processes
 and schemas are removed automatically. PG CPU/RSS are excluded from process
 totals. Use `--server-bin /path/to/baseline/anyserve --source-revision COMMIT`
 and the same `--bench-bin` for matching before/after runs on an idle host.
-The echo payload repeats one byte, so PG compression can make the 1 MiB case
-optimistic compared with compressed images or video. Use it to compare changes,
-not to size production media storage.
+PG runs default to `--payload-pattern random --payload-seed 0`: reproducible
+high-entropy bytes generated with SplitMix64 before timing, avoiding the overly
+optimistic TOAST compression of repeated bytes. Use `--payload-pattern repeat`
+for the historical repeated-x workload. Pattern, seed and generator are recorded
+alongside a post-run sample of logical/stored object bytes (excluding row/index
+and TOAST page overhead). Rebuild and freeze one new bench binary for both old
+and new servers; never compare different client hashes or payload patterns.
+The same buffer is reused across jobs: this approximates compressed JPEG/video
+bytes, not codecs, real media delivery or production storage capacity. The direct
+bench `client` and `seed` commands accept these options but retain `repeat` as
+their default, preserving the generic and Console runners' historical workloads.
+They select input/echo bytes; S2's fixed streamed output frames are unchanged.
 
 For Console overhead and large-result previews on macOS or Linux, build both
 release binaries and run the standard-library Python runner:

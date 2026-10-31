@@ -55,7 +55,10 @@ pub(super) async fn run(args: ClientArgs) -> Result {
     let clients: Vec<_> = (0..args.concurrency)
         .map(|index| channels[(index % connection_count) as usize].clone())
         .collect();
-    let payload = Arc::new(vec![b'x'; args.payload]);
+    let payload = Arc::new(
+        args.payload_pattern
+            .generate(args.payload, args.payload_seed),
+    );
     let barrier = Arc::new(Barrier::new(clients.len() + 1));
     let start = Instant::now();
     let unix_start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
@@ -165,6 +168,9 @@ pub(super) async fn run(args: ClientArgs) -> Result {
         "grpc_channels": connection_count,
         "by_path": by_path,
         "payload_bytes": args.payload,
+        "payload_pattern": args.payload_pattern.name(),
+        "payload_seed": args.payload_seed,
+        "payload_generator": args.payload_pattern.algorithm(),
         "warmup_seconds": args.warmup.as_secs_f64(),
         "target_duration_seconds": args.duration.as_secs_f64(),
         "actual_duration_seconds": actual,
@@ -205,10 +211,12 @@ pub(super) async fn seed(
     endpoint: &str,
     count: usize,
     size: usize,
+    pattern: crate::payload::Pattern,
+    seed: u64,
     out: &std::path::Path,
 ) -> Result {
     let mut client = ExecutionClient::connect_with_token(endpoint, None).await?;
-    let payload = vec![b'x'; size];
+    let payload = pattern.generate(size, seed);
     let mut ids = Vec::with_capacity(count);
     for _ in 0..count {
         ids.push(
@@ -218,7 +226,9 @@ pub(super) async fn seed(
     }
     tokio::fs::write(
         out,
-        serde_json::to_vec(&json!({"job_ids": ids, "payload_bytes": size}))?,
+        serde_json::to_vec(&json!({"job_ids": ids, "payload_bytes": size,
+            "payload_pattern": pattern.name(), "payload_seed": seed,
+            "payload_generator": pattern.algorithm()}))?,
     )
     .await?;
     Ok(())

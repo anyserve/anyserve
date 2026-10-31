@@ -340,6 +340,59 @@ async fn postgres_cluster_batch_claim_respects_input_budget() {
 
 #[tokio::test]
 #[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_large_timeouts_do_not_block_claims() {
+    let c = Cluster::start().await;
+    let mut queue = request("large-queue-timeout");
+    queue.spec.policy.queue_timeout = Some(Duration::MAX);
+    c.a.submit(queue).await.unwrap();
+    let mut spillover = request("large-spillover");
+    spillover.spec.policy.spillover_after = Some(Duration::MAX);
+    spillover
+        .spec
+        .demand
+        .preferred_attributes
+        .insert("accelerator".into(), "gpu".into());
+    c.a.submit(spillover).await.unwrap();
+    c.a.submit(request("ordinary")).await.unwrap();
+
+    let pg = c.a.inner.postgres.as_ref().unwrap();
+    let budget = Arc::new(crate::runtime::events::ByteBudget::new(1024));
+    let claimed = pg
+        .claim(
+            serde_json::json!([{"interfaces":["echo"],"attributes":{},"capacity":{}}]),
+            3,
+            Arc::clone(&budget),
+        )
+        .await
+        .unwrap();
+    assert!(claimed.iter().all(|job| job.failure.is_none()));
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|job| job.job.job_id.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from(["large-queue-timeout", "ordinary"])
+    );
+    drop(claimed);
+    // The preference delay stays closed, but a preferred worker may still claim it.
+    let preferred = pg
+        .claim(
+            serde_json::json!([{"interfaces":["echo"],"attributes":{"accelerator":"gpu"},"capacity":{}}]),
+            3,
+            Arc::clone(&budget),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preferred.len(), 1);
+    assert_eq!(preferred[0].job.job_id, "large-spillover");
+    assert!(preferred[0].failure.is_none());
+    drop(preferred);
+    assert_eq!(budget.used(), 0);
+    c.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
 async fn postgres_cluster_takeover_fences_old_result_and_preserves_watch_cursor() {
     let c = Cluster::start().await;
     let mut wa = worker(&c.a, "a", 1);

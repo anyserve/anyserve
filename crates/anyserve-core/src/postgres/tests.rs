@@ -1,4 +1,6 @@
 use super::*;
+use crate::journal::{AcceptRecord, AttemptStartRecord, TerminalRecord};
+use crate::runtime::api::{ConflictPolicy, ErrorInfo, JobSpec, JobState, Object};
 
 async fn node() -> (Arc<Postgres>, PgPool) {
     let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL")
@@ -20,6 +22,174 @@ async fn close(pg: Arc<Postgres>, admin: PgPool) {
         .await
         .unwrap();
     admin.close().await;
+}
+
+fn acceptance(id: &str, total_timeout: Option<Duration>) -> AcceptRecord {
+    let mut spec = JobSpec::default();
+    spec.policy.total_timeout = total_timeout;
+    AcceptRecord {
+        job_id: id.into(),
+        spec_hash: "same-spec".into(),
+        spec: Arc::new(spec),
+        max_attempts: 2,
+        created_at_ms: 1,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_accept_uses_database_time_and_saturates_deadlines() {
+    let (pg, admin) = node().await;
+    for (id, timeout) in [
+        ("unlimited", None),
+        ("immediate", Some(Duration::ZERO)),
+        ("bounded", Some(Duration::from_millis(17))),
+        ("overflow", Some(Duration::MAX)),
+    ] {
+        assert!(
+            pg.accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !pg.accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
+                .await
+                .unwrap()
+        );
+        let row = sqlx::query(
+            "SELECT created_at_ms,updated_at_ms,queued_at_ms,total_deadline_ms,event_sequence,
+             (SELECT at_ms FROM events WHERE job_id=jobs.job_id AND sequence=1) AS event_at,
+             (extract(epoch FROM clock_timestamp())*1000)::bigint AS db_now
+             FROM jobs WHERE job_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap();
+        let created: i64 = row.get("created_at_ms");
+        assert!(created > 1 && created <= row.get::<i64, _>("db_now"));
+        assert_eq!(created, row.get::<i64, _>("updated_at_ms"));
+        assert_eq!(created, row.get::<i64, _>("queued_at_ms"));
+        assert_eq!(created, row.get::<i64, _>("event_at"));
+        assert_eq!(row.get::<i64, _>("event_sequence"), 1);
+        let expected = match id {
+            "unlimited" => None,
+            "immediate" => Some(created),
+            "bounded" => Some(created + 17),
+            _ => Some(i64::MAX),
+        };
+        assert_eq!(row.get::<Option<i64>, _>("total_deadline_ms"), expected);
+    }
+    let mut different = acceptance("unlimited", None);
+    different.spec_hash = "different-spec".into();
+    assert!(
+        pg.accept(different, ConflictPolicy::UseExisting, None)
+            .await
+            .is_err()
+    );
+    close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_attempt_and_terminal_share_database_time_with_events() {
+    let (pg, admin) = node().await;
+    for (id, retry_at) in [
+        ("finished", None),
+        ("past-retry", Some(1)),
+        ("future-retry", Some(117)),
+        ("overflow-retry", Some(u64::MAX)),
+    ] {
+        pg.accept(acceptance(id, None), ConflictPolicy::Fail, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET owner_id=$2,ownership_epoch=7 WHERE job_id=$1")
+            .bind(id)
+            .bind(&pg.node_id)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+        let start = |epoch| {
+            JournalOp::AttemptStart(AttemptStartRecord {
+                job_id: id.into(),
+                attempt_number: 1,
+                at_ms: 1,
+                ownership_epoch: Some(epoch),
+                attempt_id: Some("attempt".into()),
+                worker_id: Some("worker".into()),
+            })
+        };
+        assert!(matches!(pg.apply(start(6)).await, CommitOutcome::Fenced(_)));
+        assert_eq!(pg.apply(start(7)).await, CommitOutcome::Committed);
+        let (started, assigned): (i64, i64) = sqlx::query_as(
+            "SELECT updated_at_ms,at_ms FROM jobs JOIN events USING(job_id)
+             WHERE job_id=$1 AND sequence=2",
+        )
+        .bind(id)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap();
+        assert!(started > 1);
+        assert_eq!(started, assigned);
+
+        let terminal = |epoch| {
+            JournalOp::Terminal(Box::new(TerminalRecord {
+                job_id: id.into(),
+                state: if retry_at.is_some() {
+                    JobState::Queued
+                } else {
+                    JobState::Succeeded
+                },
+                outputs: vec![Object::inline("output")],
+                error: retry_at.map(|_| ErrorInfo::new("RETRY", "retry", true)),
+                attempt_id: Some("attempt".into()),
+                worker_id: Some("worker".into()),
+                winning_lease_id: retry_at.is_none().then(|| "lease".into()),
+                outcome_digest: retry_at.is_none().then(|| "digest".into()),
+                at_ms: 100,
+                ownership_epoch: Some(epoch),
+                retry_at_ms: retry_at,
+            }))
+        };
+        assert!(matches!(
+            pg.apply(terminal(6)).await,
+            CommitOutcome::Fenced(_)
+        ));
+        assert_eq!(pg.apply(terminal(7)).await, CommitOutcome::Committed);
+        let row = sqlx::query(
+            "SELECT updated_at_ms,queued_at_ms,not_before_ms,event_sequence,owner_id,
+             (SELECT at_ms FROM events WHERE job_id=jobs.job_id AND sequence=3) AS event_at,
+             (extract(epoch FROM clock_timestamp())*1000)::bigint AS db_now
+             FROM jobs WHERE job_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap();
+        let updated: i64 = row.get("updated_at_ms");
+        assert!(updated >= started && updated <= row.get::<i64, _>("db_now"));
+        assert_eq!(updated, row.get::<i64, _>("queued_at_ms"));
+        assert_eq!(updated, row.get::<i64, _>("event_at"));
+        assert_eq!(row.get::<i64, _>("event_sequence"), 3);
+        assert_eq!(row.get::<Option<String>, _>("owner_id"), None);
+        let expected = match id {
+            "finished" => 0,
+            "past-retry" => updated,
+            "future-retry" => updated + 17,
+            _ => i64::MAX,
+        };
+        assert_eq!(row.get::<i64, _>("not_before_ms"), expected);
+    }
+    let (output, digest): (Vec<u8>, String) = sqlx::query_as(
+        "SELECT content,digest FROM objects JOIN receipts USING(job_id)
+         WHERE job_id='finished' AND role='output'",
+    )
+    .fetch_one(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(output, b"output");
+    assert_eq!(digest, "digest");
+    close(pg, admin).await;
 }
 
 #[tokio::test]

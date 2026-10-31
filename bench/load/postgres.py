@@ -164,6 +164,7 @@ def run_case(args, url, sql, concurrency, payload, repetition):
             client, _ = spawn([args.bench_bin, "client", "--endpoint", endpoint,
                 "--scenario", "S3", "--concurrency", str(concurrency),
                 "--connections", str(min(8, concurrency)), "--payload", str(payload),
+                "--payload-pattern", args.payload_pattern, "--payload-seed", str(args.payload_seed),
                 "--warmup", f"{args.warmup}s", "--duration", f"{args.duration}s",
                 "--out", output], "client", index)
             clients.append((client, output))
@@ -183,7 +184,12 @@ def run_case(args, url, sql, concurrency, payload, repetition):
         results = [json.loads(path.read_text()) for _, path in clients]
         summary = aggregate(results)
         summary.update(case=name, repetition=repetition, replicas=args.replicas,
-                       concurrency_per_replica=concurrency, payload_bytes=payload, schema=schema)
+                       concurrency_per_replica=concurrency, payload_bytes=payload, schema=schema,
+                       payload_pattern=args.payload_pattern, payload_seed=args.payload_seed)
+        # Outside the measurement window; content size excludes tuple/index/TOAST page overhead.
+        summary["payload_storage_sample"] = json.loads(sql(f'SELECT COALESCE(json_agg(sample), \'[]\') '
+            f'FROM (SELECT role, octet_length(content) AS logical_bytes, pg_column_size(content) AS stored_bytes '
+            f'FROM "{schema}".objects WHERE content IS NOT NULL LIMIT 32) sample;'))
         # Includes warm-up: this checks actual execution, not just client routing.
         participation = json.loads(sql(f'SELECT COALESCE(json_object_agg(last_worker_id, completed), \'{{}}\') '
             f'FROM (SELECT last_worker_id, count(*) AS completed FROM "{schema}".jobs '
@@ -247,6 +253,9 @@ def main():
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--replicas", type=int, default=2)
     parser.add_argument("--cases", default="64:256,256:256,4:1048576", help="per-replica concurrency:payload bytes")
+    parser.add_argument("--payload-pattern", choices=("repeat", "random"), default="random",
+                        help="random avoids optimistic compression of large payloads; repeat reproduces historical x payloads")
+    parser.add_argument("--payload-seed", type=int, default=0, help="reproducible unsigned 64-bit seed; ignored for repeat")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
     if args.self_check:
@@ -258,6 +267,8 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     if not args.out or min(args.duration, args.repeat, args.replicas) <= 0 or args.warmup < 0:
         parser.error("--out and positive duration/repeat/replicas are required; warmup must be nonnegative")
+    if not 0 <= args.payload_seed < 2**64:
+        parser.error("payload seed must be an unsigned 64-bit integer")
     try:
         cases = [tuple(map(int, case.split(":"))) for case in args.cases.split(",")]
         assert all(len(case) == 2 and min(case) > 0 for case in cases)
@@ -277,6 +288,7 @@ def main():
         "server_sha256": digest(args.server_bin), "bench_sha256": digest(args.bench_bin),
         "tool_sha256": {name: digest(Path(__file__).with_name(name)) for name in ("postgres.py", "console.py", "runner.py")},
         "scope": "durable Submit+Watch through verified echo output; successful measured round trips, not submission-only QPS; loopback closed-loop clients; fresh PG schema per case",
+        "payload_scope": "one deterministic buffer reused per client; random uses SplitMix64 little-endian words to model already-compressed bytes, not media codecs or distinct content per job",
         "throughput_window": "pooled successes divided by earliest client measurement start to latest finish, including drain; raw client windows retained",
         "tokio_worker_threads": {"control": "production default", "worker": 2, "client": 4},
         "cpu_unit": "100% = one logical CPU; role sums exclude PostgreSQL; ps samples every 0.5s",

@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 
 mod client;
+mod payload;
 mod profile;
 mod worker;
 
@@ -29,6 +30,10 @@ enum Command {
         count: usize,
         #[arg(long, default_value_t = 16 * 1024 * 1024)]
         payload: usize,
+        #[arg(long, value_enum, default_value = "repeat")]
+        payload_pattern: payload::Pattern,
+        #[arg(long, default_value_t = 0)]
+        payload_seed: u64,
         #[arg(long)]
         out: PathBuf,
     },
@@ -72,6 +77,12 @@ struct ClientArgs {
     warmup: Duration,
     #[arg(long, default_value_t = 256)]
     payload: usize,
+    /// Input bytes: repeat x for historical comparisons, or deterministic high entropy.
+    #[arg(long, value_enum, default_value = "repeat")]
+    payload_pattern: payload::Pattern,
+    /// SplitMix64 seed; ignored for repeat. Generated once before timing begins.
+    #[arg(long, default_value_t = 0)]
+    payload_seed: u64,
     #[arg(long)]
     out: PathBuf,
 }
@@ -95,8 +106,20 @@ async fn main() -> Result {
             endpoint,
             count,
             payload,
+            payload_pattern,
+            payload_seed,
             out,
-        } => client::seed(&endpoint, count, payload, &out).await,
+        } => {
+            client::seed(
+                &endpoint,
+                count,
+                payload,
+                payload_pattern,
+                payload_seed,
+                &out,
+            )
+            .await
+        }
         Command::Serve {
             listen,
             journal,
