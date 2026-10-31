@@ -427,33 +427,24 @@ impl Postgres {
                 anyhow::bail!("PostgreSQL acceptance uses atomic idempotent submission")
             }
             JournalOp::AttemptStart(record) => {
-                let updated: Option<(i64, i64)> = sqlx::query_as("UPDATE jobs SET state='running',
+                let kind = EventKind::Assigned {
+                    worker_id: record.worker_id.clone().unwrap_or_default(),
+                    attempt_number: record.attempt_number,
+                };
+                let inserted = sqlx::query("WITH started AS (UPDATE jobs SET state='running',
                     attempt_count=$4,last_attempt_id=$5,last_worker_id=$6,
                     updated_at_ms=(extract(epoch FROM clock_timestamp())*1000)::bigint,
                     event_sequence=event_sequence+1,last_frame_seq=0
                     WHERE job_id=$1 AND owner_id=$2 AND ownership_epoch=$3
                       AND state='queued' AND attempt_count=$4-1
                       AND EXISTS (SELECT 1 FROM nodes WHERE node_id=$2 AND expires_at>clock_timestamp())
-                    RETURNING event_sequence,updated_at_ms")
+                    RETURNING job_id,event_sequence,last_attempt_id,updated_at_ms)
+                    INSERT INTO events(job_id,sequence,attempt_id,at_ms,kind_json)
+                    SELECT job_id,event_sequence,last_attempt_id,updated_at_ms,$7 FROM started")
                     .bind(&record.job_id).bind(&self.node_id).bind(record.ownership_epoch)
                     .bind(record.attempt_number as i64).bind(&record.attempt_id).bind(&record.worker_id)
-                    .fetch_optional(&mut **tx).await?;
-                let Some((seq, now)) = updated else {
-                    return Ok(false);
-                };
-                event(
-                    tx,
-                    &record.job_id,
-                    seq,
-                    record.attempt_id.as_deref(),
-                    now,
-                    EventKind::Assigned {
-                        worker_id: record.worker_id.clone().unwrap_or_default(),
-                        attempt_number: record.attempt_number,
-                    },
-                )
-                .await?;
-                Ok(true)
+                    .bind(serde_json::to_string(&kind)?).execute(&mut **tx).await?;
+                Ok(inserted.rows_affected() == 1)
             }
             JournalOp::Terminal(record) => {
                 let retry = record.state == JobState::Queued;

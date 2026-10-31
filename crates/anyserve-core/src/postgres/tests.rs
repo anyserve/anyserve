@@ -1,6 +1,6 @@
 use super::*;
 use crate::journal::{AcceptRecord, AttemptStartRecord, TerminalRecord};
-use crate::runtime::api::{ConflictPolicy, ErrorInfo, JobSpec, JobState, Object};
+use crate::runtime::api::{ConflictPolicy, ErrorInfo, EventKind, JobSpec, JobState, Object};
 
 async fn node() -> (Arc<Postgres>, PgPool) {
     let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL")
@@ -210,6 +210,91 @@ async fn postgres_cluster_attempt_and_terminal_share_database_time_with_events()
     assert_eq!(replayed.last_attempt_id.as_deref(), Some("attempt"));
     assert_eq!(replayed.last_worker_id.as_deref(), Some("worker"));
     assert!(replayed.outputs.is_empty());
+    close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_attempt_start_is_fenced_and_atomic_with_assigned_event() {
+    let (pg, admin) = node().await;
+    pg.accept(acceptance("atomic-start", None), ConflictPolicy::Fail, None)
+        .await
+        .unwrap();
+    let start = |epoch| {
+        JournalOp::AttemptStart(AttemptStartRecord {
+            job_id: "atomic-start".into(),
+            attempt_number: 1,
+            at_ms: 1,
+            ownership_epoch: Some(epoch),
+            attempt_id: Some("attempt".into()),
+            worker_id: Some("worker".into()),
+        })
+    };
+    let snapshot = "SELECT jsonb_build_object('job',to_jsonb(jobs),'events',
+        (SELECT jsonb_agg(to_jsonb(events) ORDER BY sequence) FROM events
+         WHERE events.job_id=jobs.job_id))::text FROM jobs WHERE job_id='atomic-start'";
+    for (owner, epoch) in [("another-owner", 7), (pg.node_id.as_str(), 6)] {
+        sqlx::query("UPDATE jobs SET owner_id=$1,ownership_epoch=7 WHERE job_id='atomic-start'")
+            .bind(owner)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+        let before: String = sqlx::query_scalar(snapshot)
+            .fetch_one(&pg.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            pg.apply(start(epoch)).await,
+            CommitOutcome::Fenced(_)
+        ));
+        let after: String = sqlx::query_scalar(snapshot)
+            .fetch_one(&pg.pool)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "fenced start changed the job or events");
+    }
+    let before: String = sqlx::query_scalar(snapshot)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap();
+    // Fail Assigned insertion after the guarded UPDATE has matched the job.
+    sqlx::query("ALTER TABLE events ADD CONSTRAINT reject_assigned CHECK (sequence<>2)")
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        pg.apply(start(7)).await,
+        CommitOutcome::RolledBack(reason) if reason.contains("reject_assigned")
+    ));
+    let after: String = sqlx::query_scalar(snapshot)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "failed event insertion did not roll back the job"
+    );
+    sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_assigned")
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    assert_eq!(pg.apply(start(7)).await, CommitOutcome::Committed);
+    assert!(matches!(pg.apply(start(7)).await, CommitOutcome::Fenced(_)));
+    let (count, kind): (i64, String) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM events),kind_json FROM events
+         WHERE job_id='atomic-start' AND sequence=2",
+    )
+    .fetch_one(&pg.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(
+        serde_json::from_str::<EventKind>(&kind).unwrap(),
+        EventKind::Assigned {
+            worker_id: "worker".into(),
+            attempt_number: 1,
+        }
+    );
     close(pg, admin).await;
 }
 
