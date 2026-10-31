@@ -46,7 +46,7 @@ are outside this architecture.
 Rust and `protoc` are required to build the binary. Run from the repository root:
 
 ```bash
-cargo build -p anyserve
+cargo build --locked -p anyserve
 ./target/debug/anyserve serve --config examples/server.toml
 ```
 
@@ -70,11 +70,14 @@ From a terminal with the same Python environment:
 python examples/python/submit.py
 ```
 
-The [Python examples](examples/python/README.md) are an echo worker and a
-submitter; workers for Triton Inference Server, vLLM, ComfyUI and live video
+The Python examples are an [echo worker](examples/python/worker.py) and a
+[submitter](examples/python/submit.py); workers for Triton Inference Server,
+vLLM, ComfyUI and live video
 live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
-The [Rust example](examples/rust) uses the same protocol. Applications supply backend-specific worker code; the CLI starts the
-control plane and inspects/cancels jobs.
+The [Rust example](examples/rust) uses the same protocol. Applications supply
+backend-specific worker code; the CLI starts the control plane and
+inspects/cancels jobs. Python clients and workers use `ANYSERVE_ENDPOINT`,
+defaulting to `http://127.0.0.1:50052`.
 
 Configure separate client and worker tokens before remote access. The job CLI
 and native clients read `ANYSERVE_TOKEN`; application workers use a worker-role
@@ -88,6 +91,10 @@ interfaces, workers, byte budgets and journal. Job state gauges count entries
 currently retained in memory, not cumulative completions. With authentication
 enabled, `/metrics` and console reads require a client token; health probes
 remain accessible without one.
+
+For the browser console, run `npm --prefix console ci` and
+`npm --prefix console run dev`. The console accepts a client token and keeps it
+in the current browser tab's session storage.
 
 The core exposes the native `anyserve.v2` Client and Worker services only.
 Applications connect their own workers with the SDK and keep backend protocols,
@@ -105,7 +112,6 @@ versions; see [deployment and recovery](docs/deployment.md).
 - `bench/load`: native execution workloads and separate CPU profiling.
 - `deploy/helm/anyserve`: Helm chart for one control plane, its journal volume and an optional worker fleet.
 
-Start with [getting started](docs/getting-started.md). References cover
-[configuration](docs/configuration.md), the [Python SDK](docs/python-sdk.md),
-[architecture](docs/architecture.md), [deployment](docs/deployment.md) and
-[contributing and benchmarks](docs/contributing.md).
+References cover [configuration](docs/configuration.md), the
+[Python SDK](docs/python-sdk.md), [deployment and recovery](docs/deployment.md)
+and [development checks and benchmarks](docs/contributing.md).

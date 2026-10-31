@@ -40,6 +40,9 @@ Reusing `job_id` with the same specification is idempotent while the server
 retains that job; a different specification conflicts. `call`, `execute` and
 `result` raise `RuntimeError` for a failed/cancelled job. `RpcError` is a
 `RuntimeError` subclass with the numeric gRPC `status_code` for RPC failures.
+Durable Submit requires an enabled journal. Closing a Watch leaves the job
+running; closing an unfinished Invoke cancels it. Invoke and Watch consume
+gRPC trailers before returning Finished, so closing at that event is safe.
 
 Use event streams as context managers when you may leave before completion:
 
@@ -87,7 +90,10 @@ All maps default to `{}`, `params` to `b""` and numbers to zero.
 | `execution_timeout_ms: int` | Limit one attempt; zero leaves it unset |
 | `total_timeout_ms: int` | Limit the entire job; zero leaves it unset |
 | `spillover_after_ms: int` | Hold for all preferences before allowing partial matches; zero ranks immediately |
-| `max_attempts: int` | Includes the first attempt; zero uses the server default |
+| `max_attempts: int` | Includes the first attempt; zero uses the server default (3), one disables retries; default ceiling is 20 |
+
+Once a non-progress output event is exposed, an interrupted attempt ends with
+`output_interrupted` instead of switching workers behind the reader's back.
 
 ## Jobs and events
 
@@ -142,6 +148,8 @@ connection error. Endpoint/token defaults match the client, but workers need a
 worker-role token. The default ID is hostname plus process ID; `connection` is
 an optional transport supplied by embedded callers. Transport failures reconnect;
 authentication and invalid-argument failures propagate.
+A server Drain stops new assignments; the worker keeps in-flight handlers until
+completion or cancellation/fencing and reconnects when the session ends.
 
 With `pass_context=True`, the second argument exposes `job_id`, `attempt_id`,
 `lease_id`, `metadata`, `inputs`, `params`, `cancelled` and `terminal_replay`.
@@ -155,3 +163,6 @@ Raise `WorkerError(message, retryable=True)` for a failure that can safely retry
 elsewhere. Its default is `retryable=False`; other exceptions also fail without
 retry. Runtime execution retries may run the backend again, so make external
 side effects idempotent. SDK result-delivery retries do not rerun the handler.
+Delivery retries use exponential backoff and jitter, bounded by four negotiated
+heartbeat timeouts per open/commit operation. Job deadlines remain enforced by
+the server.

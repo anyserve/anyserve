@@ -1,9 +1,7 @@
 # Contributing
 
-The workspace checks use the Rust version in [rust-toolchain.toml](../rust-toolchain.toml),
-`protoc`, Python 3.12+ and Node.js. Container and
-chart checks also need Docker and Helm. No GPU, broker or external database is
-required. Run from the repository root.
+Use the Rust version in [rust-toolchain.toml](../rust-toolchain.toml), `protoc`,
+Python 3.12+ and Node.js. Run from the repository root.
 
 ## Checks
 
@@ -17,33 +15,38 @@ python3 -m venv .venv
 pip install --force-reinstall ./clients/python
 python -m unittest discover -s clients/python/tests -p 'test_*.py' -v
 python clients/python/tests/sdk_e2e.py -v
+npm --prefix console ci
+npm --prefix console test
+npm --prefix console run build
 python scripts/check-doc-links.py
+python scripts/check-release-version.py
 ```
 
 Rebuild the Python extension after changing Rust bindings or the protocol.
 The SDK process suite starts authenticated servers and workers in temporary
 directories. `ANYSERVE_BIN` overrides its default `target/debug/anyserve` binary.
 
+Deployment checks require Docker and Helm:
+
 ```bash
-npm --prefix console ci
-npm --prefix console run build
 helm lint deploy/helm/anyserve
 helm template anyserve deploy/helm/anyserve \
   --set worker.enabled=true --set worker.image=example/worker
 docker build -t anyserve .
 ```
 
-Rust tests cover admission, placement, attempts, deadlines, cancellation,
-bounded streams, journal commits/recovery and native TCP services. Python tests
-cover handlers, large payloads, duplex output, disconnects and process-kill
-recovery. The console build checks TypeScript and production assets.
+## Benchmarks
 
-## Core benchmarks
+Core measurements cover queries over 10,000 jobs, dispatch with 129 workers and
+256 unmatched queued jobs, and recovery of 2,048 durable jobs. They also run on
+macOS without external services:
 
-The Linux load runner builds release `anyserve` and `anyserve-bench`, then
-starts a fresh production server and FULL-sync journal per case. Native mock
-workers validate echoed payloads, frame counts and terminal success. Errors
-during warm-up or measurement fail the run.
+```bash
+cargo test --locked --release -p anyserve-core --test runtime_v2 scale_ -- --ignored --nocapture --test-threads=1
+```
+
+The Linux load runner uses release binaries and a fresh FULL-sync journal per
+case. Warm-up or measurement errors fail the run:
 
 ```bash
 bench/load/run.sh --repeat 2
@@ -58,43 +61,22 @@ bench/load/run.sh --cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2
 | S4 | Ephemeral Submit and Watch, 256 B echo |
 | S5 | Clients alternate S1 and S3 |
 
-The full matrix uses concurrency 1, 16 and 64, a 5 s warm-up and a 20 s
-measurement per case. Each client has one outstanding request; requests started
-in the measurement window are drained before computing throughput. Independent
-gRPC channels default to `min(concurrency, 8)`. Workers number
-`max(4, concurrency / 8)`, each with 16 slots and 2 Tokio threads. Client tasks
-use 4 threads; the server uses its production default.
+Compare both checkouts on the same idle host and repeat matching cases.
+`--repeat 2` checks p50 repeatability within 10%; compare against a separate
+baseline to assess regressions. S5 gates its durable-path p50. Check throughput
+as well as latency; short local runs do not predict production performance.
 
-Results in `bench/load/results/<utc>_<sha>/` include JSON/Markdown summaries,
-raw results, logs, configuration, environment and 500 ms CPU/RSS samples.
-CPU 100% is one logical CPU; worker values are summed. RSS is a sampled peak.
-Metadata records the commit, dirty state, benchmark source hash, compiler, CPU,
-host load, commands and thread settings. Preserve these artifacts on failure.
-
-Compare matching cases on the same host/configuration. `--repeat 2` requires
-each gated p50 to differ by less than 10%; this measures repeatability within
-the current checkout, not regression against another commit. For a change,
-compare against a separately measured baseline on the same host. S5 uses its
-durable-path p50; its aggregate p50 and Invoke latency depend on the mix of
-fsync-bound calls. Also compare throughput. Short CI samples do not establish
-WAN overhead or real-model throughput.
-
-`bench/load/run.sh --profile` separately samples S1/c64, S2/c16 and S3/c16,
-writing folded stacks, a flamegraph and stats per case. Profiling includes
-startup/warm-up and is not a latency baseline. `--keep` leaves the final server
-and echo workers running and records their PIDs/endpoint in `processes.json`;
-stop those processes with SIGTERM when finished.
+Results under `bench/load/results/` include summaries, raw measurements, logs,
+environment and CPU/RSS samples. Use `bench/load/run.sh --help` for workload and
+profiling options. `--keep` leaves the final processes running and records them
+in `processes.json`; stop them with SIGTERM when finished.
 
 ## CI and releases
 
-Pull requests and main-branch pushes check Rust, the rebuilt SDK, console,
-documentation links, a short repeated benchmark, container startup and Helm
-rendering. Benchmark artifacts are uploaded even when a gate fails.
+The [CI workflow](../.github/workflows/anyserve-ci.yml) runs these checks and
+uploads benchmark artifacts even when a gate fails.
 
 Version tags build platform archives, container images and Python distributions.
-Release workflows validate that the tag matches the Rust, Python and chart
-application versions. Manual runs without a tag build and check the selected
-ref without publishing. Supplying an existing version tag republishes its
-artifacts after the same checks; PyPI skips files already uploaded. PyPI
-publication uses the repository's `pypi` environment and trusted publisher
-configuration.
+Tags must match the Rust, Python and chart application versions. Manual runs
+without a tag validate the selected ref without publishing; supplying an
+existing tag republishes its artifacts, with existing PyPI files skipped.
