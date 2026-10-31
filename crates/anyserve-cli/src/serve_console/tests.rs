@@ -321,6 +321,12 @@ async fn evicted_durable_details_show_missing_spec_and_incomplete_history() {
     .await
     .unwrap();
     let (url, handle) = spawn_test_server(server.runtime.clone()).await;
+    let listed = reqwest::get(format!("{url}/api/jobs")).await.unwrap();
+    assert_eq!(listed.status().as_u16(), 200);
+    let listed: Value = listed.json().await.unwrap();
+    assert!(listed["jobs"].as_array().unwrap().is_empty());
+    assert!(listed["next_page_token"].is_null());
+
     let response = reqwest::get(format!("{url}/api/jobs/{}", job.job_id))
         .await
         .unwrap();

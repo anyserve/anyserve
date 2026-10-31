@@ -963,6 +963,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_terminal_jobs_leave_the_running_index_and_can_be_evicted() {
+        use crate::runtime::api::{JobFilter, JournalConfig};
+        use crate::runtime::index::assert_matches_jobs;
+
+        let path = std::env::temp_dir()
+            .join(format!("anyserve-index-{}", uuid::Uuid::new_v4()))
+            .join("journal.sqlite");
+        let runtime = Runtime::start(RuntimeConfig {
+            journal: Some(JournalConfig::new(path)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut session = runtime.open_session(hello("w", "", Vec::new())).unwrap();
+
+        for terminal in [JobState::Succeeded, JobState::Failed, JobState::Cancelled] {
+            let mut spec = JobSpec::default();
+            spec.demand.interface = "echo".to_string();
+            spec.policy.durability = Some(Durability::Durable);
+            let job = runtime
+                .submit(SubmitRequest {
+                    spec,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .job;
+            let assign = next_assign(&mut session).await;
+            let (link, _) = runtime
+                .open_attempt(&pb::AttemptOpen {
+                    lease_id: assign.lease_id,
+                    generation: runtime.generation(),
+                    resume_after_sequence: 0,
+                })
+                .await
+                .unwrap();
+            assert_matches_jobs(&runtime.inner.lock());
+            assert_eq!(runtime.stats().running, 1);
+
+            let outcome = match terminal {
+                JobState::Succeeded => AttemptOutcome::Succeeded,
+                JobState::Failed => {
+                    AttemptOutcome::Failed(ErrorInfo::new("test_failure", "failed", false))
+                }
+                JobState::Cancelled => {
+                    runtime.cancel(&job.job_id, "test".into()).await.unwrap();
+                    AttemptOutcome::Cancelled
+                }
+                _ => unreachable!(),
+            };
+            runtime
+                .finish_attempt(&link, outcome, Vec::new())
+                .await
+                .unwrap();
+
+            assert_matches_jobs(&runtime.inner.lock());
+            assert_eq!(runtime.stats().running, 0);
+            let listed = runtime.list_jobs(JobFilter::default()).await.unwrap();
+            assert_eq!(listed.jobs.len(), 1);
+            assert_eq!(listed.jobs[0].state, terminal);
+
+            // Simulate retention expiry without waiting for the ten-minute default.
+            {
+                let mut st = runtime.inner.lock();
+                runtime.inner.evict_terminal_locked(&mut st, u64::MAX);
+                assert_matches_jobs(&st);
+            }
+            let listed = runtime.list_jobs(JobFilter::default()).await.unwrap();
+            assert!(listed.jobs.is_empty());
+            assert!(listed.next_page_token.is_none());
+            assert!(runtime.health().ready);
+            assert_eq!(
+                runtime.get_job(&job.job_id, false).await.unwrap().state,
+                terminal
+            );
+        }
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn finished_jobs_leave_no_timers_behind() {
         let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
         let mut session = runtime.open_session(hello("w", "", Vec::new())).unwrap();

@@ -975,13 +975,15 @@ impl Inner {
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
-        if !matches!(job.phase, Phase::Terminating(_)) {
+        let Phase::Terminating(plan) = &job.phase else {
             return;
-        }
+        };
         match outcome {
             CommitOutcome::Committed => {
-                let Phase::Terminating(plan) = std::mem::replace(&mut job.phase, Phase::Queued)
-                else {
+                // Taking the plan must preserve the public state so the terminal
+                // transition removes the original entry from the read indexes.
+                let previous = *plan.previous.clone();
+                let Phase::Terminating(plan) = std::mem::replace(&mut job.phase, previous) else {
                     unreachable!()
                 };
                 self.apply_terminal_locked(&mut st, job_id, *plan, now);
