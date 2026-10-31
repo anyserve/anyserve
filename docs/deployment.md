@@ -15,12 +15,25 @@ Release images are `ghcr.io/anyserve/anyserve:vVERSION` (Linux amd64).
 To build and run this checkout:
 
 ```bash
-docker build -t anyserve .
+docker build -t anyserve:local .
+docker network create anyserve
 docker volume create anyserve-data
-docker run --rm -p 127.0.0.1:50052:50052 \
-  -v anyserve-data:/data anyserve \
+docker run -d --name anyserve --network anyserve --restart unless-stopped \
+  -p 127.0.0.1:50052:50052 -v anyserve-data:/data anyserve:local \
   serve --grpc-host 0.0.0.0 --journal /data/journal.sqlite
 ```
+
+Run the example echo worker on the same network:
+
+```bash
+docker build -f examples/python/Dockerfile -t anyserve-worker:local .
+docker run -d --name anyserve-worker --network anyserve --restart unless-stopped \
+  -e ANYSERVE_ENDPOINT=http://anyserve:50052 anyserve-worker:local
+```
+
+Both builds accept `--build-arg DEBIAN_MIRROR=https://<mirror-host>` when a
+different Debian package mirror is needed. Stop the demo with
+`docker stop anyserve-worker anyserve`; the named volume retains its journal.
 
 For remote access, mount a [server file](configuration.md) with separate client
 and worker credentials and TLS settings. Persist the journal directory,
@@ -42,6 +55,17 @@ The existing Secret must contain `ANYSERVE_CLIENT_TOKENS` and
 `ANYSERVE_WORKER_TOKEN` (one worker token when the worker fleet is enabled).
 Alternatively, supply `auth.clientTokens` and `auth.workerTokens` as lists in a
 private values file; the chart generates the Secret.
+
+To validate the local images above in an isolated kind cluster:
+
+```bash
+kind create cluster --name anyserve --kubeconfig /tmp/anyserve-kind.kubeconfig
+kind load docker-image --name anyserve anyserve:local anyserve-worker:local
+helm install anyserve deploy/helm/anyserve \
+  --kubeconfig /tmp/anyserve-kind.kubeconfig --namespace anyserve --create-namespace \
+  --set image.repository=anyserve --set image.tag=local --set image.pullPolicy=Never \
+  --set worker.enabled=true --set worker.image=anyserve-worker:local --wait
+```
 
 | Values | Default / purpose |
 |---|---|

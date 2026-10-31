@@ -6,6 +6,7 @@ docs
 deploy
 scripts
 clients/python/dist
+clients/python/python/anyserve/*.so
 **/__pycache__
 **/.venv
 bench/load/results

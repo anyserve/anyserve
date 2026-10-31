@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import signal
 from anyserve import serve, worker
 
 
@@ -13,7 +14,12 @@ def main() -> None:
     parser.add_argument("--endpoint", help="default: ANYSERVE_ENDPOINT or http://127.0.0.1:50052")
     parser.add_argument("--worker-id")
     args = parser.parse_args()
-    serve(echo, endpoint=args.endpoint, worker_id=args.worker_id)
+    # Container runtimes send SIGTERM; Python running as PID 1 needs a handler.
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    try:
+        serve(echo, endpoint=args.endpoint, worker_id=args.worker_id)
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
