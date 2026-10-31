@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 mod client;
 mod payload;
 mod profile;
+mod submit;
 mod worker;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -75,6 +76,12 @@ struct ClientArgs {
     duration: Duration,
     #[arg(long, default_value = "5s", value_parser = duration)]
     warmup: Duration,
+    /// S6 total Submit attempts, including warm-up and failed calls.
+    #[arg(long, default_value_t = 100_000, value_parser = clap::value_parser!(u32).range(1..))]
+    max_jobs: u32,
+    /// S6 shared deadline for checking results after all Submit calls finish.
+    #[arg(long, default_value = "120s", value_parser = duration)]
+    drain_timeout: Duration,
     #[arg(long, default_value_t = 256)]
     payload: usize,
     /// Input bytes: repeat x for historical comparisons, or deterministic high entropy.

@@ -97,8 +97,8 @@ schema per case. Set `ANYSERVE_TEST_POSTGRES_URL` to reuse a test database inste
 (requires `psql` and permission to create/drop schemas). The defaults cover 64
 and 256 concurrent requests per replica with 256-byte payloads, plus four per
 replica with 1 MiB payloads. Override `--cases 64:256,256:256,4:1048576` as needed.
-Measurements cover durable Submit **and Watch through verified output**, not
-submission-only QPS. Raw latency samples, errors, worker participation, process
+The default `--scenario S3` measures durable Submit **and Watch through verified
+output**, not submission-only QPS. Raw latency samples, errors, worker participation, process
 CPU/RSS, PG settings, source revision and binary hashes are retained; processes
 and schemas are removed automatically. PG CPU/RSS are excluded from process
 totals. Use `--server-bin /path/to/baseline/anyserve --source-revision COMMIT`
@@ -115,6 +115,41 @@ bytes, not codecs, real media delivery or production storage capacity. The direc
 bench `client` and `seed` commands accept these options but retain `repeat` as
 their default, preserving the generic and Console runners' historical workloads.
 They select input/echo bytes; S2's fixed streamed output frames are unchanged.
+
+Use S6 to measure durable Submit acknowledgements separately from result verification:
+
+```bash
+python3 bench/load/postgres.py --scenario S6 --cases 64:256,256:256 \
+  --worker-concurrency 256 --max-jobs 100000 --drain-timeout 120 \
+  --out bench/load/results/pg-submit --repeat 2
+```
+
+`--worker-concurrency` fixes execution slots per replica independently of client
+concurrency; omitting it retains the S3 default of matching each case's client
+concurrency. S6 caps total attempts per client, including warmup and failures, at
+`--max-jobs` (default 100,000). It records every attempted ID, then verifies complete
+echo results within `--drain-timeout` seconds (default 120), including submissions
+whose response failed after the job may have committed. Raw client JSON retains
+all IDs and ACK latencies. Each client verifies at its Submit concurrency, recorded
+as `drain_concurrency`. Jobs get a bounded total timeout of warmup + duration +
+30 seconds for an in-flight Submit + drain timeout + 5 seconds, recorded as
+`job_total_timeout_ms`. `submit_ack_rps` divides measured ACKs by the union of
+actual Submit windows, including in-flight Submit responses and excluding result
+drain. The separate `drain` metrics count verified results over the entire run,
+including warmup; they are not Submit throughput. Clients enter drain independently,
+so one may read results while another still finishes Submit calls. The summary
+records `cross_client_submit_drain_overlap_seconds` and its fraction of the Submit
+window; compare these alongside throughput, especially when `--max-jobs` stops a
+client early.
+
+S6 samples all five job states from the shared PG schema approximately once per
+second through submission and drain. Artifacts retain the queue timeline, sampled
+peaks, samples immediately before/after submission ends, and final ID reconciliation.
+ACKed jobs must exist, committed jobs must have verified results, and the final
+queued/running count must be zero. `resources` covers the Submit windows;
+`resources_whole_run` covers submission and verification. Both record observed
+sample coverage; client resource samples end when the first client exits.
+Failed cases retain `failure.json` with the stage, client exit codes and available result counts, plus a database ID/state snapshot when its five-second collection succeeds; incomplete clients have no inferred attempt count.
 
 For Console overhead and large-result previews on macOS or Linux, build both
 release binaries and run the standard-library Python runner:

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyserve_client::execution::{ExecutionClient, v2};
+use anyserve_client::execution::{ExecutionClient, ExecutionEvents, v2};
 use serde_json::json;
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
@@ -9,12 +9,13 @@ use tokio::time::Instant;
 
 use crate::{ClientArgs, Result};
 
-pub(super) const SCENARIOS: [&str; 5] = [
+pub(super) const SCENARIOS: [&str; 6] = [
     "invoke-buffered",
     "invoke-stream",
     "submit-durable",
     "submit-ephemeral",
     "mixed",
+    "submit-acceptance",
 ];
 
 pub(super) fn parse_scenario(value: &str) -> std::result::Result<u8, String> {
@@ -25,8 +26,8 @@ pub(super) fn parse_scenario(value: &str) -> std::result::Result<u8, String> {
         .trim_start_matches(['S', 's'])
         .parse::<u8>()
         .ok()
-        .filter(|scenario| (1..=5).contains(scenario))
-        .ok_or_else(|| "expected S1..S5 or a scenario name".into())
+        .filter(|scenario| (1..=6).contains(scenario))
+        .ok_or_else(|| "expected S1..S6 or a scenario name".into())
 }
 
 #[derive(Default)]
@@ -59,6 +60,9 @@ pub(super) async fn run(args: ClientArgs) -> Result {
         args.payload_pattern
             .generate(args.payload, args.payload_seed),
     );
+    if args.scenario == 6 {
+        return crate::submit::run(args, clients, payload).await;
+    }
     let barrier = Arc::new(Barrier::new(clients.len() + 1));
     let start = Instant::now();
     let unix_start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
@@ -235,8 +239,20 @@ pub(super) async fn seed(
 }
 
 async fn request(client: &mut ExecutionClient, scenario: u8, payload: &[u8]) -> Result<String> {
+    let spec = job_spec(scenario, payload);
+    let events = if matches!(scenario, 3 | 4) {
+        let accepted = client.submit(None, spec).await?;
+        let job = accepted.job.ok_or("Submit omitted job")?;
+        client.watch(job.job_id, 0).await?
+    } else {
+        client.invoke(spec).await?
+    };
+    verify(events, scenario == 2, payload).await
+}
+
+pub(super) fn job_spec(scenario: u8, payload: &[u8]) -> v2::JobSpec {
     let streamed = scenario == 2;
-    let spec = v2::JobSpec {
+    v2::JobSpec {
         demand: Some(v2::Demand {
             interface: if streamed {
                 "bench.stream.v1"
@@ -261,14 +277,14 @@ async fn request(client: &mut ExecutionClient, scenario: u8, payload: &[u8]) -> 
             ..Default::default()
         }),
         ..Default::default()
-    };
-    let mut events = if matches!(scenario, 3 | 4) {
-        let accepted = client.submit(None, spec).await?;
-        let job = accepted.job.ok_or("Submit omitted job")?;
-        client.watch(job.job_id, 0).await?
-    } else {
-        client.invoke(spec).await?
-    };
+    }
+}
+
+pub(super) async fn verify(
+    mut events: ExecutionEvents,
+    streamed: bool,
+    payload: &[u8],
+) -> Result<String> {
     let mut frames = 0;
     while let Some(event) = events.message().await? {
         match event.event {
