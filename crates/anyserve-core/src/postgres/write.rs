@@ -307,22 +307,13 @@ impl Postgres {
             } else {
                 row.try_get("queued_at_ms")?
             };
-            let ownership = sqlx::query(
-                "UPDATE jobs SET owner_id=$2,ownership_epoch=ownership_epoch+1,
-                state='queued',queued_at_ms=$3,
-                event_sequence=event_sequence+CASE WHEN state='running' THEN 1 ELSE 0 END
-                WHERE job_id=$1 RETURNING ownership_epoch,event_sequence",
-            )
-            .bind(&job.job_id)
-            .bind(&self.node_id)
-            .bind(queued_at)
-            .fetch_one(&mut *tx)
-            .await?;
             if was_running {
                 event(
                     &mut tx,
                     &job.job_id,
-                    ownership.try_get("event_sequence")?,
+                    row.try_get::<i64, _>("event_sequence")?
+                        .checked_add(1)
+                        .context("event sequence overflow")?,
                     job.last_attempt_id.as_deref(),
                     now,
                     EventKind::AttemptRestarted {
@@ -336,17 +327,38 @@ impl Postgres {
                 )
                 .await?;
             }
-            if failure.is_none() {
-                super::read::load_inputs(&mut tx, &mut job).await?;
-            }
             job.state = JobState::Queued;
             claimed.push(ClaimedJob {
                 job,
-                epoch: ownership.try_get("ownership_epoch")?,
+                epoch: row
+                    .try_get::<i64, _>("ownership_epoch")?
+                    .checked_add(1)
+                    .context("ownership epoch overflow")?,
                 queued_at_ms: queued_at as u64,
                 input_permit: permit,
                 failure,
             });
+        }
+        if !claimed.is_empty() {
+            // The selected rows stay locked until the whole batch is committed.
+            let ids: Vec<_> = claimed.iter().map(|c| c.job.job_id.as_str()).collect();
+            let changed = sqlx::query(
+                "UPDATE jobs SET owner_id=$2,ownership_epoch=ownership_epoch+1,
+                state='queued',queued_at_ms=CASE WHEN state='running' THEN $3 ELSE queued_at_ms END,
+                event_sequence=event_sequence+CASE WHEN state='running' THEN 1 ELSE 0 END
+                WHERE job_id=ANY($1)",
+            )
+            .bind(ids)
+            .bind(&self.node_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            anyhow::ensure!(
+                changed == claimed.len() as u64,
+                "claim batch changed unexpectedly"
+            );
+            super::read::load_inputs(&mut tx, &mut claimed).await?;
         }
         if let Err(error) = tx.commit().await {
             // The claim may have committed although no local job was installed.

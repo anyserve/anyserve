@@ -5,7 +5,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use sqlx::{Postgres as Pg, QueryBuilder, Row, Transaction};
 
-use super::Postgres;
+use super::{ClaimedJob, Postgres};
 use crate::error::RuntimeError;
 use crate::journal::{StoredJob, job_from_row, object_from_row, state_text};
 use crate::runtime::api::{
@@ -17,6 +17,7 @@ use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 pub(crate) enum ReadMode {
     Metadata,
     Full,
+    Events,
     Preview,
 }
 
@@ -27,14 +28,29 @@ pub(crate) struct JobSnapshot {
     pub previews: Vec<ObjectPreview>,
 }
 
-pub(super) async fn load_inputs(tx: &mut Transaction<'_, Pg>, job: &mut StoredJob) -> Result<()> {
+pub(super) async fn load_inputs(
+    tx: &mut Transaction<'_, Pg>,
+    claimed: &mut [ClaimedJob],
+) -> Result<()> {
+    let mut jobs: std::collections::HashMap<_, _> = claimed
+        .iter_mut()
+        .filter(|claimed| claimed.failure.is_none())
+        .map(|claimed| (claimed.job.job_id.clone(), &mut claimed.job))
+        .collect();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<_> = jobs.keys().cloned().collect();
     let mut rows = sqlx::query(
-        "SELECT role,uri,content,metadata_json FROM objects
-        WHERE job_id=$1 AND role IN ('input','params') ORDER BY role,idx",
+        "SELECT job_id,role,uri,content,metadata_json FROM objects
+        WHERE job_id=ANY($1) AND role IN ('input','params') ORDER BY job_id,role,idx",
     )
-    .bind(&job.job_id)
+    .bind(ids)
     .fetch(&mut **tx);
     while let Some(row) = rows.try_next().await? {
+        let job = jobs
+            .get_mut(row.try_get::<&str, _>("job_id")?)
+            .context("unexpected input job")?;
         let object = object_from_row(&row)?;
         match row.try_get::<&str, _>("role")? {
             "input" => job.spec.inputs.push(object),
@@ -53,14 +69,8 @@ async fn load_outputs(
     tx: &mut Transaction<'_, Pg>,
     job: &mut StoredJob,
     budget: Arc<ByteBudget>,
+    size: i64,
 ) -> Result<()> {
-    let size: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(octet_length(content)),0)::bigint FROM objects
-        WHERE job_id=$1 AND role='output' AND uri IS NULL",
-    )
-    .bind(&job.job_id)
-    .fetch_one(&mut **tx)
-    .await?;
     let mut permit = Permit::new(budget);
     if !permit.grow(usize::try_from(size).context("PostgreSQL result size")?) {
         return Err(
@@ -109,10 +119,30 @@ impl Postgres {
             .pool
             .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .await?;
-        let Some(row) = sqlx::query("SELECT * FROM jobs WHERE job_id=$1")
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
+        let frame_limit = if matches!(mode, ReadMode::Full | ReadMode::Events) {
+            i32::MAX
+        } else {
+            INSPECTION_PREVIEW_BYTES as i32
+        };
+        let Some(row) = sqlx::query(
+            "SELECT jobs.*,
+            CASE WHEN state='succeeded' AND ($2 OR ($3 AND $4::bigint<event_sequence))
+                THEN (SELECT COALESCE(SUM(octet_length(content)),0)::bigint FROM objects
+                      WHERE objects.job_id=jobs.job_id AND role='output' AND uri IS NULL)
+                ELSE 0 END AS result_bytes,
+            CASE WHEN $4::bigint<event_sequence
+                THEN (SELECT COALESCE(SUM(LEAST(COALESCE(octet_length(frame_data),0),$5)),0)::bigint
+                      FROM events WHERE events.job_id=jobs.job_id AND sequence>$4)
+                ELSE 0 END AS frame_bytes
+            FROM jobs WHERE job_id=$1",
+        )
+        .bind(id)
+        .bind(mode == ReadMode::Full)
+        .bind(mode == ReadMode::Events)
+        .bind(after.map(|after| after.min(i64::MAX as u64) as i64))
+        .bind(frame_limit)
+        .fetch_optional(&mut *tx)
+        .await?
         else {
             return Ok(None);
         };
@@ -121,8 +151,12 @@ impl Postgres {
         if after.is_some_and(|after| after != 0 && after < floor) {
             return Err(RuntimeError::cursor_expired(floor + 1).into());
         }
-        if mode == ReadMode::Full && job.state == JobState::Succeeded {
-            load_outputs(&mut tx, &mut job, budget).await?;
+        let sequence = row.try_get::<i64, _>("event_sequence")? as u64;
+        let after = after.filter(|after| *after < sequence);
+        if job.state == JobState::Succeeded
+            && (mode == ReadMode::Full || (mode == ReadMode::Events && after.is_some()))
+        {
+            load_outputs(&mut tx, &mut job, budget, row.try_get("result_bytes")?).await?;
         }
         let mut previews = Vec::new();
         if mode == ReadMode::Preview {
@@ -146,22 +180,8 @@ impl Postgres {
         }
         let mut events = Vec::new();
         if let Some(after) = after {
-            let frame_limit = if mode == ReadMode::Full {
-                i32::MAX
-            } else {
-                INSPECTION_PREVIEW_BYTES as i32
-            };
-            let size: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(LEAST(COALESCE(octet_length(frame_data),0),$3)),0)::bigint
-            FROM events WHERE job_id=$1 AND sequence>$2",
-            )
-            .bind(id)
-            .bind(after.min(i64::MAX as u64) as i64)
-            .bind(frame_limit)
-            .fetch_one(&mut *tx)
-            .await?;
             let mut permit = Permit::new(event_budget);
-            if !permit.grow(usize::try_from(size)?) {
+            if !permit.grow(usize::try_from(row.try_get::<i64, _>("frame_bytes")?)?) {
                 return Err(RuntimeError::exhausted("event read budget is exhausted").into());
             }
             let rows = sqlx::query("SELECT sequence,attempt_id,at_ms,kind_json,substring(frame_data FROM 1 FOR $3) AS frame_data

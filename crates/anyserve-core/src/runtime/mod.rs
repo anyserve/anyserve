@@ -1076,7 +1076,7 @@ impl Runtime {
     ) -> Result<(Vec<ExecutionEvent>, bool), RuntimeError> {
         if self.is_postgres_job(job_id) {
             let snapshot = self
-                .postgres_snapshot(job_id, ReadMode::Full, Some(after_sequence))
+                .postgres_snapshot(job_id, ReadMode::Events, Some(after_sequence))
                 .await?;
             return Ok((snapshot.events, snapshot.job.state.is_terminal()));
         }

@@ -121,6 +121,44 @@ async fn open(runtime: &Runtime, assign: &pb::Assign) -> AttemptLink {
         .0
 }
 
+#[test]
+fn released_outputs_drop_after_unlocking_runtime_state() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropProbe {
+        state: Arc<Mutex<crate::runtime::state::State>>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl AsRef<[u8]> for DropProbe {
+        fn as_ref(&self) -> &[u8] {
+            b"output"
+        }
+    }
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            assert!(
+                self.state.try_lock().is_ok(),
+                "output dropped under runtime lock"
+            );
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+    let state = Arc::new(Mutex::new(crate::runtime::state::State::default()));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut guard = super::super::StateGuard(Some(state.lock().unwrap()));
+    guard
+        .released
+        .outputs
+        .push(vec![Object::inline(Bytes::from_owner(DropProbe {
+            state: Arc::clone(&state),
+            dropped: Arc::clone(&dropped),
+        }))]);
+    assert!(!dropped.load(Ordering::Relaxed));
+    drop(guard);
+    assert!(dropped.load(Ordering::Relaxed));
+}
+
 #[tokio::test]
 #[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
 async fn postgres_cluster_idempotency_is_global_and_atomic() {
@@ -208,7 +246,10 @@ async fn postgres_cluster_two_replicas_execute_without_duplicate_claims() {
     let mut wa = worker(&c.a, "a", 16);
     let mut wb = worker(&c.b, "b", 16);
     for i in 0..32 {
-        c.a.submit(request(&format!("job-{i}"))).await.unwrap();
+        let mut request = request(&format!("job-{i}"));
+        request.spec.inputs[0] = Object::inline(format!("input-{i}"));
+        request.spec.params = Bytes::from(format!("params-{i}"));
+        c.a.submit(request).await.unwrap();
     }
     let mut seen = HashSet::new();
     for _ in 0..16 {
@@ -219,7 +260,14 @@ async fn postgres_cluster_two_replicas_execute_without_duplicate_claims() {
                 "job assigned on two live replicas"
             );
             assert_eq!(assign.inline_inputs.len(), 2);
-            assert_eq!(assign.params, Bytes::from_static(b"params"));
+            let index = assign.job_id.strip_prefix("job-").unwrap();
+            assert_eq!(
+                assign.inline_inputs[0].body,
+                Some(pb::object::Body::Inline(Bytes::from(format!(
+                    "input-{index}"
+                ))))
+            );
+            assert_eq!(assign.params, Bytes::from(format!("params-{index}")));
             let link = open(runtime, &assign).await;
             assert_eq!(
                 runtime
@@ -245,6 +293,48 @@ async fn postgres_cluster_two_replicas_execute_without_duplicate_claims() {
     for r in [&c.a, &c.b] {
         crate::runtime::state::assert_reservations(&r.inner.lock());
     }
+    c.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_batch_claim_respects_input_budget() {
+    let c = Cluster::start().await;
+    for id in ["budget-a", "budget-b"] {
+        c.a.submit(request(id)).await.unwrap();
+    }
+    let spec = request("unused").spec;
+    // URI text occupies memory too; reserve exactly one complete input.
+    let input_bytes = spec.inputs.iter().map(Object::inline_len).sum::<usize>() + spec.params.len();
+    let budget = Arc::new(crate::runtime::events::ByteBudget::new(input_bytes as u64));
+    let workers = serde_json::json!([{"interfaces":["echo"],"attributes":{},"capacity":{}}]);
+    let first =
+        c.a.inner
+            .postgres
+            .as_ref()
+            .unwrap()
+            .claim(workers.clone(), 2, Arc::clone(&budget))
+            .await
+            .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(budget.used(), input_bytes as u64);
+    assert_eq!(first[0].job.spec.inputs, spec.inputs);
+    assert_eq!(first[0].job.spec.params, spec.params);
+    // A job that did not fit remains unowned and can be claimed by another node.
+    let other_budget = Arc::new(crate::runtime::events::ByteBudget::new(input_bytes as u64));
+    let second =
+        c.b.inner
+            .postgres
+            .as_ref()
+            .unwrap()
+            .claim(workers, 2, Arc::clone(&other_budget))
+            .await
+            .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_ne!(first[0].job.job_id, second[0].job.job_id);
+    drop((first, second));
+    assert_eq!(budget.used(), 0);
+    assert_eq!(other_budget.used(), 0);
     c.close().await;
 }
 
@@ -373,12 +463,29 @@ async fn postgres_cluster_retry_receipt_and_result_budget_survive_owner_change()
     let mut wb = worker(&c.b, "b", 1);
     let second = assigned(&mut wb).await;
     let link = open(&c.b, &second).await;
-    let output = Object::inline(vec![7; 2 * 1024 * 1024]);
+    let size = 2 * 1024 * 1024;
+    let mut permit = crate::runtime::events::Permit::new(c.b.result_budget());
+    assert!(permit.grow(size));
+    let output = Object::inline(crate::runtime::events::budgeted_bytes(
+        Bytes::from(vec![7; size]),
+        permit,
+    ));
     c.b.finish_attempt(&link, AttemptOutcome::Succeeded, vec![output.clone()])
         .await
         .unwrap();
+    // A surviving caller clone keeps its permit, but the PG terminal cache must not.
+    assert_eq!(c.b.stats().result_bytes, size as u64);
+    drop(output);
+    assert_eq!(c.b.stats().input_bytes, 0);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while c.b.stats().result_bytes != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed output released after the runtime lock");
     let preview = c.a.inspect_job_preview("retry").await.unwrap();
-    assert_eq!(preview.outputs[0].size_bytes, Some(2 * 1024 * 1024));
+    assert_eq!(preview.outputs[0].size_bytes, Some(size));
     assert_eq!(
         preview.outputs[0].prefix.inline_len(),
         INSPECTION_PREVIEW_BYTES
@@ -403,9 +510,35 @@ async fn postgres_cluster_retry_receipt_and_result_budget_survive_owner_change()
         ErrorKind::ResourceExhausted
     );
     assert_eq!(budget.used(), 0);
+    let output = Object::inline(vec![7; size]);
     assert_eq!(
         c.a.get_job("retry", true).await.unwrap().outputs.unwrap(),
-        vec![output]
+        vec![output.clone()]
+    );
+    let events: Vec<_> = c.b.watch("retry", 0).unwrap().collect().await;
+    let EventKind::Finished { outputs, .. } = &events.last().unwrap().as_ref().unwrap().kind else {
+        panic!("Watch must end with the persisted result");
+    };
+    assert_eq!(outputs, &vec![output.clone()]);
+    let held = outputs[0].clone();
+    drop(events);
+    assert_eq!(c.b.stats().result_bytes, size as u64);
+    drop(held);
+    assert_eq!(c.b.stats().result_bytes, 0);
+    let replay =
+        c.a.open_attempt(&pb::AttemptOpen {
+            lease_id: second.lease_id,
+            generation: c.b.generation(),
+            resume_after_sequence: 0,
+        })
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        c.a.finish_attempt(&replay, AttemptOutcome::Succeeded, vec![output])
+            .await
+            .unwrap(),
+        FinishStatus::Committed
     );
     c.close().await;
 }
@@ -561,11 +694,35 @@ async fn postgres_cluster_progress_replays_on_other_nodes_with_bounded_cursors()
     )
     .await
     .unwrap();
-    let (_, done) =
+    let (finished, done) =
         c.b.events("frames", events.last().unwrap().sequence)
             .await
             .unwrap();
     assert!(done);
+    let last = finished.last().unwrap().sequence;
+    drop(finished);
+    let mut held = crate::runtime::events::Permit::new(c.b.result_budget());
+    assert!(held.grow(c.b.config().max_result_bytes as usize));
+    // A consumed terminal cursor needs neither the result nor event payloads.
+    let (empty, done) = c.b.events("frames", last).await.unwrap();
+    assert!(done && empty.is_empty());
+    assert_eq!(
+        c.b.events("frames", last - 1).await.unwrap_err().kind,
+        ErrorKind::ResourceExhausted
+    );
+    assert!(matches!(
+        c.b.events("frames", cursor).await.unwrap_err().kind,
+        ErrorKind::CursorExpired { .. }
+    ));
+    assert_eq!(
+        c.b.get_job("frames", true).await.unwrap_err().kind,
+        ErrorKind::ResourceExhausted
+    );
+    drop(held);
+    assert_eq!(
+        c.b.get_job("frames", true).await.unwrap().outputs.unwrap(),
+        vec![Object::inline("done")]
+    );
     c.close().await;
 }
 

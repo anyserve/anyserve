@@ -1120,9 +1120,11 @@ impl Inner {
         let job = st.jobs.get_mut(job_id).expect("job");
         self.timers.cancel(&std::mem::take(&mut job.timers));
         job.error = plan.error.clone();
-        let outputs = if plan.state == JobState::Succeeded {
+        // PostgreSQL readers load committed payloads; retain only local state and receipts.
+        let outputs = if plan.state == JobState::Succeeded && job.ownership_epoch.is_none() {
             plan.outputs
         } else {
+            st.released.outputs.push(plan.outputs);
             Vec::new()
         };
         let output_bytes = outputs.iter().map(|o| o.inline_len() as u64).sum::<u64>();

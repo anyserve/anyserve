@@ -25,6 +25,9 @@ schema/table creation privileges for bootstrap; DDL is serialized only during
 startup. The execution path has no leader or process-wide exclusive database
 lock. Use a writable primary endpoint. PostgreSQL's own replication, failover,
 backups and connection capacity remain database deployment responsibilities.
+Failover must preserve acknowledged commits and leave only one authoritative
+writable primary; application fencing cannot recover transactions lost when an
+asynchronous standby is promoted.
 
 Task admission uses a unique job ID and atomic fingerprint comparison. Schedulers
 claim matching work with `FOR UPDATE SKIP LOCKED`; ownership changes increment a
@@ -34,6 +37,8 @@ the unfinished work once the lease expires (15 seconds by default), subject to
 worker availability and the remaining attempt budget. Graceful shutdown expires
 membership immediately. A replica that loses membership fences its local work
 and the CLI exits; Kubernetes or a Docker restart policy gives it a fresh identity.
+Failed renewals are retried only within the last confirmed lease; an unconfirmed
+renewal never extends the replica's local validity.
 Keep all replicas on the same version and runtime policies.
 
 Durable Submit, GetJob, Watch, ListJobs, Cancel and Console job queries work across

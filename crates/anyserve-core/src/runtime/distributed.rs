@@ -57,8 +57,9 @@ pub(super) async fn cluster_loop(me: Weak<Inner>) {
         if !pg.healthy() {
             let mut st = inner.lock();
             let ids: Vec<_> = st
-                .jobs
-                .values()
+                .job_index
+                .unfinished_ids()
+                .filter_map(|id| st.jobs.get(id))
                 .filter(|j| j.ownership_epoch.is_some() && !j.is_terminal())
                 .map(|j| j.id.clone())
                 .collect();
@@ -103,8 +104,9 @@ impl Inner {
         let (ids, queued) = {
             let st = self.lock();
             let owned = st
-                .jobs
-                .values()
+                .job_index
+                .unfinished_ids()
+                .filter_map(|id| st.jobs.get(id))
                 .filter(|j| j.ownership_epoch.is_some() && !j.is_terminal());
             (
                 owned.clone().map(|j| j.id.clone()).collect::<Vec<_>>(),

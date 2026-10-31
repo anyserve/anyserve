@@ -2,6 +2,8 @@
 //! leases use the database clock; job epochs fence writes after ownership moves.
 //! Local memory holds only work claimed for this replica's worker connections.
 mod read;
+#[cfg(test)]
+mod tests;
 mod write;
 pub(crate) use read::{JobSnapshot, ReadMode};
 
@@ -164,29 +166,55 @@ impl Postgres {
     }
 
     pub(crate) async fn heartbeat(&self) -> Result<()> {
-        self.ensure_healthy()?;
-        let started = Instant::now();
-        let renewed = tokio::time::timeout(self.config.lease_duration / 3, async {
-            sqlx::query(
-                "UPDATE nodes SET expires_at=clock_timestamp()+$2*interval '1 millisecond'
-                WHERE node_id=$1 AND expires_at>clock_timestamp()",
+        loop {
+            self.ensure_healthy()?;
+            let deadline = *self.valid_until.lock().expect("node deadline");
+            let started = Instant::now();
+            let renewed = tokio::time::timeout_at(
+                deadline
+                    .min(started + self.config.lease_duration / 3)
+                    .into(),
+                async {
+                    let mut tx = self.heartbeat_pool.begin().await?;
+                    // Check expiry after any lock wait, not against a pre-wait row.
+                    sqlx::query("SELECT node_id FROM nodes WHERE node_id=$1 FOR UPDATE")
+                        .bind(&self.node_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    let result = sqlx::query(
+                        "UPDATE nodes SET expires_at=clock_timestamp()+$2*interval '1 millisecond'
+                        WHERE node_id=$1 AND expires_at>clock_timestamp()",
+                    )
+                    .bind(&self.node_id)
+                    .bind(self.config.lease_duration.as_millis() as i64)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    Ok::<_, sqlx::Error>(result)
+                },
             )
-            .bind(&self.node_id)
-            .bind(self.config.lease_duration.as_millis() as i64)
-            .execute(&self.heartbeat_pool)
-            .await
-        })
-        .await;
-        match renewed {
-            Ok(Ok(result)) if result.rows_affected() == 1 && self.healthy() => {
-                *self.valid_until.lock().expect("node deadline") =
-                    started + self.config.lease_duration;
-                Ok(())
-            }
-            _ => {
+            .await;
+            if let Ok(Ok(result)) = renewed {
+                let mut valid_until = self.valid_until.lock().expect("node deadline");
+                if result.rows_affected() == 1
+                    && Instant::now() < *valid_until
+                    && !self.fenced.load(Ordering::Acquire)
+                {
+                    *valid_until = started + self.config.lease_duration;
+                    return Ok(());
+                }
                 self.fence();
-                bail!("PostgreSQL node lease renewal failed; replica fenced")
+                bail!("PostgreSQL node lease renewal failed; replica fenced");
             }
+            // An uncertain renewal never extends the last confirmed local deadline.
+            self.ensure_healthy()?;
+            tracing::warn!("PostgreSQL lease renewal failed; retrying within confirmed lease");
+            tokio::time::sleep_until(
+                deadline
+                    .min(Instant::now() + Duration::from_millis(100))
+                    .into(),
+            )
+            .await;
         }
     }
 

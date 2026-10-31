@@ -126,6 +126,7 @@ pub(crate) struct Released {
     pub events: Vec<ExecutionEvent>,
     /// Full specifications of jobs that just ended; their inputs go with them.
     pub specs: Vec<Arc<JobSpec>>,
+    pub outputs: Vec<Vec<Object>>,
 }
 
 #[derive(Clone, Debug)]

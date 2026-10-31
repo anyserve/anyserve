@@ -42,6 +42,13 @@ pub(crate) struct JobIndex {
 }
 
 impl JobIndex {
+    pub(crate) fn unfinished_ids(&self) -> impl Iterator<Item = &str> + Clone {
+        self.jobs[slot(JobState::Queued)]
+            .iter()
+            .chain(self.jobs[slot(JobState::Running)].iter())
+            .map(|(_, id)| id.as_str())
+    }
+
     pub(crate) fn position(job: &Job) -> Position {
         (job.state(), job.updated_at_ms, job.queued_since_ms)
     }
@@ -176,6 +183,14 @@ impl JobIndex {
 #[cfg(test)]
 pub(crate) fn assert_matches_jobs(st: &super::state::State) {
     assert_eq!(
+        st.job_index.unfinished_ids().collect::<BTreeSet<_>>(),
+        st.jobs
+            .values()
+            .filter(|job| !job.is_terminal())
+            .map(|job| job.id.as_str())
+            .collect()
+    );
+    assert_eq!(
         st.job_index.created,
         st.jobs
             .values()
@@ -251,6 +266,7 @@ pub(crate) fn assert_matches_jobs(st: &super::state::State) {
 mod tests {
     use super::super::Runtime;
     use super::super::api::{Durability, JobSpec, RuntimeConfig, SubmitRequest};
+    use super::super::state::{Phase, TerminalPlan};
     use super::*;
 
     #[tokio::test]
@@ -283,6 +299,26 @@ mod tests {
             ids.push(id);
         }
         assert_matches_jobs(&runtime.inner.lock());
+        {
+            let mut st = runtime.inner.lock();
+            for previous in [
+                Phase::Accepting,
+                Phase::Queued,
+                Phase::Starting,
+                Phase::Assigned,
+                Phase::Running,
+            ] {
+                st.update_job(&ids[0], |job| job.phase = previous.clone());
+                assert_matches_jobs(&st);
+                let mut plan = TerminalPlan::new(JobState::Succeeded, None);
+                *plan.previous = previous;
+                st.update_job(&ids[0], |job| {
+                    job.phase = Phase::Terminating(Box::new(plan))
+                });
+                assert_matches_jobs(&st);
+            }
+            st.update_job(&ids[0], |job| job.phase = Phase::Queued);
+        }
         for id in ids {
             runtime.cancel(&id, "test".into()).await.unwrap();
             assert_matches_jobs(&runtime.inner.lock());

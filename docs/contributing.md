@@ -84,6 +84,29 @@ environment and CPU/RSS samples. Use `bench/load/run.sh --help` for workload and
 profiling options. `--keep` leaves the final processes running and records them
 in `processes.json`; stop them with SIGTERM when finished.
 
+For PG active-active benchmarks on macOS or Linux:
+
+```bash
+cargo build --release --locked -p anyserve -p anyserve-bench
+python3 bench/load/postgres.py --out bench/load/results/pg-after --repeat 3
+python3 bench/load/postgres.py --self-check
+```
+
+This runs two replicas against disposable Docker PostgreSQL 18, with an isolated
+schema per case. Set `ANYSERVE_TEST_POSTGRES_URL` to reuse a test database instead
+(requires `psql` and permission to create/drop schemas). The defaults cover 64
+and 256 concurrent requests per replica with 256-byte payloads, plus four per
+replica with 1 MiB payloads. Override `--cases 64:256,256:256,4:1048576` as needed.
+Measurements cover durable Submit **and Watch through verified output**, not
+submission-only QPS. Raw latency samples, errors, worker participation, process
+CPU/RSS, PG settings, source revision and binary hashes are retained; processes
+and schemas are removed automatically. PG CPU/RSS are excluded from process
+totals. Use `--server-bin /path/to/baseline/anyserve --source-revision COMMIT`
+and the same `--bench-bin` for matching before/after runs on an idle host.
+The echo payload repeats one byte, so PG compression can make the 1 MiB case
+optimistic compared with compressed images or video. Use it to compare changes,
+not to size production media storage.
+
 For Console overhead and large-result previews on macOS or Linux, build both
 release binaries and run the standard-library Python runner:
 
