@@ -5,13 +5,14 @@
 pub mod api;
 pub(crate) mod events;
 mod identity;
+mod index;
 pub(crate) mod input;
 mod machine;
 pub(crate) mod state;
 pub(crate) mod worker;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -20,7 +21,7 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
-    InputSink, InterfaceStats, InvokeRequest, JobFilter, JobPage, JobSpec, JobState, JobView,
+    InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobSpec, JobState, JobView,
     RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView, codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
@@ -353,7 +354,7 @@ impl Inner {
                 );
             }
         }
-        st.sessions.remove(session_id);
+        st.remove_session(session_id);
     }
 
     fn maintain(&self) {
@@ -1091,12 +1092,56 @@ impl Runtime {
             .journal
             .as_ref()
             .ok_or_else(|| RuntimeError::not_found("job", job_id))?;
-        match journal.load_job(job_id, include_outputs).await {
+        match journal
+            .load_job(job_id, include_outputs, self.result_budget())
+            .await
+        {
             Ok(Some(stored)) => Ok(view_from_stored(stored, include_outputs)),
             Ok(None) => Err(RuntimeError::not_found("job", job_id)),
-            Err(error) => Err(RuntimeError::unavailable(format!(
-                "read journal: {error:#}"
-            ))),
+            Err(error) => Err(error
+                .downcast_ref::<RuntimeError>()
+                .cloned()
+                .unwrap_or_else(|| RuntimeError::unavailable(format!("read journal: {error:#}")))),
+        }
+    }
+
+    /// Reads a detail view without loading a cold result twice for its view
+    /// and replayed events. Event cloning happens outside the runtime lock.
+    pub async fn inspect_job(&self, job_id: &str) -> Result<JobInspection, RuntimeError> {
+        loop {
+            let retained = {
+                let st = self.inner.lock();
+                match st.jobs.get(job_id) {
+                    Some(job) if job.indeterminate => {
+                        return Err(RuntimeError::unavailable(format!(
+                            "job '{job_id}' has an unknown commit outcome until restart"
+                        )));
+                    }
+                    Some(job) => {
+                        Some((job.view(true), Arc::clone(&job.spec), Arc::clone(&job.log)))
+                    }
+                    None => None,
+                }
+            };
+            if let Some((job, spec, log)) = retained {
+                let (events, _) = log.read_after(0).map_err(RuntimeError::cursor_expired)?;
+                return Ok(JobInspection {
+                    job,
+                    spec: Some(spec),
+                    events,
+                });
+            }
+            let job = self.get_job(job_id, true).await?;
+            if !job.state.is_terminal() {
+                // Admission raced the lookup: read its live log on the next pass.
+                continue;
+            }
+            let events = self.replayed_events(job.clone(), 0);
+            return Ok(JobInspection {
+                job,
+                spec: None,
+                events,
+            });
         }
     }
 
@@ -1169,29 +1214,8 @@ impl Runtime {
             filter.limit
         };
         let st = self.inner.lock();
-        let mut jobs: Vec<&state::Job> = st
-            .jobs
-            .values()
-            .filter(|job| filter.states.is_empty() || filter.states.contains(&job.state()))
-            .filter(|job| {
-                filter
-                    .interface
-                    .as_ref()
-                    .is_none_or(|interface| &job.spec.demand.interface == interface)
-            })
-            .collect();
-        jobs.sort_by(|a, b| {
-            b.updated_at_ms
-                .cmp(&a.updated_at_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let total = jobs.len();
-        let page = jobs
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|job| job.view(false))
-            .collect();
+        let (ids, total) = st.job_index.page(&filter, offset, limit);
+        let page = ids.into_iter().map(|id| st.jobs[id].view(false)).collect();
         Ok(JobPage {
             jobs: page,
             next_page_token: (offset.saturating_add(limit) < total)
@@ -1220,6 +1244,7 @@ impl Runtime {
                 last_seen_ms: session.last_seen_ms,
             })
             .collect();
+        drop(st);
         workers.sort_by(|a, b| {
             a.worker_id
                 .cmp(&b.worker_id)
@@ -1245,30 +1270,8 @@ impl Runtime {
     pub fn stats(&self) -> RuntimeStats {
         let now = now_ms();
         let st = self.inner.lock();
-        let mut interfaces: BTreeMap<String, InterfaceStats> = BTreeMap::new();
-        let (mut queued, mut running) = (0, 0);
-        let (mut succeeded, mut failed, mut cancelled) = (0, 0, 0);
-        for job in st.jobs.values() {
-            let entry = interfaces
-                .entry(job.spec.demand.interface.clone())
-                .or_default();
-            match job.state() {
-                JobState::Queued => {
-                    queued += 1;
-                    entry.queued += 1;
-                    entry.oldest_queued_age_ms = entry
-                        .oldest_queued_age_ms
-                        .max(now.saturating_sub(job.queued_since_ms));
-                }
-                JobState::Running => {
-                    running += 1;
-                    entry.running += 1;
-                }
-                JobState::Succeeded => succeeded += 1,
-                JobState::Failed => failed += 1,
-                JobState::Cancelled => cancelled += 1,
-            }
-        }
+        let mut interfaces = st.job_index.interfaces(now);
+        let [queued, running, succeeded, failed, cancelled] = st.job_index.counts();
         for session in st.sessions.values() {
             for interface in &session.interfaces {
                 let entry = interfaces.entry(interface.clone()).or_default();

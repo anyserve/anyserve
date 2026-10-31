@@ -202,6 +202,15 @@ pub struct JobView {
     pub spec_hash: String,
 }
 
+/// A job's detail and retained events. Journal replay shares the result buffers
+/// with `job`; request payloads are available only while retained in memory.
+#[derive(Clone, Debug)]
+pub struct JobInspection {
+    pub job: JobView,
+    pub spec: Option<Arc<JobSpec>>,
+    pub events: Vec<ExecutionEvent>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionEvent {
     pub job_id: String,

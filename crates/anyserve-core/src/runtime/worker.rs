@@ -134,6 +134,7 @@ impl Runtime {
             new_id()
         };
         if resume {
+            st.unindex_session(&session_id);
             let session = st.sessions.get_mut(&session_id).expect("resumed session");
             session.interfaces = interfaces;
             session.attributes = attributes;
@@ -172,6 +173,7 @@ impl Runtime {
                 },
             );
         }
+        st.index_session(&session_id);
 
         // Leases the worker still holds move to this session when they belong
         // to the same worker in this generation; every other one is fenced.
@@ -353,8 +355,10 @@ impl Runtime {
                     .is_some_and(|attempt| attempt.lease_id == reply.lease_id);
                 if current && reply.accepted {
                     if matches!(job.phase, Phase::Assigned) {
-                        job.phase = Phase::Running;
-                        job.updated_at_ms = now;
+                        st.update_job(&job_id, |job| {
+                            job.phase = Phase::Running;
+                            job.updated_at_ms = now;
+                        });
                     }
                 } else if current && matches!(job.phase, Phase::Assigned | Phase::Running) {
                     job.rejected_by.insert(session_id.to_string());
@@ -467,8 +471,10 @@ impl Runtime {
                 streaming: job.input.clone(),
             });
             if matches!(job.phase, Phase::Assigned) {
-                job.phase = Phase::Running;
-                job.updated_at_ms = now;
+                st.update_job(&job_id, |job| {
+                    job.phase = Phase::Running;
+                    job.updated_at_ms = now;
+                });
             }
             return Ok(Some((
                 AttemptLink::Live {
@@ -894,6 +900,66 @@ mod tests {
             runtime.inner.freeze_locked(&mut st, &b, "test");
         }
         assert_eq!(check(&runtime), vec![(0, 0), (1, 1)]);
+    }
+
+    #[tokio::test]
+    async fn worker_indexes_follow_changed_interfaces_drain_and_expiry() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut handle = runtime.open_session(hello("w", "", Vec::new())).unwrap();
+        let first = submit_slot_job(&runtime).await;
+        let lease = next_assign(&mut handle).await.lease_id;
+        let session_id = handle.session_id.clone();
+        runtime.session_closed(&session_id, handle.connection);
+        check(&runtime);
+        let mut resumed = hello("w", &session_id, vec![lease]);
+        resumed.interfaces = vec!["other".into()];
+        let mut handle = runtime.open_session(resumed).unwrap();
+        check(&runtime);
+        let queued = submit_slot_job(&runtime).await;
+        assert_eq!(
+            runtime.get_job(&queued, false).await.unwrap().state,
+            JobState::Queued
+        );
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "other".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        let assigned = runtime
+            .submit(SubmitRequest {
+                spec: spec.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        assert_eq!(next_assign(&mut handle).await.job_id, assigned.job_id);
+        runtime
+            .session_message(
+                &session_id,
+                handle.connection,
+                pb::worker_message::Msg::Draining(pb::Draining {}),
+            )
+            .unwrap();
+        let waiting = runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        assert_eq!(waiting.state, JobState::Queued);
+        check(&runtime);
+        runtime.session_closed(&session_id, handle.connection);
+        runtime.inner.fire(super::super::TimerKey::SessionGrace {
+            session_id,
+            connection: handle.connection,
+        });
+        check(&runtime);
+        assert!(runtime.list_workers().is_empty());
+        assert_eq!(
+            runtime.get_job(&first, false).await.unwrap().state,
+            JobState::Queued
+        );
     }
 
     #[tokio::test]

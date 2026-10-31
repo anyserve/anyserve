@@ -87,10 +87,15 @@ worker reservation until acknowledgement or `cancel_grace_ms` expires.
 | Byte budget | Default | What it retains / pressure behavior |
 |---|---|---|
 | `max_pending_bytes` | 2 GiB | Unfinished input and params; new input is refused when full |
-| `max_result_bytes` | 2 GiB | Uploaded and retained result data; evicts terminal jobs once before refusing an upload |
+| `max_result_bytes` | 2 GiB | Uploaded, retained and journal-read inline result data; evicts terminal jobs once before refusing an upload |
 | `max_event_bytes` | 1 GiB | Events across jobs; slow consumers back-pressure workers, and old history can expire |
 
 Buffers can be shared across budgets; these values do not add up to an RSS cap.
+Reading an evicted durable result through GetJob or Watch reserves its inline payload bytes
+before loading the payload. Reads that do not fit return `RESOURCE_EXHAUSTED`
+and can be retried after capacity is released. State-only GetJob reads do not
+reserve result bytes. Clones keep the reservation until their last reference
+is dropped.
 Each job also has `event_log_max_events` and `event_log_max_bytes` limits.
 `consumer_stall_timeout_ms` bounds delivery stalls. Lifecycle events can exceed
 the event byte budget; admission, attempt and retained-job limits bound them.

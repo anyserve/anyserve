@@ -76,6 +76,16 @@ impl Permit {
         self.bytes += more;
         true
     }
+
+    /// Transfers part of an existing reservation without releasing its budget.
+    pub(crate) fn split(&mut self, bytes: usize) -> Self {
+        assert!(bytes <= self.bytes, "split exceeds reserved bytes");
+        self.bytes -= bytes;
+        Self {
+            budget: Arc::clone(&self.budget),
+            bytes,
+        }
+    }
 }
 
 impl Drop for Permit {

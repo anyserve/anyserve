@@ -9,7 +9,7 @@ use super::snapshot::{
 use anyserve_core::auth::AuthPolicy;
 use anyserve_core::error::{ErrorKind, RuntimeError};
 use anyserve_core::now_ms;
-use anyserve_core::runtime::api::{JobFilter, JobState};
+use anyserve_core::runtime::api::{JobFilter, JobInspection, JobState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -126,13 +126,11 @@ async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
-    let job = state
+    let JobInspection { job, spec, events } = state
         .runtime
-        .get_job(&job_id, true)
+        .inspect_job(&job_id)
         .await
         .map_err(api_error)?;
-    let spec = state.runtime.spec(&job_id).ok();
-    let (events, _) = state.runtime.events(&job_id, 0).await.map_err(api_error)?;
     let attempts = attempts_from_events(&events);
     let incomplete = attempts.len() < job.attempt_count as usize
         || events.first().is_some_and(|event| {

@@ -245,7 +245,7 @@ impl Inner {
             finish_waiters: Vec::new(),
             finished_leases: Vec::new(),
         };
-        st.jobs.insert(job_id.clone(), job);
+        st.insert_job(job);
         if durability == Durability::Ephemeral {
             self.accepted_locked(st, &job_id, now);
         }
@@ -363,7 +363,7 @@ impl Inner {
     }
 
     pub(crate) fn remove_unaccepted_locked(&self, st: &mut State, job_id: &str, reason: &str) {
-        if let Some(mut job) = st.jobs.remove(job_id) {
+        if let Some(mut job) = st.remove_job(job_id) {
             st.unfinished_jobs -= 1;
             if let Some(count) = st.accepting.get_mut(&job.spec.demand.interface) {
                 *count = count.saturating_sub(1);
@@ -379,12 +379,14 @@ impl Inner {
         st.queue_seq += 1;
         let seq = st.queue_seq;
         let priority_cap = self.config.priority_levels.saturating_sub(1);
+        st.update_job(job_id, |job| {
+            job.phase = Phase::Queued;
+            job.queued_since_ms = now;
+            job.updated_at_ms = now;
+        });
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
-        job.phase = Phase::Queued;
-        job.queued_since_ms = now;
-        job.updated_at_ms = now;
         let key = QueueKey {
             priority: Reverse(job.spec.policy.priority.min(priority_cap)),
             seq,
@@ -446,11 +448,15 @@ impl Inner {
             .collect();
         let mut rotation_pending = false;
         for interface in interfaces {
-            if !st
-                .sessions
-                .values()
-                .any(|s| s.free_slots() > 0 && s.interfaces.contains(&interface))
-            {
+            let mut candidates: Vec<String> = st
+                .sessions_by_interface
+                .get(&interface)
+                .into_iter()
+                .flatten()
+                .filter(|id| st.sessions.get(*id).is_some_and(|s| s.free_slots() > 0))
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
                 continue;
             }
             let queue = &st.queues[&interface];
@@ -478,13 +484,6 @@ impl Inner {
                 keys.extend(window);
             }
             for key in keys {
-                if !st
-                    .sessions
-                    .values()
-                    .any(|s| s.free_slots() > 0 && s.interfaces.contains(&interface))
-                {
-                    break;
-                }
                 let Some(job) = st.jobs.get(&key.job_id) else {
                     continue;
                 };
@@ -493,10 +492,13 @@ impl Inner {
                     continue;
                 }
                 let mut rng = st.rng;
-                let picked = pick_session(st, job, now, &mut rng);
+                let picked = pick_session(st, job, &mut candidates, now, &mut rng);
                 st.rng = rng;
                 if let Some(session_id) = picked {
                     self.begin_attempt_locked(st, &key.job_id, &session_id, now);
+                }
+                if candidates.is_empty() {
+                    break;
                 }
             }
         }
@@ -515,9 +517,9 @@ impl Inner {
         let attempt_id = new_id();
         session.attach(lease_id.clone(), &reserved);
         session.assigned_since_report += 1;
+        st.update_job(job_id, |job| job.updated_at_ms = now);
         let job = st.jobs.get_mut(job_id).expect("queued job");
         job.attempt_count += 1;
-        job.updated_at_ms = now;
         let inline_bytes = spec_payload_bytes(&job.spec)
             + job
                 .spec
@@ -644,9 +646,11 @@ impl Inner {
 
     fn send_assign_locked(&self, st: &mut State, job_id: &str, now: u64) {
         let generation = st.generation;
+        st.update_job(job_id, |job| {
+            job.phase = Phase::Assigned;
+            job.updated_at_ms = now;
+        });
         let job = st.jobs.get_mut(job_id).expect("job");
-        job.phase = Phase::Assigned;
-        job.updated_at_ms = now;
         let assign = build_assign(generation, job);
         let attempt = job.attempt.as_ref().expect("attempt");
         let session_id = attempt.session_id.clone();
@@ -752,7 +756,7 @@ impl Inner {
         session.tx = None;
         session.disconnected_at_ms = Some(now);
         if session.active.is_empty() {
-            st.sessions.remove(session_id);
+            st.remove_session(session_id);
             return;
         }
         let connection = session.connection;
@@ -1024,10 +1028,12 @@ impl Inner {
 
     fn apply_terminal_locked(&self, st: &mut State, job_id: &str, plan: TerminalPlan, now: u64) {
         self.dequeue_locked(st, job_id);
+        st.update_job(job_id, |job| {
+            job.phase = Phase::Terminal(plan.state);
+            job.updated_at_ms = now;
+        });
         let job = st.jobs.get_mut(job_id).expect("job");
         self.timers.cancel(&std::mem::take(&mut job.timers));
-        job.phase = Phase::Terminal(plan.state);
-        job.updated_at_ms = now;
         job.error = plan.error.clone();
         let outputs = if plan.state == JobState::Succeeded {
             plan.outputs
@@ -1162,7 +1168,7 @@ impl Inner {
             if !st.jobs.get(&job_id).is_some_and(|job| job.is_terminal()) {
                 continue;
             }
-            let job = st.jobs.remove(&job_id).expect("job");
+            let job = st.remove_job(&job_id).expect("job");
             for lease in &job.finished_leases {
                 st.finished_leases.remove(lease);
             }
@@ -1219,7 +1225,13 @@ fn next_random(rng: &mut u64) -> u64 {
 
 /// Picks a session for `job`: eligible sessions with the most preferred
 /// attributes, then the less loaded of two random ones.
-fn pick_session(st: &State, job: &Job, now: u64, rng: &mut u64) -> Option<String> {
+fn pick_session(
+    st: &State,
+    job: &Job,
+    candidates: &mut Vec<String>,
+    now: u64,
+    rng: &mut u64,
+) -> Option<String> {
     let demand = &job.spec.demand;
     let spill_open = match job.spec.policy.spillover_after {
         Some(after) if !demand.preferred_attributes.is_empty() => {
@@ -1231,15 +1243,16 @@ fn pick_session(st: &State, job: &Job, now: u64, rng: &mut u64) -> Option<String
     // retry backoff already spaced the new attempt out.
     let mut best: Vec<&super::state::Session> = Vec::new();
     let mut best_rank = (false, 0usize);
-    for session in st.sessions.values() {
-        if session.free_slots() == 0
-            || !session.interfaces.contains(&demand.interface)
-            || !demand
-                .required_attributes
-                .iter()
-                .all(|(key, value)| session.attributes.get(key) == Some(value))
+    candidates.retain(|id| {
+        let Some(session) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
+            return false;
+        };
+        if !demand
+            .required_attributes
+            .iter()
+            .all(|(key, value)| session.attributes.get(key) == Some(value))
         {
-            continue;
+            return true;
         }
         let matches = demand
             .preferred_attributes
@@ -1247,10 +1260,10 @@ fn pick_session(st: &State, job: &Job, now: u64, rng: &mut u64) -> Option<String
             .filter(|(key, value)| session.attributes.get(*key) == Some(value))
             .count();
         if !spill_open && matches < demand.preferred_attributes.len() {
-            continue;
+            return true;
         }
         if !session.fits(&demand.required_capacity) {
-            continue;
+            return true;
         }
         let rank = (!job.rejected_by.contains(&session.id), matches);
         if best.is_empty() || rank > best_rank {
@@ -1260,7 +1273,8 @@ fn pick_session(st: &State, job: &Job, now: u64, rng: &mut u64) -> Option<String
         if rank == best_rank {
             best.push(session);
         }
-    }
+        true
+    });
     match best.len() {
         0 => None,
         1 => Some(best[0].id.clone()),

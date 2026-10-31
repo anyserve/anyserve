@@ -14,12 +14,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use fs2::FileExt;
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
     SqliteRow, SqliteSynchronous,
 };
-use sqlx::{Connection, Row, Sqlite, Transaction};
+use sqlx::{Connection, QueryBuilder, Row, Sqlite, Transaction};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::RuntimeError;
@@ -27,6 +28,7 @@ use crate::runtime::api::{
     Demand, ErrorInfo, ExecutionPolicy, JobSpec, JobState, JournalConfig, JournalStats, Metadata,
     Object,
 };
+use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 
 #[derive(Debug)]
 pub(crate) enum JournalOp {
@@ -151,6 +153,8 @@ const SCHEMA: &[&str] = &[
     )",
     "CREATE INDEX IF NOT EXISTS journal_jobs_state_updated
         ON journal_jobs(state, updated_at_ms)",
+    "CREATE INDEX IF NOT EXISTS journal_jobs_recovery
+        ON journal_jobs(created_at_ms, job_id) WHERE state = 'queued'",
     "CREATE INDEX IF NOT EXISTS journal_jobs_winner ON journal_jobs(winning_lease_id)",
     "CREATE TABLE IF NOT EXISTS journal_objects (
         job_id TEXT NOT NULL,
@@ -261,20 +265,48 @@ impl Journal {
         &self,
         job_id: &str,
         include_outputs: bool,
+        result_budget: Arc<ByteBudget>,
     ) -> Result<Option<StoredJob>> {
         let mut conn = self.read_pool.acquire().await.context("journal read")?;
-        let row = sqlx::query(JOB_COLUMNS_BY_ID)
-            .bind(job_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .context("load journal job")?;
-        let Some(row) = row else {
+        if !include_outputs {
+            return load_job_record(&mut conn, job_id).await;
+        }
+        // Keep sizing and loading in the same snapshot, including across purge.
+        let mut tx = conn.begin().await.context("begin journal read")?;
+        let Some(mut job) = load_job_record(&mut tx, job_id).await? else {
             return Ok(None);
         };
-        let mut job = job_from_row(&row)?;
-        if include_outputs {
-            job.outputs = load_objects(&mut conn, job_id, ROLE_OUTPUT).await?;
+        {
+            let bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(length(content)), 0) FROM journal_objects
+                 WHERE job_id = ? AND role = 'output' AND uri IS NULL",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            let mut permit = Permit::new(result_budget);
+            if !permit.grow(usize::try_from(bytes).context("journal result size")?) {
+                return Err(RuntimeError::exhausted(
+                    "result budget is exhausted; retry the read later",
+                )
+                .into());
+            }
+            let mut rows = sqlx::query(
+                "SELECT uri, content, metadata_json FROM journal_objects
+                 WHERE job_id = ? AND role = 'output' ORDER BY idx",
+            )
+            .bind(job_id)
+            .fetch(&mut *tx);
+            while let Some(row) = rows.try_next().await? {
+                let mut object = object_from_row(&row)?;
+                if let Object::Inline { data, .. } = &mut object {
+                    let reserved = permit.split(data.len());
+                    *data = budgeted_bytes(std::mem::take(data), reserved);
+                }
+                job.outputs.push(object);
+            }
         }
+        tx.commit().await.context("finish journal read")?;
         Ok(Some(job))
     }
 
@@ -382,27 +414,79 @@ const JOB_COLUMNS_BY_ID: &str = "SELECT job_id, state, spec_hash, spec_json, att
         result_digest, last_attempt_id, last_worker_id
      FROM journal_jobs WHERE job_id = ?";
 
+const RECOVERY_BATCH: usize = 256;
+
+async fn load_job_record(conn: &mut SqliteConnection, job_id: &str) -> Result<Option<StoredJob>> {
+    let row = sqlx::query(JOB_COLUMNS_BY_ID)
+        .bind(job_id)
+        .fetch_optional(conn)
+        .await
+        .context("load journal job")?;
+    row.as_ref().map(job_from_row).transpose()
+}
+
 async fn load_recovery(conn: &mut SqliteConnection, generation: u64) -> Result<Recovery> {
-    let rows = sqlx::query(&format!(
-        "{JOB_COLUMNS} WHERE state = 'queued' ORDER BY created_at_ms, job_id"
-    ))
-    .fetch_all(&mut *conn)
-    .await
-    .context("load unfinished jobs")?;
-    let mut active = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut job = job_from_row(&row)?;
-        job.spec.inputs = load_objects(conn, &job.job_id, ROLE_INPUT).await?;
-        job.spec.params = load_objects(conn, &job.job_id, ROLE_PARAMS)
-            .await?
-            .into_iter()
-            .next()
-            .and_then(|object| match object {
-                Object::Inline { data, .. } => Some(data),
-                Object::Uri { .. } => None,
-            })
-            .unwrap_or_default();
-        active.push(job);
+    let mut active = Vec::new();
+    let mut cursor: Option<(u64, String)> = None;
+    loop {
+        let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
+        query.push(" WHERE state = 'queued'");
+        if let Some((created, id)) = &cursor {
+            query
+                .push(" AND (created_at_ms, job_id) > (")
+                .push_bind(*created as i64)
+                .push(", ")
+                .push_bind(id)
+                .push(")");
+        }
+        let rows = query
+            .push(" ORDER BY created_at_ms, job_id LIMIT ")
+            .push_bind(RECOVERY_BATCH as i64)
+            .build()
+            .fetch_all(&mut *conn)
+            .await
+            .context("load unfinished jobs")?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut batch: Vec<StoredJob> = rows.iter().map(job_from_row).collect::<Result<_>>()?;
+        let positions: std::collections::HashMap<String, usize> = batch
+            .iter()
+            .enumerate()
+            .map(|(i, job)| (job.job_id.clone(), i))
+            .collect();
+        let mut objects = QueryBuilder::<Sqlite>::new(
+            "SELECT job_id, role, idx, uri, content, metadata_json FROM journal_objects WHERE job_id IN (",
+        );
+        let mut ids = objects.separated(", ");
+        for job in &batch {
+            ids.push_bind(job.job_id.clone());
+        }
+        ids.push_unseparated(") AND role IN ('input', 'params') ORDER BY job_id, role, idx");
+        // Bind owned ids so decoding can fill the batch while the query streams.
+        let query = objects.build();
+        let mut objects = query.fetch(&mut *conn);
+        while let Some(row) = objects.try_next().await? {
+            let id: String = row.try_get("job_id")?;
+            let job = &mut batch[positions[&id]];
+            let object = object_from_row(&row)?;
+            match row.try_get::<&str, _>("role")? {
+                ROLE_INPUT => job.spec.inputs.push(object),
+                ROLE_PARAMS if row.try_get::<i64, _>("idx")? == 0 => {
+                    if let Object::Inline { data, .. } = object {
+                        job.spec.params = data;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let last = batch.last().expect("nonempty recovery batch");
+        cursor = Some((last.created_at_ms, last.job_id.clone()));
+        let done = batch.len() < RECOVERY_BATCH;
+        active.extend(batch);
+        if done {
+            break;
+        }
     }
     Ok(Recovery { generation, active })
 }
@@ -455,36 +539,18 @@ fn job_from_row(row: &SqliteRow) -> Result<StoredJob> {
     })
 }
 
-async fn load_objects(
-    conn: &mut SqliteConnection,
-    job_id: &str,
-    role: &str,
-) -> Result<Vec<Object>> {
-    let rows = sqlx::query(
-        "SELECT uri, content, metadata_json FROM journal_objects
-         WHERE job_id = ? AND role = ? ORDER BY idx",
-    )
-    .bind(job_id)
-    .bind(role)
-    .fetch_all(&mut *conn)
-    .await
-    .context("load journal objects")?;
-    rows.iter()
-        .map(|row| {
-            let metadata: Metadata =
-                serde_json::from_str(&row.try_get::<String, _>("metadata_json")?)?;
-            Ok(match row.try_get::<Option<String>, _>("uri")? {
-                Some(uri) => Object::Uri { uri, metadata },
-                None => Object::Inline {
-                    data: Bytes::from(
-                        row.try_get::<Option<Vec<u8>>, _>("content")?
-                            .unwrap_or_default(),
-                    ),
-                    metadata,
-                },
-            })
-        })
-        .collect()
+fn object_from_row(row: &SqliteRow) -> Result<Object> {
+    let metadata: Metadata = serde_json::from_str(&row.try_get::<String, _>("metadata_json")?)?;
+    Ok(match row.try_get::<Option<String>, _>("uri")? {
+        Some(uri) => Object::Uri { uri, metadata },
+        None => Object::Inline {
+            data: Bytes::from(
+                row.try_get::<Option<Vec<u8>>, _>("content")?
+                    .unwrap_or_default(),
+            ),
+            metadata,
+        },
+    })
 }
 
 async fn insert_objects(
@@ -846,5 +912,216 @@ mod tests {
         assert!(!verify(&mut conn, &start("missing", 1)).await.unwrap());
         conn.close().await.unwrap();
         journal.close().await;
+    }
+
+    async fn finished_fixture(config: &JournalConfig) -> Journal {
+        let (journal, _) = Journal::open(config).await.unwrap();
+        assert_eq!(
+            commit(
+                &journal,
+                JournalOp::Accept(Box::new(AcceptRecord {
+                    job_id: "result".into(),
+                    spec_hash: "hash".into(),
+                    spec: Arc::new(JobSpec::default()),
+                    max_attempts: 3,
+                    created_at_ms: 1,
+                }))
+            )
+            .await,
+            CommitOutcome::Committed
+        );
+        assert_eq!(
+            commit(
+                &journal,
+                JournalOp::Terminal(Box::new(TerminalRecord {
+                    job_id: "result".into(),
+                    state: JobState::Succeeded,
+                    outputs: vec![
+                        Object::inline(vec![1; 40]),
+                        Object::inline(vec![2; 60]),
+                        Object::Uri {
+                            uri: "s3://result".into(),
+                            metadata: Metadata::new()
+                        }
+                    ],
+                    error: None,
+                    attempt_id: None,
+                    worker_id: None,
+                    winning_lease_id: None,
+                    outcome_digest: None,
+                    at_ms: 2,
+                }))
+            )
+            .await,
+            CommitOutcome::Committed
+        );
+        journal
+    }
+
+    #[tokio::test]
+    async fn cold_results_hold_budget_until_each_objects_last_reference() {
+        let config = config("read-budget");
+        let journal = finished_fixture(&config).await;
+        let budget = Arc::new(ByteBudget::new(100));
+        let job = journal
+            .load_job("result", true, Arc::clone(&budget))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.used(), 100);
+        let held = job.outputs[0].clone();
+        let refused = journal
+            .load_job("result", true, Arc::clone(&budget))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<RuntimeError>().unwrap().kind,
+            crate::error::ErrorKind::ResourceExhausted
+        );
+        // Reading just the state does not need payload capacity.
+        assert!(
+            journal
+                .load_job("result", false, Arc::clone(&budget))
+                .await
+                .unwrap()
+                .unwrap()
+                .outputs
+                .is_empty()
+        );
+        drop(job);
+        assert_eq!(budget.used(), 40);
+        drop(held);
+        assert_eq!(budget.used(), 0);
+        let again = journal
+            .load_job("result", true, Arc::clone(&budget))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.outputs.len(), 3);
+        drop(again);
+        assert_eq!(budget.used(), 0);
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_reads_share_one_budget() {
+        let journal = finished_fixture(&config("concurrent-read-budget")).await;
+        let budget = Arc::new(ByteBudget::new(200));
+        let reads = futures::future::join_all(
+            (0..16).map(|_| journal.load_job("result", true, Arc::clone(&budget))),
+        )
+        .await;
+        assert_eq!(reads.iter().filter(|read| read.is_ok()).count(), 2);
+        assert!(
+            reads
+                .iter()
+                .filter_map(|read| read.as_ref().err())
+                .all(|error| error.downcast_ref::<RuntimeError>().unwrap().kind
+                    == crate::error::ErrorKind::ResourceExhausted)
+        );
+        assert_eq!(budget.used(), 200);
+        drop(reads);
+        assert_eq!(budget.used(), 0);
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn failed_cold_reads_release_partial_results_and_unused_budget() {
+        let config = config("failed-read-budget");
+        let journal = finished_fixture(&config).await;
+        let mut conn = connect(&config).await;
+        sqlx::query("UPDATE journal_objects SET metadata_json = 'invalid' WHERE role = 'output' AND idx = 1")
+            .execute(&mut conn).await.unwrap();
+        let budget = Arc::new(ByteBudget::new(100));
+        assert!(
+            journal
+                .load_job("result", true, Arc::clone(&budget))
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.used(), 0);
+        conn.close().await.unwrap();
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_batches_preserve_order_payloads_and_attempts() {
+        let config = config("batched-recovery");
+        let (journal, _) = Journal::open(&config).await.unwrap();
+        journal.close().await;
+        let mut conn = connect(&config).await;
+        let mut tx = conn.begin().await.unwrap();
+        let mut expected = Vec::new();
+        for i in (0..RECOVERY_BATCH * 2 + 37).rev() {
+            let id = format!("job-{i:04}");
+            let created = (i % 2) as u64;
+            let mut spec = JobSpec::default();
+            spec.demand.interface = format!("interface-{}", i % 3);
+            spec.metadata.insert("ordinal".into(), i.to_string());
+            if i % 3 != 0 {
+                spec.inputs = vec![
+                    Object::inline(vec![i as u8; 3]),
+                    Object::inline(vec![0; 17]),
+                    Object::Uri {
+                        uri: format!("s3://input/{i}"),
+                        metadata: [("type".into(), "blob".into())].into(),
+                    },
+                ];
+                spec.params = Bytes::from(format!("params-{i}"));
+            }
+            apply_op(
+                &mut tx,
+                &JournalOp::Accept(Box::new(AcceptRecord {
+                    job_id: id.clone(),
+                    spec_hash: format!("hash-{i}"),
+                    spec: Arc::new(spec.clone()),
+                    max_attempts: 5,
+                    created_at_ms: created,
+                })),
+            )
+            .await
+            .unwrap();
+            apply_op(&mut tx, &start(&id, 1)).await.unwrap();
+            if i % 19 == 0 {
+                apply_op(
+                    &mut tx,
+                    &JournalOp::Terminal(Box::new(TerminalRecord {
+                        job_id: id,
+                        state: JobState::Cancelled,
+                        outputs: Vec::new(),
+                        error: None,
+                        attempt_id: None,
+                        worker_id: None,
+                        winning_lease_id: None,
+                        outcome_digest: None,
+                        at_ms: 3,
+                    })),
+                )
+                .await
+                .unwrap();
+            } else {
+                expected.push((created, id, spec));
+            }
+        }
+        tx.commit().await.unwrap();
+        expected.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let recovery = load_recovery(&mut conn, 7).await.unwrap();
+        assert_eq!(recovery.generation, 7);
+        assert_eq!(recovery.active.len(), expected.len());
+        for (job, (created, id, spec)) in recovery.active.iter().zip(&expected) {
+            assert_eq!(
+                (&job.created_at_ms, &job.job_id, &job.spec),
+                (created, id, spec)
+            );
+            assert_eq!(job.attempt_count, 1);
+            assert_eq!(job.max_attempts, 5);
+            assert!(job.outputs.is_empty());
+        }
+        sqlx::query("DELETE FROM journal_jobs")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(load_recovery(&mut conn, 8).await.unwrap().active.is_empty());
+        conn.close().await.unwrap();
     }
 }

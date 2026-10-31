@@ -101,22 +101,30 @@ impl TestWorker {
         held: Vec<String>,
         resume: String,
     ) -> Self {
+        Self::connect_hello(
+            url,
+            pb::Hello {
+                worker_id: worker_id.to_string(),
+                resume_session_id: resume,
+                interfaces: vec!["echo".to_string()],
+                attributes: attributes
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                max_concurrency: 4,
+                held_lease_ids: held,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn connect_hello(url: &str, hello: pb::Hello) -> Self {
         let mut client = WorkerClient::connect(url.to_string()).await.unwrap();
         let (tx, outbound) = mpsc::channel(64);
-        tx.send(msg(pb::worker_message::Msg::Hello(pb::Hello {
-            worker_id: worker_id.to_string(),
-            resume_session_id: resume,
-            interfaces: vec!["echo".to_string()],
-            attributes: attributes
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            max_concurrency: 4,
-            held_lease_ids: held,
-            ..Default::default()
-        })))
-        .await
-        .unwrap();
+        tx.send(msg(pb::worker_message::Msg::Hello(hello)))
+            .await
+            .unwrap();
         let mut rx = client
             .session(ReceiverStream::new(outbound))
             .await
@@ -1228,6 +1236,91 @@ async fn evicted_durable_jobs_are_read_back_from_the_journal() {
         status(&different.succeed(b"changed").await),
         pb::attempt_finished::Status::Rejected
     );
+    server.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn cold_job_reads_and_watch_share_the_upload_result_budget() {
+    let server = serve(RuntimeConfig {
+        journal: Some(JournalConfig::new(journal_path("cold-budget"))),
+        max_terminal_jobs: 0,
+        max_result_bytes: 128,
+        ..config()
+    })
+    .await;
+    let mut worker = TestWorker::connect(&server.url, "w", &[]).await;
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: spec(b"input"),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    worker
+        .attempt(&assign.lease_id, assign.generation)
+        .await
+        .succeed(&[3; 128])
+        .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while server.runtime.stats().result_bytes != 0 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.runtime.stats().retained_jobs, 0);
+    let view = server.runtime.get_job(&job.job_id, true).await.unwrap();
+    assert_eq!(server.runtime.stats().result_bytes, 128);
+    let clone = view.outputs.as_ref().unwrap()[0].clone();
+    drop(view);
+    let refused = server.runtime.get_job(&job.job_id, true).await.unwrap_err();
+    assert_eq!(
+        refused.kind,
+        anyserve_core::error::ErrorKind::ResourceExhausted
+    );
+    assert_eq!(
+        server
+            .runtime
+            .get_job(&job.job_id, false)
+            .await
+            .unwrap()
+            .state,
+        JobState::Succeeded
+    );
+    let mut watch = server.runtime.watch(&job.job_id, 0).unwrap();
+    assert_eq!(
+        watch.next().await.unwrap().unwrap_err().kind,
+        anyserve_core::error::ErrorKind::ResourceExhausted
+    );
+    drop(watch);
+    drop(clone);
+    assert_eq!(server.runtime.stats().result_bytes, 0);
+    let replay = collect(server.runtime.watch(&job.job_id, 0).unwrap()).await;
+    assert_eq!(server.runtime.stats().result_bytes, 128);
+    assert!(matches!(
+        replay.last(),
+        Some(EventKind::Finished {
+            state: JobState::Succeeded,
+            ..
+        })
+    ));
+    drop(replay);
+    assert_eq!(server.runtime.stats().result_bytes, 0);
+    // The console needs both the result and its replay. They share one read,
+    // even when the budget fits exactly one result.
+    let detail = server.runtime.inspect_job(&job.job_id).await.unwrap();
+    assert!(detail.spec.is_none());
+    assert_eq!(
+        detail.job.outputs.as_ref().unwrap()[0],
+        Object::inline(vec![3; 128])
+    );
+    assert_eq!(server.runtime.stats().result_bytes, 128);
+    drop(detail.job);
+    assert_eq!(server.runtime.stats().result_bytes, 128);
+    drop(detail.events);
+    assert_eq!(server.runtime.stats().result_bytes, 0);
     server.runtime.shutdown().await;
 }
 
@@ -2486,4 +2579,265 @@ async fn one_worker_connection_carries_thousands_of_attempts() {
             .await
             .unwrap();
     }
+}
+
+// Run these explicitly in release mode on the same host for before/after data.
+fn report_scale(name: &str, mut samples: Vec<std::time::Duration>) {
+    samples.sort();
+    println!(
+        "{}",
+        serde_json::json!({
+            "case": name, "samples": samples.len(),
+            "p50_us": samples[samples.len() / 2].as_secs_f64() * 1e6,
+            "p95_us": samples[samples.len() * 95 / 100].as_secs_f64() * 1e6,
+        })
+    );
+}
+
+#[tokio::test]
+async fn paginated_queries_match_individual_jobs_after_transitions() {
+    let runtime = Runtime::start(config()).await.unwrap();
+    let mut views = Vec::new();
+    for i in 0..23 {
+        let mut spec = spec(b"x");
+        spec.demand.interface = format!("interface-{}", i % 3);
+        spec.policy.durability = Some(Durability::Ephemeral);
+        let job = runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("job-{:03}", 23 - i)),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        if i % 2 == 0 {
+            runtime.cancel(&job.job_id, "test".into()).await.unwrap();
+        }
+        views.push(runtime.get_job(&job.job_id, false).await.unwrap());
+    }
+    for states in [
+        Vec::new(),
+        vec![JobState::Queued],
+        vec![JobState::Cancelled, JobState::Queued, JobState::Cancelled],
+    ] {
+        for interface in [
+            None,
+            Some("interface-1".to_string()),
+            Some("absent".to_string()),
+        ] {
+            let mut expected: Vec<_> = views
+                .iter()
+                .filter(|job| {
+                    (states.is_empty() || states.contains(&job.state))
+                        && interface.as_ref().is_none_or(|name| name == &job.interface)
+                })
+                .cloned()
+                .collect();
+            expected.sort_by(|a, b| {
+                b.updated_at_ms
+                    .cmp(&a.updated_at_ms)
+                    .then_with(|| a.job_id.cmp(&b.job_id))
+            });
+            let mut actual = Vec::new();
+            let mut token = None;
+            loop {
+                let page = runtime
+                    .list_jobs(api::JobFilter {
+                        states: states.clone(),
+                        interface: interface.clone(),
+                        limit: 3,
+                        page_token: token,
+                    })
+                    .await
+                    .unwrap();
+                actual.extend(page.jobs);
+                token = page.next_page_token;
+                if token.is_none() {
+                    break;
+                }
+                assert!(actual.len() < expected.len());
+                assert_eq!(token.as_deref(), Some(actual.len().to_string().as_str()));
+            }
+            assert_eq!(actual, expected);
+        }
+    }
+    let stats = runtime.stats();
+    assert_eq!((stats.queued, stats.cancelled, stats.running), (11, 12, 0));
+    assert_eq!(
+        stats
+            .interfaces
+            .values()
+            .map(|entry| entry.queued)
+            .sum::<usize>(),
+        11
+    );
+}
+
+#[tokio::test]
+#[ignore = "local scalability measurement"]
+async fn scale_management_queries() {
+    let runtime = Runtime::start(RuntimeConfig {
+        default_max_queue: 20_000,
+        ..config()
+    })
+    .await
+    .unwrap();
+    let start = std::time::Instant::now();
+    for i in 0..10_000 {
+        let mut spec = spec(b"x");
+        spec.policy.durability = Some(Durability::Ephemeral);
+        spec.policy.queue_timeout = Some(Duration::from_secs(3600));
+        runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("job-{i:06}")),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    println!(
+        "{}",
+        serde_json::json!({"case": "admit_10000", "elapsed_ms": start.elapsed().as_secs_f64() * 1000.0})
+    );
+    for i in 0..5_000 {
+        runtime
+            .cancel(&format!("job-{i:06}"), "scale".into())
+            .await
+            .unwrap();
+    }
+    let mut lists = Vec::new();
+    let mut stats = Vec::new();
+    for _ in 0..500 {
+        let start = std::time::Instant::now();
+        let page = runtime
+            .list_jobs(api::JobFilter {
+                states: vec![JobState::Queued],
+                limit: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.jobs.len(), 100);
+        std::hint::black_box(page);
+        lists.push(start.elapsed());
+        let start = std::time::Instant::now();
+        let snapshot = runtime.stats();
+        assert_eq!((snapshot.queued, snapshot.cancelled), (5000, 5000));
+        std::hint::black_box(snapshot);
+        stats.push(start.elapsed());
+    }
+    report_scale("list_100_of_10000", lists);
+    report_scale("stats_10000", stats);
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "local scalability measurement"]
+async fn scale_dispatch_interfaces() {
+    let server = serve(RuntimeConfig {
+        heartbeat_timeout: Duration::from_secs(600),
+        ..config()
+    })
+    .await;
+    for _ in 0..256 {
+        let mut spec = spec(b"x");
+        spec.policy.durability = Some(Durability::Ephemeral);
+        spec.demand
+            .required_attributes
+            .insert("unavailable".into(), "true".into());
+        server
+            .runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut unrelated = Vec::new();
+    for i in 0..128 {
+        let worker = TestWorker::connect_hello(
+            &server.url,
+            pb::Hello {
+                worker_id: format!("unrelated-{i}"),
+                interfaces: vec![format!("other-{i}")],
+                max_concurrency: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        worker.heartbeat.abort();
+        unrelated.push(worker);
+    }
+    let mut worker = TestWorker::connect_hello(
+        &server.url,
+        pb::Hello {
+            worker_id: "matching".into(),
+            interfaces: vec!["echo".into()],
+            max_concurrency: 1024,
+            ..Default::default()
+        },
+    )
+    .await;
+    worker.heartbeat.abort();
+    let mut samples = Vec::new();
+    for _ in 0..100 {
+        let mut spec = spec(b"x");
+        spec.policy.durability = Some(Durability::Ephemeral);
+        spec.policy.priority = 3;
+        let start = std::time::Instant::now();
+        let job = server
+            .runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        samples.push(start.elapsed());
+        assert_eq!(worker.next_assign().await.job_id, job.job_id);
+    }
+    report_scale("dispatch_129_workers_256_blocked", samples);
+    server.runtime.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "local scalability measurement"]
+async fn scale_journal_recovery() {
+    let journal = JournalConfig::new(journal_path("scale-recovery"));
+    let cfg = RuntimeConfig {
+        journal: Some(journal.clone()),
+        ..config()
+    };
+    let runtime = Runtime::start(cfg.clone()).await.unwrap();
+    for chunk in 0..32 {
+        let accepts = (0..64).map(|i| {
+            let mut spec = spec(&[i; 64]);
+            spec.params = Bytes::from(vec![1; 32]);
+            spec.policy.queue_timeout = Some(Duration::from_secs(3600));
+            runtime.submit(SubmitRequest {
+                job_id: Some(format!("job-{chunk}-{i}")),
+                spec,
+                ..Default::default()
+            })
+        });
+        for result in futures::future::join_all(accepts).await {
+            result.unwrap();
+        }
+    }
+    runtime.shutdown().await;
+    drop(runtime);
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        let runtime = Runtime::start(cfg.clone()).await.unwrap();
+        samples.push(start.elapsed());
+        assert_eq!(runtime.stats().queued, 2048);
+        runtime.shutdown().await;
+    }
+    report_scale("recover_2048_jobs", samples);
+    std::fs::remove_dir_all(journal.path.parent().unwrap()).unwrap();
 }

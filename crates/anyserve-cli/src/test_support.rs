@@ -132,12 +132,16 @@ impl Worker {
 }
 
 pub(crate) fn temporary_path(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "anyserve-{label}-{}-{}",
+        "anyserve-{label}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        // Wall-clock reads can be equal across parallel tests on macOS.
+        NEXT_PATH.fetch_add(1, Ordering::Relaxed)
     ))
 }

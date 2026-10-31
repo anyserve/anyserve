@@ -338,6 +338,78 @@ async fn evicted_durable_details_show_missing_spec_and_incomplete_history() {
     let _ = std::fs::remove_file(path);
 }
 
+#[tokio::test]
+async fn cold_result_preview_fits_a_single_result_budget() {
+    use anyserve_client::execution::{Attempt, v2};
+    use anyserve_core::runtime::api::JournalConfig;
+    use std::time::Duration;
+
+    let path = crate::test_support::temporary_path("console-result.sqlite");
+    let server = Server::start(
+        RuntimeConfig {
+            journal: Some(JournalConfig::new(&path)),
+            max_terminal_jobs: 0,
+            max_result_bytes: 128,
+            ..Default::default()
+        },
+        AuthPolicy::default(),
+    )
+    .await;
+    let mut worker = Worker::connect(&server, "cold-result", vec!["demo.cold.v1".into()], 1).await;
+    let mut spec = test_job_spec("demo.cold.v1");
+    spec.policy.durability = Some(Durability::Durable);
+    let job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let assignment = worker.assignment().await;
+    let mut attempt = Attempt::open(
+        &mut worker.session.data,
+        &assignment,
+        &worker.limits,
+        worker.heartbeat_timeout,
+    )
+    .await
+    .unwrap();
+    attempt
+        .finish(
+            &[v2::Object {
+                body: Some(v2::object::Body::Inline(vec![b'a'; 128].into())),
+                ..Default::default()
+            }],
+            v2::finish::Outcome::Succeeded(v2::Succeeded {}),
+        )
+        .await
+        .unwrap();
+    drop(attempt);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.runtime.stats().result_bytes != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (url, handle) = spawn_test_server(server.runtime.clone()).await;
+    for _ in 0..2 {
+        let response = reqwest::get(format!("{url}/api/jobs/{}", job.job_id))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["job"]["output_preview"]["preview"], "a".repeat(128));
+        assert_eq!(body["job"]["outputs"][0]["size_bytes"], 128);
+        assert_eq!(server.runtime.stats().result_bytes, 0);
+    }
+    handle.abort();
+    server.stop().await;
+    let _ = std::fs::remove_file(path);
+}
+
 async fn test_runtime() -> Runtime {
     Runtime::start(RuntimeConfig::default()).await.unwrap()
 }

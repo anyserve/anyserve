@@ -13,6 +13,7 @@ use super::api::{
     WorkerLoad,
 };
 use super::events::{JobLog, Permit};
+use super::index::JobIndex;
 use super::input::InputLog;
 use crate::error::RuntimeError;
 
@@ -37,6 +38,7 @@ pub(crate) struct QueueKey {
 pub(crate) struct State {
     pub generation: u64,
     pub jobs: HashMap<String, Job>,
+    pub job_index: JobIndex,
     /// Queued jobs per interface, highest priority then oldest first.
     pub queues: HashMap<String, BTreeSet<QueueKey>>,
     pub queue_seq: u64,
@@ -47,6 +49,7 @@ pub(crate) struct State {
     /// Jobs not yet terminal, including those being accepted.
     pub unfinished_jobs: usize,
     pub sessions: HashMap<String, Session>,
+    pub sessions_by_interface: HashMap<String, HashSet<String>>,
     pub leases: HashMap<String, Lease>,
     /// Completion receipts of jobs held in memory: lease id -> (job id,
     /// outcome digest). Receipts of evicted durable jobs are read from the
@@ -58,6 +61,60 @@ pub(crate) struct State {
     pub shutting_down: bool,
     /// Taken out under the lock, freed once it is released.
     pub released: Released,
+}
+
+impl State {
+    pub(crate) fn insert_job(&mut self, job: Job) {
+        self.job_index.insert(&job);
+        self.jobs.insert(job.id.clone(), job);
+    }
+
+    /// All changes to a job's public state or ordering timestamps go here.
+    pub(crate) fn update_job(&mut self, id: &str, update: impl FnOnce(&mut Job)) {
+        if let Some(job) = self.jobs.get_mut(id) {
+            let previous = JobIndex::position(job);
+            update(job);
+            // Internal phases often share a public state and millisecond
+            // timestamp. Their identity and interface never change.
+            if previous != JobIndex::position(job) {
+                self.job_index.remove_position(job, previous, false);
+                self.job_index.insert(job);
+            }
+        }
+    }
+
+    pub(crate) fn remove_job(&mut self, id: &str) -> Option<Job> {
+        let job = self.jobs.remove(id)?;
+        self.job_index.remove(&job, true);
+        Some(job)
+    }
+
+    pub(crate) fn index_session(&mut self, id: &str) {
+        for interface in &self.sessions[id].interfaces {
+            self.sessions_by_interface
+                .entry(interface.clone())
+                .or_default()
+                .insert(id.to_string());
+        }
+    }
+
+    pub(crate) fn unindex_session(&mut self, id: &str) {
+        if let Some(session) = self.sessions.get(id) {
+            for interface in &session.interfaces {
+                if let Some(ids) = self.sessions_by_interface.get_mut(interface) {
+                    ids.remove(id);
+                    if ids.is_empty() {
+                        self.sessions_by_interface.remove(interface);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn remove_session(&mut self, id: &str) {
+        self.unindex_session(id);
+        self.sessions.remove(id);
+    }
 }
 
 /// What lock holders set aside instead of freeing it in place: freeing an
@@ -315,6 +372,17 @@ impl Session {
 /// Test check: every session's `reserved` equals the sum over its leases.
 #[cfg(test)]
 pub(crate) fn assert_reservations(st: &State) {
+    super::index::assert_matches_jobs(st);
+    let mut expected_interfaces: HashMap<String, HashSet<String>> = HashMap::new();
+    for session in st.sessions.values() {
+        for interface in &session.interfaces {
+            expected_interfaces
+                .entry(interface.clone())
+                .or_default()
+                .insert(session.id.clone());
+        }
+    }
+    assert_eq!(st.sessions_by_interface, expected_interfaces);
     for session in st.sessions.values() {
         let mut expected = Capacity::new();
         for lease_id in &session.active {

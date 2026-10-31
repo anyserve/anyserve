@@ -4,14 +4,7 @@ use std::time::Duration;
 use super::{ResolvedServeConfig, ServeOverrides};
 
 fn config(raw: &str, mut overrides: ServeOverrides) -> anyhow::Result<ResolvedServeConfig> {
-    let path = std::env::temp_dir().join(format!(
-        "anyserve-config-{}-{}.toml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::test_support::temporary_path("config").with_extension("toml");
     fs::write(&path, raw)?;
     overrides.config = Some(path.clone());
     let result = ResolvedServeConfig::load(overrides);
