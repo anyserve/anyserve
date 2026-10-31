@@ -171,6 +171,7 @@ dependencies = [
  "fs2",
  "futures",
  "http",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "sha2",

@@ -4,12 +4,13 @@ use super::api::{
 };
 use super::snapshot::{
     INLINE_PREVIEW_LIMIT_BYTES, aggregate_capacity, attempts_from_events, event_summary,
-    inline_preview, job_summary, object_ref_summary, output_preview, worker_summary,
+    inline_preview, job_summary, object_preview_summary, object_ref_summary, output_preview,
+    worker_summary,
 };
 use anyserve_core::auth::AuthPolicy;
 use anyserve_core::error::{ErrorKind, RuntimeError};
 use anyserve_core::now_ms;
-use anyserve_core::runtime::api::{JobFilter, JobInspection, JobState};
+use anyserve_core::runtime::api::{JobFilter, JobPreview, JobState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -126,9 +127,14 @@ async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
-    let JobInspection { job, spec, events } = state
+    let JobPreview {
+        job,
+        spec,
+        events,
+        outputs,
+    } = state
         .runtime
-        .inspect_job(&job_id)
+        .inspect_job_preview(&job_id)
         .await
         .map_err(api_error)?;
     let attempts = attempts_from_events(&events);
@@ -146,7 +152,6 @@ async fn get_job(
         .iter()
         .find(|worker| Some(&worker.worker_id) == latest_worker_id)
         .map(worker_summary);
-    let outputs = job.outputs.as_deref().unwrap_or_default();
     Ok(Json(JobDetailResponse {
         job: JobDetail {
             summary: job_summary(&job),
@@ -161,8 +166,8 @@ async fn get_job(
                 .as_ref()
                 .map(|spec| spec.inputs.iter().map(object_ref_summary).collect())
                 .unwrap_or_default(),
-            outputs: outputs.iter().map(object_ref_summary).collect(),
-            output_preview: output_preview(&events, outputs),
+            outputs: outputs.iter().map(object_preview_summary).collect(),
+            output_preview: output_preview(&events, &outputs),
         },
         attempts,
         events: events.iter().map(event_summary).collect(),

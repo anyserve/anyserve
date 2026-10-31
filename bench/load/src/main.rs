@@ -21,6 +21,17 @@ struct Cli {
 enum Command {
     Worker(WorkerArgs),
     Client(ClientArgs),
+    /// Persist a fixed number of verified echo results for management benchmarks.
+    Seed {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long, default_value_t = 4)]
+        count: usize,
+        #[arg(long, default_value_t = 16 * 1024 * 1024)]
+        payload: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Profile the library runtime; normal baselines use the production binary.
     Serve {
         #[arg(long, default_value = "127.0.0.1:50052")]
@@ -80,6 +91,12 @@ async fn main() -> Result {
     match Cli::parse().command {
         Command::Worker(args) => worker::run(args).await,
         Command::Client(args) => client::run(args).await,
+        Command::Seed {
+            endpoint,
+            count,
+            payload,
+            out,
+        } => client::seed(&endpoint, count, payload, &out).await,
         Command::Serve {
             listen,
             journal,

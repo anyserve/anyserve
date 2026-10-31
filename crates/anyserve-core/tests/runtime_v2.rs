@@ -1280,6 +1280,21 @@ async fn cold_job_reads_and_watch_share_the_upload_result_budget() {
         refused.kind,
         anyserve_core::error::ErrorKind::ResourceExhausted
     );
+    // Management reads have their own bounded representation and remain
+    // available while a business client holds all result-byte capacity.
+    let preview = server
+        .runtime
+        .inspect_job_preview(&job.job_id)
+        .await
+        .unwrap();
+    assert!(preview.job.outputs.is_none());
+    assert!(preview.spec.is_none());
+    assert_eq!(preview.outputs[0].size_bytes, Some(128));
+    assert_eq!(preview.outputs[0].prefix, Object::inline(vec![3; 128]));
+    assert_eq!(server.runtime.stats().result_bytes, 128);
+    assert!(matches!(preview.events.last().unwrap().kind,
+        EventKind::Finished { ref outputs, .. } if outputs.is_empty()));
+    drop(preview);
     assert_eq!(
         server
             .runtime

@@ -102,3 +102,32 @@ it("discards the first StrictMode effect's result", async () => {
   expect(success.mock.calls).toEqual([["current"]]);
   expect(vi.getTimerCount()).toBe(1);
 });
+
+it("aborts hidden-page requests and immediately refreshes on return without stale callbacks", async () => {
+  const visibility = vi.spyOn(document, "visibilityState", "get");
+  visibility.mockReturnValue("hidden");
+  const old = deferred<string>();
+  const task = vi.fn().mockReturnValueOnce(old.promise).mockResolvedValue("fresh");
+  const success = vi.fn();
+  const { unmount } = renderHook(() => usePollingEffect(task, success, vi.fn(), 1000, []));
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(task).not.toHaveBeenCalled();
+  visibility.mockReturnValue("visible");
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  expect(task).toHaveBeenCalledTimes(1);
+  visibility.mockReturnValue("hidden");
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  expect((task.mock.calls[0][0] as AbortSignal).aborted).toBe(true);
+  await act(async () => old.resolve("stale"));
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(success).not.toHaveBeenCalled();
+  expect(task).toHaveBeenCalledTimes(1);
+  visibility.mockReturnValue("visible");
+  await act(async () => document.dispatchEvent(new Event("visibilitychange")));
+  expect(success.mock.calls).toEqual([["fresh"]]);
+  expect(vi.getTimerCount()).toBe(1);
+  unmount();
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  expect(task).toHaveBeenCalledTimes(2);
+  visibility.mockRestore();
+});

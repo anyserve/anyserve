@@ -96,6 +96,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: bench/load/run.sh --cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2
+      - run: python3 bench/load/console.py --out bench/load/results/console-ci --cases cold,S3-console --concurrency 16 --operators 2 --duration 3 --warmup 1 --repeat 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -106,6 +107,9 @@ jobs:
             bench/load/results/**/*.log
             bench/load/results/**/client.json
             bench/load/results/**/process-samples.jsonl
+            bench/load/results/**/business.json
+            bench/load/results/**/http.json
+            bench/load/results/**/resources.json
           retention-days: 14
 
   container:

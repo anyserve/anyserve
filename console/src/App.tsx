@@ -94,9 +94,9 @@ export default function App() {
       setError(null);
     },
     handleError,
-    activeTab === "queue" ? QUEUE_POLL_MS : 3_000,
-    [activeTab],
-    polling,
+    QUEUE_POLL_MS,
+    [],
+    polling && activeTab === "queue",
   );
 
   usePollingEffect(
@@ -106,9 +106,9 @@ export default function App() {
       setError(null);
     },
     handleError,
-    activeTab === "history" ? 2_000 : HISTORY_POLL_MS,
-    [activeTab],
-    polling,
+    HISTORY_POLL_MS,
+    [],
+    polling && activeTab === "history",
   );
 
   usePollingEffect(
@@ -118,9 +118,9 @@ export default function App() {
       setError(null);
     },
     handleError,
-    activeTab === "workers" ? 2_000 : WORKERS_POLL_MS,
-    [activeTab],
-    polling,
+    WORKERS_POLL_MS,
+    [],
+    polling && activeTab === "workers",
   );
 
   useEffect(() => {
@@ -141,7 +141,8 @@ export default function App() {
     },
     activeTab === "queue" ? DETAIL_POLL_MS : 2_000,
     [activeTab, activeSelectedJobId],
-    polling && activeSelectedJobId !== null,
+    polling && activeSelectedJobId !== null &&
+      !(selectedJobDetail && HISTORY_STATES.includes(selectedJobDetail.job.state)),
   );
 
   const queueSelection = useMemo(

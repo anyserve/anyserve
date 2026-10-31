@@ -211,6 +211,47 @@ pub struct JobInspection {
     pub events: Vec<ExecutionEvent>,
 }
 
+/// Maximum inline bytes per object in a management preview.
+pub const INSPECTION_PREVIEW_BYTES: usize = 4 * 1024;
+
+/// An object's original size and a bounded prefix, never a complete-result API.
+/// URI objects and metadata are preserved without fetching external content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectPreview {
+    pub prefix: Object,
+    /// Original inline length; unknown for a URI.
+    pub size_bytes: Option<usize>,
+}
+
+impl From<&Object> for ObjectPreview {
+    fn from(object: &Object) -> Self {
+        match object {
+            Object::Inline { data, metadata } => Self {
+                prefix: Object::Inline {
+                    data: Bytes::copy_from_slice(&data[..data.len().min(INSPECTION_PREVIEW_BYTES)]),
+                    metadata: metadata.clone(),
+                },
+                size_bytes: Some(data.len()),
+            },
+            Object::Uri { .. } => Self {
+                prefix: object.clone(),
+                size_bytes: None,
+            },
+        }
+    }
+}
+
+/// Management detail with bounded output prefixes. `job.outputs` is absent;
+/// callers needing full results must use `get_job` or `inspect_job` instead.
+/// Live events share retained buffers; cold replay contains no output payloads.
+#[derive(Clone, Debug)]
+pub struct JobPreview {
+    pub job: JobView,
+    pub spec: Option<Arc<JobSpec>>,
+    pub events: Vec<ExecutionEvent>,
+    pub outputs: Vec<ObjectPreview>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionEvent {
     pub job_id: String,

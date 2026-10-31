@@ -87,13 +87,13 @@ pub(super) async fn run(args: ClientArgs) -> Result {
                 .await;
                 let elapsed = sent.elapsed().as_secs_f64() * 1000.0;
                 match result {
-                    Ok(Ok(())) if sent >= measure_start => {
+                    Ok(Ok(_)) if sent >= measure_start => {
                         samples.latencies.push(elapsed);
                         if args.scenario == 5 {
                             samples.mixed_paths[usize::from(scenario == 3)].push(elapsed);
                         }
                     }
-                    Ok(Ok(())) => {}
+                    Ok(Ok(_)) => {}
                     error => {
                         if sent >= measure_start {
                             samples.errors += 1;
@@ -103,7 +103,7 @@ pub(super) async fn run(args: ClientArgs) -> Result {
                         samples.first_error.get_or_insert_with(|| match error {
                             Ok(Err(error)) => error.to_string(),
                             Err(error) => error.to_string(),
-                            Ok(Ok(())) => unreachable!(),
+                            Ok(Ok(_)) => unreachable!(),
                         });
                     }
                 }
@@ -201,7 +201,30 @@ pub(super) async fn run(args: ClientArgs) -> Result {
     Ok(())
 }
 
-async fn request(client: &mut ExecutionClient, scenario: u8, payload: &[u8]) -> Result {
+pub(super) async fn seed(
+    endpoint: &str,
+    count: usize,
+    size: usize,
+    out: &std::path::Path,
+) -> Result {
+    let mut client = ExecutionClient::connect_with_token(endpoint, None).await?;
+    let payload = vec![b'x'; size];
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        ids.push(
+            tokio::time::timeout(Duration::from_secs(30), request(&mut client, 3, &payload))
+                .await??,
+        );
+    }
+    tokio::fs::write(
+        out,
+        serde_json::to_vec(&json!({"job_ids": ids, "payload_bytes": size}))?,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn request(client: &mut ExecutionClient, scenario: u8, payload: &[u8]) -> Result<String> {
     let streamed = scenario == 2;
     let spec = v2::JobSpec {
         demand: Some(v2::Demand {
@@ -266,7 +289,7 @@ async fn request(client: &mut ExecutionClient, scenario: u8, payload: &[u8]) -> 
                 if events.message().await?.is_some() {
                     return Err("event received after Finished".into());
                 }
-                return Ok(());
+                return Ok(event.job_id);
             }
             _ => {}
         }

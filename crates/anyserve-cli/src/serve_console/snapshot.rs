@@ -3,11 +3,11 @@ use super::api::{
     WorkerSummary,
 };
 use anyserve_core::runtime::api::{
-    EventKind, ExecutionEvent, JobState, JobView, Metadata, Object, WorkerView,
+    EventKind, ExecutionEvent, JobState, JobView, Metadata, Object, ObjectPreview, WorkerView,
 };
 use std::collections::BTreeMap;
 
-pub(crate) const INLINE_PREVIEW_LIMIT_BYTES: usize = 4 * 1024;
+pub(crate) use anyserve_core::runtime::api::INSPECTION_PREVIEW_BYTES as INLINE_PREVIEW_LIMIT_BYTES;
 
 pub(crate) fn state_name(state: JobState) -> &'static str {
     match state {
@@ -167,42 +167,48 @@ pub(crate) fn object_ref_summary(value: &Object) -> ObjectRefSummary {
         },
     }
 }
+pub(crate) fn object_preview_summary(value: &ObjectPreview) -> ObjectRefSummary {
+    let mut summary = object_ref_summary(&value.prefix);
+    summary.size_bytes = value.size_bytes;
+    summary.truncated = value
+        .size_bytes
+        .is_some_and(|size| size > INLINE_PREVIEW_LIMIT_BYTES);
+    summary
+}
+
 pub(crate) fn output_preview(
     events: &[ExecutionEvent],
-    outputs: &[Object],
+    outputs: &[ObjectPreview],
 ) -> Option<InlinePreviewSummary> {
     let mut size = 0usize;
     let mut preview = Vec::new();
     let mut content_type = None;
-    let frames: Vec<_> = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            EventKind::Output {
-                data,
-                metadata,
-                progress: false,
-            } => Some((data.as_ref(), metadata)),
-            _ => None,
-        })
-        .collect();
-    let chunks: Vec<_> = if frames.is_empty() {
-        outputs
-            .iter()
-            .filter_map(|object| match object {
-                Object::Inline { data, metadata } => Some((data.as_ref(), metadata)),
-                _ => None,
-            })
-            .collect()
-    } else {
-        frames
-    };
-    for (data, metadata) in chunks {
-        size = size.saturating_add(data.len());
+    let mut append = |data: &[u8], metadata: &Metadata, original_size: usize| {
+        size = size.saturating_add(original_size);
         if content_type.is_none() {
             content_type = metadata_value(metadata, "content_type");
         }
         let remaining = INLINE_PREVIEW_LIMIT_BYTES.saturating_sub(preview.len());
         preview.extend_from_slice(&data[..data.len().min(remaining)]);
+    };
+    let mut has_frames = false;
+    for event in events {
+        if let EventKind::Output {
+            data,
+            metadata,
+            progress: false,
+        } = &event.kind
+        {
+            has_frames = true;
+            append(data, metadata, data.len());
+        }
+    }
+    if !has_frames {
+        for output in outputs {
+            if let Object::Inline { data, metadata } = &output.prefix {
+                append(data, metadata, output.size_bytes.unwrap_or(data.len()));
+            }
+        }
     }
     (size > 0).then(|| InlinePreviewSummary {
         size_bytes: size,

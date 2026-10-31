@@ -37,7 +37,7 @@ beforeEach(() => {
     interfaces: [], refreshed_at_ms: 1,
   });
 });
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 it("keeps the selected job's detail and cancel target when an older response arrives late", async () => {
   render(<App />);
@@ -63,4 +63,38 @@ it("hides the previous detail and cancel action while loading a new selection", 
   fireEvent.click(screen.getByText("B"));
   expect(screen.queryByRole("heading", { name: "A" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Cancel job" })).toBeNull();
+});
+
+it("polls the active pane and fetches completed details only once per selection", async () => {
+  vi.useFakeTimers();
+  vi.mocked(getJobs).mockImplementation(async (states) => ({
+    jobs: states.includes("queued") ? [summary("A")] : [{ ...summary("B"), state: "succeeded" }],
+    next_page_token: null,
+  }));
+  vi.mocked(getJob).mockImplementation(async (id) => ({
+    ...detail(id), job: { ...detail(id).job, state: id === "B" ? "succeeded" : "queued" },
+  }));
+  render(<App />);
+  await act(async () => {});
+  expect(vi.mocked(getJobs).mock.calls.every(([states]) => states.includes("queued"))).toBe(true);
+  expect(getWorkers).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: /History/ }));
+  await act(async () => {});
+  vi.mocked(getJobs).mockClear();
+  vi.mocked(getJob).mockClear();
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(getJobs).toHaveBeenCalledTimes(30);
+  expect(vi.mocked(getJobs).mock.calls.every(([states]) => states.includes("succeeded"))).toBe(true);
+  expect(getWorkers).not.toHaveBeenCalled();
+  expect(getJob).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
+  await act(async () => {});
+  vi.mocked(getJobs).mockClear();
+  await act(() => vi.advanceTimersByTimeAsync(4_000));
+  expect(getWorkers).toHaveBeenCalledTimes(3);
+  expect(getJobs).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: /History/ }));
+  await act(async () => {});
+  expect(getJob).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledWith("B", expect.any(AbortSignal));
 });

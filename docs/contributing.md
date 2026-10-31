@@ -71,6 +71,28 @@ environment and CPU/RSS samples. Use `bench/load/run.sh --help` for workload and
 profiling options. `--keep` leaves the final processes running and records them
 in `processes.json`; stop them with SIGTERM when finished.
 
+For Console overhead and large-result previews on macOS or Linux, build both
+release binaries and run the standard-library Python runner:
+
+```bash
+cargo build --release --locked -p anyserve -p anyserve-bench
+python3 bench/load/console.py --out bench/load/results/console-after --repeat 3
+```
+
+Use `--server-bin /path/to/baseline/anyserve` with a separate output directory
+to compare a saved baseline binary. Keep `--bench-bin` identical between runs.
+The runner uses fresh local ports and journals, four echo workers, 64 concurrent
+clients, and 20-second measurements after 5 seconds of warm-up. It compares S1
+and S3 with and without ten simulated operators issuing four HTTP queries every
+500 ms (about 80 requests/s total). A separate case saturates cold detail reads
+with four readers. Four verified 16 MiB durable results are seeded before each
+run and left on disk after restart. Every detail response is checked for the
+original size and a truncated 4 KiB preview. HTTP errors, business errors,
+latency samples, CPU/RSS, binary hashes and environment are recorded; measured
+processes are stopped automatically. The HTTP load is held constant, so these
+comparisons exclude frontend polling savings. These are short, closed-loop
+local measurements, not a production capacity or large-media transfer test.
+
 ## CI and releases
 
 The [CI workflow](../.github/workflows/anyserve-ci.yml) runs these checks and

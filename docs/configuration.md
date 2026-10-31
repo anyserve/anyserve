@@ -106,6 +106,14 @@ only lists jobs still in memory. `full_sync=false` selects SQLite NORMAL sync,
 which weakens durability under power loss. Journal queue capacity bounds pending
 operations; `max_batch` controls group commits.
 
+For evicted durable jobs, Console previews read at most 4 KiB per inline output
+directly from the journal, preserving the original size without reserving
+full-result capacity. GetJob/Watch continue to return complete results and
+account for their bytes. Console polling pauses in hidden browser tabs;
+inactive panes and completed job details do not poll.
+Opening an older journal creates a large-output metadata index once; its build time
+depends on the retained data size.
+
 Compiled protocol limits are 16 MiB per inline object, 32 MiB per job's input or
 attempt result (including associated metadata), 32 KiB metadata, 1,024 objects,
 256-byte identifiers, 64 KiB chunks and a 4 MiB unacknowledged attempt window.

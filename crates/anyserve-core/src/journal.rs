@@ -5,6 +5,8 @@
 //! writer task owns the write connection and groups queued operations into one
 //! WAL transaction; callers never hold runtime locks while it waits on fsync.
 
+mod preview;
+
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,7 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::RuntimeError;
 use crate::runtime::api::{
     Demand, ErrorInfo, ExecutionPolicy, JobSpec, JobState, JournalConfig, JournalStats, Metadata,
-    Object,
+    Object, ObjectPreview,
 };
 use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 
@@ -165,6 +167,12 @@ const SCHEMA: &[&str] = &[
         metadata_json TEXT NOT NULL,
         PRIMARY KEY (job_id, role, idx)
     )",
+    // Metadata follows the BLOB in the table record. Cover large outputs so
+    // previews avoid its overflow pages, without extra index writes for small
+    // messages or URIs. Small outputs can be read whole within the preview cap.
+    "CREATE INDEX IF NOT EXISTS journal_large_outputs_preview
+        ON journal_objects(job_id, idx, uri, metadata_json, length(content))
+        WHERE role = 'output' AND uri IS NULL AND length(content) > 4096",
 ];
 
 const ROLE_INPUT: &str = "input";
@@ -211,6 +219,9 @@ impl Journal {
         let recovery = load_recovery(&mut conn, generation).await?;
         let read_pool = SqlitePoolOptions::new()
             .max_connections(4)
+            .after_connect(|connection, _| {
+                Box::pin(async move { preview::register(&mut connection.lock_handle().await?) })
+            })
             .connect_with(options.clone().create_if_missing(false))
             .await
             .context("open journal read pool")?;
@@ -308,6 +319,54 @@ impl Journal {
         }
         tx.commit().await.context("finish journal read")?;
         Ok(Some(job))
+    }
+
+    /// Read lengths and prefixes in SQLite, so inspecting a large result never
+    /// materializes its full blob or reserves the worker/client result budget.
+    pub(crate) async fn load_job_preview(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(StoredJob, Vec<ObjectPreview>)>> {
+        let mut tx = self
+            .read_pool
+            .begin()
+            .await
+            .context("begin journal preview")?;
+        let Some(job) = load_job_record(&mut tx, job_id).await? else {
+            return Ok(None);
+        };
+        let mut outputs = Vec::new();
+        {
+            let mut rows = sqlx::query(
+                "SELECT idx, uri, length(content) AS size_bytes,
+                        anyserve_object_prefix(rowid) AS content, metadata_json
+                 FROM journal_objects INDEXED BY journal_large_outputs_preview
+                 WHERE job_id = ? AND role = 'output' AND uri IS NULL AND length(content) > 4096
+                 UNION ALL
+                 SELECT idx, uri, COALESCE(length(content), 0) AS size_bytes, content, metadata_json
+                 FROM journal_objects
+                 WHERE job_id = ? AND role = 'output'
+                   AND (uri IS NOT NULL OR COALESCE(length(content), 0) <= 4096)
+                 ORDER BY idx",
+            )
+            .bind(job_id)
+            .bind(job_id)
+            .fetch(&mut *tx);
+            while let Some(row) = rows.try_next().await? {
+                let prefix = object_from_row(&row)?;
+                let size_bytes = if matches!(prefix, Object::Inline { .. }) {
+                    Some(
+                        usize::try_from(row.try_get::<i64, _>("size_bytes")?)
+                            .context("journal preview size")?,
+                    )
+                } else {
+                    None
+                };
+                outputs.push(ObjectPreview { prefix, size_bytes });
+            }
+        }
+        tx.commit().await.context("finish journal preview")?;
+        Ok(Some((job, outputs)))
     }
 
     /// Fingerprint of a stored job, if any.
@@ -861,6 +920,7 @@ async fn writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::api::INSPECTION_PREVIEW_BYTES;
 
     fn config(name: &str) -> JournalConfig {
         JournalConfig::new(
@@ -1022,6 +1082,84 @@ mod tests {
         assert_eq!(budget.used(), 200);
         drop(reads);
         assert_eq!(budget.used(), 0);
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn cold_previews_match_live_prefixes_without_changing_full_results() {
+        let config = config("read-preview");
+        let journal = finished_fixture(&config).await;
+        let mut conn = connect(&config).await;
+        assert!(journal.load_job_preview("missing").await.unwrap().is_none());
+        // A failed native BLOB open is a SQL error, and the connection remains usable.
+        assert!(
+            sqlx::query("SELECT anyserve_object_prefix(-1)")
+                .execute(&journal.read_pool)
+                .await
+                .is_err()
+        );
+        for size in [
+            0,
+            INSPECTION_PREVIEW_BYTES,
+            INSPECTION_PREVIEW_BYTES + 1,
+            5 * 1024 * 1024,
+        ] {
+            sqlx::query("UPDATE journal_objects SET content = ? WHERE job_id = 'result' AND role = 'output' AND idx = 0")
+                .bind(vec![b'x'; size]).execute(&mut conn).await.unwrap();
+            let budget = Arc::new(ByteBudget::new((size + 60) as u64));
+            let full = journal
+                .load_job("result", true, Arc::clone(&budget))
+                .await
+                .unwrap()
+                .unwrap();
+            let (record, previews) = journal.load_job_preview("result").await.unwrap().unwrap();
+            assert!(record.outputs.is_empty());
+            assert_eq!(
+                previews,
+                full.outputs
+                    .iter()
+                    .map(ObjectPreview::from)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(previews[0].size_bytes, Some(size));
+            assert_eq!(
+                previews[0].prefix.inline_len(),
+                size.min(INSPECTION_PREVIEW_BYTES)
+            );
+            assert_eq!(full.outputs[0].inline_len(), size);
+            assert_eq!(budget.used(), (size + 60) as u64);
+            drop(full);
+            assert_eq!(budget.used(), 0);
+        }
+        conn.close().await.unwrap();
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn opening_an_existing_journal_adds_the_preview_index() {
+        let config = config("preview-migration");
+        let journal = finished_fixture(&config).await;
+        journal.close().await;
+        let mut conn = connect(&config).await;
+        sqlx::query("UPDATE journal_objects SET content = ? WHERE role = 'output' AND idx = 0")
+            .bind(vec![1u8; 8192])
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX journal_large_outputs_preview")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        let (journal, _) = Journal::open(&config).await.unwrap();
+        let (_, outputs) = journal.load_job_preview("result").await.unwrap().unwrap();
+        assert_eq!(
+            outputs[0].prefix,
+            Object::inline(vec![1; INSPECTION_PREVIEW_BYTES])
+        );
+        assert_eq!(outputs[0].size_bytes, Some(8192));
+        assert_eq!(outputs[1].size_bytes, Some(60));
+        assert!(matches!(&outputs[2].prefix, Object::Uri { uri, .. } if uri == "s3://result"));
         journal.close().await;
     }
 

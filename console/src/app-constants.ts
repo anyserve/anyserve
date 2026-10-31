@@ -22,8 +22,8 @@ export const HISTORY_STATES: JobState[] = ["succeeded", "failed", "cancelled"];
 export const QUEUE_POLL_MS = 800;
 export const OVERVIEW_POLL_MS = 1_000;
 export const DETAIL_POLL_MS = 1_000;
-export const WORKERS_POLL_MS = 4_000;
-export const HISTORY_POLL_MS = 6_000;
+export const WORKERS_POLL_MS = 2_000;
+export const HISTORY_POLL_MS = 2_000;
 
 export type PaneStat = {
   label: string;

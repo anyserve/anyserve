@@ -19,31 +19,45 @@ export function usePollingEffect<T>(
       return;
     }
 
-    const controller = new AbortController();
+    let controller: AbortController | undefined;
     let timeoutId: number | undefined;
 
-    async function refresh() {
+    async function refresh(current: AbortController) {
       try {
-        const value = await callbacks.current.task(controller.signal);
-        if (!controller.signal.aborted) {
+        const value = await callbacks.current.task(current.signal);
+        if (!current.signal.aborted) {
           callbacks.current.onSuccess(value);
         }
       } catch (error) {
-        if (!controller.signal.aborted) {
+        if (!current.signal.aborted) {
           callbacks.current.onError(error);
         }
       } finally {
         // Schedule from completion so a slow request cannot overlap the next.
-        if (!controller.signal.aborted) {
-          timeoutId = window.setTimeout(() => void refresh(), pollMs);
+        if (!current.signal.aborted) {
+          timeoutId = window.setTimeout(() => void refresh(current), pollMs);
         }
       }
     }
 
-    void refresh();
-    return () => {
-      controller.abort();
+    function stop() {
+      controller?.abort();
       window.clearTimeout(timeoutId);
+    }
+
+    function resumeIfVisible() {
+      stop();
+      if (document.visibilityState !== "hidden") {
+        controller = new AbortController();
+        void refresh(controller);
+      }
+    }
+
+    document.addEventListener("visibilitychange", resumeIfVisible);
+    resumeIfVisible();
+    return () => {
+      document.removeEventListener("visibilitychange", resumeIfVisible);
+      stop();
     };
   }, [enabled, pollMs, ...deps]);
 }

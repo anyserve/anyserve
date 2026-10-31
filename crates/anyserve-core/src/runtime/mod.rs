@@ -21,8 +21,9 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
-    InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobSpec, JobState, JobView,
-    RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView, codes,
+    InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview, JobSpec, JobState,
+    JobView, ObjectPreview, RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView,
+    codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
@@ -1105,31 +1106,36 @@ impl Runtime {
         }
     }
 
+    fn inspect_retained_job(&self, job_id: &str) -> Result<Option<JobInspection>, RuntimeError> {
+        let retained = {
+            let st = self.inner.lock();
+            match st.jobs.get(job_id) {
+                Some(job) if job.indeterminate => {
+                    return Err(RuntimeError::unavailable(format!(
+                        "job '{job_id}' has an unknown commit outcome until restart"
+                    )));
+                }
+                Some(job) => Some((job.view(true), Arc::clone(&job.spec), Arc::clone(&job.log))),
+                None => None,
+            }
+        };
+        if let Some((job, spec, log)) = retained {
+            let (events, _) = log.read_after(0).map_err(RuntimeError::cursor_expired)?;
+            return Ok(Some(JobInspection {
+                job,
+                spec: Some(spec),
+                events,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Reads a detail view without loading a cold result twice for its view
     /// and replayed events. Event cloning happens outside the runtime lock.
     pub async fn inspect_job(&self, job_id: &str) -> Result<JobInspection, RuntimeError> {
         loop {
-            let retained = {
-                let st = self.inner.lock();
-                match st.jobs.get(job_id) {
-                    Some(job) if job.indeterminate => {
-                        return Err(RuntimeError::unavailable(format!(
-                            "job '{job_id}' has an unknown commit outcome until restart"
-                        )));
-                    }
-                    Some(job) => {
-                        Some((job.view(true), Arc::clone(&job.spec), Arc::clone(&job.log)))
-                    }
-                    None => None,
-                }
-            };
-            if let Some((job, spec, log)) = retained {
-                let (events, _) = log.read_after(0).map_err(RuntimeError::cursor_expired)?;
-                return Ok(JobInspection {
-                    job,
-                    spec: Some(spec),
-                    events,
-                });
+            if let Some(retained) = self.inspect_retained_job(job_id)? {
+                return Ok(retained);
             }
             let job = self.get_job(job_id, true).await?;
             if !job.state.is_terminal() {
@@ -1141,6 +1147,57 @@ impl Runtime {
                 job,
                 spec: None,
                 events,
+            });
+        }
+    }
+
+    /// Management inspection: cold inline outputs are read as bounded prefixes
+    /// directly in storage and never consume the business result-byte budget.
+    pub async fn inspect_job_preview(&self, job_id: &str) -> Result<JobPreview, RuntimeError> {
+        loop {
+            if let Some(JobInspection {
+                mut job,
+                spec,
+                events,
+            }) = self.inspect_retained_job(job_id)?
+            {
+                let outputs = job
+                    .outputs
+                    .take()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(ObjectPreview::from)
+                    .collect();
+                return Ok(JobPreview {
+                    job,
+                    spec,
+                    events,
+                    outputs,
+                });
+            }
+            let journal = self
+                .inner
+                .journal
+                .as_ref()
+                .ok_or_else(|| RuntimeError::not_found("job", job_id))?;
+            let (stored, outputs) = journal
+                .load_job_preview(job_id)
+                .await
+                .map_err(|error| {
+                    RuntimeError::unavailable(format!("read journal preview: {error:#}"))
+                })?
+                .ok_or_else(|| RuntimeError::not_found("job", job_id))?;
+            if !stored.state.is_terminal() {
+                // Admission raced the lookup: use its live spec and events.
+                continue;
+            }
+            let job = view_from_stored(stored, false);
+            let events = self.replayed_events(job.clone(), 0);
+            return Ok(JobPreview {
+                job,
+                spec: None,
+                events,
+                outputs,
             });
         }
     }

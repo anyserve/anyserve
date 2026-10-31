@@ -345,17 +345,19 @@ async fn evicted_durable_details_show_missing_spec_and_incomplete_history() {
 }
 
 #[tokio::test]
-async fn cold_result_preview_fits_a_single_result_budget() {
+async fn cold_result_preview_is_bounded_and_works_with_an_exhausted_result_budget() {
     use anyserve_client::execution::{Attempt, v2};
     use anyserve_core::runtime::api::JournalConfig;
     use std::time::Duration;
 
+    const SIZE: usize = 5 * 1024 * 1024;
+    const BINARY_SIZE: usize = 8192;
     let path = crate::test_support::temporary_path("console-result.sqlite");
     let server = Server::start(
         RuntimeConfig {
             journal: Some(JournalConfig::new(&path)),
             max_terminal_jobs: 0,
-            max_result_bytes: 128,
+            max_result_bytes: (SIZE + BINARY_SIZE + 128) as u64,
             ..Default::default()
         },
         AuthPolicy::default(),
@@ -384,10 +386,24 @@ async fn cold_result_preview_fits_a_single_result_budget() {
     .unwrap();
     attempt
         .finish(
-            &[v2::Object {
-                body: Some(v2::object::Body::Inline(vec![b'a'; 128].into())),
-                ..Default::default()
-            }],
+            &[
+                v2::Object {
+                    body: Some(v2::object::Body::Inline(vec![b'a'; SIZE].into())),
+                    metadata: [("content_type".into(), "text/plain".into())].into(),
+                },
+                v2::Object {
+                    body: Some(v2::object::Body::Inline(vec![0; BINARY_SIZE].into())),
+                    ..Default::default()
+                },
+                v2::Object {
+                    body: Some(v2::object::Body::Uri("s3://media/video.mp4".into())),
+                    metadata: [("content_type".into(), "video/mp4".into())].into(),
+                },
+                v2::Object {
+                    body: Some(v2::object::Body::Inline(Vec::new().into())),
+                    ..Default::default()
+                },
+            ],
             v2::finish::Outcome::Succeeded(v2::Succeeded {}),
         )
         .await
@@ -400,17 +416,58 @@ async fn cold_result_preview_fits_a_single_result_budget() {
     })
     .await
     .unwrap();
-    let (url, handle) = spawn_test_server(server.runtime.clone()).await;
-    for _ in 0..2 {
-        let response = reqwest::get(format!("{url}/api/jobs/{}", job.job_id))
+    // A business reader holds the full result. Another full read must fail,
+    // but concurrent management previews must still work and leave that budget alone.
+    let held = server.runtime.get_job(&job.job_id, true).await.unwrap();
+    assert_eq!(held.outputs.as_ref().unwrap()[0].inline_len(), SIZE);
+    assert_eq!(
+        server.runtime.stats().result_bytes,
+        (SIZE + BINARY_SIZE) as u64
+    );
+    assert_eq!(
+        server
+            .runtime
+            .get_job(&job.job_id, true)
             .await
-            .unwrap();
+            .unwrap_err()
+            .kind,
+        anyserve_core::error::ErrorKind::ResourceExhausted
+    );
+    let (url, handle) = spawn_test_server(server.runtime.clone()).await;
+    let responses = futures::future::join_all(
+        (0..8).map(|_| reqwest::get(format!("{url}/api/jobs/{}", job.job_id))),
+    )
+    .await;
+    for response in responses {
+        let response = response.unwrap();
         assert_eq!(response.status().as_u16(), 200);
         let body: Value = response.json().await.unwrap();
-        assert_eq!(body["job"]["output_preview"]["preview"], "a".repeat(128));
-        assert_eq!(body["job"]["outputs"][0]["size_bytes"], 128);
-        assert_eq!(server.runtime.stats().result_bytes, 0);
+        assert_eq!(body["job"]["output_preview"]["preview"], "a".repeat(4096));
+        assert_eq!(
+            body["job"]["output_preview"]["size_bytes"],
+            SIZE + BINARY_SIZE
+        );
+        assert_eq!(body["job"]["output_preview"]["truncated"], true);
+        assert_eq!(body["job"]["output_preview"]["content_type"], "text/plain");
+        let outputs = &body["job"]["outputs"];
+        assert_eq!(outputs[0]["size_bytes"], SIZE);
+        assert_eq!(outputs[0]["preview"], "a".repeat(4096));
+        assert_eq!(outputs[0]["truncated"], true);
+        assert_eq!(outputs[1]["size_bytes"], BINARY_SIZE);
+        assert!(outputs[1]["preview"].is_null());
+        assert_eq!(outputs[2]["uri"], "s3://media/video.mp4");
+        assert_eq!(outputs[2]["content_type"], "video/mp4");
+        assert!(outputs[2]["size_bytes"].is_null());
+        assert_eq!(outputs[3]["size_bytes"], 0);
+        assert_eq!(outputs[3]["truncated"], false);
+        assert!(outputs[3]["preview"].is_null());
+        assert_eq!(
+            server.runtime.stats().result_bytes,
+            (SIZE + BINARY_SIZE) as u64
+        );
     }
+    drop(held);
+    assert_eq!(server.runtime.stats().result_bytes, 0);
     handle.abort();
     server.stop().await;
     let _ = std::fs::remove_file(path);
