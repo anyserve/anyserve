@@ -219,6 +219,8 @@ Validate production asset loading in a browser when changing the Worker setup.
 
 The [CI workflow](../.github/workflows/anyserve-ci.yml) runs these checks and
 uploads benchmark artifacts even when a gate fails.
+The Rust job also runs the PG multi-replica integration tests serially against
+a disposable PostgreSQL 18 service.
 
 Version tags build platform archives, container images and Python distributions.
 Tags must match the Rust, Python and chart application versions. Manual runs
