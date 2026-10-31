@@ -7,7 +7,7 @@ use sqlx::{Postgres as Pg, Row, Transaction};
 use super::{ClaimedJob, Postgres};
 use crate::error::RuntimeError;
 use crate::journal::{
-    AcceptRecord, CommitOutcome, JournalOp, StoredSpec, job_from_row, state_text,
+    AcceptRecord, CommitOutcome, JournalOp, StoredJob, StoredSpec, job_from_row, state_text,
 };
 use crate::runtime::api::{ConflictPolicy, ErrorInfo, EventKind, JobState, Object, codes};
 use crate::runtime::events::{ByteBudget, Permit};
@@ -163,7 +163,7 @@ impl Postgres {
         record: AcceptRecord,
         conflict: ConflictPolicy,
         queue_timeout_ms: Option<i64>,
-    ) -> Result<bool> {
+    ) -> Result<(StoredJob, bool)> {
         self.ensure_healthy()?;
         let _permit = self
             .operations
@@ -179,7 +179,7 @@ impl Postgres {
         };
         let input_bytes =
             spec.inputs.iter().map(Object::inline_len).sum::<usize>() + spec.params.len();
-        let now: Option<i64> = sqlx::query_scalar("WITH stamp AS MATERIALIZED (
+        let inserted = sqlx::query("WITH stamp AS MATERIALIZED (
             SELECT (extract(epoch FROM clock_timestamp())*1000)::bigint AS now_ms)
             INSERT INTO jobs(job_id,state,spec_hash,spec_json,interface,
             required_attributes,preferred_attributes,required_capacity,priority,input_bytes,max_attempts,
@@ -189,7 +189,7 @@ impl Postgres {
                 CASE WHEN $12::bigint IS NULL THEN NULL
                      WHEN now_ms>9223372036854775807-$12 THEN 9223372036854775807
                      ELSE now_ms+$12 END,$13,1 FROM stamp
-            ON CONFLICT(job_id) DO NOTHING RETURNING created_at_ms")
+            ON CONFLICT(job_id) DO NOTHING RETURNING *")
             .bind(&record.job_id).bind(&record.spec_hash).bind(serde_json::to_string(&slim)?)
             .bind(&spec.demand.interface).bind(serde_json::to_string(&spec.demand.required_attributes)?)
             .bind(serde_json::to_string(&spec.demand.preferred_attributes)?)
@@ -199,8 +199,9 @@ impl Postgres {
             .bind(spec.policy.total_timeout.map(|d| d.as_millis().min(i64::MAX as u128) as i64))
             .bind(spec.policy.spillover_after.map(|d| d.as_millis().min(i64::MAX as u128) as i64))
             .fetch_optional(&mut *tx).await?;
-        let inserted = now.is_some();
-        if let Some(now) = now {
+        let created = inserted.is_some();
+        let row = if let Some(row) = inserted {
+            let now: i64 = row.try_get("created_at_ms")?;
             insert_objects(&mut tx, &record.job_id, "input", &spec.inputs).await?;
             if !spec.params.is_empty() {
                 insert_objects(
@@ -212,11 +213,13 @@ impl Postgres {
                 .await?;
             }
             event(&mut tx, &record.job_id, 1, None, now, EventKind::Accepted).await?;
+            row
         } else {
-            let hash: String = sqlx::query_scalar("SELECT spec_hash FROM jobs WHERE job_id=$1")
+            let row = sqlx::query("SELECT * FROM jobs WHERE job_id=$1")
                 .bind(&record.job_id)
                 .fetch_one(&mut *tx)
                 .await?;
+            let hash: &str = row.try_get("spec_hash")?;
             if conflict == ConflictPolicy::Fail || hash != record.spec_hash {
                 return Err(RuntimeError::conflict(format!(
                     "job '{}' already exists{}",
@@ -229,9 +232,11 @@ impl Postgres {
                 ))
                 .into());
             }
-        }
+            row
+        };
+        let job = job_from_row(&row)?;
         tx.commit().await?;
-        Ok(inserted)
+        Ok((job, created))
     }
 
     pub(crate) async fn claim(

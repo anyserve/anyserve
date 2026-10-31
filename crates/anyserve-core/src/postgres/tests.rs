@@ -46,16 +46,22 @@ async fn postgres_cluster_accept_uses_database_time_and_saturates_deadlines() {
         ("bounded", Some(Duration::from_millis(17))),
         ("overflow", Some(Duration::MAX)),
     ] {
-        assert!(
-            pg.accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
-                .await
-                .unwrap()
-        );
-        assert!(
-            !pg.accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
-                .await
-                .unwrap()
-        );
+        let (accepted, created) = pg
+            .accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(accepted.job_id, id);
+        assert_eq!(accepted.state, JobState::Queued);
+        assert_eq!(accepted.attempt_count, 0);
+        assert_eq!(accepted.spec_hash, "same-spec");
+        assert_eq!(accepted.spec.policy.total_timeout, timeout);
+        let (replayed, created) = pg
+            .accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
+            .await
+            .unwrap();
+        assert!(!created);
+        assert_eq!(replayed.created_at_ms, accepted.created_at_ms);
         let row = sqlx::query(
             "SELECT created_at_ms,updated_at_ms,queued_at_ms,total_deadline_ms,event_sequence,
              (SELECT at_ms FROM events WHERE job_id=jobs.job_id AND sequence=1) AS event_at,
@@ -67,6 +73,7 @@ async fn postgres_cluster_accept_uses_database_time_and_saturates_deadlines() {
         .await
         .unwrap();
         let created: i64 = row.get("created_at_ms");
+        assert_eq!(accepted.created_at_ms, created as u64);
         assert!(created > 1 && created <= row.get::<i64, _>("db_now"));
         assert_eq!(created, row.get::<i64, _>("updated_at_ms"));
         assert_eq!(created, row.get::<i64, _>("queued_at_ms"));
@@ -189,6 +196,20 @@ async fn postgres_cluster_attempt_and_terminal_share_database_time_with_events()
     .unwrap();
     assert_eq!(output, b"output");
     assert_eq!(digest, "digest");
+    let (replayed, created) = pg
+        .accept(
+            acceptance("finished", None),
+            ConflictPolicy::UseExisting,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(!created);
+    assert_eq!(replayed.state, JobState::Succeeded);
+    assert_eq!(replayed.attempt_count, 1);
+    assert_eq!(replayed.last_attempt_id.as_deref(), Some("attempt"));
+    assert_eq!(replayed.last_worker_id.as_deref(), Some("worker"));
+    assert!(replayed.outputs.is_empty());
     close(pg, admin).await;
 }
 

@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(interface, priority DESC, created_at_ms, job_id)
     WHERE state IN ('queued','running');
+-- Claims order eligible jobs across interfaces by priority and acceptance time.
+CREATE INDEX IF NOT EXISTS jobs_claim_order ON jobs(priority DESC, created_at_ms, job_id)
+    WHERE state IN ('queued','running');
 CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner_id) WHERE state IN ('queued','running');
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at_ms DESC, job_id DESC);
 CREATE INDEX IF NOT EXISTS jobs_history ON jobs(created_at_ms DESC, job_id DESC)

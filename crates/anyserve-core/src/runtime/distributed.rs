@@ -316,7 +316,7 @@ impl Runtime {
             conflict,
             queue_timeout,
         );
-        let created = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
+        let (job, created) = tokio::time::timeout(std::time::Duration::from_secs(10), accepted)
             .await
             .map_err(|_| {
                 RuntimeError::unavailable(
@@ -327,7 +327,7 @@ impl Runtime {
         drop(permit);
         self.inner.cluster_wakeup.notify_one();
         Ok(SubmitOutcome {
-            job: self.get_job(&id, false).await?,
+            job: view_from_stored(job, false),
             created,
         })
     }
