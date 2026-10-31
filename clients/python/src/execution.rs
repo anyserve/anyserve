@@ -303,6 +303,9 @@ pub(crate) fn objects_from_py(objects: Vec<PyObjectRef>) -> PyResult<Vec<v2::Obj
         .map(|object| {
             let body = match (object.inline, object.uri) {
                 (Some(data), None) => v2::object::Body::Inline(data.into()),
+                (None, Some(uri)) if uri.is_empty() => {
+                    return Err(PyValueError::new_err("object URI must not be empty"));
+                }
                 (None, Some(uri)) => v2::object::Body::Uri(uri),
                 _ => {
                     return Err(PyValueError::new_err(

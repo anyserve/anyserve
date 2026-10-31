@@ -15,7 +15,7 @@ import time
 import unittest
 import uuid
 
-from anyserve import AnyserveClient, ExecutionOptions, RpcError, serve, worker
+from anyserve import AnyserveClient, ExecutionOptions, RpcError, WorkerConnection, inline_object, uri_object, serve, worker
 
 
 def run_worker(endpoint: str, interface: str, kind: str, marker: str | None = None) -> None:
@@ -152,6 +152,34 @@ worker_tokens=["worker"]
         with self.assertRaises(RpcError) as conflict:
             self.client.submit(interface, b"different", job_id=job_id, options=options)
         self.assertEqual(conflict.exception.status_code, 6)
+
+    def test_uri_objects_reject_empty_and_round_trip_opaque_references(self):
+        interface = "test.python.uri"
+        with self.assertRaisesRegex(ValueError, "URI must not be empty"):
+            uri_object("")
+        with self.assertRaisesRegex(ValueError, "URI must not be empty"):
+            self.client.submit(interface, [{"uri": ""}])
+        connection = WorkerConnection(self.endpoint, {
+            "worker_id": "uri-worker", "interfaces": [interface], "max_concurrency": 1,
+        }, "worker")
+        try:
+            objects = [inline_object(b""), uri_object("relative/video.mp4", {
+                "content_type": "video/mp4", "size_bytes": "1099511627776",
+            })]
+            # Force URI input through InputData rather than the small Assign path.
+            job = self.client.submit(interface, objects,
+                options=ExecutionOptions(params=b"p" * (65 * 1024), total_timeout_ms=10000))
+            message = eventually(lambda: connection.receive(0.1))
+            self.assertEqual(message["type"], "assignment")
+            connection.accept(message["lease_id"])
+            attempt = message["assignment"].open()
+            self.assertEqual(attempt.inputs, objects)
+            with self.assertRaisesRegex(ValueError, "URI must not be empty"):
+                attempt.complete([{"uri": ""}])
+            attempt.complete(objects)
+            self.assertEqual(self.client.result(job["job_id"]), objects)
+        finally:
+            connection.close()
 
     def test_duplex_output_arrives_before_input_end_with_large_object_boundaries(self):
         interface = "test.python.duplex"

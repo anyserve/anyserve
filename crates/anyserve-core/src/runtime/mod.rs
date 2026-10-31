@@ -723,6 +723,9 @@ impl Runtime {
         }
         let mut total = spec.params.len() as u64;
         for input in &spec.inputs {
+            if matches!(input, api::Object::Uri { uri, .. } if uri.is_empty()) {
+                return Err(RuntimeError::invalid("object URI must not be empty"));
+            }
             let size = input.inline_len() as u64;
             if size > limits.max_inline_object_bytes {
                 return Err(RuntimeError::invalid(format!(
@@ -1500,6 +1503,56 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_uri_inputs_are_rejected_without_rejecting_empty_inline() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "opaque-uri".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        spec.inputs.push(api::Object::Uri {
+            uri: String::new(),
+            metadata: Default::default(),
+        });
+        assert_eq!(
+            runtime
+                .submit(SubmitRequest {
+                    spec: spec.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            runtime
+                .invoke(InvokeRequest {
+                    spec: spec.clone(),
+                    ..Default::default()
+                })
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            crate::error::ErrorKind::InvalidArgument
+        );
+        spec.inputs = vec![
+            api::Object::inline(bytes::Bytes::new()),
+            api::Object::Uri {
+                uri: "relative/video.mp4".into(),
+                metadata: Default::default(),
+            },
+        ];
+        runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        runtime.shutdown().await;
+    }
 
     #[test]
     fn cancelled_timers_leave_the_heap_without_firing() {

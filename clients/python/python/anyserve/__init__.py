@@ -10,6 +10,8 @@ def inline_object(content: bytes, metadata: dict[str, str] | None = None) -> dic
 
 
 def uri_object(uri: str, metadata: dict[str, str] | None = None) -> dict[str, object]:
+    if uri == "":
+        raise ValueError("object URI must not be empty")
     return {"uri": uri, "metadata": dict(metadata or {})}
 
 

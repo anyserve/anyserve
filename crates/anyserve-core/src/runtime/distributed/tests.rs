@@ -340,6 +340,132 @@ async fn postgres_cluster_batch_claim_respects_input_budget() {
 
 #[tokio::test]
 #[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_uri_references_survive_replica_restart_and_receipt_replay() {
+    let mut c = Cluster::start().await;
+    let mut wb = worker(&c.b, "uri-worker", 1);
+    let uri = "opaque-media:video/object";
+    let metadata: Metadata = [
+        ("content_type".into(), "video/mp4".into()),
+        ("size_bytes".into(), "1099511627776".into()),
+    ]
+    .into();
+    let reference = Object::Uri {
+        uri: uri.into(),
+        metadata: metadata.clone(),
+    };
+    let mut submitted = request("uri-reference");
+    submitted.spec.inputs = vec![reference.clone()];
+    submitted.spec.params = Bytes::new();
+    c.a.submit(submitted).await.unwrap();
+    let assign = assigned(&mut wb).await;
+    assert_eq!(assign.inline_inputs.len(), 1);
+    assert_eq!(
+        assign.inline_inputs[0].body,
+        Some(pb::object::Body::Uri(uri.into()))
+    );
+    assert_eq!(
+        assign.inline_inputs[0].metadata,
+        metadata.clone().into_iter().collect()
+    );
+    // The input budget covers the reference text, never the declared media size.
+    assert_eq!(c.b.stats().input_bytes, uri.len() as u64);
+    let link = open(&c.b, &assign).await;
+    assert_eq!(
+        c.b.finish_attempt(&link, AttemptOutcome::Succeeded, vec![reference.clone()])
+            .await
+            .unwrap(),
+        FinishStatus::Committed
+    );
+    let rows: Vec<(String, String, bool, String)> = sqlx::query_as(&format!(
+        "SELECT role,uri,content IS NULL,metadata_json FROM \"{}\".objects
+         WHERE job_id='uri-reference' ORDER BY role",
+        c.schema
+    ))
+    .fetch_all(&c.admin)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "input");
+    assert_eq!(rows[1].0, "output");
+    for (_, stored_uri, no_content, stored_metadata) in rows {
+        assert_eq!(stored_uri, uri);
+        assert!(no_content);
+        assert_eq!(
+            serde_json::from_str::<Metadata>(&stored_metadata).unwrap(),
+            metadata
+        );
+    }
+    let zero = Arc::new(crate::runtime::events::ByteBudget::new(0));
+    let snapshot =
+        c.a.inner
+            .postgres
+            .as_ref()
+            .unwrap()
+            .snapshot(
+                "uri-reference",
+                crate::postgres::ReadMode::Full,
+                None,
+                zero.clone(),
+                zero.clone(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(snapshot.job.outputs, vec![reference.clone()]);
+    assert_eq!(zero.used(), 0);
+    let (events, done) = c.a.events("uri-reference", 0).await.unwrap();
+    assert!(done);
+    assert!(matches!(&events.last().unwrap().kind,
+        EventKind::Finished { outputs, .. } if outputs == &vec![reference.clone()]));
+
+    let config = c.b.config().clone();
+    c.b.shutdown().await;
+    c.b = Runtime::start(config).await.unwrap();
+    for runtime in [&c.a, &c.b] {
+        assert_eq!(
+            runtime
+                .get_job("uri-reference", true)
+                .await
+                .unwrap()
+                .outputs,
+            Some(vec![reference.clone()])
+        );
+    }
+    let replay =
+        c.b.open_attempt(&pb::AttemptOpen {
+            lease_id: assign.lease_id,
+            generation: assign.generation,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        c.b.finish_attempt(&replay, AttemptOutcome::Succeeded, vec![reference.clone()])
+            .await
+            .unwrap(),
+        FinishStatus::Committed
+    );
+    let mut changed = metadata;
+    changed.insert("size_bytes".into(), "1".into());
+    assert!(matches!(
+        c.b.finish_attempt(
+            &replay,
+            AttemptOutcome::Succeeded,
+            vec![Object::Uri {
+                uri: uri.into(),
+                metadata: changed
+            }]
+        )
+        .await
+        .unwrap(),
+        FinishStatus::Rejected(_)
+    ));
+    c.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
 async fn postgres_cluster_large_timeouts_do_not_block_claims() {
     let c = Cluster::start().await;
     let mut queue = request("large-queue-timeout");

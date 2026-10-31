@@ -120,6 +120,74 @@ impl Drop for Server {
     }
 }
 
+#[tokio::test]
+async fn empty_uri_is_rejected_before_result_chunks_are_sent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (finishes, mut observed) = mpsc::unbounded_channel();
+    let worker = InterruptedWorker {
+        resume_from: 0,
+        terminal_replay: false,
+        fail_ack_again: false,
+        calls: Arc::new(AtomicUsize::new(0)),
+        cut: Arc::new(Notify::new()),
+        finishes,
+    };
+    let _server = Server(tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(v2::worker_server::WorkerServer::new(worker))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    }));
+    let mut client = AttemptClient::connect(&endpoint, None).await.unwrap();
+    let mut attempt = Attempt::open(
+        &mut client,
+        &v2::Assign::default(),
+        &v2::Limits {
+            max_chunk_bytes: 1024,
+            attempt_window_bytes: 4096,
+            ..Default::default()
+        },
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let empty_inline = v2::Object {
+        body: Some(v2::object::Body::Inline(Bytes::new())),
+        ..Default::default()
+    };
+    let empty_uri = v2::Object {
+        body: Some(v2::object::Body::Uri(String::new())),
+        ..Default::default()
+    };
+    let succeeded = || v2::finish::Outcome::Succeeded(v2::Succeeded {});
+    assert_eq!(
+        attempt
+            .finish(&[empty_inline.clone(), empty_uri], succeeded())
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let reference = v2::Object {
+        body: Some(v2::object::Body::Uri("relative/video.mp4".into())),
+        metadata: [("size_bytes".into(), "1099511627776".into())].into(),
+    };
+    attempt
+        .finish(&[empty_inline, reference.clone()], succeeded())
+        .await
+        .unwrap();
+    let recorded = observed.try_recv().unwrap();
+    // A rejected empty URI must not send a partial object prefix. Empty inline
+    // remains valid even though its wire URI field is also the empty string.
+    assert_eq!(recorded.results.len(), 2);
+    assert!(recorded.results.iter().all(|result| result.data.is_empty()));
+    assert!(recorded.results[0].uri.is_empty());
+    assert_eq!(recorded.results[1].uri, "relative/video.mp4");
+    assert_eq!(recorded.results[1].metadata, reference.metadata);
+}
+
 async fn recover(
     resume_from: u64,
     terminal_replay: bool,

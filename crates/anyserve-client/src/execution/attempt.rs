@@ -247,6 +247,12 @@ impl Attempt {
         outputs: &[v2::Object],
         outcome: v2::finish::Outcome,
     ) -> Result<(), Status> {
+        // ResultChunk uses an empty URI field for inline data.
+        if outputs.iter().any(
+            |object| matches!(&object.body, Some(v2::object::Body::Uri(uri)) if uri.is_empty()),
+        ) {
+            return Err(Status::invalid_argument("object URI must not be empty"));
+        }
         for (index, object) in outputs.iter().enumerate() {
             let (data, uri) = match &object.body {
                 Some(v2::object::Body::Inline(data)) => (data.clone(), String::new()),
