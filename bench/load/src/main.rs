@@ -79,6 +79,9 @@ struct ClientArgs {
     /// S6 total Submit attempts, including warm-up and failed calls.
     #[arg(long, default_value_t = 100_000, value_parser = clap::value_parser!(u32).range(1..))]
     max_jobs: u32,
+    /// S6 per-client Submit rate ceiling; omitted keeps concurrency-driven sending.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    submit_rate: Option<u32>,
     /// S6 shared deadline for checking results after all Submit calls finish.
     #[arg(long, default_value = "120s", value_parser = duration)]
     drain_timeout: Duration,

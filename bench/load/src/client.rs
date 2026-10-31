@@ -40,6 +40,9 @@ struct Samples {
 }
 
 pub(super) async fn run(args: ClientArgs) -> Result {
+    if args.submit_rate.is_some() && args.scenario != 6 {
+        return Err("submit-rate is only supported by S6".into());
+    }
     if args.duration.is_zero() {
         return Err("measurement duration must be positive".into());
     }

@@ -158,6 +158,28 @@ def aggregate(results, scenario="S3"):
                           "whole_run_seconds": run_finish - run_start,
                           "verified_over_whole_run_rps": verified / (run_finish - run_start) if run_finish > run_start else 0,
                           "scope": "all attempts including warmup; verified echo results / entire Submit+drain run, not Submit ACK throughput"})
+    if all("observed_peak_inflight" in result for result in results):
+        summary["observed_peak_inflight_by_client"] = [result["observed_peak_inflight"] for result in results]
+    paced = [result.get("rate_control") for result in results]
+    if any(paced):
+        if not all(paced):
+            raise ValueError("cannot aggregate paced and unpaced clients")
+        sending_windows = union_windows((rate["measurement_sending_started_unix_s"],
+                                         rate["measurement_sending_finished_unix_s"]) for rate in paced)
+        sending_seconds = sum(end - begin for begin, end in sending_windows)
+        counters = {phase: {key: sum(rate[phase][key] for rate in paced) for key in
+                           ("scheduled", "offered", "sent", "skipped", "skipped_busy",
+                            "skipped_expired", "skipped_max_jobs")} for phase in ("warmup", "measured")}
+        summary["rate_control"] = {
+            "target_submit_rps_per_client": [rate["target_submit_rps"] for rate in paced],
+            "target_submit_rps_all_clients": sum(rate["target_submit_rps"] for rate in paced),
+            "measurement_sending_windows": sending_windows, "measurement_sending_seconds": sending_seconds,
+            "measurement_window_complete": all(rate["measurement_window_complete"] for rate in paced),
+            "actual_sent_rps": counters["measured"]["sent"] / sending_seconds if sending_seconds else 0,
+            "schedule_fully_sent": all(rate["measurement_window_complete"] and rate["measured"]["scheduled"] > 0
+                                       and rate["measured"]["skipped"] == 0 for rate in paced),
+            **counters,
+            "scope": "per-client paced sending; actual sends / union of sending windows, excluding in-flight ACK tail and result drain; configured target is not achieved throughput"}
     return summary
 
 
@@ -195,7 +217,7 @@ def queue_summary(samples, results):
     during = [sample for sample in samples if start <= sample["unix_s"] <= finish]
     before = [sample for sample in samples if sample["unix_s"] <= finish]
     after = [sample for sample in samples if sample["unix_s"] >= finish]
-    return {"sample_interval_target_seconds": 1, "submission_started_unix_s": start,
+    summary = {"sample_interval_target_seconds": 1, "submission_started_unix_s": start,
             "submission_finished_unix_s": finish,
             "sampled_peak_queued_running_during_submission": max(
                 (sample["states"]["queued"] + sample["states"]["running"] for sample in during), default=None),
@@ -205,6 +227,28 @@ def queue_summary(samples, results):
             "last_sample_before_submission_end": before[-1] if before else None,
             "first_sample_after_submission_end": after[0] if after else None,
             "final": samples[-1], "scope": "shared PG schema; sampled peaks, not exact instantaneous maxima; local timestamps bracket each query"}
+    paced = [result.get("rate_control") for result in results]
+    if all(paced):
+        begin = max(rate["measurement_sending_started_unix_s"] for rate in paced)
+        end = max(begin, min(rate["measurement_sending_finished_unix_s"] for rate in paced))
+        points = [sample for sample in samples if begin <= sample["started_unix_s"] <= sample["unix_s"] <= end]
+        measured = {"common_sending_started_unix_s": begin, "common_sending_finished_unix_s": end,
+                    "sample_count": len(points), "observed_seconds": 0,
+                    "succeeded_delta": None, "sampled_completed_rps": None,
+                    "pending_change": None, "pending_growth_per_second": None,
+                    "scope": "shared counts within the overlap of all clients' measurement sending windows; includes jobs accepted during warmup that finish in this interval, not per-job latency or a steady-state pass verdict"}
+        if len(points) >= 2 and points[-1]["unix_s"] > points[0]["unix_s"]:
+            first, last = points[0], points[-1]
+            seconds = last["unix_s"] - first["unix_s"]
+            completed = last["states"]["succeeded"] - first["states"]["succeeded"]
+            pending = lambda point: point["states"]["queued"] + point["states"]["running"]
+            change = pending(last) - pending(first)
+            measured.update(observed_seconds=seconds, succeeded_delta=completed,
+                            sampled_completed_rps=completed / seconds, pending_change=change,
+                            pending_growth_per_second=change / seconds,
+                            first_sample=first, last_sample=last)
+        summary["paced_measurement"] = measured
+    return summary
 
 
 def reconcile_ids(results, database_rows):
@@ -229,6 +273,26 @@ def reconcile_ids(results, database_rows):
                 counter_mismatches.append({"client": index, "counter": key, "reported": result[key], "from_attempts": count})
         if len(result["latency_samples_ms"]) != expected["requests"]:
             counter_mismatches.append({"client": index, "counter": "latency_samples_ms", "from_attempts": expected["requests"]})
+        if "observed_peak_inflight" in result and not 0 <= result["observed_peak_inflight"] <= result["concurrency"]:
+            counter_mismatches.append({"client": index, "counter": "observed_peak_inflight",
+                                       "reported": result["observed_peak_inflight"], "limit": result["concurrency"]})
+        if rate := result.get("rate_control"):
+            for phase, label in (("warmup", "warmup"), ("measured", "measurement")):
+                phase_counts = rate[phase]
+                actual = sum(row["phase"] == label for row in rows)
+                for key, reported, expected_count in (
+                    ("sent", phase_counts["sent"], actual),
+                    ("scheduled", phase_counts["scheduled"], phase_counts["sent"] + phase_counts["skipped"]),
+                    ("skipped", phase_counts["skipped"], sum(phase_counts[name] for name in
+                      ("skipped_busy", "skipped_expired", "skipped_max_jobs"))),
+                ):
+                    if reported != expected_count:
+                        counter_mismatches.append({"client": index, "counter": f"rate_control.{phase}.{key}",
+                                                   "reported": reported, "expected": expected_count})
+                offered_min = phase_counts["sent"] + phase_counts["skipped_max_jobs"]
+                if not offered_min <= phase_counts["offered"] <= offered_min + phase_counts["skipped_expired"]:
+                    counter_mismatches.append({"client": index, "counter": f"rate_control.{phase}.offered",
+                                               "reported": phase_counts["offered"]})
     problems = {
         "client_counter_mismatches": counter_mismatches,
         "duplicate_attempt_ids": sorted(job_id for job_id, count in counts.items() if count != 1),
@@ -349,6 +413,8 @@ def run_case(args, url, sql, concurrency, payload, repetition):
                 "--out", output]
             if args.scenario == "S6":
                 command += ["--max-jobs", str(args.max_jobs), "--drain-timeout", f"{args.drain_timeout}s"]
+                if args.submit_rate is not None:
+                    command += ["--submit-rate", str(args.submit_rate)]
             client, _ = spawn(command, "client", index)
             clients.append((client, output))
         stage = "submit_and_drain"
@@ -489,6 +555,34 @@ def self_check():
     zero = dict(submit_rows[0], latency_samples_ms=[], requests=0,
                 measurement_started_unix_s=12, measurement_finished_unix_s=12)
     assert aggregate([zero], "S6")["submit_ack_rps"] == 0
+    def rate_counts(sent, busy=0, expired=0, capped=0):
+        skipped = busy + expired + capped
+        return {"scheduled": sent + skipped, "offered": sent + capped,
+                "sent": sent, "skipped": skipped, "skipped_busy": busy,
+                "skipped_expired": expired, "skipped_max_jobs": capped}
+    def rate_window(begin, end, sent, **skips):
+        return {"target_submit_rps": 10, "measurement_window_complete": True,
+                "measurement_sending_started_unix_s": begin,
+                "measurement_sending_finished_unix_s": end,
+                "warmup": rate_counts(1), "measured": rate_counts(sent, **skips)}
+    # Sending rate excludes both ACK tail and drain; targets never substitute for actual sends.
+    paced = [dict(submit_rows[0], rate_control=rate_window(10, 13, 29, busy=1)),
+             dict(submit_rows[1], rate_control=rate_window(11, 14, 30))]
+    rate = aggregate(paced, "S6")["rate_control"]
+    assert rate["target_submit_rps_all_clients"] == 20
+    assert rate["measurement_sending_seconds"] == 4 and rate["actual_sent_rps"] == 59 / 4
+    assert rate["measured"]["skipped_busy"] == 1 and not rate["schedule_fully_sent"]
+    assert rate["measurement_window_complete"]
+    cap = dict(zero, rate_control=dict(rate_window(12, 12, 0), measurement_window_complete=False))
+    early = aggregate([cap], "S6")["rate_control"]
+    assert early["actual_sent_rps"] == 0 and early["measurement_sending_seconds"] == 0
+    assert not early["measurement_window_complete"] and not early["schedule_fully_sent"]
+    try:
+        aggregate([paced[0], submit_rows[1]], "S6")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mixed paced and unpaced clients were accepted")
     samples = [{"unix_s": timestamp, "roles": {"control": {"rss_mib": 10, "cpu_seconds": cpu}}}
                for timestamp, cpu in ((10, 0), (12, 2), (15, 100), (17, 104))]
     assert resource_summary(samples, [(10, 12), (15, 17)])["control"]["cpu_mean_percent"] == 150
@@ -500,6 +594,20 @@ def self_check():
     assert queue["last_sample_before_submission_end"]["unix_s"] == 13
     assert queue["first_sample_after_submission_end"]["unix_s"] == 18
     assert queue["final"]["states"]["queued"] == 0
+    # Only queries wholly within both clients' sending windows contribute to completion rate.
+    paced_queues = [dict(point, started_unix_s=timestamp - 0.1, unix_s=timestamp,
+                         states=dict(point["states"], queued=index, succeeded=index * 10))
+                    for index, (point, timestamp) in enumerate(zip(queues, (10, 11, 11.5, 12.5, 14)))]
+    measured_queue = queue_summary(paced_queues, paced)["paced_measurement"]
+    assert measured_queue["sample_count"] == 2 and measured_queue["observed_seconds"] == 1
+    assert measured_queue["sampled_completed_rps"] == 10
+    assert measured_queue["pending_growth_per_second"] == 1
+    sparse = queue_summary(paced_queues[:3], paced)["paced_measurement"]
+    assert sparse["sample_count"] == 1 and sparse["sampled_completed_rps"] is None
+    assert queue_summary(paced_queues, [cap])["paced_measurement"]["sample_count"] == 0
+    no_overlap = queue_summary(paced_queues, [paced[0], dict(paced[1], rate_control=rate_window(20, 21, 3))])["paced_measurement"]
+    assert no_overlap["common_sending_started_unix_s"] == no_overlap["common_sending_finished_unix_s"]
+    assert no_overlap["sample_count"] == 0 and no_overlap["sampled_completed_rps"] is None
     attempts = [{"job_id": name, "phase": phase, "submit_status": ack, "drain_status": drain}
                 for name, phase, ack, drain in (
                     ("warmup", "warmup", "accepted", "verified"),
@@ -520,6 +628,14 @@ def self_check():
     assert not duplicate["passed"] and duplicate["duplicate_attempt_ids"]
     mismatched = reconcile_ids([dict(client, submit_attempts=5)], database_rows)
     assert not mismatched["passed"] and mismatched["client_counter_mismatches"]
+    paced_client = dict(client, rate_control=rate_window(10, 11, 3, busy=2, expired=1, capped=1))
+    assert reconcile_ids([paced_client], database_rows)["passed"]
+    for key in ("sent", "scheduled", "skipped", "offered"):
+        rate = paced_client["rate_control"]
+        invalid = dict(paced_client, rate_control=dict(rate, measured=dict(rate["measured"], **{key: 99})))
+        invalid_counts = reconcile_ids([invalid], database_rows)
+        assert not invalid_counts["passed"] and invalid_counts["client_counter_mismatches"]
+    assert not reconcile_ids([dict(client, observed_peak_inflight=3, concurrency=2)], database_rows)["passed"]
     # Failure artifacts must distinguish recorded IDs from still-running clients.
     import io
     from types import SimpleNamespace
@@ -598,6 +714,8 @@ def main():
                         help="S6 total attempts per client, including warmup and failed Submit calls")
     parser.add_argument("--drain-timeout", type=float, default=120,
                         help="S6 result drain deadline in seconds, excluded from Submit throughput")
+    parser.add_argument("--submit-rate", type=int,
+                        help="S6 target sends per second per client; bounded concurrency, missed sends are counted and skipped")
     parser.add_argument("--cases", default="64:256,256:256,4:1048576", help="per-replica concurrency:payload bytes")
     parser.add_argument("--payload-pattern", choices=("repeat", "random"), default="random",
                         help="random avoids optimistic compression of large payloads; repeat reproduces historical x payloads")
@@ -618,6 +736,8 @@ def main():
         parser.error("max-jobs must be a positive u32 and drain-timeout must be positive")
     if args.worker_concurrency is not None and not 0 < args.worker_concurrency < 2**32:
         parser.error("worker-concurrency must be a positive u32")
+    if args.submit_rate is not None and (args.scenario != "S6" or not 0 < args.submit_rate < 2**32):
+        parser.error("submit-rate requires S6 and a positive u32")
     if not 0 <= args.payload_seed < 2**64:
         parser.error("payload seed must be an unsigned 64-bit integer")
     try:
@@ -641,7 +761,8 @@ def main():
         "scope": ("S3 durable Submit+Watch through verified echo output; successful measured round trips"
                   if args.scenario == "S3" else
                   "S6 durable Submit ACK latency/throughput, then separate complete echo verification and authoritative DB ID reconciliation")
-                 + "; loopback closed-loop clients; fresh PG schema per case",
+                 + ("; bounded paced loopback clients" if args.submit_rate else "; loopback closed-loop clients")
+                 + "; fresh PG schema per case",
         "payload_scope": "one deterministic buffer reused per client; random uses SplitMix64 little-endian words to model already-compressed bytes, not media codecs or distinct content per job",
         "throughput_window": ("pooled successes divided by earliest client measurement start to latest finish, including drain"
                               if args.scenario == "S3" else

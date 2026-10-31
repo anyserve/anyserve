@@ -142,6 +142,28 @@ records `cross_client_submit_drain_overlap_seconds` and its fraction of the Subm
 window; compare these alongside throughput, especially when `--max-jobs` stops a
 client early.
 
+To test a sustained offered load, add `--submit-rate` (per client, with one client
+per replica). For example, this requests 2,000 sends/s across two replicas:
+
+```bash
+python3 bench/load/postgres.py --scenario S6 --replicas 2 --cases 256:256 \
+  --worker-concurrency 256 --submit-rate 1000 --warmup 30 --duration 300 \
+  --max-jobs 400000 --drain-timeout 300 --repeat 1 \
+  --out bench/load/results/pg-paced
+```
+
+Pacing uses 10 ms batches with bounded in-flight RPCs. Busy slots and expired
+allocations are counted and skipped; there is no waiting send queue or catch-up
+burst. `rate_control` reports actual sends, skipped allocations and the sending
+window separately from ACK tail and drain. Keep `--max-jobs` above the requested
+warmup + measurement volume; reaching it early marks the window incomplete.
+`observed_peak_inflight` checks the client concurrency bound. A configured rate,
+or a run with every result eventually verified, does not prove sustained capacity:
+check actual sends, skipped allocations, completed jobs/s and pending-job growth
+during the full measurement window. The shared queue samples use only queries
+wholly within all clients' overlapping sending windows; completions may include
+warmup jobs, so this is not a per-job completion latency measurement.
+
 S6 samples all five job states from the shared PG schema approximately once per
 second through submission and drain. Artifacts retain the queue timeline, sampled
 peaks, samples immediately before/after submission ends, and final ID reconciliation.
