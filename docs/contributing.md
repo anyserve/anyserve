@@ -178,6 +178,21 @@ queued/running count must be zero. `resources` covers the Submit windows;
 sample coverage; client resource samples end when the first client exits.
 Failed cases retain `failure.json` with the stage, client exit codes and available result counts, plus a database ID/state snapshot when its five-second collection succeeds; incomplete clients have no inferred attempt count.
 
+Add `--console-operators 10` to measure PostgreSQL business traffic alongside
+Console HTTP reads. The total operator count is distributed across replicas;
+each operator reads overview, jobs, workers and one listed job's detail every
+500 ms, with serial requests and no catch-up bursts. The default is disabled.
+Compare otherwise identical runs with `0` and `10`, using the same binaries.
+The observer creates no jobs and leaves S6's complete ID reconciliation unchanged.
+`console-http.json` retains request timings, status, response body bytes and errors;
+the summary separates the entire HTTP run from the business measurement windows.
+Every configured operator must successfully exercise all four endpoints during
+measurement. Rates count actual HTTP attempts; latency includes completion tails.
+Polling continues through result drain, and observer threads stop before servers.
+Observer CPU runs in the Python harness and is excluded from role CPU totals.
+Overview and worker counters are replica-local; use shared PG queue samples for
+backlog. This covers HTTP APIs, not browser rendering or DuckDB/Explore queries.
+
 For Console overhead and large-result previews on macOS or Linux, build both
 release binaries and run the standard-library Python runner:
 

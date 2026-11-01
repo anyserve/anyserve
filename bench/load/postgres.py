@@ -17,13 +17,15 @@ import platform
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
 from console import ROOT, digest, free_port, get, percentile, sample_resources, stop, write_json
 from runner import wait_ready
@@ -119,6 +121,157 @@ def union_windows(windows):
         else:
             merged.append([start, finish])
     return merged
+
+
+class ConsoleLoad:
+    """Read existing PG jobs; one outstanding request per operator, no catch-up queue."""
+
+    def __init__(self, ports, operators, directory):
+        self.directory = directory
+        self.ended, self.forced = threading.Event(), threading.Event()
+        self.samples, self.threads, self.connections, self.operators = [], [], [], []
+        self.started, self.finished, self.stop_requested = time.time(), None, None
+        for index in range(operators):
+            replica = index % len(ports)
+            connection = http.client.HTTPConnection("127.0.0.1", ports[replica], timeout=2)
+            operator = {"operator": index, "replica": replica,
+                        "endpoint": f"http://127.0.0.1:{ports[replica]}",
+                        "empty_list_cycles": 0}
+            self.connections.append(connection)
+            self.operators.append(operator)
+
+    def start(self):
+        for index, (operator, connection) in enumerate(zip(self.operators, self.connections)):
+            thread = threading.Thread(target=self.poll, args=(operator, connection, index * 0.5 / len(self.operators)),
+                                      daemon=True, name=f"console-{index}")
+            thread.start()
+            self.threads.append(thread)
+
+    def poll(self, operator, connection, offset):
+        iteration = 0
+        self.ended.wait(offset)
+        operator["started_unix_s"] = time.time()
+        try:
+            while not self.ended.is_set():
+                cycle, job_ids = time.monotonic(), []
+                for name, path in (("overview", "/api/overview"), ("jobs", "/api/jobs?limit=100"),
+                                   ("workers", "/api/workers"), ("detail", None)):
+                    if self.ended.is_set():
+                        break
+                    if name == "detail":
+                        if not job_ids:
+                            operator["empty_list_cycles"] += 1
+                            continue
+                        job_id = job_ids[iteration % len(job_ids)]
+                        path = "/api/jobs/" + quote(job_id, safe="")
+                    sample = {"operator": operator["operator"], "replica": operator["replica"],
+                              "endpoint": operator["endpoint"], "operation": name, "path": path,
+                              "started_unix_s": time.time(), "status": None, "body_bytes": 0,
+                              "outcome": "ok"}
+                    started = time.perf_counter()
+                    try:
+                        connection.request("GET", path)
+                        response = connection.getresponse()
+                        sample["status"] = response.status
+                        data = response.read()
+                        sample["body_bytes"] = len(data)
+                        if response.status != 200:
+                            raise RuntimeError("unexpected HTTP status")
+                        body = json.loads(data)
+                        if not isinstance(body, dict):
+                            raise ValueError("expected a JSON object")
+                        if name == "jobs":
+                            job_ids = [job["job_id"] for job in body["jobs"]]
+                            if not all(isinstance(job_id, str) for job_id in job_ids):
+                                raise ValueError("invalid job ID")
+                        elif name == "detail" and body["job"]["job_id"] != job_id:
+                            raise ValueError("detail returned a different job ID")
+                    except Exception as error:
+                        sample.update(outcome="interrupted" if self.forced.is_set() else "error",
+                                      error_type=type(error).__name__)
+                        if name == "jobs":
+                            job_ids = []
+                        connection.close()
+                    finally:
+                        sample.update(finished_unix_s=time.time(),
+                                      latency_ms=(time.perf_counter() - started) * 1000)
+                        self.samples.append(sample)
+                iteration += 1
+                self.ended.wait(max(0, 0.5 - (time.monotonic() - cycle)))
+        except Exception as error:
+            operator["error_type"] = type(error).__name__
+        finally:
+            connection.close()
+            operator["finished_unix_s"] = time.time()
+
+    def close(self):
+        if self.finished is not None:
+            return
+        self.stop_requested = time.time()
+        self.ended.set()
+        deadline = time.monotonic() + 3
+        for thread in self.threads:
+            thread.join(max(0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in self.threads):
+            self.forced.set()
+            for connection in self.connections:
+                sock = connection.sock
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+            deadline = time.monotonic() + 1
+            for thread in self.threads:
+                thread.join(max(0, deadline - time.monotonic()))
+        alive = [thread.name for thread in self.threads if thread.is_alive()]
+        self.finished = time.time()
+        write_json(self.directory / "console-http.json", {
+            "started_unix_s": self.started, "stop_requested_unix_s": self.stop_requested,
+            "finished_unix_s": self.finished, "operators": self.operators,
+            "threads_still_running": alive, "samples": self.samples,
+            "cycle_seconds": 0.5, "socket_timeout_seconds": 2,
+            "scope": "Read-only HTTP, no browser/DuckDB execution. Overview/workers are replica-local; shared backlog comes only from SQL queue samples. Response bytes exclude HTTP headers; failed partial bodies are not counted.",
+        })
+        if alive:
+            raise RuntimeError("Console threads did not stop before service cleanup")
+
+    def summary(self, windows):
+        exercised = {(row["operator"], row["operation"]) for row in self.samples
+                     if row["outcome"] == "ok" and any(begin <= row["started_unix_s"] < end for begin, end in windows)}
+        missing = [{"operator": operator["operator"], "replica": operator["replica"],
+                    "missing_operations": [name for name in ("overview", "jobs", "workers", "detail")
+                                           if (operator["operator"], name) not in exercised]}
+                   for operator in self.operators]
+        return {"artifact": "console-http.json", "operators": len(self.operators),
+                "operators_by_replica": dict(Counter(row["replica"] for row in self.operators)),
+                "operator_errors": [row for row in self.operators if "error_type" in row],
+                "incomplete_measured_operator_coverage": [row for row in missing if row["missing_operations"]],
+                "whole_load": console_summary(self.samples, [(self.started, self.finished)]),
+                "measurement": console_summary(self.samples, windows)}
+
+
+def console_summary(samples, windows):
+    windows = union_windows(windows)
+    seconds = sum(end - begin for begin, end in windows)
+    selected = [row for row in samples if any(begin <= row["started_unix_s"] < end for begin, end in windows)]
+
+    def counts(rows):
+        latencies = [row["latency_ms"] for row in rows]
+        return {"requests": len(rows), "errors": sum(row["outcome"] == "error" for row in rows),
+                "interrupted": sum(row["outcome"] == "interrupted" for row in rows),
+                "response_body_bytes": sum(row["body_bytes"] for row in rows),
+                "actual_http_rps": len(rows) / seconds if seconds else None,
+                "p50_ms": percentile(latencies, 0.5), "p95_ms": percentile(latencies, 0.95),
+                "p99_ms": percentile(latencies, 0.99), "max_ms": max(latencies, default=None)}
+
+    return {"windows": windows, "seconds": seconds, **counts(selected),
+            "by_endpoint": [{"replica": replica, "operation": name,
+                             **counts([row for row in selected if row["replica"] == replica and row["operation"] == name])}
+                            for replica, name in sorted({(row["replica"], row["operation"]) for row in samples})],
+            "completion_tail_requests": sum(not any(begin <= row["started_unix_s"] < end and row["finished_unix_s"] <= end
+                                                     for begin, end in windows) for row in selected),
+            "scope": "Requests attributed by start time to the window union; latency/body bytes include completion tails and errors. HTTP rate counts actual attempts, not configured operators or target cycles."}
 
 
 def aggregate(results, scenario="S3"):
@@ -367,6 +520,7 @@ def run_case(args, url, sql, concurrency, payload, repetition):
     schema = "bench_" + uuid.uuid4().hex
     processes, controls, workers, clients, resources, queues = [], [], [], [], [], []
     stage, failed = "startup", False
+    console, http_ports = None, []
     worker_concurrency = args.worker_concurrency or concurrency
     env = dict(os.environ, RUST_LOG="warn", ANYSERVE_DATABASE_URL=url)
     env.pop("TOKIO_WORKER_THREADS", None)
@@ -406,10 +560,14 @@ def run_case(args, url, sql, concurrency, payload, repetition):
             finally:
                 connection.close()
             controls.append((server, endpoint))
+            http_ports.append(http_port)
             workers.append(worker)
         if args.scenario == "S6":
             queues.append(queue_sample(sql, schema))
         next_queue_sample = time.monotonic() + args.queue_sample_interval
+        if args.console_operators:
+            console = ConsoleLoad(http_ports, args.console_operators, directory)
+            console.start()
         for index, (_, endpoint) in enumerate(controls):
             output = directory / f"client-{index}.json"
             command = [args.bench_bin, "client", "--endpoint", endpoint,
@@ -441,6 +599,8 @@ def run_case(args, url, sql, concurrency, payload, repetition):
             time.sleep(0.5)
         if any(process.poll() is not None for role, process in processes if role != "client"):
             raise RuntimeError(f"service exited during {name}; see {directory}")
+        if console:
+            console.close()
         stage = "reading_client_results"
         results = [json.loads(path.read_text()) for _, path in clients]
         summary = aggregate(results, args.scenario)
@@ -468,6 +628,10 @@ def run_case(args, url, sql, concurrency, payload, repetition):
         else:
             summary["resources"] = resource_summary(resources, [
                 (summary["measurement_started_unix_s"], summary["measurement_finished_unix_s"])])
+        if console:
+            windows = summary["submit_windows"] if args.scenario == "S6" else [(
+                summary["measurement_started_unix_s"], summary["measurement_finished_unix_s"])]
+            summary["console"] = console.summary(windows)
         stage = "post_run_statistics"
         # Outside the measurement window; content size excludes tuple/index/TOAST page overhead.
         summary["payload_storage_sample"] = json.loads(sql(f'SELECT COALESCE(json_agg(sample), \'[]\') '
@@ -487,6 +651,11 @@ def run_case(args, url, sql, concurrency, payload, repetition):
         write_json(directory / "summary.json", summary)
         print(json.dumps({k: v for k, v in summary.items() if k not in {"clients", "resources"}}), flush=True)
         stage = "validating_results"
+        if console and (summary["console"]["operator_errors"] or
+                        summary["console"]["incomplete_measured_operator_coverage"] or
+                        summary["console"]["whole_load"]["errors"] or
+                        summary["console"]["whole_load"]["interrupted"]):
+            raise RuntimeError(f"Console load returned errors or incomplete coverage; see {directory}")
         if any(client.returncode for client, _ in clients) or summary["errors"] or summary["warmup_errors"]:
             raise RuntimeError(f"benchmark returned errors; see {directory}")
         if args.scenario == "S6" and (summary["drain"]["errors"] or not reconciliation["passed"]):
@@ -507,6 +676,8 @@ def run_case(args, url, sql, concurrency, payload, repetition):
                 cleanup.callback(sql, f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
                 for _, process in processes:
                     cleanup.callback(stop, process)
+                if console:
+                    cleanup.callback(console.close)
                 write_json(directory / "resources.json", resources)
                 if args.scenario == "S6":
                     write_json(directory / "queue-samples.json", queues)
@@ -710,6 +881,89 @@ def self_check():
         assert "credential-sentinel" not in diagnostics.getvalue()
         assert (directory / "c1-p1-r1/resources.json").exists()
         assert (directory / "c1-p1-r1/queue-samples.json").exists()
+    # HTTP metrics use request-start attribution, retain completion tails, and split endpoints.
+    def http_row(replica, start, end, outcome="ok"):
+        return {"replica": replica, "operation": "jobs", "started_unix_s": start,
+                "finished_unix_s": end, "outcome": outcome, "body_bytes": 10, "latency_ms": 5}
+    http_rows = [http_row(0, 1, 1.1), http_row(1, 2, 4, "error"), http_row(0, 3, 3.1)]
+    measured = console_summary(http_rows, [(1, 2), (1.5, 3)])
+    assert measured["seconds"] == 2 and measured["requests"] == 2
+    assert measured["actual_http_rps"] == 1 and measured["response_body_bytes"] == 20
+    assert measured["errors"] == 1 and measured["completion_tail_requests"] == 1
+    assert [row["requests"] for row in measured["by_endpoint"]] == [1, 1]
+    assert console_summary(http_rows, [])["actual_http_rps"] is None
+    with tempfile.TemporaryDirectory(prefix="anyserve-console-check-") as temporary:
+        load = ConsoleLoad([10000], 2, Path(temporary))
+        requested = []
+        detail_job_id = "a/b"
+        class Response:
+            status = 200
+            def read(self):
+                if requested[-1].startswith("/api/jobs/"):
+                    load.ended.set()
+                    return json.dumps({"job": {"job_id": detail_job_id}}).encode()
+                return b'{"jobs":[{"job_id":"a/b"}]}' if requested[-1] == "/api/jobs?limit=100" else b'{}'
+        connection = SimpleNamespace(request=lambda method, path: requested.append(path),
+                                     getresponse=Response, close=lambda: None, sock=None)
+        load.poll(load.operators[0], connection, 0)
+        assert requested == ["/api/overview", "/api/jobs?limit=100", "/api/workers", "/api/jobs/a%2Fb"]
+        assert len(load.samples) == 4 and all(row["outcome"] == "ok" for row in load.samples)
+        load.close()
+        report = json.loads((Path(temporary) / "console-http.json").read_text())
+        assert not report["threads_still_running"] and len(report["samples"]) == 4
+        coverage = load.summary([(load.started, load.finished)])["incomplete_measured_operator_coverage"]
+        assert coverage == [{"operator": 1, "replica": 0, "missing_operations": ["overview", "jobs", "workers", "detail"]}]
+        detail_job_id = "wrong"
+        requested.clear()
+        load = ConsoleLoad([10000], 1, Path(temporary))
+        load.poll(load.operators[0], connection, 0)
+        load.close()
+        assert load.samples[-1]["outcome"] == "error"
+        assert load.summary([(load.started, load.finished)])["incomplete_measured_operator_coverage"][0]["missing_operations"] == ["detail"]
+
+        # A live slow response avoids inactivity timeout but must not hold teardown open.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        entered, release = threading.Event(), threading.Event()
+        class SlowResponse(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "1000000")
+                self.end_headers()
+                entered.set()
+                try:
+                    while not release.wait(0.05):
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                except OSError:
+                    pass
+                finally:
+                    self.close_connection = True
+            def log_message(self, *_args):
+                pass
+        # The loopback fixture does not need reverse DNS.
+        with patch("socket.getfqdn", return_value="localhost"):
+            server = ThreadingHTTPServer(("127.0.0.1", 0), SlowResponse)
+        serving = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        serving.start()
+        stuck = ConsoleLoad([server.server_port], 1, Path(temporary))
+        try:
+            stuck.start()
+            assert entered.wait(2), "HTTP test handler did not receive a request"
+            started = time.monotonic()
+            stuck.close()
+            assert time.monotonic() - started < 5
+            assert stuck.forced.is_set() and all(not thread.is_alive() for thread in stuck.threads)
+            assert stuck.samples[0]["outcome"] == "interrupted"
+        finally:
+            release.set()
+            try:
+                stuck.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                serving.join(2)
+
     print("postgres benchmark self-check passed")
 
 
@@ -735,6 +989,8 @@ def main():
                         help="S6 target sends per second per client; bounded concurrency, missed sends are counted and skipped")
     parser.add_argument("--queue-sample-interval", type=positive_seconds, default=1,
                         help="S6 shared PG queue sampling interval in seconds (positive and finite; default 1)")
+    parser.add_argument("--console-operators", type=int, default=0,
+                        help="total read-only Console operators across replicas; 500ms cycles; default disabled")
     parser.add_argument("--cases", default="64:256,256:256,4:1048576", help="per-replica concurrency:payload bytes")
     parser.add_argument("--payload-pattern", choices=("repeat", "random"), default="random",
                         help="random avoids optimistic compression of large payloads; repeat reproduces historical x payloads")
@@ -757,6 +1013,8 @@ def main():
         parser.error("worker-concurrency must be a positive u32")
     if args.submit_rate is not None and (args.scenario != "S6" or not 0 < args.submit_rate < 2**32):
         parser.error("submit-rate requires S6 and a positive u32")
+    if args.console_operators < 0:
+        parser.error("console-operators must be nonnegative")
     if not 0 <= args.payload_seed < 2**64:
         parser.error("payload seed must be an unsigned 64-bit integer")
     try:
@@ -789,6 +1047,9 @@ def main():
         "queue_sampling": f"S6: shared PG jobs grouped by state approximately every {args.queue_sample_interval:g}s through submission and drain; initial/final states and raw query start/end times retained",
         "resource_windows": "S3: measurement window; S6: Submit-window union and whole run separately; CPU is over observed sample spans, with coverage seconds recorded; client samples stop when any client exits",
         "tokio_worker_threads": {"control": "production default", "worker": 2, "client": 4},
+        "console_load": {"operators": args.console_operators, "cycle_seconds": 0.5,
+                         "socket_timeout_seconds": 2,
+                         "scope": "GET overview/jobs/workers/detail only; total operators round-robin across replicas, serial requests per operator, delayed cycles do not catch up; HTTP through client drain; no browser or Explore execution; observer CPU is in Python runner, excluded from role CPU sums"},
         "cpu_unit": "100% = one logical CPU; role sums exclude PostgreSQL; ps samples every 0.5s",
         "database": "external" if os.environ.get("ANYSERVE_TEST_POSTGRES_URL") else "disposable postgres:18-bookworm Docker",
     }
