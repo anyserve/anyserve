@@ -418,6 +418,7 @@ impl Postgres {
 
     async fn apply_in_tx(&self, tx: &mut Transaction<'_, Pg>, op: &JournalOp) -> Result<bool> {
         self.ensure_healthy()?;
+        // IS TRUE keeps point updates from matching partial queue indexes.
         match op {
             JournalOp::Probe => {
                 db_now(tx).await?;
@@ -436,7 +437,7 @@ impl Postgres {
                     updated_at_ms=(extract(epoch FROM clock_timestamp())*1000)::bigint,
                     event_sequence=event_sequence+1,last_frame_seq=0
                     WHERE job_id=$1 AND owner_id=$2 AND ownership_epoch=$3
-                      AND state='queued' AND attempt_count=$4-1
+                      AND (state='queued') IS TRUE AND attempt_count=$4-1
                       AND EXISTS (SELECT 1 FROM nodes WHERE node_id=$2 AND expires_at>clock_timestamp())
                     RETURNING job_id,event_sequence,last_attempt_id,updated_at_ms)
                     INSERT INTO events(job_id,sequence,attempt_id,at_ms,kind_json)
@@ -457,7 +458,7 @@ impl Postgres {
                         WHEN stamp.now_ms>9223372036854775807-$6 THEN 9223372036854775807
                         ELSE stamp.now_ms+$6 END
                     FROM stamp
-                    WHERE job_id=$1 AND owner_id=$2 AND ownership_epoch=$3 AND state IN ('queued','running')
+                    WHERE job_id=$1 AND owner_id=$2 AND ownership_epoch=$3 AND (state IN ('queued','running')) IS TRUE
                       AND EXISTS (SELECT 1 FROM nodes WHERE node_id=$2 AND expires_at>clock_timestamp())
                     RETURNING event_sequence,updated_at_ms")
                     .bind(&record.job_id).bind(&self.node_id).bind(record.ownership_epoch).bind(state)

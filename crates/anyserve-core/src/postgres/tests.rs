@@ -300,6 +300,126 @@ async fn postgres_cluster_attempt_start_is_fenced_and_atomic_with_assigned_event
 
 #[tokio::test]
 #[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_terminal_rechecks_state_after_row_lock_wait() {
+    let (pg, admin) = node().await;
+    pg.accept(acceptance("terminal-epq", None), ConflictPolicy::Fail, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET owner_id=$1,ownership_epoch=7 WHERE job_id='terminal-epq'")
+        .bind(&pg.node_id)
+        .execute(&pg.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pg.apply(JournalOp::AttemptStart(AttemptStartRecord {
+            job_id: "terminal-epq".into(),
+            attempt_number: 1,
+            at_ms: 1,
+            ownership_epoch: Some(7),
+            attempt_id: Some("attempt".into()),
+            worker_id: Some("worker".into()),
+        }))
+        .await,
+        CommitOutcome::Committed
+    );
+    let snapshot = "SELECT jsonb_build_object(
+        'jobs',(SELECT jsonb_agg(to_jsonb(jobs) ORDER BY job_id) FROM jobs),
+        'events',(SELECT jsonb_agg(to_jsonb(events) ORDER BY job_id,sequence) FROM events),
+        'objects',(SELECT jsonb_agg(to_jsonb(objects) ORDER BY job_id,role,idx) FROM objects),
+        'receipts',(SELECT jsonb_agg(to_jsonb(receipts) ORDER BY lease_id) FROM receipts))::text";
+    // Give the short test lease a fresh confirmed deadline before blocking a write.
+    pg.heartbeat().await.unwrap();
+    let mut blocker = pg.pool.begin().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    // Change only state: owner, epoch and attempt still match the pending finish.
+    assert_eq!(
+        sqlx::query(
+            "UPDATE jobs SET state='cancelled' WHERE job_id='terminal-epq'
+            AND owner_id=$1 AND ownership_epoch=7 AND state='running'"
+        )
+        .bind(&pg.node_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap()
+        .rows_affected(),
+        1
+    );
+    let expected: String = sqlx::query_scalar(snapshot)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let terminal = {
+        let pg = Arc::clone(&pg);
+        tokio::spawn(async move {
+            pg.apply(JournalOp::Terminal(Box::new(TerminalRecord {
+                job_id: "terminal-epq".into(),
+                state: JobState::Succeeded,
+                outputs: vec![Object::inline("late output")],
+                error: None,
+                attempt_id: Some("attempt".into()),
+                worker_id: Some("worker".into()),
+                winning_lease_id: Some("late-lease".into()),
+                outcome_digest: Some("late-digest".into()),
+                at_ms: 1,
+                ownership_epoch: Some(7),
+                retry_at_ms: None,
+            })))
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+                 WHERE application_name=$1 AND wait_event_type='Lock'
+                   AND $2=ANY(pg_blocking_pids(pid)))",
+            )
+            .bind(format!("anyserve:{}", pg.node_id))
+            .bind(blocker_pid)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal write must wait for the state-changing transaction");
+    blocker.commit().await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(1), terminal)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(outcome, CommitOutcome::Fenced(_)));
+    assert!(pg.healthy(), "local lease expired during the guard test");
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT expires_at>clock_timestamp() FROM nodes WHERE node_id=$1",
+        )
+        .bind(&pg.node_id)
+        .fetch_one(&pg.pool)
+        .await
+        .unwrap(),
+        "database lease expired during the guard test"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(snapshot)
+            .fetch_one(&pg.pool)
+            .await
+            .unwrap(),
+        expected,
+        "fenced terminal write changed the job, events, objects or receipts"
+    );
+    close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
 async fn postgres_cluster_heartbeat_recovers_within_confirmed_lease() {
     let (pg, admin) = node().await;
     let deadline = *pg.valid_until.lock().unwrap();
