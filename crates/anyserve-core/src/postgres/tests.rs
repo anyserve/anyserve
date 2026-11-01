@@ -38,6 +38,101 @@ fn acceptance(id: &str, total_timeout: Option<Duration>) -> AcceptRecord {
 
 #[tokio::test]
 #[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_scan_preserves_state_subsets_and_mixed_filters() {
+    use JobState::{Cancelled, Failed, Queued, Running, Succeeded};
+
+    let (pg, admin) = node().await;
+    for (index, id) in ["queued", "running", "succeeded", "failed", "cancelled"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut record = acceptance(id, None);
+        record.spec = Arc::new(JobSpec {
+            demand: crate::runtime::api::Demand {
+                interface: if index % 2 == 0 { "alpha" } else { "beta" }.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        pg.accept(record, ConflictPolicy::UseExisting, None)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET state=$1,created_at_ms=$2 WHERE job_id=$1")
+            .bind(id)
+            .bind(1000 + index as i64)
+            .execute(&pg.pool)
+            .await
+            .unwrap();
+    }
+    for (states, expected) in [
+        (
+            vec![],
+            vec!["cancelled", "failed", "succeeded", "running", "queued"],
+        ),
+        (vec![Queued], vec!["queued"]),
+        (vec![Running], vec!["running"]),
+        (vec![Succeeded], vec!["succeeded"]),
+        (vec![Failed], vec!["failed"]),
+        (vec![Cancelled], vec!["cancelled"]),
+        (vec![Queued, Running], vec!["running", "queued"]),
+        (
+            vec![Succeeded, Failed, Cancelled],
+            vec!["cancelled", "failed", "succeeded"],
+        ),
+        (vec![Queued, Succeeded], vec!["succeeded", "queued"]),
+        (vec![Running, Cancelled], vec!["cancelled", "running"]),
+        (vec![Queued, Queued], vec!["queued"]),
+    ] {
+        let jobs = pg
+            .scan_jobs(0, u64::MAX, None, &states, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{states:?}"
+        );
+    }
+    for (states, expected) in [
+        (vec![Queued, Running], vec!["queued"]),
+        (
+            vec![Succeeded, Failed, Cancelled],
+            vec!["cancelled", "succeeded"],
+        ),
+        (vec![Queued, Failed], vec!["queued"]),
+    ] {
+        let jobs = pg
+            .scan_jobs(0, u64::MAX, None, &states, Some("alpha"), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            jobs.iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "{states:?}"
+        );
+    }
+    let jobs = pg
+        .scan_jobs(
+            1001,
+            1004,
+            Some((1003, "failed".into())),
+            &[Succeeded, Failed, Cancelled],
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].job_id, "succeeded");
+    close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
 async fn postgres_cluster_accept_uses_database_time_and_saturates_deadlines() {
     let (pg, admin) = node().await;
     for (id, timeout) in [

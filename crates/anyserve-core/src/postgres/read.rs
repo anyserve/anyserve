@@ -238,6 +238,12 @@ impl Postgres {
                 .push(")");
         }
         if !states.is_empty() {
+            // Generic prepared plans need a literal predicate to use partial indexes.
+            if states.iter().all(|state| state.is_terminal()) {
+                query.push(" AND state IN ('succeeded','failed','cancelled')");
+            } else if states.iter().all(|state| !state.is_terminal()) {
+                query.push(" AND state IN ('queued','running')");
+            }
             query
                 .push(" AND state=ANY(")
                 .push_bind(states.iter().copied().map(state_text).collect::<Vec<_>>())
