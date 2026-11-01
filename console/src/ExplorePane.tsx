@@ -17,7 +17,7 @@ interface Dataset {
 
 function localDate(value: number): string {
   const date = new Date(value);
-  return new Date(value - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+  return new Date(value - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
 }
 
 export default function ExplorePane({ journalEnabled, distributed = false, onAuthenticationError }: {
@@ -188,8 +188,8 @@ export default function ExplorePane({ journalEnabled, distributed = false, onAut
             <option value="1440">Last 24 hours</option><option value="custom">Custom range</option>
           </select></label>
           {windowMinutes === "custom" ? <>
-            <label>From<input type="datetime-local" value={from} onChange={event => setFrom(event.target.value)} disabled={busy} required /></label>
-            <label>Until<input type="datetime-local" value={to} onChange={event => setTo(event.target.value)} disabled={busy} required /></label>
+            <label>From<input type="datetime-local" step="1" value={from} onChange={event => setFrom(event.target.value)} disabled={busy} required /></label>
+            <label>Until<input type="datetime-local" step="1" value={to} onChange={event => setTo(event.target.value)} disabled={busy} required /></label>
           </> : null}
           <label>Maximum jobs<select value={rowLimit} onChange={event => setRowLimit(Number(event.target.value))} disabled={busy}>
             <option value={1_000}>1,000</option><option value={10_000}>10,000</option><option value={100_000}>100,000</option>

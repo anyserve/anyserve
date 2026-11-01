@@ -84,3 +84,24 @@ it("releases the database and shows a retryable state when metadata loading fail
   expect(db.dispose).toHaveBeenCalledTimes(1);
   expect((screen.getByRole("button", { name: "Run query" }) as HTMLButtonElement).disabled).toBe(true);
 });
+
+it("loads a five-second custom range without rounding its bounds", async () => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(new Date(2026, 10, 1, 10, 0, 7).getTime());
+  try {
+    render(<ExplorePane journalEnabled onAuthenticationError={vi.fn()} />);
+  } finally {
+    clock.mockRestore();
+  }
+  fireEvent.change(screen.getByLabelText("Created within"), { target: { value: "custom" } });
+  const from = screen.getByLabelText("From") as HTMLInputElement;
+  const until = screen.getByLabelText("Until") as HTMLInputElement;
+  expect(from.value.endsWith(":07")).toBe(true);
+  fireEvent.change(from, { target: { value: "2026-11-01T10:00:03" } });
+  fireEvent.change(until, { target: { value: "2026-11-01T10:00:08" } });
+  expect(from.checkValidity() && until.checkValidity()).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Load data" }));
+  await waitFor(() => expect(getAnalyticsJobs).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(getAnalyticsJobs).mock.calls[0].slice(1, 3)).toEqual([
+    new Date("2026-11-01T10:00:03").getTime(), new Date("2026-11-01T10:00:08").getTime(),
+  ]);
+});
