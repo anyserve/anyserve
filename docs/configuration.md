@@ -80,7 +80,8 @@ private CA.
 ## Limits and retention
 
 `max_queue` limits queued/accepting jobs per interface; `max_pending_jobs` limits
-unfinished jobs globally. Admission beyond these limits returns
+unfinished jobs in each Runtime. In PG mode these limit replica-local admission
+and loaded work, not the shared backlog. Admission beyond these limits returns
 `RESOURCE_EXHAUSTED`. Heartbeat timeout closes a silent session, then gives its
 leases another heartbeat-timeout interval to reconnect. Cancellation keeps a
 worker reservation until acknowledgement or `cancel_grace_ms` expires.

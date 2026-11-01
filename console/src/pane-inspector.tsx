@@ -6,7 +6,7 @@ import {
   truncateMiddle,
 } from "./format";
 import { QUEUE_STATES } from "./app-constants";
-import { EmptyState } from "./pane-tables";
+import { EmptyState, StateBadge } from "./pane-tables";
 import {
   CodeBlock,
   InlineList,
@@ -14,10 +14,9 @@ import {
   InspectorSection,
   MetaItem,
   ObjectRefList,
-  PreviewMeta,
 } from "./pane-inspector-details";
 import { AttemptsTimeline, EventsTimeline } from "./pane-inspector-timeline";
-import type { JobDetailResponse, JobState } from "./types";
+import type { JobDetailResponse } from "./types";
 
 export function JobInspector(props: {
   detail: JobDetailResponse | null;
@@ -91,7 +90,8 @@ export function JobInspector(props: {
         <InspectorSection title="Request">
           {detail.job.params_preview ? (
             <>
-              <PreviewMeta
+              <InlineList
+                className="preview-meta"
                 values={[
                   `${detail.job.params_size_bytes} B`,
                   detail.job.params_truncated ? "truncated" : "full",
@@ -115,7 +115,8 @@ export function JobInspector(props: {
         <InspectorSection title="Response">
           {detail.job.output_preview ? (
             <>
-              <PreviewMeta
+              <InlineList
+                className="preview-meta"
                 values={[
                   `${detail.job.output_preview.size_bytes} B`,
                   detail.job.output_preview.content_type ?? "unknown content-type",
@@ -155,8 +156,4 @@ export function JobInspector(props: {
       </InspectorGroup>
     </aside>
   );
-}
-
-function StateBadge(props: { state: JobState }) {
-  return <span className={`badge badge--${props.state}`}>{props.state}</span>;
 }

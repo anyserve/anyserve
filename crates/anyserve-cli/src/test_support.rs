@@ -6,7 +6,7 @@ use anyserve_core::auth::{AuthLayer, AuthPolicy};
 use anyserve_core::client_service::ClientGrpcService;
 use anyserve_core::runtime::{Runtime, api::RuntimeConfig};
 use anyserve_core::worker_service::WorkerGrpcService;
-use anyserve_proto::v2::{client_server::ClientServer, worker_server::WorkerServer};
+use anyserve_proto::v2::client_server::ClientServer;
 use tokio_stream::wrappers::TcpListenerStream;
 
 pub(crate) struct Server {
@@ -20,7 +20,7 @@ impl Server {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let client = ClientGrpcService::new(runtime.clone());
-        let worker = WorkerGrpcService::new(runtime.clone());
+        let worker = WorkerGrpcService::server(runtime.clone());
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .layer(AuthLayer::new(auth))
@@ -29,11 +29,7 @@ impl Server {
                         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
                         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE),
                 )
-                .add_service(
-                    WorkerServer::new(worker)
-                        .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
-                        .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE),
-                )
+                .add_service(worker)
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();

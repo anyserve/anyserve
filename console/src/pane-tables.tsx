@@ -126,7 +126,7 @@ export function EmptyState(props: { message: string; compact?: boolean }) {
   );
 }
 
-function StateBadge(props: { state: JobState }) {
+export function StateBadge(props: { state: JobState }) {
   return <span className={`badge badge--${props.state}`}>{props.state}</span>;
 }
 

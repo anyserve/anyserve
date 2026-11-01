@@ -114,8 +114,10 @@ Every event has `job_id`, `sequence`, `attempt_id`, `at_ms` and `type`:
 | `finished` | `state`, `outputs`, `error` |
 
 Sequence zero starts at the earliest retained event. Expired nonzero cursors
-report cursor expiry; history is bounded and does not survive a restart.
-`get()` and `result()` can read a retained durable result without its old events.
+report cursor expiry. SQLite and ephemeral event history is held in memory;
+PostgreSQL durable events survive restart and ownership changes, within retention
+limits. `get()` and `result()` can read a retained durable result after older
+events expire. See [recovery behavior](deployment.md#restart-and-backup).
 
 Runtime error codes include `queue_timeout`, `execution_timeout`, `total_timeout`,
 `cancelled`, `worker_failed`, `worker_lost`, `worker_rejected`,

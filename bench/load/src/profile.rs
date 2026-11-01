@@ -40,9 +40,7 @@ pub(super) async fn serve(listen: SocketAddr, journal: PathBuf, profile: PathBuf
     let client = ClientServer::new(ClientGrpcService::new(runtime.clone()))
         .max_decoding_message_size(MESSAGE_BYTES)
         .max_encoding_message_size(MESSAGE_BYTES);
-    let worker = WorkerServer::new(WorkerGrpcService::new(runtime.clone()))
-        .max_decoding_message_size(MESSAGE_BYTES)
-        .max_encoding_message_size(MESSAGE_BYTES);
+    let worker = WorkerGrpcService::server(runtime.clone());
     let (mut health, service) = tonic_health::server::health_reporter();
     health
         .set_serving::<ClientServer<ClientGrpcService>>()

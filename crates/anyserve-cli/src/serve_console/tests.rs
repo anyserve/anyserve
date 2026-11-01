@@ -189,6 +189,8 @@ async fn analytics_pages_metadata_and_validates_ranges_and_sources() {
     assert_eq!(received, expected);
     for query in [
         "source=archive&from_ms=0&to_ms=100",
+        "source=unknown&from_ms=0&to_ms=100",
+        "from_ms=0&to_ms=100",
         "source=retained&from_ms=10&to_ms=10",
         "source=retained&from_ms=0&to_ms=9999999999",
         "source=retained&from_ms=0&to_ms=100&cursor=invalid",

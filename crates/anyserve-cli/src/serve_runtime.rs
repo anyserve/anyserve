@@ -169,9 +169,7 @@ async fn run_grpc_server(
     let client_service = ClientServer::new(ClientGrpcService::new(runtime.clone()))
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
-    let worker_service = WorkerServer::new(WorkerGrpcService::new(runtime))
-        .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
+    let worker_service = WorkerGrpcService::server(runtime);
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_serving::<ClientServer<ClientGrpcService>>()

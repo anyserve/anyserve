@@ -27,8 +27,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from console import ROOT, digest, free_port, get, percentile, sample_resources, stop, write_json
-from runner import wait_ready
+from console import digest, get, percentile, sample_resources
+from runner import ROOT, free_port, stop, wait_ready, write_json
 
 
 def positive_seconds(value):

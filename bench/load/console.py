@@ -15,38 +15,16 @@ import math
 import os
 import platform
 import shutil
-import socket
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-
-
-def write_json(path, value):
-    path.write_text(json.dumps(value, indent=2) + "\n")
+from runner import ROOT, free_port, stop, write_json
 
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def stop(process):
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-            raise RuntimeError(f"process {process.pid} did not stop")
 
 
 def get(connection, path):
@@ -276,6 +254,7 @@ def main():
         "git_status": subprocess.check_output(["git", "status", "--short"], cwd=ROOT, text=True),
         "server_sha256": digest(args.server_bin), "bench_sha256": digest(args.bench_bin),
         "runner_sha256": digest(Path(__file__)),
+        "shared_runner_sha256": digest(Path(__file__).with_name("runner.py")),
         "scope": "loopback; release; FULL SQLite sync; four workers; 256-byte business echo; four cold 16-MiB results; closed-loop client; default production control threads",
         "http_load": "cold: four continuous readers; business+console: ten operators by default, four sequential queries per poll, evenly staggered; identical HTTP traffic before/after (frontend savings excluded)",
         "cpu_unit": "100% = one logical CPU; ps cumulative CPU sampled every 0.5s",

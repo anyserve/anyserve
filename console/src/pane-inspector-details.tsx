@@ -40,19 +40,9 @@ export function MetaItem(props: { label: string; value: string; mono?: boolean }
   );
 }
 
-export function InlineList(props: { values: string[] }) {
+export function InlineList(props: { values: string[]; className?: string }) {
   return (
-    <div className="inline-list">
-      {props.values.map((value) => (
-        <span key={value}>{value}</span>
-      ))}
-    </div>
-  );
-}
-
-export function PreviewMeta(props: { values: string[] }) {
-  return (
-    <div className="preview-meta">
+    <div className={props.className ?? "inline-list"}>
       {props.values.map((value) => (
         <span key={value}>{value}</span>
       ))}

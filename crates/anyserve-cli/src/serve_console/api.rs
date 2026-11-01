@@ -123,7 +123,7 @@ pub(crate) struct JobEventSummary {
     pub(crate) created_at_ms: u64,
     pub(crate) payload_size_bytes: usize,
 }
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 pub(crate) struct WorkerSummary {
     pub(crate) worker_id: String,
     pub(crate) healthy: bool,
@@ -156,11 +156,10 @@ pub(crate) struct JobsQuery {
     pub(crate) page_token: Option<String>,
 }
 
-#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AnalyticsSource {
     Archive,
-    #[default]
     Retained,
 }
 
