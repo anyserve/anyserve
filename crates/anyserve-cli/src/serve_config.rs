@@ -85,54 +85,41 @@ pub struct ServeConsoleConfig {
 
 impl ResolvedServeConfig {
     pub fn load(overrides: ServeOverrides) -> Result<Self> {
-        let file_path = overrides.config.clone();
+        let file_path = overrides.config;
         let file_config = if let Some(path) = file_path.as_ref() {
-            Some(AnyserveConfigFile::load(path)?)
+            AnyserveConfigFile::load(path)?
         } else {
-            None
+            AnyserveConfigFile::default()
         };
 
-        let server = file_config
-            .as_ref()
-            .and_then(|config| config.server.as_ref());
-        let tls = server.and_then(|server| server.tls.as_ref());
-        let mut runtime = file_config
-            .as_ref()
-            .and_then(|config| config.runtime.clone())
-            .unwrap_or_default()
-            .resolve();
+        let server = file_config.server.unwrap_or_default();
+        let tls = server.tls.unwrap_or_default();
+        let defaults = GrpcConfig::default();
+        let mut runtime = file_config.runtime.unwrap_or_default().resolve();
         runtime.journal = if overrides.ephemeral {
             None
         } else {
             file_config
-                .as_ref()
-                .and_then(|config| config.journal.clone())
+                .journal
                 .unwrap_or_default()
                 .resolve(overrides.journal_path)?
         };
-        let console = file_config
-            .as_ref()
-            .and_then(|config| config.console.as_ref())
-            .and_then(|config| config.clone().resolve());
+        let console = file_config.console.and_then(|config| config.resolve());
         let grpc = GrpcConfig {
             host: overrides
                 .grpc_host
-                .or_else(|| server.and_then(|server| server.grpc_host.clone()))
-                .unwrap_or_else(|| GrpcConfig::default().host),
+                .or(server.grpc_host)
+                .unwrap_or(defaults.host),
             port: overrides
                 .grpc_port
-                .or_else(|| server.and_then(|server| server.grpc_port))
-                .unwrap_or(GrpcConfig::default().port),
+                .or(server.grpc_port)
+                .unwrap_or(defaults.port),
             tls_enabled: overrides
                 .grpc_tls_enabled
-                .or_else(|| tls.and_then(|tls| tls.enabled))
-                .unwrap_or(GrpcConfig::default().tls_enabled),
-            cert_file: overrides
-                .grpc_cert_file
-                .or_else(|| tls.and_then(|tls| tls.cert_file.clone())),
-            key_file: overrides
-                .grpc_key_file
-                .or_else(|| tls.and_then(|tls| tls.key_file.clone())),
+                .or(tls.enabled)
+                .unwrap_or(defaults.tls_enabled),
+            cert_file: overrides.grpc_cert_file.or(tls.cert_file),
+            key_file: overrides.grpc_key_file.or(tls.key_file),
         };
 
         Ok(Self {
@@ -140,11 +127,7 @@ impl ResolvedServeConfig {
             grpc,
             runtime,
             console,
-            auth: file_config
-                .as_ref()
-                .and_then(|config| config.auth.clone())
-                .unwrap_or_default()
-                .resolve()?,
+            auth: file_config.auth.unwrap_or_default().resolve()?,
         })
     }
 

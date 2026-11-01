@@ -4,7 +4,7 @@ import { type PaneStat } from "./app-constants";
 import { formatCapacityMap, formatNumber } from "./format";
 import type { JobDetailResponse, JobSummary, OverviewResponse, WorkerSummary } from "./types";
 import { InterfacesTable, JobsTable, WorkersTable } from "./pane-tables";
-import { JobInspector as JobInspectorPanel } from "./pane-inspector";
+import { JobInspector } from "./pane-inspector";
 
 export function JobsPane(props: {
   title: string;
@@ -164,12 +164,10 @@ export function HistoryPane(props: {
           </label>
         </div>
       }
-      inspector={<JobInspectorPanel detail={detail} />}
+      inspector={<JobInspector detail={detail} />}
     />
   );
 }
-
-export { JobInspector } from "./pane-inspector";
 
 function StatsRow(props: { stats: PaneStat[] }) {
   return (

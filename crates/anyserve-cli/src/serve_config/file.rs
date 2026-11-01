@@ -11,33 +11,26 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AnyserveConfigFile {
-    #[serde(default)]
     pub(super) server: Option<ServerConfigFile>,
-    #[serde(default)]
     pub(super) runtime: Option<RuntimeConfigFile>,
-    #[serde(default)]
     pub(super) journal: Option<JournalConfigFile>,
-    #[serde(default)]
     pub(super) console: Option<ServeConsoleConfigFile>,
-    #[serde(default)]
     pub(super) auth: Option<AuthConfigFile>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AuthConfigFile {
     #[serde(default)]
     client_tokens: Vec<String>,
     /// Env var holding comma-separated client tokens.
-    #[serde(default)]
     client_tokens_env: Option<String>,
     #[serde(default)]
     worker_tokens: Vec<String>,
     /// Env var holding comma-separated worker tokens.
-    #[serde(default)]
     worker_tokens_env: Option<String>,
 }
 
@@ -67,23 +60,18 @@ impl AnyserveConfigFile {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ServerConfigFile {
-    #[serde(default)]
     pub(super) grpc_host: Option<String>,
-    #[serde(default)]
     pub(super) grpc_port: Option<u16>,
-    #[serde(default)]
     pub(super) tls: Option<TlsConfigFile>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ServeConsoleConfigFile {
-    #[serde(default)]
     enabled: Option<bool>,
-    #[serde(default)]
     listen: Option<String>,
     #[serde(default)]
     allowed_origins: Vec<String>,
@@ -104,18 +92,15 @@ impl ServeConsoleConfigFile {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TlsConfigFile {
-    #[serde(default)]
     pub(super) enabled: Option<bool>,
-    #[serde(default)]
     pub(super) cert_file: Option<String>,
-    #[serde(default)]
     pub(super) key_file: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct JournalConfigFile {
     enabled: Option<bool>,
@@ -258,7 +243,7 @@ impl JournalConfigFile {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RuntimeConfigFile {
     heartbeat_interval_ms: Option<u64>,
@@ -279,7 +264,7 @@ pub(super) struct RuntimeConfigFile {
     #[serde(default)]
     interfaces: BTreeMap<String, InterfaceConfigFile>,
 }
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InterfaceConfigFile {
     max_queue: Option<usize>,

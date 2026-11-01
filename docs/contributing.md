@@ -1,7 +1,7 @@
 # Contributing
 
 Use the Rust version in [rust-toolchain.toml](../rust-toolchain.toml), `protoc`,
-Python 3.12+ and Node.js. Run from the repository root.
+Python 3.12+ and Node.js 24+. Run commands from the repository root.
 
 ## Checks
 
@@ -23,221 +23,156 @@ python scripts/check-release-version.py
 ```
 
 Rebuild the Python extension after changing Rust bindings or the protocol.
-The SDK process suite starts authenticated servers and workers in temporary
-directories. `ANYSERVE_BIN` overrides its default `target/debug/anyserve` binary.
+The SDK process suite uses temporary authenticated servers/workers;
+`ANYSERVE_BIN` overrides its default `target/debug/anyserve` binary.
 
-Deployment checks require Docker and Helm:
-
-```bash
-helm lint deploy/helm/anyserve
-helm template anyserve deploy/helm/anyserve \
-  --set worker.enabled=true --set worker.image=example/worker
-docker build -t anyserve .
-```
-
-## Benchmarks
-
-The multi-replica integration suite uses real PostgreSQL, isolated schemas and
-a TCP load balancer. It covers competing submissions/claims, cancellation,
-takeover fencing, attempt limits, shared progress cursors, receipts and bounded
-result reads. Run it with Docker (the script removes only its own test container):
+Run the real PostgreSQL integration suite with Docker:
 
 ```bash
 python3 scripts/test-postgres.py
 ```
 
-Alternatively, set `ANYSERVE_TEST_POSTGRES_URL` to a disposable PostgreSQL database
-whose user can create schemas. The same tests can be run directly with
-`cargo test --locked -p anyserve-core postgres_cluster_ -- --ignored`.
+It creates a disposable PostgreSQL 18 container and isolated schemas, covering
+claims, cancellation, takeover fencing, attempt limits, shared cursors, receipts
+and bounded reads. The script removes its own container. Alternatively, set
+`ANYSERVE_TEST_POSTGRES_URL` to a disposable database with schema creation
+privileges and run serially:
 
-Core measurements cover queries over 10,000 jobs, dispatch with 129 workers and
-256 unmatched queued jobs, and recovery of 2,048 durable jobs. They also run on
-macOS without external services:
+```bash
+cargo test --locked -p anyserve-core postgres_cluster_ -- --ignored --test-threads=1
+```
+
+Deployment checks:
+
+```bash
+helm lint deploy/helm/anyserve
+helm template anyserve deploy/helm/anyserve \
+  --set worker.enabled=true --set worker.image=example/worker
+docker build -t anyserve:local .
+```
+
+See [deployment](deployment.md) for Worker images, kind and PostgreSQL setup.
+
+## Benchmarks
+
+Build release binaries once and preserve them for comparisons:
+
+```bash
+cargo build --release --locked -p anyserve -p anyserve-bench
+python3 bench/load/postgres.py --self-check
+```
+
+| Runner | Scope / entry point |
+|---|---|
+| `bench/load/run.sh` | Linux, fresh FULL-sync SQLite journal per case; `--repeat 2`, `--help` for options |
+| `bench/load/postgres.py` | macOS/Linux, two active replicas and disposable PG 18 schemas; S3 defaults to complete durable Submit/Watch round trips |
+| `bench/load/console.py` | SQLite business traffic with/without ten HTTP observers, plus cold 16 MiB result reads checked for 4 KiB previews |
+| `npm --prefix console run bench:analytics -- /tmp/analytics.json` | DuckDB-WASM imports/queries over 10k/100k synthetic metadata rows, three repetitions; excludes browser rendering/network |
+
+The native scenarios are S1 ephemeral Invoke, S2 streamed Invoke (64 × 1 KiB
+output frames), S3 durable Submit/Watch, S4 ephemeral Submit/Watch, and S5 mixed
+S1/S3. The Linux runner's repeatability gate compares p50 within 10%; S5 gates
+its durable path. Throughput and errors must also be checked.
+
+Core scale checks measure queries over 10,000 jobs, dispatch with 129 workers
+and recovery of 2,048 durable jobs:
 
 ```bash
 cargo test --locked --release -p anyserve-core --test runtime_v2 scale_ -- --ignored --nocapture --test-threads=1
 ```
 
-The Linux load runner uses release binaries and a fresh FULL-sync journal per
-case. Warm-up or measurement errors fail the run:
-
-```bash
-bench/load/run.sh --repeat 2
-bench/load/run.sh --cases S1-c16,S3-c16 --duration 5s --warmup 2s --repeat 2
-```
-
-| Scenario | Workload |
-|---|---|
-| S1 | Ephemeral Invoke, 256 B echo as a terminal result |
-| S2 | Streamed Invoke, 64 frames of 1 KiB |
-| S3 | Durable Submit and Watch, 256 B echo with journal commits |
-| S4 | Ephemeral Submit and Watch, 256 B echo |
-| S5 | Clients alternate S1 and S3 |
-
-Compare both checkouts on the same idle host and repeat matching cases.
-`--repeat 2` checks p50 repeatability within 10%; compare against a separate
-baseline to assess regressions. S5 gates its durable-path p50. Check throughput
-as well as latency; short local runs do not predict production performance.
-
-Results under `bench/load/results/` include summaries, raw measurements, logs,
-environment and CPU/RSS samples. Use `bench/load/run.sh --help` for workload and
-profiling options. `--keep` leaves the final processes running and records them
-in `processes.json`; stop them with SIGTERM when finished.
-
-For PG active-active benchmarks on macOS or Linux:
-
-```bash
-cargo build --release --locked -p anyserve -p anyserve-bench
-python3 bench/load/postgres.py --out bench/load/results/pg-after --repeat 3
-python3 bench/load/postgres.py --self-check
-```
-
-This runs two replicas against disposable Docker PostgreSQL 18, with an isolated
-schema per case. Set `ANYSERVE_TEST_POSTGRES_URL` to reuse a test database instead
-(requires `psql` and permission to create/drop schemas). The defaults cover 64
-and 256 concurrent requests per replica with 256-byte payloads, plus four per
-replica with 1 MiB payloads. Override `--cases 64:256,256:256,4:1048576` as needed.
-The default `--scenario S3` measures durable Submit **and Watch through verified
-output**, not submission-only QPS. Raw latency samples, errors, worker participation, process
-CPU/RSS, PG settings, source revision and binary hashes are retained; processes
-and schemas are removed automatically. PG CPU/RSS are excluded from process
-totals. Use `--server-bin /path/to/baseline/anyserve --source-revision COMMIT`
-and the same `--bench-bin` for matching before/after runs on an idle host.
-PG runs default to `--payload-pattern random --payload-seed 0`: reproducible
-high-entropy bytes generated with SplitMix64 before timing, avoiding the overly
-optimistic TOAST compression of repeated bytes. Use `--payload-pattern repeat`
-for the historical repeated-x workload. Pattern, seed and generator are recorded
-alongside a post-run sample of logical/stored object bytes (excluding row/index
-and TOAST page overhead). Rebuild and freeze one new bench binary for both old
-and new servers; never compare different client hashes or payload patterns.
-The same buffer is reused across jobs: this approximates compressed JPEG/video
-bytes, not codecs, real media delivery or production storage capacity. The direct
-bench `client` and `seed` commands accept these options but retain `repeat` as
-their default, preserving the generic and Console runners' historical workloads.
-They select input/echo bytes; S2's fixed streamed output frames are unchanged.
-
-Use S6 to measure durable Submit acknowledgements separately from result verification:
-
-```bash
-python3 bench/load/postgres.py --scenario S6 --cases 64:256,256:256 \
-  --worker-concurrency 256 --max-jobs 100000 --drain-timeout 120 \
-  --out bench/load/results/pg-submit --repeat 2
-```
-
-`--worker-concurrency` fixes execution slots per replica independently of client
-concurrency; omitting it retains the S3 default of matching each case's client
-concurrency. S6 caps total attempts per client, including warmup and failures, at
-`--max-jobs` (default 100,000). It records every attempted ID, then verifies complete
-echo results within `--drain-timeout` seconds (default 120), including submissions
-whose response failed after the job may have committed. Raw client JSON retains
-all IDs and ACK latencies. Each client verifies at its Submit concurrency, recorded
-as `drain_concurrency`. Jobs get a bounded total timeout of warmup + duration +
-30 seconds for an in-flight Submit + drain timeout + 5 seconds, recorded as
-`job_total_timeout_ms`. `submit_ack_rps` divides measured ACKs by the union of
-actual Submit windows, including in-flight Submit responses and excluding result
-drain. The separate `drain` metrics count verified results over the entire run,
-including warmup; they are not Submit throughput. Clients enter drain independently,
-so one may read results while another still finishes Submit calls. The summary
-records `cross_client_submit_drain_overlap_seconds` and its fraction of the Submit
-window; compare these alongside throughput, especially when `--max-jobs` stops a
-client early.
-
-To test a sustained offered load, add `--submit-rate` (per client, with one client
-per replica). For example, this requests 2,000 sends/s across two replicas:
+### PostgreSQL traffic and Console reads
 
 ```bash
 python3 bench/load/postgres.py --scenario S6 --replicas 2 --cases 256:256 \
   --worker-concurrency 256 --submit-rate 1000 --warmup 30 --duration 300 \
-  --max-jobs 400000 --drain-timeout 300 --repeat 1 \
-  --out bench/load/results/pg-paced
+  --max-jobs 400000 --drain-timeout 300 --queue-sample-interval 10 \
+  --console-operators 10 --repeat 1 --out bench/load/results/pg-paced
 ```
 
-Pacing uses 10 ms batches with bounded in-flight RPCs. Busy slots and expired
-allocations are counted and skipped; there is no waiting send queue or catch-up
-burst. `rate_control` reports actual sends, skipped allocations and the sending
-window separately from ACK tail and drain. Keep `--max-jobs` above the requested
-warmup + measurement volume; reaching it early marks the window incomplete.
-`observed_peak_inflight` checks the client concurrency bound. A configured rate,
-or a run with every result eventually verified, does not prove sustained capacity:
-check actual sends, skipped allocations, completed jobs/s and pending-job growth
-during the full measurement window. The shared queue samples use only queries
-wholly within all clients' overlapping sending windows; completions may include
-warmup jobs, so this is not a per-job completion latency measurement.
+This requests 2,000 sends/s across two clients. S6 measures durable Submit ACKs
+and then separately verifies complete echo results and reconciles actual job IDs
+against PG. Omitting `--submit-rate` uses a bounded closed loop. The default S3
+scenario includes result delivery in each measured round trip.
 
-S6 samples all five job states from the shared PG schema approximately every
-`--queue-sample-interval` seconds (default 1; positive and finite) through submission
-and drain. This is a target interval after the previous query finishes; resource
-sampling and the runner's 0.5-second polling loop add delay. Increasing it,
-for example to `10`, reduces count-query overhead but makes queue peaks and
-completion-rate estimates coarser. The initial state and final full ID/state
-reconciliation are always collected. Artifacts retain the queue timeline, sampled
-peaks, samples immediately before/after submission ends, and final ID reconciliation.
-ACKed jobs must exist, committed jobs must have verified results, and the final
-queued/running count must be zero. `resources` covers the Submit windows;
-`resources_whole_run` covers submission and verification. Both record observed
-sample coverage; client resource samples end when the first client exits.
-Failed cases retain `failure.json` with the stage, client exit codes and available result counts, plus a database ID/state snapshot when its five-second collection succeeds; incomplete clients have no inferred attempt count.
+| Option / artifact | Meaning |
+|---|---|
+| `--cases` | Per-replica client concurrency:payload bytes; defaults `64:256,256:256,4:1048576` |
+| `--worker-concurrency` | Slots per replica; defaults to each case's client concurrency |
+| `--max-jobs` | Attempt cap per S6 client, including warmup/failures; default 100,000; keep above requested warmup + measurement volume |
+| `--drain-timeout` | Result-verification deadline, default 120 seconds; clients drain independently and may overlap another client's sends |
+| `--payload-pattern`, `--payload-seed` | PG runner defaults to reproducible high-entropy `random`, seed 0; `repeat` reproduces the historical repeated-x workload |
+| `rate_control` | Actual sends, skipped allocations, in-flight peak and sending window; no waiting send queue or catch-up bursts |
+| `submit_ack_rps`, `drain` | ACKs over the union of Submit windows including response tails; separately, verified results over the whole run including warmup |
+| `queue`, `id_reconciliation` | Shared PG state samples, backlog growth and full attempted/ACKed/committed/verified ID reconciliation |
+| `resources`, `resources_whole_run` | Process CPU/RSS over Submit windows or whole run, with sample coverage; excludes PG and Python observer CPU |
 
-Add `--console-operators 10` to measure PostgreSQL business traffic alongside
-Console HTTP reads. The total operator count is distributed across replicas;
-each operator reads overview, jobs, workers and one listed job's detail every
-500 ms, with serial requests and no catch-up bursts. The default is disabled.
-Compare otherwise identical runs with `0` and `10`, using the same binaries.
-The observer creates no jobs and leaves S6's complete ID reconciliation unchanged.
-`console-http.json` retains request timings, status, response body bytes and errors;
-the summary separates the entire HTTP run from the business measurement windows.
-Every configured operator must successfully exercise all four endpoints during
-measurement. Rates count actual HTTP attempts; latency includes completion tails.
-Polling continues through result drain, and observer threads stop before servers.
-Observer CPU runs in the Python harness and is excluded from role CPU totals.
-Overview and worker counters are replica-local; use shared PG queue samples for
-backlog. This covers HTTP APIs, not browser rendering or DuckDB/Explore queries.
+PG runs use fresh schemas and remove their processes and schemas on exit.
+`ANYSERVE_TEST_POSTGRES_URL` reuses a disposable database instead of Docker;
+this needs `psql` and schema creation/drop privileges. S6 must verify every
+committed job and finish with no queued/running jobs. Failed runs retain their
+stage, available client results and a bounded database snapshot in `failure.json`.
+Never treat missing client output as a measured attempt count.
 
-For Console overhead and large-result previews on macOS or Linux, build both
-release binaries and run the standard-library Python runner:
+`--console-operators` distributes serial 500 ms polling cycles across replicas:
+overview, latest jobs, workers and a listed job's detail. Compare `0` and `10`
+with otherwise identical settings. `console-http.json` records actual timings,
+status, body bytes and errors through drain; every operator must exercise all
+four operations during measurement. Threads stop before server cleanup.
+The stock runner requests `/api/jobs?limit=100`; actual Queue/History pages use
+state filters. Test these separately against a large completed history,
+including an empty Queue, rather than extrapolating from the latest-jobs route.
+Overview and worker counters are replica-local; use PG queue samples for backlog.
 
-```bash
-cargo build --release --locked -p anyserve -p anyserve-bench
-python3 bench/load/console.py --out bench/load/results/console-after --repeat 3
-```
+### Comparing and interpreting runs
 
-Use `--server-bin /path/to/baseline/anyserve` with a separate output directory
-to compare a saved baseline binary. Keep `--bench-bin` identical between runs.
-The runner uses fresh local ports and journals, four echo workers, 64 concurrent
-clients, and 20-second measurements after 5 seconds of warm-up. It compares S1
-and S3 with and without ten simulated operators issuing four HTTP queries every
-500 ms (about 80 requests/s total). A separate case saturates cold detail reads
-with four readers. Four verified 16 MiB durable results are seeded before each
-run and left on disk after restart. Every detail response is checked for the
-original size and a truncated 4 KiB preview. HTTP errors, business errors,
-latency samples, CPU/RSS, binary hashes and environment are recorded; measured
-processes are stopped automatically. The HTTP load is held constant, so these
-comparisons exclude frontend polling savings. These are short, closed-loop
-local measurements, not a production capacity or large-media transfer test.
+- Use the same idle host, database durability settings, client binary hash,
+  payload pattern/seed, concurrency and sampling interval. Freeze server binaries
+  and record their source revisions; `--server-bin`, `--bench-bin` and
+  `--source-revision` select them. Use separate output directories.
+- Repeat matching cases in A/B/B/A order. Check actual sends, skipped allocations,
+  completed jobs/s and pending-job growth, alongside p50/p95/p99. A configured
+  rate or eventual successful drain does not establish sustained capacity.
+- The default queue interval is one second. Increasing it to ten reduces count
+  overhead but misses peaks. Completion estimates use samples wholly within all
+  clients' overlapping send windows and may include warmup jobs.
+- Random payloads reuse one deterministic buffer per client. They approximate
+  compressed bytes, not media codecs or distinct assets. URI objects, 5 MiB
+  deployment smoke tests and bounded Console previews do not establish media
+  throughput or production storage capacity.
+- Browser/Explore performance is separate from HTTP polling. Frontend tests run
+  actual WASM queries and Arrow imports under Node; verify production assets in
+  a browser when changing Worker loading. The 100k-row engine benchmark bypasses
+  the UI's 32 MiB JSON load cap.
 
-Explore's tests run actual DuckDB-WASM queries, Arrow IPC imports, query bounds,
-error recovery and cancellation through a real Worker transport under Node.
-The browser UI is tested separately for paging, partial loads and stale responses.
-Measure the same engine over 10,000 and 100,000 synthetic metadata rows with
-Node 24+, three repetitions per size:
+Results under `bench/load/results/` retain environment, hashes, raw measurements,
+logs and resource samples; local results are ignored by Git. The Linux runner's
+`--keep` leaves the final processes listed in `processes.json`; stop them with
+SIGTERM. Short local runs do not predict production capacity.
 
-```bash
-npm --prefix console run bench:analytics -- /tmp/anyserve-analytics.json
-```
+### Recorded local baseline (2026-11-01)
 
-This records initialization, 250-row batch imports, SQL timings and Node RSS.
-It excludes network transfer, browser rendering and browser Worker messaging;
-the 100,000-row engine case is independent of the UI's 32 MiB JSON input cap.
-Validate production asset loading in a browser when changing the Worker setup.
+These are macOS arm64 / Docker PostgreSQL 18.6 observations for server commit
+`f0e0b05`, using 256 B repeated payloads. They are reference measurements, not
+release capacity guarantees.
+
+| Check | Observed result / scope |
+|---|---|
+| Empty Queue, 119,992 completed jobs | Same-data A/B/B/A against `3fd8683`, fresh process per case, 100 warmup and 100 measured cycles per endpoint: P50 41.55/42.12 ms before, 1.99/0.68 ms after |
+| Concurrent tasks and real Queue/History filters | Two replicas, 256 client/worker slots each, 5 Queue + 5 History observers: 120,000 IDs fully verified, zero business/HTTP errors, 1,998.49 Submit ACKs/s over a 60-second sending window; result drain is separate |
+
+The longer 2,000 sends/s runs showed backlog growth in one control case, so
+stable 2,000 completed jobs/s remains unproven. Application-instance pause and
+stale-result fencing were tested separately at 100 sends/s; PG primary failover, full-load
+failover and large-media throughput were not established by these runs.
 
 ## CI and releases
 
-The [CI workflow](../.github/workflows/anyserve-ci.yml) runs these checks and
-uploads benchmark artifacts even when a gate fails.
-The Rust job also runs the PG multi-replica integration tests serially against
-a disposable PostgreSQL 18 service.
+[CI](../.github/workflows/anyserve-ci.yml) runs these checks and uploads benchmark
+artifacts even when a gate fails. Its Rust job runs the real PG integration
+suite serially against a disposable PostgreSQL 18 service.
 
 Version tags build platform archives, container images and Python distributions.
-Tags must match the Rust, Python and chart application versions. Manual runs
-without a tag validate the selected ref without publishing; supplying an
-existing tag republishes its artifacts, with existing PyPI files skipped.
+Tags must match Rust, Python and chart application versions. Manual runs without
+a tag validate the selected ref; supplying an existing tag republishes its
+artifacts, with existing PyPI files skipped.

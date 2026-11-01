@@ -601,12 +601,6 @@ code {
   cursor: default;
 }
 
-.button--quiet {
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-muted);
-}
-
 /* Inspector */
 
 .inspector__actions {

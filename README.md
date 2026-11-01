@@ -27,13 +27,10 @@ backend-specific semantics to the control plane.
   API, console, health probes, Runtime metrics and logs.
 
 ```text
-Rust / Python client -> native Client gRPC -> Execution Runtime
-                                                |       |
-                                 optional SQLite       Worker.Session / Attempt
-                                     journal                  |
-                                                     application worker
-                                                              |
-                                                       application backend
+Clients -- Client gRPC --> control-plane replica(s) <-- Worker gRPC -- workers
+                                    |                                  |
+                       SQLite (one process) or                 application backend
+                       PostgreSQL (shared queue)
 ```
 
 PostgreSQL supports multiple active control-plane replicas sharing a durable
@@ -95,13 +92,15 @@ enabled, `/metrics` and console reads require a client token; health probes
 remain accessible without one.
 
 For the browser console, run `npm --prefix console ci` and
-`npm --prefix console run dev`. The console accepts a client token and keeps it
-in the current browser tab's session storage.
+`npm --prefix console run dev`, then open the URL printed by Vite. The dev server
+proxies `/api` to `127.0.0.1:3001`. The management listener serves the API;
+browser assets are built and hosted separately. See
+[Console deployment](docs/deployment.md#browser-console) for production hosting.
+The console keeps its client token in the current browser tab's session storage.
 
-The core exposes the native `anyserve.v2` Client and Worker services only.
-Applications connect their own workers with the SDK and keep backend protocols,
-model loading and batching in worker code. Use matching binary, SDK and protocol
-versions; see [deployment and recovery](docs/deployment.md).
+Explore uses DuckDB-WASM to query a bounded, manually loaded metadata dataset.
+It excludes request/result bodies and media. Use matching binary, SDK and protocol
+versions; see [configuration](docs/configuration.md#console-explore) for query limits.
 
 ## Repository and documentation
 

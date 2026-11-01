@@ -159,6 +159,9 @@ worker_tokens=["worker"]
             uri_object("")
         with self.assertRaisesRegex(ValueError, "URI must not be empty"):
             self.client.submit(interface, [{"uri": ""}])
+        for invalid in [{}, {"inline": None, "uri": None}, {"inline": b"x", "uri": "video.mp4"}]:
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "exactly one"):
+                self.client.submit(interface, [invalid])
         connection = WorkerConnection(self.endpoint, {
             "worker_id": "uri-worker", "interfaces": [interface], "max_concurrency": 1,
         }, "worker")
@@ -166,8 +169,10 @@ worker_tokens=["worker"]
             objects = [inline_object(b""), uri_object("relative/video.mp4", {
                 "content_type": "video/mp4", "size_bytes": "1099511627776",
             })]
+            nullable_objects = [{"inline": b"", "uri": None, "metadata": None},
+                                {**objects[1], "inline": None}]
             # Force URI input through InputData rather than the small Assign path.
-            job = self.client.submit(interface, objects,
+            job = self.client.submit(interface, nullable_objects,
                 options=ExecutionOptions(params=b"p" * (65 * 1024), total_timeout_ms=10000))
             message = eventually(lambda: connection.receive(0.1))
             self.assertEqual(message["type"], "assignment")
@@ -176,7 +181,7 @@ worker_tokens=["worker"]
             self.assertEqual(attempt.inputs, objects)
             with self.assertRaisesRegex(ValueError, "URI must not be empty"):
                 attempt.complete([{"uri": ""}])
-            attempt.complete(objects)
+            attempt.complete(nullable_objects)
             self.assertEqual(self.client.result(job["job_id"]), objects)
         finally:
             connection.close()

@@ -3,7 +3,7 @@ import { AuthenticationError, getAnalyticsJobs, getJob } from "./api";
 import { MAX_DATA_BYTES, MAX_RESULT_ROWS, QUERY_PRESETS, resultCsv, type QueryResult } from "./analytics-data";
 import type { AnalyticsEngine } from "./analytics-engine";
 import { asErrorMessage, formatTimestamp } from "./format";
-import { JobInspector } from "./panes";
+import { JobInspector } from "./pane-inspector";
 import type { AnalyticsSource, JobDetailResponse } from "./types";
 
 interface Dataset {

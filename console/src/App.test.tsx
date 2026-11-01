@@ -65,6 +65,32 @@ it("hides the previous detail and cancel action while loading a new selection", 
   expect(screen.queryByRole("button", { name: "Cancel job" })).toBeNull();
 });
 
+it("keeps each pane's selection and follows the history worker filter", async () => {
+  vi.mocked(getJobs).mockImplementation(async (states) => ({
+    jobs: states.includes("queued") ? [summary("A"), summary("B")] : ["C", "D"].map(id => ({
+      ...summary(id), state: "succeeded" as const, latest_worker_id: `worker-${id}`,
+    })),
+    next_page_token: null,
+  }));
+  vi.mocked(getJob).mockImplementation(async id => ({
+    ...detail(id), job: { ...detail(id).job, state: ["C", "D"].includes(id) ? "succeeded" : "queued" },
+  }));
+  render(<App />);
+  fireEvent.click(await screen.findByText("B"));
+  await screen.findByRole("heading", { name: "B" });
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  fireEvent.click(await screen.findByText("D"));
+  await screen.findByRole("heading", { name: "D" });
+  fireEvent.click(screen.getByRole("button", { name: "Queue" }));
+  await screen.findByRole("heading", { name: "B" });
+  fireEvent.click(screen.getByRole("button", { name: "History" }));
+  await screen.findByRole("heading", { name: "D" });
+  fireEvent.change(screen.getByLabelText("Worker"), { target: { value: "worker-C" } });
+  await screen.findByRole("heading", { name: "C" });
+  expect(screen.queryByRole("heading", { name: "D" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Cancel job" })).toBeNull();
+});
+
 it("polls the active pane and fetches completed details only once per selection", async () => {
   vi.useFakeTimers();
   vi.mocked(getJobs).mockImplementation(async (states) => ({

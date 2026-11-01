@@ -6,9 +6,9 @@ journal is enabled and management HTTP is disabled.
 
 ## Server file
 
-This example lists all server-file keys. Runtime and journal values are their
-defaults; the TLS block is commented because it requires your certificate files.
-Paths are relative to the server's working directory.
+This example shows the SQLite server file with default runtime and journal
+values. PostgreSQL keys are described below. The TLS block requires your
+certificate files. Paths are relative to the server's working directory.
 
 ```toml
 [server]
@@ -123,8 +123,8 @@ directly from the journal, preserving the original size without reserving
 full-result capacity. GetJob/Watch continue to return complete results and
 account for their bytes. Console polling pauses in hidden browser tabs;
 inactive panes and completed job details do not poll.
-Opening an older journal creates a large-output metadata index once; its build time
-depends on the retained data size.
+Opening an older SQLite journal can build missing preview/history indexes;
+allow for startup time proportional to retained data.
 
 Compiled protocol limits are 16 MiB per inline object, 32 MiB per job's input or
 attempt result (including associated metadata), 32 KiB metadata, 1,024 objects,
@@ -132,33 +132,33 @@ attempt result (including associated metadata), 32 KiB metadata, 1,024 objects,
 The gRPC message cap is 64 MiB including protobuf overhead. URI objects are opaque
 references; applications fetch them.
 
-Console's **Explore** page loads task metadata into an in-memory DuckDB-WASM
-database in a dedicated Worker. Choose completed durable history (including
-evicted jobs) or current retained jobs, and a creation-time window of at most
-31 days. The authenticated `/api/analytics/jobs` endpoint uses creation-time
-and job-id cursors, with at most 250 rows per page. A new partial history index
-is built on first journal open; its startup cost depends on retained history.
-Pages are independent observations, so job states can change during a load.
-In PG mode, the current-work dataset covers shared queued/running durable jobs;
-completed durable jobs are available from the history source.
+## Console Explore
 
-Explore loads data manually, with a default of 10,000 jobs and upper bounds of
-100,000 jobs and 32 MiB of serialized metadata. It marks partial datasets;
-aggregations cover only the loaded data. `jobs` contains summary columns and
-`job_metadata(job_id, key, value)` supports tag filters and joins. Durations
-include queue time. Request/result bodies and media are excluded. Query results
-are capped at 1,000 rows / 100 columns / 4 MiB, large cells are shortened, and tables render
-50 rows per page. CSV exports contain the displayed, filtered results.
+Explore manually loads metadata into a local DuckDB-WASM database in a dedicated
+Worker. `jobs` contains summary columns; `job_metadata(job_id, key, value)`
+supports tag filters and joins. Durations include queue time. Request/result
+bodies and media are excluded.
 
-SQL runs locally with a 256 MB DuckDB memory limit and a 15-second deadline.
-Cancellation or timeout terminates the Worker and requires reloading the data.
-External access and extension installation are disabled; queries are prepared
-as a single SELECT relation. Leaving Explore releases its Worker and dataset.
-The WASM and Worker assets are served with the Console (no runtime CDN). Only
-Explore loads them; the EH WASM asset is about 36 MB before HTTP compression.
-Use a browser with WebAssembly exception handling. Serve the production assets
-with compression and immutable caching for hashed filenames; no cross-origin
-isolation headers are required by this single-threaded bundle.
+| Boundary | Behavior |
+|---|---|
+| Source | Completed durable history, or current retained jobs; in PG mode the latter means shared queued/running durable jobs |
+| Time range | Creation time, at most 31 days; custom inputs use local time with second precision |
+| Load | 10,000 jobs by default; at most 100,000 jobs or 32 MiB of serialized metadata |
+| API | Authenticated `/api/analytics/jobs`, up to 250 rows per page with creation-time/job-ID cursors |
+| SQL | One prepared SELECT relation; 256 MB DuckDB memory limit, 15-second deadline, no external access or extension installation |
+| Results | At most 1,000 rows, 100 columns or 4 MiB; large cells shortened, 50 rows rendered per page |
+| CSV | Displayed query results after the text filter; includes clipped values and the result limits |
+
+Pages are independent observations, not one database snapshot. Partial loads are
+marked; aggregates cover only the loaded rows. At high task rates, choose a
+seconds-long custom window to stay within the row/byte limits.
+
+Cancellation or timeout terminates the Worker and requires reloading data.
+Leaving Explore releases its Worker and dataset. Only Explore loads the locally
+served WASM/Worker assets; the EH WASM asset is about 36 MB before compression.
+Use a browser with WebAssembly exception handling. The single-threaded bundle
+needs no cross-origin isolation headers. See
+[Console hosting](deployment.md#browser-console) for asset and API setup.
 
 ## CLI
 

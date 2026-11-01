@@ -31,15 +31,18 @@ asynchronous standby is promoted.
 
 Task admission uses a unique job ID and atomic fingerprint comparison. Schedulers
 claim matching work with `FOR UPDATE SKIP LOCKED`; ownership changes increment a
-job epoch. A database-clock node lease, owner ID and epoch guard every attempt
-start, retry and terminal transaction. After a crash, another replica can claim
+job epoch. A node lease is a time-limited permission to own work, renewed against
+database time. Owner ID, lease validity and epoch guard every attempt start,
+retry and terminal transaction. After a crash, another replica can claim
 the unfinished work once the lease expires (15 seconds by default), subject to
 worker availability and the remaining attempt budget. Graceful shutdown expires
 membership immediately. A replica that loses membership fences its local work
 and the CLI exits; Kubernetes or a Docker restart policy gives it a fresh identity.
 Failed renewals are retried only within the last confirmed lease; an unconfirmed
 renewal never extends the replica's local validity.
-Keep all replicas on the same version and runtime policies.
+Keep all replicas on the same version and runtime policies. Budget up to
+`replicas × (max_connections + 1)` database connections, plus administration
+and other applications; the extra connection is dedicated to heartbeat renewal.
 
 Durable Submit, GetJob, Watch, ListJobs, Cancel and Console job queries work across
 replicas. Lifecycle and bounded progress events share database cursors; retries
@@ -62,8 +65,8 @@ Long-lived worker connections can concentrate on one replica after rolling updat
 Durable Submit works even on a replica with no local worker; Invoke requires a
 matching local worker. Rebalance worker connections when using Invoke across replicas.
 Metrics and worker lists describe the serving replica; aggregate metrics across
-pods. Memory and admission
-limits bound each replica's loaded/in-flight work, not the entire PG backlog.
+pods. Memory and admission limits bound each replica's loaded/in-flight work,
+not the entire PG backlog.
 
 For Helm, create a Secret from a private file containing `ANYSERVE_DATABASE_URL`,
 then install a separate PG release (the chart does not install PostgreSQL):
@@ -155,7 +158,28 @@ The worker image contains your handler and the SDK. The chart injects
 `ANYSERVE_ENDPOINT=http://anyserve:50052` (using the actual Service name/port)
 and a worker-role `ANYSERVE_TOKEN`; Python workers can call `serve(handler)`.
 Application clients can run in their own pods, using that Service endpoint and
-a client token from the Secret. SQLite must remain at one replica.
+a client token from the Secret.
+
+## Browser Console
+
+The binary and container expose the management API, not browser assets. Build
+the frontend separately:
+
+```bash
+npm --prefix console ci
+npm --prefix console run build
+```
+
+Serve `console/dist` from a static web server with an `index.html` fallback for
+`/queue`, `/workers`, `/history` and `/explore`. Reverse-proxy `/api` to the
+management listener on port 3001; this keeps browser API requests on the same
+origin. For a separate API origin, set `VITE_CONSOLE_API_BASE_URL` at build time
+and include the frontend origin in `[console].allowed_origins`.
+
+Use a client-role token at the Console sign-in prompt. Enable compression and
+immutable caching for hashed assets, including the Explore WASM and Worker.
+See [Explore limits](configuration.md#console-explore); a partial metadata load
+does not represent the whole task history.
 
 ## Workers across hosts and clusters
 
@@ -189,17 +213,21 @@ Reconstruct sessions or model caches at the application layer after failover.
 
 ## Restart and backup
 
-1. Stop incoming work at the deployment boundary and send SIGTERM/SIGINT. The
-   server stops admission, drains sessions and waits for journal operations.
-2. Wait for exit before replacement. For an offline backup, copy the database
-   and any SQLite sidecars together while the server is stopped.
-3. Start one matching binary with the same journal. Unfinished durable jobs
-   recover within their committed attempt budget. Downtime consumes wall-clock
-   deadlines; recovery time depends on journal size and storage, with no fixed
-   outage guarantee.
-4. Read known job IDs and verify readiness and matching workers before restoring
-   traffic. External side effects need idempotency because recovered work can
-   execute again.
+- **SQLite:** stop incoming work and send SIGTERM/SIGINT. Wait for process exit
+  before copying the database with its SQLite sidecars or starting its replacement.
+  Start one matching binary with the same journal, then check known job IDs,
+  readiness and worker connectivity before restoring traffic.
+- **PostgreSQL:** roll control-plane replicas one at a time, checking readiness
+  and shared results after each replacement. Graceful exit releases membership;
+  a crash requires lease expiry before takeover. Reconnect workers with the
+  matching SDK and check their distribution across replicas. Back up and restore
+  PostgreSQL using the database deployment's own procedures.
+
+Shutdown stops admission and sends Drain; it does not guarantee every handler
+finishes before exit. Unfinished durable jobs can execute again within their
+remaining attempt budget. Downtime consumes wall-clock deadlines, and takeover
+still needs an eligible worker. Invoke, ephemeral jobs and worker-local state
+do not recover through the shared journal.
 
 | State | Survives with a persistent journal? |
 |---|---|
@@ -220,9 +248,11 @@ at the deployment's ingress or proxy.
 |---|---|
 | `/readyz` returns 503 | Shutdown or journal write availability |
 | Ready but calls queue | Matching interfaces, worker connectivity, free slots and capacity |
-| Journal lock failure | Previous process still owns that path |
-| Durable admission fails | Journal capacity, write errors or an uncertain commit; reconcile uncertain commits by restarting |
-| GetJob works but ListJobs omits a job | In-memory retention expired; durable result remains in SQLite |
+| SQLite journal lock failure | Previous process still owns that path |
+| Durable admission fails | Journal capacity and write availability; recover a frozen replica by restart, then reconcile uncertain Submit with the same job ID/specification |
+| SQLite GetJob works but ListJobs omits a job | In-memory retention expired; read the durable result by ID |
+| PG counters differ from job lists | Counters are replica-local; durable job lists cover the shared schema |
+| PG replica exits after lease loss | Check database connectivity and restart policy; use another healthy replica for durable work |
 | Cursor expired | Event history was evicted or belongs to a prior generation; read current state by ID |
 
 Metrics cover Runtime jobs, interfaces, workers, byte budgets and journal.

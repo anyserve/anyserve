@@ -45,8 +45,8 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// Each call establishes its own connection. Worker control and attempt data
-/// deliberately use separate calls so HTTP/2 connection flow control is isolated.
+/// Open a channel. WorkerSession reuses it for control and attempts when the
+/// server requests connection affinity; single-instance mode uses two channels.
 pub(crate) async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let mut transport = Endpoint::from_shared(endpoint.to_owned())
         .context("parse anyserve gRPC endpoint")?

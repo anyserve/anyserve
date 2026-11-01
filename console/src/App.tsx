@@ -23,7 +23,8 @@ import {
   type ConsoleTab,
 } from "./app-constants";
 import { asErrorMessage, formatTimestamp, readTabFromLocation, sortJobs, sortWorkers, truncateMiddle } from "./format";
-import { HistoryPane, JobsPane, JobInspector, WorkersPane } from "./panes";
+import { HistoryPane, JobsPane, WorkersPane } from "./panes";
+import { JobInspector } from "./pane-inspector";
 import { usePollingEffect } from "./usePollingEffect";
 import type { JobDetailResponse, JobSummary, OverviewResponse, WorkerSummary } from "./types";
 
@@ -147,10 +148,6 @@ export default function App() {
       !(selectedJobDetail && HISTORY_STATES.includes(selectedJobDetail.job.state)),
   );
 
-  const queueSelection = useMemo(
-    () => queueJobs.find((job) => job.job_id === selectedQueueJobId) ?? null,
-    [queueJobs, selectedQueueJobId],
-  );
   const historyWorkerOptions = useMemo(() => {
     const ids = new Set<string>();
     for (const worker of workers) {
@@ -178,9 +175,10 @@ export default function App() {
     }
     return historyJobs.filter((job) => job.latest_worker_id === historyWorkerFilter);
   }, [historyJobs, historyWorkerFilter]);
-  const historySelection = useMemo(
-    () => filteredHistoryJobs.find((job) => job.job_id === selectedHistoryJobId) ?? null,
-    [filteredHistoryJobs, selectedHistoryJobId],
+  const activeJobs = activeTab === "history" ? filteredHistoryJobs : queueJobs;
+  const selectedJob = useMemo(
+    () => activeJobs.find((job) => job.job_id === activeSelectedJobId) ?? null,
+    [activeJobs, activeSelectedJobId],
   );
 
   useEffect(() => {
@@ -193,34 +191,14 @@ export default function App() {
   }, [historyWorkerFilter, historyWorkerOptions]);
 
   useEffect(() => {
-    if (activeTab === "workers" || activeTab === "explore") {
+    if (activeTab !== "queue" && activeTab !== "history") {
       return;
     }
-
-    if (activeTab === "history") {
-      if (filteredHistoryJobs.length === 0) {
-        setSelectedHistoryJobId(null);
-        return;
-      }
-
-      if (
-        !selectedHistoryJobId ||
-        !filteredHistoryJobs.some((job) => job.job_id === selectedHistoryJobId)
-      ) {
-        setSelectedHistoryJobId(filteredHistoryJobs[0].job_id);
-      }
-      return;
+    if (!selectedJob) {
+      const select = activeTab === "queue" ? setSelectedQueueJobId : setSelectedHistoryJobId;
+      select(activeJobs[0]?.job_id ?? null);
     }
-
-    if (queueJobs.length === 0) {
-      setSelectedQueueJobId(null);
-      return;
-    }
-
-    if (!selectedQueueJobId || !queueJobs.some((job) => job.job_id === selectedQueueJobId)) {
-      setSelectedQueueJobId(queueJobs[0].job_id);
-    }
-  }, [activeTab, filteredHistoryJobs, queueJobs, selectedHistoryJobId, selectedQueueJobId]);
+  }, [activeTab, activeJobs, activeSelectedJobId, selectedJob]);
 
   async function handleCancel(jobId: string) {
     try {
@@ -344,11 +322,11 @@ export default function App() {
               { label: "Running", value: overview?.queue.running ?? 0 },
             ]}
             jobs={queueJobs}
-            selectedJobId={queueSelection?.job_id ?? null}
+            selectedJobId={selectedJob?.job_id ?? null}
             emptyMessage="No active jobs"
             onSelect={setSelectedQueueJobId}
             inspector={
-              queueSelection ? (
+              selectedJob ? (
                 <JobInspector
                   detail={selectedJobDetail}
                   isCancelling={isCancelling}
@@ -368,8 +346,8 @@ export default function App() {
             overview={overview}
             jobs={filteredHistoryJobs}
             totalJobs={historyJobs.length}
-            selectedJobId={historySelection?.job_id ?? null}
-            detail={historySelection ? selectedJobDetail : null}
+            selectedJobId={selectedJob?.job_id ?? null}
+            detail={selectedJob ? selectedJobDetail : null}
             workerFilter={historyWorkerFilter}
             workerOptions={historyWorkerOptions}
             onWorkerFilterChange={setHistoryWorkerFilter}

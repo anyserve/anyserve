@@ -14,16 +14,50 @@ fn config(raw: &str, mut overrides: ServeOverrides) -> anyhow::Result<ResolvedSe
 
 #[test]
 fn defaults_enable_a_local_full_sync_journal() {
-    let resolved = ResolvedServeConfig::load(ServeOverrides::default()).unwrap();
-    assert_eq!(resolved.grpc.host, "127.0.0.1");
+    for resolved in [
+        ResolvedServeConfig::load(ServeOverrides::default()).unwrap(),
+        config("", ServeOverrides::default()).unwrap(),
+        config(
+            "[server]\n[server.tls]\n[runtime]\n[journal]\n[auth]",
+            ServeOverrides::default(),
+        )
+        .unwrap(),
+    ] {
+        assert_eq!(resolved.grpc.host, "127.0.0.1");
+        assert_eq!(resolved.grpc.port, 50_052);
+        assert!(!resolved.grpc.tls_enabled);
+        let journal = resolved.runtime.journal.unwrap();
+        assert_eq!(
+            journal.path,
+            std::path::Path::new(".anyserve/journal.sqlite")
+        );
+        assert!(journal.full_sync);
+        assert!(resolved.console.is_none());
+        assert!(!resolved.auth.is_enabled());
+    }
+    let resolved = config("[console]\n[auth]", ServeOverrides::default()).unwrap();
+    let console = resolved.console.unwrap();
+    assert_eq!(console.listen, "127.0.0.1:3001");
+    assert!(console.allowed_origins.is_empty());
+}
+
+#[test]
+fn cli_overrides_tls_fields_without_clearing_other_file_settings() {
+    let resolved = config(
+        "[server]\ngrpc_host='0.0.0.0'\n[server.tls]\nenabled=true\ncert_file='file.crt'\nkey_file='file.key'",
+        ServeOverrides {
+            grpc_host: Some("127.0.0.2".into()),
+            grpc_tls_enabled: Some(false),
+            grpc_cert_file: Some("cli.crt".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved.grpc.host, "127.0.0.2");
     assert_eq!(resolved.grpc.port, 50_052);
-    let journal = resolved.runtime.journal.unwrap();
-    assert_eq!(
-        journal.path,
-        std::path::Path::new(".anyserve/journal.sqlite")
-    );
-    assert!(journal.full_sync);
-    assert!(resolved.console.is_none());
+    assert!(!resolved.grpc.tls_enabled);
+    assert_eq!(resolved.grpc.cert_file.as_deref(), Some("cli.crt"));
+    assert_eq!(resolved.grpc.key_file.as_deref(), Some("file.key"));
 }
 
 #[test]

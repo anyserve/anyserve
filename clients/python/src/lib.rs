@@ -10,6 +10,8 @@ pyo3::create_exception!(_native, RpcError, PyRuntimeError);
 use pyo3::types::PyDict;
 use tokio::runtime::{Builder, Runtime};
 
+use execution::field;
+
 type SharedRuntime = Arc<Runtime>;
 
 struct PyObjectRef {
@@ -24,21 +26,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for PyObjectRef {
     fn extract(object: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let object = object.cast::<PyDict>()?;
         Ok(Self {
-            inline: object
-                .get_item("inline")?
-                .map(|value| value.extract())
-                .transpose()?
-                .flatten(),
-            uri: object
-                .get_item("uri")?
-                .map(|value| value.extract())
-                .transpose()?
-                .flatten(),
-            metadata: object
-                .get_item("metadata")?
-                .map(|value| value.extract())
-                .transpose()?
-                .flatten(),
+            inline: field!(object, "inline", Option<Vec<u8>>, None),
+            uri: field!(object, "uri", Option<String>, None),
+            metadata: field!(object, "metadata", Option<HashMap<String, String>>, None),
         })
     }
 }

@@ -2,7 +2,7 @@
     clippy::result_large_err,
     reason = "native RPCs preserve typed tonic statuses"
 )]
-//! Native execution API. Worker control and data use separate TCP connections.
+//! Native execution API. Worker transport follows the server's affinity policy.
 //! The generated protocol types are public so custom engines need no core crate.
 
 use anyhow::Result;
