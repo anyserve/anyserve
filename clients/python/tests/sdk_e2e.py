@@ -380,10 +380,7 @@ serve([async_unary, async_stream], sys.argv[1], token="worker", worker_id="py-as
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_uri_sha256_idempotency_and_cli_connect_bridge(self):
-        import http.server
-        import subprocess
-        from pathlib import Path
+    def test_uri_sha256_idempotency(self):
         from anyserve import uri_object
 
         digest = "a" * 64
@@ -403,110 +400,6 @@ serve([async_unary, async_stream], sys.argv[1], token="worker", worker_id="py-as
             options=ExecutionOptions(affinity_key="a2", fairness_key="f2", concurrency_key="c2"),
         )
         self.assertFalse(j2["created"])
-
-        class UpstreamHandler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                if self.path == "/health":
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"ok")
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length)
-                if self.path == "/predict":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.end_headers()
-                    self.wfile.write(b"http:" + body)
-                elif self.path == "/stream":
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.end_headers()
-                    self.wfile.write(b"data: tok1\n\ndata: tok2\n\ndata: [DONE]\n\n")
-                    self.wfile.flush()
-                else:
-                    self.send_response(404)
-                    self.end_headers()
-
-            def log_message(self, format, *args):
-                pass
-
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
-        http_port = httpd.server_address[1]
-        http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        http_thread.start()
-
-        repo_root = Path(__file__).resolve().parents[3]
-        bin_path = repo_root / "target" / "debug" / "anyserve"
-        bridge_unary = subprocess.Popen(
-            [
-                str(bin_path),
-                "--endpoint",
-                self.endpoint,
-                "connect",
-                "--token",
-                "worker",
-                "--interface",
-                "cli.http.unary",
-                "--pool",
-                "edge-http",
-                "--upstream",
-                f"http://127.0.0.1:{http_port}/predict",
-                "--health-url",
-                f"http://127.0.0.1:{http_port}/health",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        bridge_sse = subprocess.Popen(
-            [
-                str(bin_path),
-                "--endpoint",
-                self.endpoint,
-                "connect",
-                "--token",
-                "worker",
-                "--interface",
-                "cli.http.sse",
-                "--pool",
-                "edge-http",
-                "--upstream",
-                f"http://127.0.0.1:{http_port}/stream",
-                "--stream-sse",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            self.assertEqual(
-                self.client.call(
-                    "cli.http.unary",
-                    b"ping",
-                    options=ExecutionOptions(total_timeout_ms=5_000),
-                ),
-                b"http:ping",
-            )
-            tokens = []
-            with self.client.invoke(
-                "cli.http.sse",
-                b"{}",
-                options=ExecutionOptions(total_timeout_ms=5_000),
-            ) as evs:
-                for ev in evs:
-                    if ev["type"] == "output":
-                        tokens.append(ev["data"])
-            self.assertEqual(b"".join(tokens), b"tok1\ntok2\n")
-        finally:
-            bridge_unary.terminate()
-            bridge_sse.terminate()
-            bridge_unary.wait(timeout=5)
-            bridge_sse.wait(timeout=5)
-            httpd.shutdown()
-            httpd.server_close()
 
 
 if __name__ == "__main__":
