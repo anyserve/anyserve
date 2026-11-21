@@ -9,7 +9,16 @@ pub(super) fn render(runtime: &Runtime) -> String {
     let health = runtime.health();
     let config = runtime.config();
     let workers = runtime.list_workers();
-    let mut out = String::new();
+    let mut live_workers = 0usize;
+    let mut active_leases = 0u64;
+    for worker in &workers {
+        if worker.connected && !worker.draining {
+            live_workers += 1;
+        }
+        active_leases += u64::from(worker.active_leases);
+    }
+
+    let mut out = String::with_capacity(2048);
     out.push_str("# HELP anyserve_runtime_ready Whether the runtime accepts new work.\n# TYPE anyserve_runtime_ready gauge\n");
     let _ = writeln!(out, "anyserve_runtime_ready {}", u8::from(health.ready));
     out.push_str("# HELP anyserve_jobs Jobs currently retained in memory, by state.\n# TYPE anyserve_jobs gauge\n");
@@ -23,25 +32,11 @@ pub(super) fn render(runtime: &Runtime) -> String {
         let _ = writeln!(out, "anyserve_jobs{{state=\"{state}\"}} {count}");
     }
     out.push_str("# HELP anyserve_live_workers Connected, non-draining workers.\n# TYPE anyserve_live_workers gauge\n");
-    let _ = writeln!(
-        out,
-        "anyserve_live_workers {}",
-        workers
-            .iter()
-            .filter(|worker| worker.connected && !worker.draining)
-            .count()
-    );
+    let _ = writeln!(out, "anyserve_live_workers {live_workers}");
     out.push_str("# HELP anyserve_sessions Retained worker sessions, including reconnect grace.\n# TYPE anyserve_sessions gauge\n");
     let _ = writeln!(out, "anyserve_sessions {}", stats.sessions);
     out.push_str("# HELP anyserve_active_leases Active worker leases, including reconnect grace.\n# TYPE anyserve_active_leases gauge\n");
-    let _ = writeln!(
-        out,
-        "anyserve_active_leases {}",
-        workers
-            .iter()
-            .map(|worker| u64::from(worker.active_leases))
-            .sum::<u64>()
-    );
+    let _ = writeln!(out, "anyserve_active_leases {active_leases}");
     out.push_str("# HELP anyserve_budget_bytes Bytes currently reserved in each shared Runtime budget.\n# TYPE anyserve_budget_bytes gauge\n# HELP anyserve_budget_limit_bytes Configured byte limit for each shared Runtime budget.\n# TYPE anyserve_budget_limit_bytes gauge\n");
     for (budget, used, limit) in [
         ("input", stats.input_bytes, config.max_pending_bytes),
@@ -55,37 +50,44 @@ pub(super) fn render(runtime: &Runtime) -> String {
         );
     }
     out.push_str("# HELP anyserve_interface_jobs Queued or running jobs retained per interface.\n# TYPE anyserve_interface_jobs gauge\n# HELP anyserve_interface_oldest_queue_age_seconds Age in seconds of the oldest queued job per interface.\n# TYPE anyserve_interface_oldest_queue_age_seconds gauge\n# HELP anyserve_interface_sessions Retained sessions, including reconnect grace.\n# TYPE anyserve_interface_sessions gauge\n# HELP anyserve_interface_free_slots Available execution slots per interface after credits and concurrency limits.\n# TYPE anyserve_interface_free_slots gauge\n");
+    let mut iface_buf = String::new();
     for (interface, current) in &stats.interfaces {
-        let interface = escape(interface);
+        iface_buf.clear();
+        write_escaped(&mut iface_buf, interface);
         for (state, count) in [("queued", current.queued), ("running", current.running)] {
             let _ = writeln!(
                 out,
-                "anyserve_interface_jobs{{interface=\"{interface}\",state=\"{state}\"}} {count}"
+                "anyserve_interface_jobs{{interface=\"{iface_buf}\",state=\"{state}\"}} {count}"
             );
         }
         let _ = writeln!(
             out,
-            "anyserve_interface_oldest_queue_age_seconds{{interface=\"{interface}\"}} {}",
+            "anyserve_interface_oldest_queue_age_seconds{{interface=\"{iface_buf}\"}} {}",
             current.oldest_queued_age_ms as f64 / 1000.0
         );
         let _ = writeln!(
             out,
-            "anyserve_interface_sessions{{interface=\"{interface}\"}} {}",
+            "anyserve_interface_sessions{{interface=\"{iface_buf}\"}} {}",
             current.sessions
         );
         let _ = writeln!(
             out,
-            "anyserve_interface_free_slots{{interface=\"{interface}\"}} {}",
+            "anyserve_interface_free_slots{{interface=\"{iface_buf}\"}} {}",
             current.free_slots
         );
     }
     if !stats.pools.is_empty() {
         out.push_str("# HELP anyserve_pool_sessions Retained worker sessions per namespace, interface, and pool.\n# TYPE anyserve_pool_sessions gauge\n# HELP anyserve_pool_free_slots Available execution slots per namespace, interface, and pool.\n# TYPE anyserve_pool_free_slots gauge\n# HELP anyserve_pool_active_leases Active execution leases per namespace, interface, and pool.\n# TYPE anyserve_pool_active_leases gauge\n# HELP anyserve_pool_desired_additional_slots Additional worker slots needed for queued demand per pool.\n# TYPE anyserve_pool_desired_additional_slots gauge\n");
+        let mut labels = String::with_capacity(64);
         for ((namespace, interface, pool), current) in &stats.pools {
-            let ns = escape(namespace);
-            let iface = escape(interface);
-            let pool = escape(pool);
-            let labels = format!("namespace=\"{ns}\",interface=\"{iface}\",pool=\"{pool}\"");
+            labels.clear();
+            labels.push_str("namespace=\"");
+            write_escaped(&mut labels, namespace);
+            labels.push_str("\",interface=\"");
+            write_escaped(&mut labels, interface);
+            labels.push_str("\",pool=\"");
+            write_escaped(&mut labels, pool);
+            labels.push('"');
             let _ = writeln!(
                 out,
                 "anyserve_pool_sessions{{{labels}}} {}",
@@ -135,9 +137,18 @@ pub(super) fn render(runtime: &Runtime) -> String {
     out
 }
 
-fn escape(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
+fn write_escaped(out: &mut String, value: &str) {
+    let mut last = 0;
+    for (idx, ch) in value.char_indices() {
+        let replacement = match ch {
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '"' => "\\\"",
+            _ => continue,
+        };
+        out.push_str(&value[last..idx]);
+        out.push_str(replacement);
+        last = idx + ch.len_utf8();
+    }
+    out.push_str(&value[last..]);
 }

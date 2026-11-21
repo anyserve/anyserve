@@ -1,11 +1,14 @@
 use super::api::{
-    AttemptSummary, InlinePreviewSummary, JobEventSummary, JobSummary, ObjectRefSummary,
-    WorkerSummary,
+    AttemptSummary, HealthSummary, InlinePreviewSummary, InterfacePolicySummary, JobEventSummary,
+    JobSummary, JournalHealthSummary, JournalStatsSummary, ObjectRefSummary, PoolTierSummary,
+    WorkerLoadSummary, WorkerRollup, WorkerSummary,
 };
 use anyserve_core::runtime::api::{
-    EventKind, ExecutionEvent, JobState, JobView, Metadata, Object, ObjectPreview, WorkerView,
+    Durability, EventKind, ExecutionEvent, Health, InterfacePolicy, JobState, JobView,
+    JournalHealth, JournalStats, Metadata, Object, ObjectPreview, WorkerView,
 };
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 pub(crate) use anyserve_core::runtime::api::INSPECTION_PREVIEW_BYTES as INLINE_PREVIEW_LIMIT_BYTES;
 
@@ -18,52 +21,145 @@ pub(crate) fn state_name(state: JobState) -> &'static str {
         JobState::Cancelled => "cancelled",
     }
 }
-pub(crate) fn aggregate_capacity<'a>(
-    capacities: impl Iterator<Item = &'a BTreeMap<String, i64>>,
-) -> BTreeMap<String, i64> {
-    let mut total = BTreeMap::new();
-    for capacity in capacities {
-        for (name, value) in capacity {
-            *total.entry(name.clone()).or_default() += value;
+
+pub(crate) fn durability_name(durability: Durability) -> &'static str {
+    match durability {
+        Durability::Durable => "durable",
+        Durability::Ephemeral => "ephemeral",
+    }
+}
+
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn health_summary(health: Health) -> HealthSummary {
+    let (status, message) = match health.journal {
+        JournalHealth::Disabled => ("disabled", None),
+        JournalHealth::Healthy => ("healthy", None),
+        JournalHealth::Unavailable(msg) => ("unavailable", Some(msg)),
+    };
+    HealthSummary {
+        live: health.live,
+        ready: health.ready,
+        journal: JournalHealthSummary { status, message },
+    }
+}
+
+pub(crate) fn journal_stats_summary(stats: JournalStats) -> JournalStatsSummary {
+    JournalStatsSummary {
+        pending_ops: stats.pending_ops,
+        committed_batches: stats.committed_batches,
+        committed_ops: stats.committed_ops,
+        last_batch_size: stats.last_batch_size,
+        last_commit_micros: stats.last_commit_micros,
+    }
+}
+
+pub(crate) fn interface_policy_summary(policy: &InterfacePolicy) -> InterfacePolicySummary {
+    InterfacePolicySummary {
+        max_queue: policy.max_queue,
+        queue_timeout_ms: policy.queue_timeout.map(duration_ms),
+        max_in_flight_per_key: policy.max_in_flight_per_key,
+        pool_tiers: policy
+            .pool_tiers
+            .iter()
+            .map(|tier| PoolTierSummary {
+                pool: tier.pool.clone(),
+                spillover_after_ms: duration_ms(tier.spillover_after),
+                reconnect_grace_ms: tier.reconnect_grace.map(duration_ms),
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn worker_rollup(workers: &[WorkerView]) -> WorkerRollup {
+    let mut healthy = 0usize;
+    let mut active_leases = 0u64;
+    let mut total_capacity: BTreeMap<String, i64> = BTreeMap::new();
+    let mut last_seen_at_ms: Option<u64> = None;
+
+    for worker in workers {
+        active_leases += u64::from(worker.active_leases);
+        last_seen_at_ms =
+            Some(last_seen_at_ms.map_or(worker.last_seen_ms, |max| max.max(worker.last_seen_ms)));
+        if worker.connected && !worker.draining {
+            healthy += 1;
+            for (name, value) in &worker.total_capacity {
+                *total_capacity.entry(name.clone()).or_default() += value;
+            }
         }
     }
-    total
-}
-pub(crate) fn job_summary(job: &JobView) -> JobSummary {
-    JobSummary {
-        job_id: job.job_id.clone(),
-        state: state_name(job.state),
-        interface_name: job.interface.clone(),
-        source: metadata_value(&job.metadata, "source"),
-        created_at_ms: job.created_at_ms,
-        updated_at_ms: job.updated_at_ms,
-        duration_ms: job
-            .state
-            .is_terminal()
-            .then(|| job.updated_at_ms.saturating_sub(job.created_at_ms)),
-        current_attempt_id: job.current_attempt_id.clone(),
-        latest_worker_id: job.current_worker_id.clone(),
-        attempt_count: job.attempt_count,
-        last_error: job.error.as_ref().map(|error| error.message.clone()),
-        metadata: job.metadata.clone(),
+
+    WorkerRollup {
+        total: workers.len(),
+        healthy,
+        unavailable: workers.len() - healthy,
+        active_leases,
+        total_capacity,
+        last_seen_at_ms,
     }
 }
-pub(crate) fn worker_summary(worker: &WorkerView) -> WorkerSummary {
+
+pub(crate) fn job_summary(job: JobView) -> JobSummary {
+    let duration_ms = job
+        .state
+        .is_terminal()
+        .then(|| job.updated_at_ms.saturating_sub(job.created_at_ms));
+    let source = metadata_value(&job.metadata, "source");
+    let (last_error, error_code, error_retryable) = match job.error {
+        Some(error) => (Some(error.message), Some(error.code), Some(error.retryable)),
+        None => (None, None, None),
+    };
+    JobSummary {
+        job_id: job.job_id,
+        namespace: job.namespace,
+        state: state_name(job.state),
+        durability: durability_name(job.durability),
+        interface_name: job.interface,
+        source,
+        created_at_ms: job.created_at_ms,
+        updated_at_ms: job.updated_at_ms,
+        duration_ms,
+        current_attempt_id: job.current_attempt_id,
+        latest_worker_id: job.current_worker_id,
+        attempt_count: job.attempt_count,
+        last_error,
+        error_code,
+        error_retryable,
+        metadata: job.metadata,
+    }
+}
+
+pub(crate) fn worker_summary(worker: WorkerView) -> WorkerSummary {
+    let healthy = worker.connected && !worker.draining;
+    let utilization = worker.load.utilization;
     WorkerSummary {
-        worker_id: worker.worker_id.clone(),
-        healthy: worker.connected && !worker.draining,
-        interfaces: worker.interfaces.clone(),
-        attributes: worker.attributes.clone(),
-        total_capacity: worker.total_capacity.clone(),
+        session_id: worker.session_id,
+        worker_id: worker.worker_id,
+        namespace: worker.namespace,
+        pool: worker.pool,
+        healthy,
+        interfaces: worker.interfaces,
+        attributes: worker.attributes,
+        total_capacity: worker.total_capacity,
         max_concurrency: worker.max_concurrency,
         active_leases: worker.active_leases,
         free_slots: worker.free_slots,
-        utilization: worker.load.utilization,
+        utilization,
+        load: WorkerLoadSummary {
+            queued: worker.load.queued,
+            running: worker.load.running,
+            utilization: worker.load.utilization,
+            custom: worker.load.custom,
+        },
         connected: worker.connected,
         draining: worker.draining,
+        connected_at_ms: worker.connected_at_ms,
         last_seen_at_ms: worker.last_seen_ms,
     }
 }
+
 pub(crate) fn attempts_from_events(events: &[ExecutionEvent]) -> Vec<AttemptSummary> {
     let mut attempts: Vec<AttemptSummary> = Vec::new();
     for event in events {
@@ -117,6 +213,7 @@ pub(crate) fn attempts_from_events(events: &[ExecutionEvent]) -> Vec<AttemptSumm
     }
     attempts
 }
+
 fn finish_attempt(
     attempt: &mut AttemptSummary,
     state: &'static str,
@@ -128,6 +225,7 @@ fn finish_attempt(
     attempt.duration_ms = Some(at_ms.saturating_sub(attempt.created_at_ms));
     attempt.last_error = error;
 }
+
 pub(crate) fn event_summary(event: &ExecutionEvent) -> JobEventSummary {
     let (kind, payload_size_bytes) = match &event.kind {
         EventKind::Accepted => ("accepted", 0),
@@ -145,6 +243,7 @@ pub(crate) fn event_summary(event: &ExecutionEvent) -> JobEventSummary {
         payload_size_bytes,
     }
 }
+
 pub(crate) fn object_ref_summary(value: &Object) -> ObjectRefSummary {
     match value {
         Object::Inline { data, metadata } => ObjectRefSummary {
@@ -167,6 +266,7 @@ pub(crate) fn object_ref_summary(value: &Object) -> ObjectRefSummary {
         },
     }
 }
+
 pub(crate) fn object_preview_summary(value: &ObjectPreview) -> ObjectRefSummary {
     let mut summary = object_ref_summary(&value.prefix);
     summary.size_bytes = value.size_bytes;
@@ -189,7 +289,9 @@ pub(crate) fn output_preview(
             content_type = metadata_value(metadata, "content_type");
         }
         let remaining = INLINE_PREVIEW_LIMIT_BYTES.saturating_sub(preview.len());
-        preview.extend_from_slice(&data[..data.len().min(remaining)]);
+        if remaining > 0 && !data.is_empty() {
+            preview.extend_from_slice(&data[..data.len().min(remaining)]);
+        }
     };
     let mut has_frames = false;
     for event in events {
@@ -217,6 +319,7 @@ pub(crate) fn output_preview(
         truncated: size > INLINE_PREVIEW_LIMIT_BYTES,
     })
 }
+
 pub(crate) fn inline_preview(bytes: &[u8]) -> Option<String> {
     if bytes.is_empty() {
         return None;
@@ -235,6 +338,7 @@ pub(crate) fn inline_preview(bytes: &[u8]) -> Option<String> {
             .to_string(),
     )
 }
+
 pub(crate) fn metadata_value(metadata: &Metadata, key: &str) -> Option<String> {
     metadata
         .get(key)

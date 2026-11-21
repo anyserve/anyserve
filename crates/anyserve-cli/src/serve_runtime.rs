@@ -13,7 +13,9 @@ use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
 use crate::serve_config::{GrpcConfig, ResolvedServeConfig, ServeOverrides};
-use crate::serve_console::run_server as run_console_server;
+use crate::serve_console::{
+    ControlPlaneMetadata, format_host_port, run_server as run_console_server,
+};
 
 #[cfg(test)]
 mod tests;
@@ -56,7 +58,6 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         ephemeral: args.ephemeral,
         journal_path: args.journal_path,
     })?;
-    let grpc_config = config.grpc.clone();
     let runtime = Runtime::start(config.runtime.clone())
         .await
         .context("start execution runtime")?;
@@ -67,35 +68,44 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         );
     }
 
-    let grpc_addr = socket_addr(&grpc_config.host, grpc_config.port)?;
+    let grpc_addr = socket_addr(&config.grpc.host, config.grpc.port)?;
     let console_addr = config
         .console
         .as_ref()
         .map(|console| socket_addr_from_bind(&console.listen))
         .transpose()?;
 
+    let tls = config.grpc.tls_enabled;
+    let console_meta = ControlPlaneMetadata {
+        grpc_listen: format_host_port(&config.grpc.host, config.grpc.port),
+        grpc_tls_enabled: tls,
+    };
+    let runtime_mode = config.runtime_mode();
+    let config_path = config.config_path;
+    let console_config = config.console;
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut servers = tokio::task::JoinSet::new();
     servers.spawn(run_grpc_server(
         grpc_addr,
         runtime.clone(),
-        grpc_config,
+        config.grpc,
         AuthPolicy::clone(&auth),
         shutdown_rx,
     ));
-    if let (Some(adapter), Some(addr)) = (config.console.clone(), console_addr) {
+    if let (Some(adapter), Some(addr)) = (console_config, console_addr) {
         servers.spawn(run_console_server(
             addr,
             runtime.clone(),
             adapter,
-            config.runtime_mode(),
+            console_meta,
+            runtime_mode,
             Arc::clone(&auth),
             shutdown_tx.subscribe(),
         ));
     }
 
-    let tls = config.grpc.tls_enabled;
-    if let Some(config_path) = config.config_path.as_ref() {
+    if let Some(config_path) = config_path.as_ref() {
         let config_path = config_path.display().to_string();
         info!(grpc = %grpc_addr, tls, config = %config_path, "control plane started");
     } else {
