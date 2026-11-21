@@ -154,12 +154,15 @@ async fn console_rejects_scoped_tenant_tokens() {
                 subject: "default".into(),
                 forced_pool: None,
             },
-        ])
-        .with_peer_tokens(["peer-secret".into()]);
+        ]);
     let (base_url, handle) = spawn_test_server_with_auth(runtime, policy).await;
     let client = reqwest::Client::new();
 
-    for token in ["scoped-a-client", "scoped-default-client", "peer-secret"] {
+    for token in [
+        "scoped-a-client",
+        "scoped-default-client",
+        "operator-worker",
+    ] {
         for path in [
             "/metrics",
             "/api/overview",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the active-active suite against an isolated real PostgreSQL server.
+"""Run the PostgreSQL journal and leader-standby failover suite against a real PostgreSQL server.
 
 Set ANYSERVE_TEST_POSTGRES_URL to use an existing disposable database instead.
 Each test creates and removes its own schema; the DB user needs CREATE SCHEMA.
@@ -43,7 +43,7 @@ def main():
                 time.sleep(0.25)
             env["ANYSERVE_TEST_POSTGRES_URL"] = f"postgresql://anyserve:{password}@127.0.0.1:{port}/anyserve"
         return subprocess.run([
-            "cargo", "test", "--locked", "-p", "anyserve-core", "postgres_cluster_", "--", "--ignored",
+            "cargo", "test", "--locked", "-p", "anyserve-core", "postgres_", "--", "--ignored", "--test-threads=1",
         ], cwd=root, env=env).returncode
     finally:
         if container:

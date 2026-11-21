@@ -14,7 +14,7 @@ auth:
   workerTokens: []
   existingSecret: ""
 
-# PostgreSQL supports multiple active control-plane replicas. SQLite requires 1.
+# PostgreSQL supports 1 active leader plus standby replicas (/readyz gates routing). SQLite requires 1.
 replicaCount: 1
 
 # SQLite uses a PersistentVolumeClaim; PostgreSQL uses an external database.
@@ -30,9 +30,9 @@ journal:
     existingSecret: ""
     secretKey: ANYSERVE_DATABASE_URL
     schema: anyserve
-    leaseDurationMs: 15000
+    leaseDurationMs: 5000
     pollIntervalMs: 100
-    maxConnections: 16
+    maxConnections: 8
 
 # Scalar [runtime] keys written into server.toml, for example
 # max_attempts: 5 or consumer_stall_timeout_ms: 10000.

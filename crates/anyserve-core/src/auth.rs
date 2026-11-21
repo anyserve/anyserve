@@ -20,7 +20,6 @@ pub const NAMESPACE_HEADER: &str = "x-anyserve-namespace";
 
 const V2_CLIENT_PREFIX: &str = "/anyserve.v2.Client/";
 const V2_WORKER_PREFIX: &str = "/anyserve.v2.Worker/";
-const CLUSTER_PREFIX: &str = "/anyserve.cluster.v1.";
 const HEALTH_PREFIX: &str = "/grpc.health.v1.Health/";
 const REFLECTION_PREFIX: &str = "/grpc.reflection.";
 
@@ -85,7 +84,6 @@ pub struct AuthPolicy {
     client_tokens: BTreeSet<String>,
     worker_tokens: BTreeSet<String>,
     scoped_tokens: Vec<ScopedToken>,
-    peer_tokens: BTreeSet<String>,
 }
 
 #[allow(clippy::result_large_err)] // tonic::Status is the natural error for gRPC auth.
@@ -104,7 +102,6 @@ impl AuthPolicy {
             client_tokens: clean(&mut client_tokens.into_iter()),
             worker_tokens: clean(&mut worker_tokens.into_iter()),
             scoped_tokens: Vec::new(),
-            peer_tokens: BTreeSet::new(),
         }
     }
 
@@ -117,19 +114,6 @@ impl AuthPolicy {
             })
             .collect();
         self
-    }
-
-    pub fn with_peer_tokens(mut self, tokens: impl IntoIterator<Item = String>) -> Self {
-        self.peer_tokens = tokens
-            .into_iter()
-            .map(|token| token.trim().to_string())
-            .filter(|token| !token.is_empty())
-            .collect();
-        self
-    }
-
-    pub fn has_peer_tokens(&self) -> bool {
-        !self.peer_tokens.is_empty()
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -194,9 +178,6 @@ impl AuthPolicy {
             Some(_) => Err(Status::permission_denied(
                 "management API requires an operator client token",
             )),
-            None if contains_token(&self.peer_tokens, token) => Err(Status::permission_denied(
-                "peer token cannot access management API",
-            )),
             None => Err(Status::unauthenticated("missing or invalid bearer token")),
         }
     }
@@ -227,24 +208,6 @@ impl AuthPolicy {
     pub fn verify(&self, path: &str, headers: &HeaderMap) -> Result<Option<Principal>, Status> {
         if path.starts_with(HEALTH_PREFIX) || path.starts_with(REFLECTION_PREFIX) {
             return Ok(None);
-        }
-        if path.starts_with(CLUSTER_PREFIX) {
-            if self.peer_tokens.is_empty() {
-                return Err(Status::permission_denied(
-                    "PeerMesh is disabled (configure [cluster].peer_token_env)",
-                ));
-            }
-            let token = bearer_token(headers)
-                .ok_or_else(|| Status::unauthenticated("missing peer bearer token"))?;
-            if contains_token(&self.peer_tokens, token) {
-                return Ok(None);
-            }
-            if self.principal_for_token(token).is_some() {
-                return Err(Status::permission_denied(
-                    "client or worker tokens cannot invoke PeerMesh",
-                ));
-            }
-            return Err(Status::unauthenticated("invalid peer bearer token"));
         }
         let default_role = if path.starts_with(V2_WORKER_PREFIX) {
             Role::Worker
@@ -465,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn peermesh_requires_dedicated_peer_token_and_management_requires_operator_token() {
+    fn management_requires_operator_token() {
         let policy = AuthPolicy::new(["op-client".into()], ["op-worker".into()])
             .with_scoped_tokens([
                 ScopedToken {
@@ -489,45 +452,8 @@ mod tests {
                     subject: "w".into(),
                     forced_pool: None,
                 },
-            ])
-            .with_peer_tokens(["peer-secret".into()]);
+            ]);
 
-        for method in [
-            "/anyserve.cluster.v1.PeerMesh/SyncDirectory",
-            "/anyserve.cluster.v1.PeerMesh/ForwardInvoke",
-            "/anyserve.cluster.v1.PeerMesh/WatchRemote",
-        ] {
-            assert_eq!(
-                policy
-                    .authorize(method, &HeaderMap::new())
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::Unauthenticated
-            );
-            for bad in [
-                "op-client",
-                "op-worker",
-                "scoped-a-client",
-                "scoped-b-worker",
-            ] {
-                assert_eq!(
-                    policy.authorize(method, &headers(bad)).unwrap_err().code(),
-                    tonic::Code::PermissionDenied
-                );
-            }
-            assert!(policy.authorize(method, &headers("peer-secret")).is_ok());
-        }
-
-        // Peer token must not work on public Client/Worker APIs.
-        assert_eq!(
-            policy
-                .authorize(&path("GetJob"), &headers("peer-secret"))
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unauthenticated
-        );
-
-        // Management API only allows operator client tokens.
         assert!(
             policy
                 .authorize_operator_headers(&headers("op-client"))
@@ -538,7 +464,6 @@ mod tests {
             "scoped-a-client",
             "scoped-default-client",
             "scoped-b-worker",
-            "peer-secret",
         ] {
             assert_eq!(
                 policy

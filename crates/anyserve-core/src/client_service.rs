@@ -47,6 +47,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::SubmitRequest>,
     ) -> Result<Response<pb::SubmitResponse>, Status> {
+        self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         let conflict = match pb::ConflictPolicy::try_from(request.conflict_policy) {
@@ -80,6 +81,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<Streaming<pb::InvokeRequest>>,
     ) -> Result<Response<Self::InvokeStream>, Status> {
+        self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
         let mut incoming = request.into_inner();
         let start = match incoming.message().await?.and_then(|message| message.msg) {
@@ -141,6 +143,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         let events = self
@@ -155,6 +158,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::GetJobRequest>,
     ) -> Result<Response<pb::Job>, Status> {
+        self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         Ok(Response::new(job_to_proto(
@@ -167,6 +171,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::CancelRequest>,
     ) -> Result<Response<pb::Job>, Status> {
+        self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         Ok(Response::new(job_to_proto(
@@ -179,6 +184,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::ListJobsRequest>,
     ) -> Result<Response<pb::ListJobsResponse>, Status> {
+        self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         let states = request

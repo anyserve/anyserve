@@ -33,13 +33,13 @@ python3 scripts/test-postgres.py
 ```
 
 It creates a disposable PostgreSQL 18 container and isolated schemas, covering
-claims, cancellation, takeover fencing, attempt limits, shared cursors, receipts
-and bounded reads. The script removes its own container. Alternatively, set
-`ANYSERVE_TEST_POSTGRES_URL` to a disposable database with schema creation
-privileges and run serially:
+single-leader lease acquisition, standby gating, crash/pause/graceful failover,
+fencing, dual-backend scheduling parity and bounded reads. The script removes its
+own container. Alternatively, set `ANYSERVE_TEST_POSTGRES_URL` to a disposable
+database with schema creation privileges and run serially:
 
 ```bash
-cargo test --locked -p anyserve-core postgres_cluster_ -- --ignored --test-threads=1
+cargo test --locked -p anyserve-core postgres_ -- --ignored --test-threads=1
 ```
 
 Deployment checks:

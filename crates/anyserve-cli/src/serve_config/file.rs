@@ -19,47 +19,6 @@ pub(super) struct AnyserveConfigFile {
     pub(super) journal: Option<JournalConfigFile>,
     pub(super) console: Option<ServeConsoleConfigFile>,
     pub(super) auth: Option<AuthConfigFile>,
-    pub(super) cluster: Option<ClusterConfigFile>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ClusterConfigFile {
-    internal_grpc_addr: Option<String>,
-    peer_token: Option<String>,
-    peer_token_env: Option<String>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct ResolvedClusterConfig {
-    pub(super) internal_grpc_addr: Option<String>,
-    pub(super) peer_token: Option<String>,
-}
-
-impl ClusterConfigFile {
-    pub(super) fn resolve(self) -> Result<ResolvedClusterConfig> {
-        let token = match (self.peer_token, self.peer_token_env) {
-            (Some(t), _) => Some(t),
-            (None, Some(env)) => {
-                let raw = std::env::var(&env)
-                    .with_context(|| format!("read cluster peer_token from env var {env}"))?;
-                if raw.trim().is_empty() {
-                    anyhow::bail!("cluster.peer_token_env env var {env} is empty");
-                }
-                Some(raw)
-            }
-            (None, None) => None,
-        }
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty());
-        Ok(ResolvedClusterConfig {
-            internal_grpc_addr: self
-                .internal_grpc_addr
-                .map(|a| a.trim().to_string())
-                .filter(|a| !a.is_empty()),
-            peer_token: token,
-        })
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,7 +155,6 @@ pub(super) struct JournalConfigFile {
     lease_duration_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
     max_connections: Option<u32>,
-    internal_grpc_addr: Option<String>,
     path: Option<PathBuf>,
     full_sync: Option<bool>,
     queue_capacity: Option<usize>,
@@ -288,9 +246,6 @@ impl JournalConfigFile {
                 .with_context(|| format!("PostgreSQL requires connection URL in env var {name}"))?;
             let mut config = JournalConfig::postgres(url);
             let pg = config.postgres.as_mut().expect("PostgreSQL config");
-            if let Some(addr) = self.internal_grpc_addr {
-                pg.internal_grpc_addr = Some(addr);
-            }
             if let Some(schema) = self.schema {
                 pg.schema = schema;
             }

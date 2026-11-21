@@ -6,6 +6,7 @@ impl Runtime {
     /// Pages across creation-time indexes, without an OFFSET walk or payload
     /// reads. Pages are independent observations, not a long-lived transaction.
     pub async fn scan_job_metadata(&self, scan: JobScan) -> Result<JobPage, RuntimeError> {
+        self.ensure_active_leader()?;
         if scan.from_ms >= scan.to_ms
             || scan.to_ms > i64::MAX as u64
             || scan.to_ms - scan.from_ms > 31 * 24 * 60 * 60 * 1000
@@ -36,31 +37,7 @@ impl Runtime {
                 Ok(cursor)
             })
             .transpose()?;
-        let mut jobs = if let Some(pg) = &self.inner.postgres {
-            let states = if scan.archived {
-                vec![
-                    super::api::JobState::Succeeded,
-                    super::api::JobState::Failed,
-                    super::api::JobState::Cancelled,
-                ]
-            } else {
-                vec![super::api::JobState::Queued, super::api::JobState::Running]
-            };
-            pg.scan_jobs_in(
-                scan.from_ms,
-                scan.to_ms,
-                before,
-                &states,
-                None,
-                scan.namespace.as_deref(),
-                limit + 1,
-            )
-            .await
-            .map_err(super::distributed::read_error)?
-            .into_iter()
-            .map(|job| view_from_stored(job, false))
-            .collect::<Vec<_>>()
-        } else if scan.archived {
+        let mut jobs = if scan.archived {
             let journal = self
                 .inner
                 .journal

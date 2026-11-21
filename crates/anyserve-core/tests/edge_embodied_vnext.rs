@@ -762,3 +762,126 @@ async fn phase1c_affinity_fairness_and_concurrency_key() {
         second.job_id
     );
 }
+
+#[tokio::test]
+async fn multi_endpoint_client_and_worker_probe_sequentially_and_stick_to_leader() {
+    use anyserve_client::ExecutionClient;
+    use anyserve_client::execution::WorkerSession;
+    use tonic::Code;
+
+    // 1. Obtain a guaranteed-closed localhost port.
+    let closed_port = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let dead_url = format!("http://127.0.0.1:{closed_port}");
+
+    // 2. Start a server and immediately shut down its runtime so it responds with UNAVAILABLE
+    // (same wire behavior as a standby replica), plus two healthy independent servers.
+    let standby_like = serve(RuntimeConfig::default()).await;
+    standby_like.runtime.shutdown().await;
+
+    let leader1 = serve(RuntimeConfig::default()).await;
+    let leader2 = serve(RuntimeConfig::default()).await;
+
+    let endpoints = format!(
+        "{dead_url}, {}, {}, {}",
+        standby_like.url, leader1.url, leader2.url
+    );
+    let mut client = ExecutionClient::connect(&endpoints).await.unwrap();
+    let mut worker = WorkerSession::connect(
+        &endpoints,
+        None,
+        pb::Hello {
+            worker_id: "sticky-multi-w".into(),
+            interfaces: vec!["multi.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let welcome = worker.messages.message().await.unwrap().unwrap();
+    assert!(matches!(
+        welcome.msg,
+        Some(pb::server_message::Msg::Welcome(_))
+    ));
+    // Worker must have landed on leader1 (first active endpoint in order), not leader2.
+    assert_eq!(leader1.runtime.list_workers().len(), 1);
+    assert_eq!(leader2.runtime.list_workers().len(), 0);
+
+    // Submit 5 jobs: all 5 must stick to leader1, never spraying to leader2!
+    for i in 0..5 {
+        client
+            .submit(
+                Some(format!("m-{i}")),
+                pb::JobSpec {
+                    demand: Some(pb::Demand {
+                        interface: "multi.v1".into(),
+                        ..Default::default()
+                    }),
+                    policy: Some(pb::ExecutionPolicy {
+                        durability: pb::Durability::Ephemeral as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        leader1
+            .runtime
+            .list_jobs(JobFilter::default())
+            .await
+            .unwrap()
+            .jobs
+            .len(),
+        5
+    );
+    assert_eq!(
+        leader2
+            .runtime
+            .list_jobs(JobFilter::default())
+            .await
+            .unwrap()
+            .jobs
+            .len(),
+        0
+    );
+
+    // Non-Unavailable errors (e.g. NotFound) must stay pinned to leader1 without failing over!
+    let nf = client.get("does-not-exist", false).await.unwrap_err();
+    assert_eq!(nf.code(), Code::NotFound);
+
+    // Shut down leader1 -> next RPC gets Unavailable and automatically fails over & sticks to leader2!
+    leader1.runtime.shutdown().await;
+    client
+        .submit(
+            Some("after-failover".into()),
+            pb::JobSpec {
+                demand: Some(pb::Demand {
+                    interface: "multi.v1".into(),
+                    ..Default::default()
+                }),
+                policy: Some(pb::ExecutionPolicy {
+                    durability: pb::Durability::Ephemeral as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        leader2
+            .runtime
+            .list_jobs(JobFilter::default())
+            .await
+            .unwrap()
+            .jobs
+            .len(),
+        1
+    );
+}

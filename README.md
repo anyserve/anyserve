@@ -23,20 +23,21 @@ backend-specific semantics to the control plane.
 - **Operations** provides client/worker/scoped-tenant token roles, TLS for gRPC, a management API, console, health probes, pool autoscaling Prometheus metrics, and logs.
 
 ```text
-Clients -- Client gRPC --> control-plane replica(s) <-- Worker gRPC -- workers / `anyserve connect`
-                                    |    ^ PeerMesh gRPC                 |
-                       SQLite (one process) or                 application / HTTP backend
-                       PostgreSQL (shared queue)
+Clients -- Client gRPC --> active leader (standby replicas wait on lease) <-- Worker gRPC -- workers / `anyserve connect`
+                                              |                                                      |
+                                SQLite (one process) or                                 application / HTTP backend
+                                PostgreSQL (shared journal + lease)
 ```
 
-PostgreSQL supports multiple active control-plane replicas sharing a durable
-queue with `PeerMesh` gRPC linking replicas for fast claim wakeups and
-single-hop ephemeral `Invoke` forwarding. Each replica claims work for its
-connected workers; database-clock node leases and per-job fencing epochs protect
-takeover and terminal commits. Submit, GetJob, Watch and Cancel can reach any
-replica. SQLite remains the single-process option. See
-[deployment](docs/deployment.md#postgresql-active-active) for configuration,
-load balancing and failure recovery.
+PostgreSQL provides high availability through a single active scheduler and one
+or more standby control-plane replicas sharing a three-table durable journal
+(`scheduler_lease`, `jobs`, `objects`). One leader holds the database-clock
+lease and runs the in-memory scheduler; standbys stay live (`/healthz` 204,
+`/readyz` 503, gRPC `UNAVAILABLE`) and take over automatically when the lease
+is relinquished or expires. SQLite uses the same runtime and journal interface
+in a single process. See
+[deployment](docs/deployment.md#postgresql-high-availability) for failover,
+load balancing and edge-site patterns.
 
 ## Run from this checkout
 

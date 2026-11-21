@@ -12,16 +12,8 @@ mod generated {
         pub mod v2 {
             tonic::include_proto!("anyserve.v2");
         }
-        pub mod cluster {
-            pub mod v1 {
-                tonic::include_proto!("anyserve.cluster.v1");
-            }
-        }
     }
 }
 
 /// Execution protocol: a client API and separate worker control/data streams.
 pub use generated::anyserve::v2;
-
-/// Internal active-active control-plane PeerMesh protocol.
-pub use generated::anyserve::cluster::v1 as cluster;

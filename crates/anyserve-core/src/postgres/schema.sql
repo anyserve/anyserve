@@ -1,89 +1,54 @@
--- Version 2. Schema creation is serialized only during initial bootstrap/upgrade.
+-- Schema version 3: single-leader scheduler lease + durable journal.
 CREATE TABLE IF NOT EXISTS cluster_schema (version BIGINT PRIMARY KEY);
-INSERT INTO cluster_schema VALUES (1) ON CONFLICT DO NOTHING;
-INSERT INTO cluster_schema VALUES (2) ON CONFLICT DO NOTHING;
-CREATE SEQUENCE IF NOT EXISTS node_generation;
-CREATE TABLE IF NOT EXISTS nodes (
-    node_id TEXT PRIMARY KEY,
+INSERT INTO cluster_schema VALUES (3) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS scheduler_lease (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    holder_id TEXT NOT NULL,
     generation BIGINT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    internal_grpc_addr TEXT
+    expires_at TIMESTAMPTZ NOT NULL
 );
+
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT COLLATE "C" PRIMARY KEY,
-    state TEXT NOT NULL CHECK (state IN ('queued','running','succeeded','failed','cancelled')),
+    namespace TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'succeeded', 'failed', 'cancelled')),
     spec_hash TEXT NOT NULL,
     spec_json TEXT NOT NULL,
-    namespace TEXT NOT NULL DEFAULT 'default',
-    interface TEXT NOT NULL,
-    fairness_key TEXT NOT NULL DEFAULT '_default',
-    concurrency_key TEXT,
-    failed_workers TEXT[] NOT NULL DEFAULT '{}',
-    required_attributes JSONB NOT NULL,
-    preferred_attributes JSONB NOT NULL,
-    required_capacity JSONB NOT NULL,
-    priority BIGINT NOT NULL,
-    input_bytes BIGINT NOT NULL,
     attempt_count BIGINT NOT NULL DEFAULT 0,
     max_attempts BIGINT NOT NULL,
     created_at_ms BIGINT NOT NULL,
     updated_at_ms BIGINT NOT NULL,
-    queued_at_ms BIGINT NOT NULL,
-    not_before_ms BIGINT NOT NULL DEFAULT 0,
-    queue_timeout_ms BIGINT,
-    total_deadline_ms BIGINT,
-    spillover_ms BIGINT,
-    owner_id TEXT,
-    ownership_epoch BIGINT NOT NULL DEFAULT 0,
-    event_sequence BIGINT NOT NULL DEFAULT 0,
-    events_floor BIGINT NOT NULL DEFAULT 0,
-    last_frame_seq BIGINT NOT NULL DEFAULT 0,
     error_json TEXT,
+    winning_lease_id TEXT,
+    result_digest TEXT,
     last_attempt_id TEXT,
     last_worker_id TEXT
 );
-CREATE INDEX IF NOT EXISTS jobs_claim_fair_groups
-    ON jobs(namespace, interface, priority DESC, fairness_key ASC, queued_at_ms ASC, job_id ASC)
-    WHERE state = 'queued' AND owner_id IS NULL;
-CREATE INDEX IF NOT EXISTS jobs_queued_expiry ON jobs (
-    LEAST(
-        COALESCE(total_deadline_ms, 9223372036854775807),
-        CASE WHEN queue_timeout_ms IS NULL THEN 9223372036854775807
-             WHEN queued_at_ms > 9223372036854775807 - queue_timeout_ms THEN 9223372036854775807
-             ELSE queued_at_ms + queue_timeout_ms END
-    )
-) WHERE state = 'queued' AND owner_id IS NULL
-  AND (total_deadline_ms IS NOT NULL OR queue_timeout_ms IS NOT NULL);
-CREATE INDEX IF NOT EXISTS jobs_orphan_recovery ON jobs(owner_id, updated_at_ms)
-    WHERE state IN ('queued','running') AND owner_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS jobs_concurrency_active ON jobs(namespace, concurrency_key)
-    WHERE concurrency_key IS NOT NULL AND concurrency_key <> '' AND owner_id IS NOT NULL AND state IN ('queued','running');
-CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at_ms DESC, job_id DESC);
-CREATE INDEX IF NOT EXISTS jobs_ns_created ON jobs(namespace, created_at_ms DESC, job_id DESC);
-CREATE INDEX IF NOT EXISTS jobs_history ON jobs(created_at_ms DESC, job_id DESC)
-    WHERE state IN ('succeeded','failed','cancelled');
-CREATE INDEX IF NOT EXISTS jobs_retention ON jobs(updated_at_ms)
-    WHERE state IN ('succeeded','failed','cancelled');
+
+CREATE INDEX IF NOT EXISTS jobs_recovery
+    ON jobs(created_at_ms, job_id)
+    WHERE state = 'queued';
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_winner
+    ON jobs(winning_lease_id)
+    WHERE winning_lease_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_history
+    ON jobs(created_at_ms DESC, job_id DESC)
+    WHERE state IN ('succeeded', 'failed', 'cancelled');
+CREATE INDEX IF NOT EXISTS jobs_ns_history
+    ON jobs(namespace, created_at_ms DESC, job_id DESC)
+    WHERE state IN ('succeeded', 'failed', 'cancelled');
+CREATE INDEX IF NOT EXISTS jobs_retention
+    ON jobs(updated_at_ms)
+    WHERE state IN ('succeeded', 'failed', 'cancelled');
+
 CREATE TABLE IF NOT EXISTS objects (
-    job_id TEXT COLLATE "C" NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    job_id TEXT COLLATE "C" NOT NULL
+        REFERENCES jobs(job_id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
     role TEXT NOT NULL,
     idx BIGINT NOT NULL,
     uri TEXT,
     content BYTEA,
     metadata_json TEXT NOT NULL,
-    PRIMARY KEY (job_id,role,idx)
-);
-CREATE TABLE IF NOT EXISTS events (
-    job_id TEXT COLLATE "C" NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-    sequence BIGINT NOT NULL,
-    attempt_id TEXT,
-    at_ms BIGINT NOT NULL,
-    kind_json TEXT NOT NULL,
-    frame_data BYTEA,
-    PRIMARY KEY(job_id,sequence)
-);
-CREATE TABLE IF NOT EXISTS receipts (
-    lease_id TEXT PRIMARY KEY,
-    job_id TEXT COLLATE "C" NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
-    digest TEXT NOT NULL
+    PRIMARY KEY (job_id, role, idx)
 );

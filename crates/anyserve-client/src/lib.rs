@@ -66,8 +66,24 @@ impl Interceptor for BearerAuth {
     }
 }
 
-/// Open a channel. WorkerSession reuses it for control and attempts when the
-/// server requests connection affinity; single-instance mode uses two channels.
+pub(crate) fn parse_endpoints(raw: &str) -> Result<Vec<String>> {
+    let endpoints: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if endpoints.is_empty() {
+        return Err(anyhow!("anyserve gRPC endpoint must not be empty"));
+    }
+    for ep in &endpoints {
+        Endpoint::from_shared(ep.clone())
+            .with_context(|| format!("parse anyserve gRPC endpoint '{ep}'"))?;
+    }
+    Ok(endpoints)
+}
+
+/// Open a channel to a single gRPC endpoint.
 pub(crate) async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let mut transport = Endpoint::from_shared(endpoint.to_owned())
         .context("parse anyserve gRPC endpoint")?

@@ -104,6 +104,7 @@ impl Worker for WorkerGrpcService {
         &self,
         request: Request<Streaming<pb::WorkerMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
+        self.runtime.ensure_active_leader()?;
         let principal = worker_principal(&request)?;
         let mut inbound = request.into_inner();
         let timeout = self.runtime.config().heartbeat_timeout;
@@ -145,28 +146,14 @@ impl Worker for WorkerGrpcService {
             runtime.session_closed(&session_id, connection);
         });
         let stream: Self::SessionStream = Box::pin(ReceiverStream::new(handle.messages).map(Ok));
-        let mut response = Response::new(stream);
-        if self
-            .runtime
-            .config()
-            .journal
-            .as_ref()
-            .is_some_and(|j| j.postgres.is_some())
-        {
-            // The SDK keeps Session and Attempt on this HTTP/2 connection so
-            // a TCP load balancer sends both to the worker's owning replica.
-            response.metadata_mut().insert(
-                "anyserve-worker-affinity",
-                "connection".parse().expect("static metadata"),
-            );
-        }
-        Ok(response)
+        Ok(Response::new(stream))
     }
 
     async fn attempt(
         &self,
         request: Request<Streaming<pb::AttemptUp>>,
     ) -> Result<Response<Self::AttemptStream>, Status> {
+        self.runtime.ensure_active_leader()?;
         require_worker(&request)?;
         let mut inbound = request.into_inner();
         let timeout = self.runtime.config().heartbeat_timeout;

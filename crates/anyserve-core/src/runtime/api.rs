@@ -677,20 +677,16 @@ impl JournalConfig {
     }
 }
 
-/// All replicas of an execution domain use the same database and schema.
+/// Shared PostgreSQL journal and single-leader lease configuration.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PostgresConfig {
     pub url: String,
     pub schema: String,
-    /// Database-clock node lease. An expired node must restart to rejoin.
+    /// Database-clock scheduler lease duration (default 5s).
     pub lease_duration: Duration,
+    /// Standby lease-polling interval (default 100ms).
     pub poll_interval: Duration,
     pub max_connections: u32,
-    /// Optional internal gRPC endpoint advertised in `nodes` for PeerMesh
-    /// cross-replica `Invoke` forwarding and `<1ms` claim wakeups.
-    pub internal_grpc_addr: Option<String>,
-    /// Shared secret bearer token required to authenticate inter-replica PeerMesh RPCs.
-    pub peer_token: Option<String>,
 }
 
 impl PostgresConfig {
@@ -698,11 +694,9 @@ impl PostgresConfig {
         Self {
             url: url.into(),
             schema: "anyserve".to_string(),
-            lease_duration: Duration::from_secs(15),
+            lease_duration: Duration::from_secs(5),
             poll_interval: Duration::from_millis(100),
-            max_connections: 16,
-            internal_grpc_addr: None,
-            peer_token: None,
+            max_connections: 8,
         }
     }
 }
@@ -715,11 +709,6 @@ impl std::fmt::Debug for PostgresConfig {
             .field("lease_duration", &self.lease_duration)
             .field("poll_interval", &self.poll_interval)
             .field("max_connections", &self.max_connections)
-            .field("internal_grpc_addr", &self.internal_grpc_addr)
-            .field(
-                "peer_token",
-                &self.peer_token.as_ref().map(|_| "[redacted]"),
-            )
             .finish()
     }
 }

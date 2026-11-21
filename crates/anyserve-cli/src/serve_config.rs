@@ -58,21 +58,21 @@ pub struct ResolvedServeConfig {
 pub enum RuntimeMode {
     Memory,
     MemoryPlusSqlite,
-    PostgresCluster,
+    MemoryPlusPostgres,
 }
 impl RuntimeMode {
     pub fn code(self) -> &'static str {
         match self {
             Self::Memory => "memory",
             Self::MemoryPlusSqlite => "memory_plus_sqlite",
-            Self::PostgresCluster => "postgres_cluster",
+            Self::MemoryPlusPostgres => "memory_plus_postgres",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::Memory => "Memory",
             Self::MemoryPlusSqlite => "Memory + SQLite journal",
-            Self::PostgresCluster => "PostgreSQL active-active",
+            Self::MemoryPlusPostgres => "Memory + PostgreSQL journal",
         }
     }
 }
@@ -95,7 +95,6 @@ impl ResolvedServeConfig {
         let server = file_config.server.unwrap_or_default();
         let tls = server.tls.unwrap_or_default();
         let defaults = GrpcConfig::default();
-        let cluster = file_config.cluster.unwrap_or_default().resolve()?;
         let mut runtime = file_config.runtime.unwrap_or_default().resolve();
         runtime.journal = if overrides.ephemeral {
             None
@@ -105,22 +104,7 @@ impl ResolvedServeConfig {
                 .unwrap_or_default()
                 .resolve(overrides.journal_path)?
         };
-        if let Some(pg) = runtime
-            .journal
-            .as_mut()
-            .and_then(|journal| journal.postgres.as_mut())
-        {
-            if let Some(addr) = cluster.internal_grpc_addr {
-                pg.internal_grpc_addr = Some(addr);
-            }
-            if let Some(token) = cluster.peer_token.clone() {
-                pg.peer_token = Some(token);
-            }
-        }
-        let mut auth = file_config.auth.unwrap_or_default().resolve()?;
-        if let Some(token) = cluster.peer_token {
-            auth = auth.with_peer_tokens([token]);
-        }
+        let auth = file_config.auth.unwrap_or_default().resolve()?;
         let console = file_config.console.and_then(|config| config.resolve());
         let grpc = GrpcConfig {
             host: overrides
@@ -155,7 +139,7 @@ impl ResolvedServeConfig {
             .as_ref()
             .is_some_and(|j| j.postgres.is_some())
         {
-            RuntimeMode::PostgresCluster
+            RuntimeMode::MemoryPlusPostgres
         } else if self.runtime.journal.is_some() {
             RuntimeMode::MemoryPlusSqlite
         } else {

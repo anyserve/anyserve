@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use anyserve_core::auth::{AuthLayer, AuthPolicy};
 use anyserve_core::client_service::ClientGrpcService;
-use anyserve_core::cluster::PeerMeshGrpcService;
 use anyserve_core::runtime::Runtime;
 use anyserve_core::worker_service::WorkerGrpcService;
 use anyserve_proto::v2::{client_server::ClientServer, worker_server::WorkerServer};
@@ -106,10 +105,12 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         info!(console = %console_addr, "console api started");
     }
 
+    let mut lease_lost = false;
     let failure = tokio::select! {
         signal = shutdown_signal() => { signal?; None }
-        _ = postgres_membership_lost(runtime.clone()), if config.runtime.journal.as_ref().is_some_and(|j| j.postgres.is_some()) => {
-            Some(anyhow::anyhow!("PostgreSQL node lease lost; exiting so the supervisor can restart this replica"))
+        _ = runtime.wait_for_lease_loss() => {
+            lease_lost = true;
+            Some(anyhow::anyhow!("leadership lease lost; exiting so standby or supervisor can recover"))
         }
         ended = servers.join_next() => Some(match ended {
             Some(Ok(Err(error))) => error,
@@ -118,31 +119,29 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         }),
     };
     let _ = shutdown_tx.send(true);
-    runtime.shutdown().await;
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while let Some(joined) = servers.join_next().await {
-            if let Ok(Err(error)) = joined {
-                warn!(%error, "server stopped during shutdown");
-            }
-        }
-    })
-    .await;
-    if drained.is_err() {
+    if lease_lost {
+        // Sever active HTTP/2 connections immediately when fenced so clients and
+        // workers reconnect to the new leader without waiting for drain grace.
         servers.abort_all();
+    }
+    runtime.shutdown().await;
+    if !lease_lost {
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(joined) = servers.join_next().await {
+                if let Ok(Err(error)) = joined {
+                    warn!(%error, "server stopped during shutdown");
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            servers.abort_all();
+        }
     }
     if let Some(error) = failure {
         return Err(error);
     }
     Ok(())
-}
-
-async fn postgres_membership_lost(runtime: Runtime) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        if !runtime.health().live {
-            return;
-        }
-    }
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -170,17 +169,43 @@ async fn run_grpc_server(
     let client_service = ClientServer::new(ClientGrpcService::new(runtime.clone()))
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
-    let peer_mesh_service = auth
-        .has_peer_tokens()
-        .then(|| PeerMeshGrpcService::server(runtime.clone()));
-    let worker_service = WorkerGrpcService::server(runtime);
+    let worker_service = WorkerGrpcService::server(runtime.clone());
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    health_reporter
-        .set_serving::<ClientServer<ClientGrpcService>>()
-        .await;
-    health_reporter
-        .set_serving::<WorkerServer<WorkerGrpcService>>()
-        .await;
+    if runtime.is_leader_active() {
+        health_reporter
+            .set_serving::<ClientServer<ClientGrpcService>>()
+            .await;
+        health_reporter
+            .set_serving::<WorkerServer<WorkerGrpcService>>()
+            .await;
+    } else {
+        health_reporter
+            .set_not_serving::<ClientServer<ClientGrpcService>>()
+            .await;
+        health_reporter
+            .set_not_serving::<WorkerServer<WorkerGrpcService>>()
+            .await;
+    }
+    let mut leader_rx = runtime.subscribe_leadership();
+    let health_watch = tokio::spawn(async move {
+        while leader_rx.changed().await.is_ok() {
+            if *leader_rx.borrow() {
+                health_reporter
+                    .set_serving::<ClientServer<ClientGrpcService>>()
+                    .await;
+                health_reporter
+                    .set_serving::<WorkerServer<WorkerGrpcService>>()
+                    .await;
+            } else {
+                health_reporter
+                    .set_not_serving::<ClientServer<ClientGrpcService>>()
+                    .await;
+                health_reporter
+                    .set_not_serving::<WorkerServer<WorkerGrpcService>>()
+                    .await;
+            }
+        }
+    });
 
     let mut builder = Server::builder();
     if config.tls_enabled {
@@ -217,9 +242,9 @@ async fn run_grpc_server(
         .add_service(health_service)
         .add_service(client_service)
         .add_service(worker_service)
-        .add_optional_service(peer_mesh_service)
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;
+            health_watch.abort();
         })
         .await
         .context("run grpc server")

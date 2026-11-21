@@ -16,7 +16,9 @@ output = client.call("demo.echo.v1", b"hello",
 `AnyserveClient` is an alias of `ExecutionClient`; `AsyncAnyserveClient` wraps the
 same operations for `asyncio` applications (`await client.call(...)`,
 `async with await client.invoke(...) as events: ...`). Endpoint resolution is
-the explicit argument, then `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`.
+the explicit argument, then `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`
+(comma-separated URLs probe sequentially on `UNAVAILABLE` and stick to the
+active leader).
 Token resolution is `token=`, then `ANYSERVE_TOKEN`; use a client-role token.
 Namespace defaults to `namespace=`, then `ANYSERVE_NAMESPACE`, then `"default"`
 (when scoped token auth is configured, the server derives namespace from the token).
@@ -97,7 +99,7 @@ All maps default to `{}`, `params` to `b""` and numbers to zero.
 | `max_attempts: int` | Includes the first attempt; zero uses the server default (3), one disables retries; default ceiling is 20 |
 | `affinity_key: str` | Sticky bounded-load Rendezvous routing preference (`< 0.85` utilization), excluding failed workers |
 | `fairness_key: str` | Two-level Priority + per-key round-robin queue key preventing bulk bursts from starving peer tenants |
-| `concurrency_key: str` | Per-key in-flight serialization / cap across workers and replicas |
+| `concurrency_key: str` | Per-key in-flight serialization / cap across workers |
 
 Once a non-progress output event is exposed, an interrupted attempt ends with
 `output_interrupted` instead of switching workers behind the reader's back.
@@ -121,10 +123,10 @@ Every event has `job_id`, `sequence`, `attempt_id`, `at_ms` and `type`:
 | `finished` | `state`, `outputs`, `error` |
 
 Sequence zero starts at the earliest retained event. Expired nonzero cursors
-report cursor expiry. SQLite and ephemeral event history is held in memory;
-PostgreSQL durable events survive restart and ownership changes, within retention
-limits. `get()` and `result()` can read a retained durable result after older
-events expire. See [recovery behavior](deployment.md#restart-and-backup).
+report cursor expiry. Live event history is held in memory; once evicted or
+after a leader restart, `watch()` replays acceptance and the committed terminal
+outcome from the journal. `get()` and `result()` can read a retained durable
+result after older events expire. See [recovery behavior](deployment.md#restart-and-backup).
 
 Runtime error codes include `queue_timeout`, `execution_timeout`, `total_timeout`,
 `cancelled`, `worker_failed`, `worker_lost`, `worker_rejected`,

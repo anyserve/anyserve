@@ -1,10 +1,9 @@
 //! The execution runtime: one in-memory state machine for ephemeral and
-//! durable jobs, worker sessions and attempt streams. Durable jobs use either
-//! a local SQLite journal or a shared PostgreSQL queue.
+//! durable jobs, worker sessions and attempt streams. Durable jobs commit to a
+//! pluggable journal backend (local SQLite or single-leader PostgreSQL).
 
 mod analytics;
 pub mod api;
-mod distributed;
 pub(crate) mod events;
 pub(crate) mod identity;
 mod index;
@@ -16,6 +15,7 @@ pub(crate) mod worker;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -33,9 +33,8 @@ use self::machine::{LeaseEnd, ms};
 use self::state::{Phase, State, TerminalPlan};
 use crate::auth::{DEFAULT_NAMESPACE, validate_namespace};
 use crate::error::RuntimeError;
-use crate::journal::{Journal, Recovery, StoredJob};
+use crate::journal::{JournalBackend, Leadership, LeaseHandle, Recovery, SqliteJournal, StoredJob};
 use crate::now_ms;
-use crate::postgres::ReadMode;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const PURGE_INTERVAL_MS: u64 = 3_600_000;
@@ -170,12 +169,15 @@ impl Timers {
 
 pub(crate) struct Inner {
     pub(crate) config: RuntimeConfig,
-    pub(crate) generation: u64,
+    pub(crate) generation: AtomicU64,
+    pub(crate) leader_active: AtomicBool,
+    pub(crate) lease_lost: AtomicBool,
+    pub(crate) leadership_tx: watch::Sender<bool>,
+    pub(crate) lease_lost_tx: watch::Sender<bool>,
+    pub(crate) stop_tx: watch::Sender<bool>,
+    pub(crate) lease_handle: Mutex<Option<LeaseHandle>>,
     state: Mutex<State>,
-    pub(crate) journal: Option<Journal>,
-    pub(crate) postgres: Option<Arc<crate::postgres::Postgres>>,
-    pub(crate) cluster_wakeup: Arc<Notify>,
-    pub(crate) peer_mesh: Option<Arc<crate::cluster::PeerMeshState>>,
+    pub(crate) journal: Option<Arc<dyn JournalBackend>>,
     pub(crate) journal_status: Mutex<JournalStatus>,
     pub(crate) timers: Timers,
     /// Event log bytes across all jobs.
@@ -384,27 +386,84 @@ impl Inner {
     }
 
     async fn purge(&self) {
-        if let Some(pg) = &self.postgres {
-            if let Some(config) = &self.config.journal
-                && let Err(error) = pg
-                    .purge(now_ms().saturating_sub(ms(config.retention)))
-                    .await
-            {
-                tracing::warn!(%error, "PostgreSQL retention cleanup failed");
-            }
-            return;
-        }
         let Some(journal) = &self.journal else {
             return;
         };
+        if !self.leader_active.load(Ordering::Acquire) {
+            return;
+        }
         let Some(retention) = self.config.journal.as_ref().map(|c| c.retention) else {
             return;
         };
-        match journal.purge(now_ms().saturating_sub(ms(retention))).await {
+        let term = self.generation.load(Ordering::Acquire);
+        match journal
+            .purge(term, now_ms().saturating_sub(ms(retention)))
+            .await
+        {
             Ok(removed) if removed > 0 => tracing::info!(removed, "purged terminal journal jobs"),
             Ok(_) => {}
             Err(error) => tracing::warn!(error = %error, "journal purge failed"),
         }
+    }
+
+    pub(crate) fn activate_leadership(&self, leadership: Leadership) {
+        if *self.stop_tx.borrow() || self.lease_lost.load(Ordering::Acquire) {
+            let lease = leadership.lease;
+            tokio::spawn(async move {
+                lease.relinquish().await;
+            });
+            return;
+        }
+        let term = leadership.term;
+        self.generation.store(term, Ordering::Release);
+        {
+            let mut st = self.lock();
+            st.generation = term;
+            st.rng = term ^ 0x5DEE_CE66_D1CE_4E5B;
+        }
+        self.recover(leadership.recovery);
+        let lost_rx = leadership.lease.lost();
+        *self
+            .lease_handle
+            .lock()
+            .expect("lease handle mutex poisoned") = Some(leadership.lease);
+        *self.journal_status.lock().expect("journal status poisoned") = JournalStatus::Healthy;
+        self.leader_active.store(true, Ordering::Release);
+        self.leadership_tx.send_replace(true);
+        tokio::spawn(lease_loss_watcher(
+            self.me.clone(),
+            lost_rx,
+            self.stop_tx.subscribe(),
+        ));
+    }
+
+    pub(crate) fn mark_lease_lost(&self, reason: &str) {
+        if self.lease_lost.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tracing::error!(reason = %reason, "control plane lost leadership lease; fencing local state");
+        self.leader_active.store(false, Ordering::Release);
+        self.leadership_tx.send_replace(false);
+        self.stop_tx.send_replace(true);
+        *self.journal_status.lock().expect("journal status poisoned") =
+            JournalStatus::Failed(reason.to_string());
+        {
+            let mut st = self.lock();
+            st.shutting_down = true;
+            for session in st.sessions.values_mut() {
+                session.tx = None;
+            }
+            let err = RuntimeError::unavailable(format!("control plane lost leadership: {reason}"));
+            for job in st.jobs.values_mut() {
+                for waiter in job.accept_waiters.drain(..).chain(job.waiters.drain(..)) {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+                for waiter in job.finish_waiters.drain(..) {
+                    let _ = waiter.send(Err(err.clone()));
+                }
+            }
+        }
+        self.lease_lost_tx.send_replace(true);
     }
 
     fn recover(&self, recovery: Recovery) {
@@ -458,6 +517,59 @@ impl Inner {
             }
         }
         self.dispatch_locked(&mut st, now);
+    }
+}
+
+async fn standby_acquire_loop(
+    me: Weak<Inner>,
+    backend: Arc<dyn JournalBackend>,
+    stop: watch::Receiver<bool>,
+) {
+    match backend.acquire_leadership(stop).await {
+        Ok(Some(leadership)) => {
+            if let Some(inner) = me.upgrade() {
+                tracing::info!(term = leadership.term, "acquired control-plane leadership");
+                inner.activate_leadership(leadership);
+            } else {
+                leadership.lease.relinquish().await;
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if let Some(inner) = me.upgrade() {
+                inner.mark_lease_lost(&format!("leadership acquisition failed: {error:#}"));
+            }
+        }
+    }
+}
+
+async fn lease_loss_watcher(
+    me: Weak<Inner>,
+    mut lost: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
+) {
+    loop {
+        if *lost.borrow() {
+            if let Some(inner) = me.upgrade() {
+                inner.mark_lease_lost("leadership lease expired or renewal failed");
+            }
+            return;
+        }
+        if *stop.borrow() {
+            return;
+        }
+        tokio::select! {
+            res = lost.changed() => {
+                if res.is_err() {
+                    return;
+                }
+            }
+            res = stop.changed() => {
+                if res.is_err() || *stop.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -655,29 +767,33 @@ fn check_namespace(namespace: &str) -> Result<String, RuntimeError> {
 }
 
 impl Runtime {
-    /// Starts the runtime, recovering durable jobs when a journal is
-    /// configured.
+    /// Starts the runtime, recovering durable jobs when leadership on a
+    /// configured journal backend is acquired.
     pub async fn start(config: RuntimeConfig) -> anyhow::Result<Runtime> {
-        let postgres = match config.journal.as_ref().filter(|c| c.postgres.is_some()) {
-            Some(config) => Some(crate::postgres::Postgres::open(config).await?),
+        let journal: Option<Arc<dyn JournalBackend>> = match &config.journal {
+            Some(c) if c.postgres.is_some() => Some(crate::postgres::PgJournal::open(c).await?),
+            Some(c) => Some(SqliteJournal::open(c).await?),
             None => None,
         };
-        let (journal, recovery) = match config.journal.as_ref().filter(|c| c.postgres.is_none()) {
-            Some(journal_config) => {
-                let (journal, recovery) = Journal::open(journal_config).await?;
-                (Some(journal), Some(recovery))
-            }
-            None => (None, None),
+        Self::start_with_backend(config, journal).await
+    }
+
+    pub(crate) async fn start_with_backend(
+        config: RuntimeConfig,
+        journal: Option<Arc<dyn JournalBackend>>,
+    ) -> anyhow::Result<Runtime> {
+        let initial_leadership = match &journal {
+            Some(backend) => backend.try_acquire_leadership().await?,
+            None => None,
         };
-        let generation = postgres
+        let generation = initial_leadership
             .as_ref()
-            .map(|pg| pg.generation)
-            .or_else(|| recovery.as_ref().map(|recovery| recovery.generation))
-            // Without a journal nothing survives a restart; a timestamp in
-            // seconds still distinguishes this process from the previous one
-            // and keeps event sequences (`generation << 32`) in range.
+            .map(|l| l.term)
+            // Without an active journal term yet, a timestamp in seconds
+            // distinguishes ephemeral runs and keeps sequences in range.
             .unwrap_or_else(|| now_ms() / 1000);
-        let status = if journal.is_some() || postgres.is_some() {
+        let initially_active = journal.is_none() || initial_leadership.is_some();
+        let status = if journal.is_some() {
             JournalStatus::Healthy
         } else {
             JournalStatus::Disabled
@@ -685,24 +801,26 @@ impl Runtime {
         let event_budget = config.max_event_bytes;
         let input_budget = config.max_pending_bytes;
         let result_budget = config.max_result_bytes;
-        let peer_enabled = postgres.as_ref().is_some_and(|pg| {
-            pg.config
-                .peer_token
-                .as_deref()
-                .is_some_and(|t| !t.trim().is_empty())
-        });
-        let peer_mesh = peer_enabled.then(|| Arc::new(crate::cluster::PeerMeshState::new()));
+        let (leadership_tx, _) = watch::channel(initially_active);
+        let (lease_lost_tx, _) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let standby_backend = (!initially_active)
+            .then(|| journal.as_ref().cloned())
+            .flatten();
         let inner = Arc::new_cyclic(|me| Inner {
-            generation,
+            generation: AtomicU64::new(generation),
+            leader_active: AtomicBool::new(initially_active),
+            lease_lost: AtomicBool::new(false),
+            leadership_tx,
+            lease_lost_tx,
+            stop_tx,
+            lease_handle: Mutex::new(None),
             state: Mutex::new(State {
                 generation,
                 rng: generation ^ 0x5DEE_CE66_D1CE_4E5B,
                 ..State::default()
             }),
             journal,
-            postgres,
-            cluster_wakeup: Arc::new(Notify::new()),
-            peer_mesh,
             journal_status: Mutex::new(status),
             timers: Timers::new(),
             event_budget: Arc::new(ByteBudget::new(event_budget)),
@@ -711,18 +829,17 @@ impl Runtime {
             me: me.clone(),
             config,
         });
-        if let Some(recovery) = recovery {
-            inner.recover(recovery);
+        if let Some(leadership) = initial_leadership {
+            inner.activate_leadership(leadership);
+        } else if let Some(backend) = standby_backend {
+            tokio::spawn(standby_acquire_loop(
+                Arc::downgrade(&inner),
+                backend,
+                stop_rx,
+            ));
         }
         tokio::spawn(timer_loop(Arc::downgrade(&inner)));
         tokio::spawn(maintenance_loop(Arc::downgrade(&inner)));
-        if inner.postgres.is_some() {
-            tokio::spawn(distributed::cluster_loop(Arc::downgrade(&inner)));
-            tokio::spawn(distributed::heartbeat_loop(Arc::downgrade(&inner)));
-            if inner.peer_mesh.is_some() {
-                tokio::spawn(crate::cluster::peer_sync_loop(Arc::downgrade(&inner)));
-            }
-        }
         Ok(Runtime { inner })
     }
 
@@ -731,7 +848,45 @@ impl Runtime {
     }
 
     pub fn generation(&self) -> u64 {
-        self.inner.generation
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_leader_active(&self) -> bool {
+        self.inner.leader_active.load(Ordering::Acquire)
+            && !self.inner.lease_lost.load(Ordering::Acquire)
+    }
+
+    pub fn subscribe_leadership(&self) -> watch::Receiver<bool> {
+        self.inner.leadership_tx.subscribe()
+    }
+
+    pub async fn wait_for_lease_loss(&self) {
+        if self.inner.lease_lost.load(Ordering::Acquire) {
+            return;
+        }
+        let mut rx = self.inner.lease_lost_tx.subscribe();
+        loop {
+            if *rx.borrow() || self.inner.lease_lost.load(Ordering::Acquire) {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    pub fn ensure_active_leader(&self) -> Result<(), RuntimeError> {
+        if self.inner.lease_lost.load(Ordering::Acquire) {
+            return Err(RuntimeError::unavailable(
+                "control plane lost its leadership lease",
+            ));
+        }
+        if !self.inner.leader_active.load(Ordering::Acquire) {
+            return Err(RuntimeError::unavailable(
+                "control plane replica is on standby",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn result_budget(&self) -> Arc<ByteBudget> {
@@ -828,6 +983,7 @@ impl Runtime {
 
     /// Accepts a job. Durable jobs return once acceptance is committed.
     pub async fn submit(&self, request: SubmitRequest) -> Result<SubmitOutcome, RuntimeError> {
+        self.ensure_active_leader()?;
         let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
         let durability = request
             .spec
@@ -853,28 +1009,8 @@ impl Runtime {
         // A caller-chosen id may belong to a durable job that already left
         // memory; generated ids cannot.
         let mut cold_checked = requested.is_none() || self.inner.journal.is_none();
-        if self.inner.postgres.is_some()
-            && requested.as_ref().is_some_and(|id| {
-                durability == Durability::Ephemeral || id.starts_with(distributed::EPHEMERAL_PREFIX)
-            })
-        {
-            return Err(RuntimeError::invalid(
-                "PG caller-chosen IDs require durable Submit and cannot start with ephemeral:",
-            ));
-        }
-        let raw_id = requested.unwrap_or_else(|| self.generated_job_id(durability));
+        let raw_id = requested.unwrap_or_else(machine::new_id);
         let scoped_id = identity::encode_scoped_id(&namespace, &raw_id);
-        if durability == Durability::Durable && self.inner.postgres.is_some() {
-            return self
-                .submit_postgres(
-                    scoped_id,
-                    spec.take().expect("spec"),
-                    spec_hash,
-                    max_attempts,
-                    request.conflict,
-                )
-                .await;
-        }
         let conflict = |existing: &str| -> Result<(), RuntimeError> {
             if existing.is_empty() {
                 return Err(RuntimeError::conflict(format!(
@@ -998,65 +1134,12 @@ impl Runtime {
         }
     }
 
-    /// Starts an ephemeral execution whose events the caller follows, routing
-    /// single-hop across PeerMesh if no local worker matches in cluster mode.
+    /// Starts an ephemeral execution whose events the caller follows.
     pub async fn invoke(&self, request: InvokeRequest) -> Result<Execution, RuntimeError> {
-        let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
-        if let Some(mesh) = &self.inner.peer_mesh
-            && self.inner.postgres.is_some()
-            && !self.has_local_ready_worker(&namespace, &request.spec.demand)
-        {
-            let policy = self
-                .inner
-                .config
-                .interfaces
-                .get(&request.spec.demand.interface);
-            if let Some((_, peer_addr)) =
-                mesh.find_peer_for_demand(&namespace, &request.spec.demand, policy)
-            {
-                let peer_token = self
-                    .inner
-                    .postgres
-                    .as_ref()
-                    .and_then(|pg| pg.config.peer_token.clone())
-                    .unwrap_or_default();
-                let (spec, _) = self.normalize(request.spec, Durability::Ephemeral)?;
-                let raw_id = self.generated_job_id(Durability::Ephemeral);
-                match crate::cluster::forward_invoke(
-                    peer_addr,
-                    peer_token,
-                    namespace.clone(),
-                    raw_id,
-                    spec.clone(),
-                    request.input,
-                    &self.inner,
-                )
-                .await
-                {
-                    Ok(exec) => return Ok(exec),
-                    Err(err) => {
-                        tracing::debug!(error = %err, "PeerMesh ForwardInvoke failed; falling back to local");
-                        return self
-                            .invoke_local(InvokeRequest {
-                                namespace: Some(namespace),
-                                spec,
-                                input: request.input,
-                            })
-                            .await;
-                    }
-                }
-            }
-        }
-        self.invoke_local(request).await
-    }
-
-    pub(crate) async fn invoke_local(
-        &self,
-        request: InvokeRequest,
-    ) -> Result<Execution, RuntimeError> {
+        self.ensure_active_leader()?;
         let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
         let (spec, max_attempts) = self.normalize(request.spec, Durability::Ephemeral)?;
-        let raw_id = self.generated_job_id(Durability::Ephemeral);
+        let raw_id = machine::new_id();
         let scoped_id = identity::encode_scoped_id(&namespace, &raw_id);
         let limits = &self.inner.config.limits;
         let input = (request.input == InputMode::Streaming).then(|| {
@@ -1126,88 +1209,6 @@ impl Runtime {
         })
     }
 
-    fn has_local_ready_worker(&self, namespace: &str, demand: &api::Demand) -> bool {
-        let st = self.inner.lock();
-        st.interface_sessions(namespace, &demand.interface)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| st.sessions.get(id))
-            .any(|s| {
-                s.free_slots() > 0
-                    && demand
-                        .required_attributes
-                        .iter()
-                        .all(|(k, v)| s.attributes.get(k) == Some(v))
-                    && s.fits(&demand.required_capacity)
-            })
-    }
-
-    pub(crate) fn cluster_directory(&self) -> Vec<anyserve_proto::cluster::PoolSlotSummary> {
-        let st = self.inner.lock();
-        struct Accum {
-            free_slots: u32,
-            min_load: f64,
-            worker_ids: Vec<String>,
-            shared_attrs: Option<std::collections::BTreeMap<String, String>>,
-            max_free_capacity: std::collections::HashMap<String, i64>,
-        }
-        let mut grouped: BTreeMap<(String, String, String), Accum> = BTreeMap::new();
-        for s in st.sessions.values() {
-            let free = s.free_slots();
-            if free == 0 {
-                continue;
-            }
-            let load =
-                s.active.len() as f64 / s.max_concurrency.max(1) as f64 + s.load.utilization * 0.5;
-            for iface in &s.interfaces {
-                let entry = grouped
-                    .entry((s.namespace.clone(), iface.clone(), s.pool.clone()))
-                    .or_insert_with(|| Accum {
-                        free_slots: 0,
-                        min_load: load,
-                        worker_ids: Vec::new(),
-                        shared_attrs: None,
-                        max_free_capacity: std::collections::HashMap::new(),
-                    });
-                entry.free_slots = entry.free_slots.saturating_add(free);
-                entry.min_load = entry.min_load.min(load);
-                if entry.worker_ids.len() < 32 {
-                    entry.worker_ids.push(s.worker_id.clone());
-                }
-                match &mut entry.shared_attrs {
-                    None => entry.shared_attrs = Some(s.attributes.clone()),
-                    Some(shared) => {
-                        shared.retain(|k, v| s.attributes.get(k) == Some(v));
-                    }
-                }
-                for (cap_key, total) in &s.total_capacity {
-                    let free_cap =
-                        total.saturating_sub(s.reserved.get(cap_key).copied().unwrap_or(0));
-                    entry
-                        .max_free_capacity
-                        .entry(cap_key.clone())
-                        .and_modify(|prev| *prev = (*prev).max(free_cap))
-                        .or_insert(free_cap);
-                }
-            }
-        }
-        grouped
-            .into_iter()
-            .map(
-                |((namespace, interface, pool), acc)| anyserve_proto::cluster::PoolSlotSummary {
-                    namespace,
-                    interface,
-                    pool,
-                    free_slots: acc.free_slots,
-                    min_load_score: acc.min_load,
-                    ready_worker_ids: acc.worker_ids,
-                    shared_attributes: acc.shared_attrs.unwrap_or_default().into_iter().collect(),
-                    max_free_capacity: acc.max_free_capacity,
-                },
-            )
-            .collect()
-    }
-
     pub fn watch(&self, job_id: &str, after_sequence: u64) -> Result<EventStream, RuntimeError> {
         self.watch_in(DEFAULT_NAMESPACE, job_id, after_sequence)
     }
@@ -1222,25 +1223,9 @@ impl Runtime {
         job_id: &str,
         after_sequence: u64,
     ) -> Result<EventStream, RuntimeError> {
+        self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(&ns, job_id);
-        if self.is_postgres_job(&scoped_id) {
-            let runtime = self.clone();
-            let raw = job_id.to_string();
-            return Ok(EventStream::new(async_stream::stream! {
-                let mut after = after_sequence;
-                loop {
-                    match runtime.events_in(&ns, &raw, after).await {
-                        Err(error) => { yield Err(error); break; }
-                        Ok((events, done)) => {
-                            for event in events { after = event.sequence; yield Ok(event); }
-                            if done { break; }
-                        }
-                    }
-                    tokio::time::sleep(runtime.inner.postgres.as_ref().expect("PG").config.poll_interval).await;
-                }
-            }));
-        }
         let st = self.inner.lock();
         if let Some(job) = st.jobs.get(&scoped_id) {
             let changes = job.log.subscribe();
@@ -1291,14 +1276,9 @@ impl Runtime {
         job_id: &str,
         after_sequence: u64,
     ) -> Result<(Vec<ExecutionEvent>, bool), RuntimeError> {
+        self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(&ns, job_id);
-        if self.is_postgres_job(&scoped_id) {
-            let snapshot = self
-                .postgres_snapshot(&scoped_id, ReadMode::Events, Some(after_sequence))
-                .await?;
-            return Ok((snapshot.events, snapshot.job.state.is_terminal()));
-        }
         let log = {
             let st = self.inner.lock();
             match st.jobs.get(&scoped_id) {
@@ -1343,7 +1323,7 @@ impl Runtime {
     fn replayed_events(&self, job: JobView, after_sequence: u64) -> Vec<ExecutionEvent> {
         // Finished takes the generation's last sequence: above anything the
         // job's live log handed out, below the next generation.
-        let base = self.inner.generation << 32;
+        let base = self.generation() << 32;
         [
             (base + 1, EventKind::Accepted),
             (
@@ -1382,17 +1362,9 @@ impl Runtime {
         job_id: &str,
         include_outputs: bool,
     ) -> Result<JobView, RuntimeError> {
+        self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(&ns, job_id);
-        if self.is_postgres_job(&scoped_id) {
-            let mode = if include_outputs {
-                ReadMode::Full
-            } else {
-                ReadMode::Metadata
-            };
-            let snapshot = self.postgres_snapshot(&scoped_id, mode, None).await?;
-            return Ok(view_from_stored(snapshot.job, include_outputs));
-        }
         {
             let st = self.inner.lock();
             if let Some(job) = st.jobs.get(&scoped_id) {
@@ -1461,18 +1433,9 @@ impl Runtime {
         namespace: &str,
         job_id: &str,
     ) -> Result<JobInspection, RuntimeError> {
+        self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(&ns, job_id);
-        if self.is_postgres_job(&scoped_id) {
-            let snapshot = self
-                .postgres_snapshot(&scoped_id, ReadMode::Full, Some(0))
-                .await?;
-            return Ok(JobInspection {
-                job: view_from_stored(snapshot.job, true),
-                spec: None,
-                events: snapshot.events,
-            });
-        }
         loop {
             if let Some(retained) = self.inspect_retained_job(&scoped_id, job_id)? {
                 return Ok(retained);
@@ -1502,19 +1465,9 @@ impl Runtime {
         namespace: &str,
         job_id: &str,
     ) -> Result<JobPreview, RuntimeError> {
+        self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(&ns, job_id);
-        if self.is_postgres_job(&scoped_id) {
-            let snapshot = self
-                .postgres_snapshot(&scoped_id, ReadMode::Preview, Some(0))
-                .await?;
-            return Ok(JobPreview {
-                job: view_from_stored(snapshot.job, false),
-                spec: None,
-                events: snapshot.events,
-                outputs: snapshot.previews,
-            });
-        }
         loop {
             if let Some(JobInspection {
                 mut job,
@@ -1575,18 +1528,9 @@ impl Runtime {
         job_id: &str,
         reason: String,
     ) -> Result<JobView, RuntimeError> {
+        self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(&ns, job_id);
-        if self.is_postgres_job(&scoped_id) {
-            self.inner
-                .postgres
-                .as_ref()
-                .expect("PG")
-                .cancel(&scoped_id, reason)
-                .await
-                .map_err(distributed::read_error)?;
-            return self.get_job_in(&ns, job_id, false).await;
-        }
         let receiver = {
             let mut st = self.inner.lock();
             let now = now_ms();
@@ -1641,9 +1585,7 @@ impl Runtime {
     }
 
     pub async fn list_jobs(&self, filter: JobFilter) -> Result<JobPage, RuntimeError> {
-        if self.inner.postgres.is_some() {
-            return self.list_postgres_jobs(filter).await;
-        }
+        self.ensure_active_leader()?;
         let offset = match filter.page_token.as_deref().filter(|t| !t.is_empty()) {
             Some(token) => token
                 .parse::<usize>()
@@ -1700,9 +1642,13 @@ impl Runtime {
     pub fn health(&self) -> Health {
         let journal = self.inner.journal_health();
         let st = self.inner.lock();
+        let live = !self.inner.lease_lost.load(Ordering::Acquire);
+        let active = self.inner.leader_active.load(Ordering::Acquire);
         Health {
-            live: self.inner.postgres.as_ref().is_none_or(|pg| pg.healthy()),
-            ready: !st.shutting_down
+            live,
+            ready: live
+                && active
+                && !st.shutting_down
                 && matches!(
                     journal,
                     api::JournalHealth::Disabled | api::JournalHealth::Healthy
@@ -1775,21 +1721,19 @@ impl Runtime {
             sessions: st.sessions.len(),
             interfaces,
             pools,
-            journal: self
-                .inner
-                .postgres
-                .as_ref()
-                .map(|pg| pg.stats())
-                .or_else(|| self.inner.journal.as_ref().map(|journal| journal.stats())),
+            journal: self.inner.journal.as_ref().map(|journal| journal.stats()),
             input_bytes: self.inner.input_budget.used(),
             result_bytes: self.inner.result_budget.used(),
             event_bytes: self.inner.event_budget.used(),
         }
     }
 
-    /// Stops accepting work, asks workers to drain and closes the journal
-    /// after its queued commits.
+    /// Stops accepting work, asks workers to drain, flushes queued commits, and
+    /// relinquishes leadership so a standby can take over immediately.
     pub async fn shutdown(&self) {
+        self.inner.stop_tx.send_replace(true);
+        self.inner.leader_active.store(false, Ordering::Release);
+        self.inner.leadership_tx.send_replace(false);
         {
             let mut st = self.inner.lock();
             st.shutting_down = true;
@@ -1807,8 +1751,20 @@ impl Runtime {
         if let Some(journal) = &self.inner.journal {
             journal.close().await;
         }
-        if let Some(pg) = &self.inner.postgres {
-            let _ = tokio::time::timeout(Duration::from_secs(10), pg.close()).await;
+        let lease = self
+            .inner
+            .lease_handle
+            .lock()
+            .expect("lease handle mutex poisoned")
+            .take();
+        if let Some(lease) = lease {
+            lease.relinquish().await;
+        }
+        {
+            let mut st = self.inner.lock();
+            for session in st.sessions.values_mut() {
+                session.tx = None;
+            }
         }
     }
 }
@@ -1891,5 +1847,212 @@ mod tests {
         assert!(matches!(due.as_slice(), [TimerKey::Dispatch]), "{due:?}");
         let inner = timers.lock();
         assert!(inner.heap.is_empty() && inner.keys.is_empty() && inner.cancelled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn standby_gate_takeover_fencing_and_graceful_relinquish() {
+        use crate::journal::{BoxFuture, CommitOutcome, JournalOp};
+        use std::sync::atomic::AtomicUsize;
+
+        struct MockLeasedBackend {
+            allow_acquire: AtomicBool,
+            term: AtomicU64,
+            lost_tx: watch::Sender<bool>,
+            relinquished: Arc<AtomicUsize>,
+            fence_next: AtomicBool,
+        }
+
+        impl JournalBackend for MockLeasedBackend {
+            fn try_acquire_leadership(&self) -> BoxFuture<'_, anyhow::Result<Option<Leadership>>> {
+                if !self.allow_acquire.load(Ordering::Acquire) {
+                    return Box::pin(async { Ok(None) });
+                }
+                let term = self.term.fetch_add(1, Ordering::AcqRel) + 1;
+                let lost_rx = self.lost_tx.subscribe();
+                let rel = Arc::clone(&self.relinquished);
+                let mut spec = JobSpec::default();
+                spec.demand.interface = "demo.v1".into();
+                spec.policy.durability = Some(Durability::Durable);
+                let recovered = StoredJob {
+                    job_id: identity::encode_scoped_id(DEFAULT_NAMESPACE, "recovered-1"),
+                    state: JobState::Queued,
+                    spec,
+                    spec_hash: "h1".into(),
+                    attempt_count: 0,
+                    max_attempts: 3,
+                    created_at_ms: 100,
+                    updated_at_ms: 100,
+                    error: None,
+                    outputs: Vec::new(),
+                    last_attempt_id: None,
+                    last_worker_id: None,
+                    failed_workers: Default::default(),
+                };
+                Box::pin(async move {
+                    Ok(Some(Leadership {
+                        term,
+                        recovery: Recovery {
+                            generation: term,
+                            active: vec![recovered],
+                        },
+                        lease: LeaseHandle::new(lost_rx, move || {
+                            Box::pin(async move {
+                                rel.fetch_add(1, Ordering::SeqCst);
+                            })
+                        }),
+                    }))
+                })
+            }
+
+            fn standby_poll_interval(&self) -> Duration {
+                Duration::from_millis(15)
+            }
+
+            fn enqueue(
+                &self,
+                _term: u64,
+                _op: JournalOp,
+            ) -> Result<oneshot::Receiver<CommitOutcome>, RuntimeError> {
+                let (tx, rx) = oneshot::channel();
+                if self.fence_next.load(Ordering::Acquire) {
+                    let _ = tx.send(CommitOutcome::Fenced("mock lease stolen".into()));
+                } else {
+                    let _ = tx.send(CommitOutcome::Committed);
+                }
+                Ok(rx)
+            }
+
+            fn spec_hash<'a>(
+                &'a self,
+                _id: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn receipt<'a>(
+                &'a self,
+                _lease_id: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<(String, String)>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn load_job<'a>(
+                &'a self,
+                _id: &'a str,
+                _include_outputs: bool,
+                _budget: Arc<ByteBudget>,
+            ) -> BoxFuture<'a, anyhow::Result<Option<StoredJob>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn load_job_preview<'a>(
+                &'a self,
+                _id: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<(StoredJob, Vec<ObjectPreview>)>>>
+            {
+                Box::pin(async { Ok(None) })
+            }
+            fn scan_jobs<'a>(
+                &'a self,
+                _from: u64,
+                _to: u64,
+                _before: Option<(u64, String)>,
+                _ns: Option<&'a str>,
+                _limit: usize,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<StoredJob>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn purge<'a>(
+                &'a self,
+                _term: u64,
+                _before: u64,
+            ) -> BoxFuture<'a, anyhow::Result<usize>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn stats(&self) -> api::JournalStats {
+                api::JournalStats::default()
+            }
+            fn close(&self) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let (lost_tx, _) = watch::channel(false);
+        let relinquished = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(MockLeasedBackend {
+            allow_acquire: AtomicBool::new(false),
+            term: AtomicU64::new(41),
+            lost_tx: lost_tx.clone(),
+            relinquished: Arc::clone(&relinquished),
+            fence_next: AtomicBool::new(false),
+        });
+
+        // 1. Starts on standby: live=true, ready=false, RPCs fail with Unavailable.
+        let runtime = Runtime::start_with_backend(
+            RuntimeConfig::default(),
+            Some(Arc::clone(&mock) as Arc<dyn JournalBackend>),
+        )
+        .await
+        .unwrap();
+        assert!(!runtime.is_leader_active());
+        assert!(runtime.health().live);
+        assert!(!runtime.health().ready);
+        assert_eq!(
+            runtime
+                .list_jobs(JobFilter::default())
+                .await
+                .unwrap_err()
+                .kind,
+            crate::error::ErrorKind::PersistenceUnavailable
+        );
+        assert_eq!(
+            runtime
+                .open_session(anyserve_proto::v2::Hello {
+                    interfaces: vec!["demo.v1".into()],
+                    ..Default::default()
+                })
+                .err()
+                .unwrap()
+                .kind,
+            crate::error::ErrorKind::PersistenceUnavailable
+        );
+
+        // 2. Grant leadership -> standby takes over, recovers queued job, flips ready=true.
+        let mut leader_sub = runtime.subscribe_leadership();
+        mock.allow_acquire.store(true, Ordering::Release);
+        while !*leader_sub.borrow() {
+            leader_sub.changed().await.unwrap();
+        }
+        assert!(runtime.is_leader_active());
+        assert_eq!(runtime.generation(), 42);
+        assert!(runtime.health().ready);
+        let view = runtime.get_job("recovered-1", false).await.unwrap();
+        assert_eq!(view.state, JobState::Queued);
+
+        // 3. Graceful shutdown invokes relinquish() cleanly.
+        runtime.shutdown().await;
+        assert_eq!(relinquished.load(Ordering::SeqCst), 1);
+
+        // 4. Fenced write or lease expiry triggers wait_for_lease_loss() immediately.
+        let runtime2 = Runtime::start_with_backend(
+            RuntimeConfig::default(),
+            Some(Arc::clone(&mock) as Arc<dyn JournalBackend>),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime2.generation(), 43);
+        mock.fence_next.store(true, Ordering::Release);
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "demo.v1".into();
+        let err = runtime2
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, crate::error::ErrorKind::PersistenceUnavailable);
+        tokio::time::timeout(Duration::from_secs(2), runtime2.wait_for_lease_loss())
+            .await
+            .expect("fenced write must trigger lease loss notification");
+        assert!(!runtime2.health().live);
+        assert!(!runtime2.health().ready);
     }
 }

@@ -86,6 +86,7 @@ impl Runtime {
         hello: pb::Hello,
         principal: crate::auth::Principal,
     ) -> Result<SessionHandle, RuntimeError> {
+        self.ensure_active_leader()?;
         let limits = &self.inner.config.limits;
         let identifier = limits.max_identifier_bytes as usize;
         if hello.interfaces.is_empty() {
@@ -281,10 +282,6 @@ impl Runtime {
             });
         }
         inner.dispatch_locked(&mut st, now);
-        inner.cluster_wakeup.notify_one();
-        if let Some(mesh) = &inner.peer_mesh {
-            mesh.notify_directory_changed();
-        }
         Ok(SessionHandle {
             session_id,
             connection,
@@ -449,12 +446,6 @@ impl Runtime {
         }
         if may_free_slot {
             inner.dispatch_locked(&mut st, now);
-            if inner.postgres.is_some() {
-                inner.cluster_wakeup.notify_one();
-            }
-            if let Some(mesh) = &inner.peer_mesh {
-                mesh.notify_directory_changed();
-            }
         }
         Ok(())
     }
@@ -470,9 +461,6 @@ impl Runtime {
             .is_some_and(|session| session.connection == connection)
         {
             inner.disconnect_locked(&mut st, session_id, now_ms());
-            if let Some(mesh) = &inner.peer_mesh {
-                mesh.notify_directory_changed();
-            }
         }
     }
 
@@ -480,6 +468,7 @@ impl Runtime {
         &self,
         open: &pb::AttemptOpen,
     ) -> Result<(AttemptLink, u64), RuntimeError> {
+        self.ensure_active_leader()?;
         if let Some(opened) = self.open_attempt_in_memory(open)? {
             return Ok(opened);
         }
@@ -508,12 +497,6 @@ impl Runtime {
         &self,
         lease_id: &str,
     ) -> Result<Option<(String, String)>, RuntimeError> {
-        if let Some(pg) = &self.inner.postgres {
-            return pg
-                .receipt(lease_id)
-                .await
-                .map_err(super::distributed::read_error);
-        }
         match &self.inner.journal {
             None => Ok(None),
             Some(journal) => journal
@@ -597,43 +580,6 @@ impl Runtime {
         let metadata = to_metadata(std::mem::take(&mut frame.metadata));
         if metadata_size(&metadata) > limits.max_metadata_bytes as usize {
             return Err(RuntimeError::invalid("frame metadata is too large"));
-        }
-        if let Some(pg) = &self.inner.postgres {
-            let owned = {
-                let st = self.inner.lock();
-                st.leases
-                    .get(lease_id)
-                    .filter(|l| !l.cancelling)
-                    .and_then(|l| st.jobs.get(&l.job_id))
-                    .and_then(|j| j.ownership_epoch.zip(j.attempt.as_ref()))
-                    .map(|(epoch, a)| {
-                        (
-                            st.leases[lease_id].job_id.clone(),
-                            epoch,
-                            a.attempt_id.clone(),
-                        )
-                    })
-            };
-            if let Some((id, epoch, attempt)) = owned {
-                let sequence = pg
-                    .append_frame(
-                        &id,
-                        epoch,
-                        &attempt,
-                        &frame,
-                        metadata,
-                        self.inner.config.event_log_max_events,
-                        self.inner.config.event_log_max_bytes,
-                    )
-                    .await
-                    .map_err(super::distributed::read_error)?;
-                if let Some(job) = self.inner.lock().jobs.get_mut(&id)
-                    && let Some(a) = job.attempt.as_mut().filter(|a| a.lease_id == lease_id)
-                {
-                    a.last_frame_seq = a.last_frame_seq.max(sequence);
-                }
-                return Ok(sequence);
-            }
         }
         let stall = self.inner.config.consumer_stall_timeout;
         let deadline = tokio::time::Instant::now() + stall;

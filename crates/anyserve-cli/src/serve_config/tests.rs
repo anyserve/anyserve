@@ -150,24 +150,12 @@ fn unknown_keys_and_sections_are_rejected() {
         "[server]\nheartbeat_ttl_secs=30",
         "[server.storage]\nbackend='sqlite'",
         "[gateway]\nenabled=true",
+        "[cluster]\npeer_token='cluster-secret'",
+        "[journal]\ninternal_grpc_addr='http://127.0.0.1:50052'",
     ] {
         let message = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
         assert!(message.contains("unknown field"), "{message}");
     }
-}
-
-#[test]
-fn cluster_section_configures_peer_token_and_internal_addr() {
-    let resolved = config(
-        r#"
-[cluster]
-internal_grpc_addr = "https://10.0.0.5:50052"
-peer_token = "cluster-secret"
-"#,
-        ServeOverrides::default(),
-    )
-    .unwrap();
-    assert!(resolved.auth.has_peer_tokens());
 }
 
 #[test]

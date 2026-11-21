@@ -191,7 +191,7 @@ pub(crate) fn runtime_mode_summary(mode: RuntimeMode) -> RuntimeModeSummary {
         journal: match mode {
             RuntimeMode::Memory => "disabled",
             RuntimeMode::MemoryPlusSqlite => "sqlite",
-            RuntimeMode::PostgresCluster => "postgres",
+            RuntimeMode::MemoryPlusPostgres => "postgres",
         },
     }
 }

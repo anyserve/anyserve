@@ -33,11 +33,6 @@ worker_tokens = []
 # namespace = "robot-fleet-a"
 # forced_pool = "jetson-local"
 
-# Optional inter-replica PeerMesh configuration (PostgreSQL cluster mode):
-# [cluster]
-# internal_grpc_addr = "https://10.0.1.12:50052"
-# peer_token_env = "ANYSERVE_PEER_TOKEN"
-
 # Omit this section to disable management HTTP.
 [console]
 enabled = true
@@ -97,20 +92,9 @@ client-role tokens, workers need worker-role tokens, and tenant isolation comes 
 operator token from `[auth].client_tokens` (scoped tenant tokens and worker tokens
 receive `403 Forbidden`).
 
-`[cluster]` authenticates active-active `PeerMesh` control-plane traffic between PG
-replicas using a dedicated `[cluster].peer_token` / `peer_token_env`. When no peer
-token is configured, `PeerMesh` services are not registered and peer-sync loops are
-not started. Client, worker, and scoped tokens are rejected on `PeerMesh` RPCs.
-Use an `https://` `internal_grpc_addr` with a publicly trusted TLS certificate for
-encrypted peer links.
-
 When a job sets a non-empty `concurrency_key` and neither `runtime.default_max_in_flight_per_key`
-nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, all backends (in-memory,
-SQLite, and PostgreSQL) default to `1` (strict per-key serialization within each
-namespace). In PostgreSQL mode, each claim pass excludes saturated `concurrency_key`s
-discovered during that pass across bounded retries so other keys behind a saturated
-key are still claimed; when a single `concurrency_key` may accumulate deep queues, set
-`fairness_key` equal to `concurrency_key` so each key has its own O(log N) fairness bucket.
+nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, the scheduler defaults to `1`
+(per-key serialization within each namespace).
 
 TLS protects gRPC; terminate management HTTP TLS at your ingress or proxy. CORS
 origins control browser access independently of authentication.
@@ -123,8 +107,7 @@ private CA.
 ## Limits and retention
 
 `max_queue` limits queued/accepting jobs per interface; `max_pending_jobs` limits
-unfinished jobs in each Runtime. In PG mode these limit replica-local admission
-and loaded work, not the shared backlog. Admission beyond these limits returns
+unfinished jobs in the active Runtime. Admission beyond these limits returns
 `RESOURCE_EXHAUSTED`. Heartbeat timeout closes a silent session, then gives its
 leases another heartbeat-timeout interval to reconnect. Cancellation keeps a
 worker reservation until acknowledgement or `cancel_grace_ms` expires.
@@ -146,21 +129,20 @@ Each job also has `event_log_max_events` and `event_log_max_bytes` limits.
 the event byte budget; admission, attempt and retained-job limits bound them.
 
 `terminal_retention_secs` and `max_terminal_jobs` limit terminal jobs in memory.
-Durable results remain readable by ID until journal retention expires. SQLite
-ListJobs lists jobs still in memory; PostgreSQL lists shared durable jobs and
-local ephemeral jobs. `full_sync=false` selects SQLite NORMAL sync,
+Durable results remain readable by ID until journal retention expires. ListJobs
+lists jobs currently held in memory. `full_sync=false` selects SQLite NORMAL sync,
 which weakens durability under power loss. Journal queue capacity bounds pending
-operations; `max_batch` controls group commits.
+operations; `max_batch` controls group commits for both SQLite and PostgreSQL.
 
-For multiple active replicas, select `backend="postgres"`, omit `path`, and set
+For leader-standby high availability, select `backend="postgres"`, omit `path`, and set
 `url_env="ANYSERVE_DATABASE_URL"`. Optional PG keys are `schema="anyserve"`,
-`lease_duration_ms=15000` (3–300 seconds), `poll_interval_ms=100` (at least 10 ms
-and at most one quarter of the lease), and `max_connections=16` (at least 2).
-Each replica also opens one dedicated heartbeat connection. `full_sync=false`
-and the embedded SQLite `max_bytes` cap are rejected for PG. `max_batch` is
-SQLite-only; PG commits independent transactions concurrently. `--journal PATH`
-explicitly selects SQLite and `--ephemeral` disables persistence. See
-[PG deployment](deployment.md#postgresql-active-active) for ownership and load balancing.
+`lease_duration_ms=5000` (500–300,000 ms), `poll_interval_ms=100` (10 ms up to half
+the lease), and `max_connections=8` (at least 2, plus dedicated write and lease
+connections). `full_sync=false` and the embedded SQLite `max_bytes` cap are rejected
+for PG. PostgreSQL uses schema v3 (`scheduler_lease`, `jobs`, `objects`) and rejects
+legacy v1/v2 schemas at startup. `--journal PATH` explicitly selects SQLite and
+`--ephemeral` disables persistence. See
+[PG deployment](deployment.md#postgresql-high-availability) for failover and routing.
 
 For evicted durable jobs, Console previews read at most 4 KiB per inline output
 directly from the journal, preserving the original size without reserving
@@ -185,7 +167,7 @@ bodies and media are excluded.
 
 | Boundary | Behavior |
 |---|---|
-| Source | Completed durable history, or current retained jobs; in PG mode the latter means shared queued/running durable jobs |
+| Source | Completed durable history, or current retained jobs in memory |
 | Time range | Creation time, at most 31 days; custom inputs use local time with second precision |
 | Load | 10,000 jobs by default; at most 100,000 jobs or 32 MiB of serialized metadata |
 | API | Authenticated `/api/analytics/jobs`, up to 250 rows per page with creation-time/job-ID cursors |

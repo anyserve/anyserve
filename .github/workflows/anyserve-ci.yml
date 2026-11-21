@@ -50,8 +50,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
-      - name: Test PostgreSQL multi-replica integration
-        run: cargo test --locked -p anyserve-core postgres_cluster -- --ignored --test-threads=1
+      - name: Test PostgreSQL leader-standby integration
+        run: cargo test --locked -p anyserve-core postgres_ -- --ignored --test-threads=1
         env:
           ANYSERVE_TEST_POSTGRES_URL: postgresql://anyserve_ci:anyserve_ci@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anyserve_ci
 

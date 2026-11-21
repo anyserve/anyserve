@@ -1,11 +1,12 @@
 # Deployment and Recovery
 
-An execution domain is either a PostgreSQL database/schema shared by multiple
-active control-plane replicas, or one process with a SQLite journal. Add workers
-for execution capacity and PG control-plane replicas for concurrent admission
-and scheduling. Separate database schemas isolate domains. Redis is not required.
+An execution domain runs one active in-memory scheduler backed either by a
+PostgreSQL database/schema (allowing warm standby control-plane replicas for
+automatic failover) or by a local SQLite journal in a single process. Add
+workers for execution capacity. Separate database schemas isolate domains.
+Redis is not required.
 
-## PostgreSQL active-active
+## PostgreSQL high availability
 
 Replace the SQLite `[journal]` section in the server file with:
 
@@ -14,86 +15,62 @@ Replace the SQLite `[journal]` section in the server file with:
 backend = "postgres"
 url_env = "ANYSERVE_DATABASE_URL"
 schema = "anyserve"
-lease_duration_ms = 15000
+lease_duration_ms = 5000
 poll_interval_ms = 100
-max_connections = 16
-
-[cluster]
-internal_grpc_addr = "https://10.0.1.12:50052"
-peer_token_env = "ANYSERVE_PEER_TOKEN"
+max_connections = 8
 ```
 
-Provide the PostgreSQL URL through that environment variable, preferably from
-a secret manager. All replicas use the same database and schema. The role needs
-schema/table creation privileges for bootstrap; DDL is serialized only during
-startup. The execution path has no leader or process-wide exclusive database
-lock. Use a writable primary endpoint. PostgreSQL's own replication, failover,
-backups and connection capacity remain database deployment responsibilities.
-Failover must preserve acknowledged commits and leave only one authoritative
-writable primary; application fencing cannot recover transactions lost when an
-asynchronous standby is promoted.
+Provide the PostgreSQL URL through `ANYSERVE_DATABASE_URL`, preferably from a
+secret manager. All control-plane instances point to the same writable primary
+database and schema. PostgreSQL's own HA replication, synchronous commit policy,
+backups and connection pooling remain database responsibilities. Schema v3
+(`scheduler_lease`, `jobs`, `objects`) is a clean break from older releases:
+drain existing work and recreate the schema before upgrading.
 
-Each replica issues one best-effort `ANALYZE jobs` after its first claim of 16
-or more jobs, so a backlog loaded before autovacuum refreshed planner statistics
-is claimed with current estimates. The statement does not block reads or writes,
-and its failure is ignored.
+Exactly one instance holds the single-row `scheduler_lease` (`generation`
+fencing token + database `clock_timestamp()` expiry) and runs the scheduler.
+Every journal write batch validates `holder_id`, `generation`, and `expires_at`
+under `FOR SHARE` in a single implicit-transaction SQL round-trip, with bounded
+session/statement/lock timeouts so a hung leader never blocks standby takeover.
+Standby instances stay live (`/healthz` returns `204`, `/readyz` returns `503`,
+gRPC returns `UNAVAILABLE`) and poll `scheduler_lease` every `poll_interval_ms`.
 
-Task admission uses a unique job ID and atomic fingerprint comparison. Schedulers
-claim matching work with `FOR UPDATE SKIP LOCKED`; ownership changes increment a
-job epoch. A node lease is a time-limited permission to own work, renewed against
-database time. Owner ID, lease validity and epoch guard every attempt start,
-retry and terminal transaction. After a crash, another replica can claim
-the unfinished work once the lease expires (15 seconds by default), subject to
-worker availability and the remaining attempt budget. Graceful shutdown expires
-membership immediately. A replica that loses membership fences its local work
-and the CLI exits; Kubernetes or a Docker restart policy gives it a fresh identity.
-Failed renewals are retried only within the last confirmed lease; an unconfirmed
-renewal never extends the replica's local validity.
-Keep all replicas on the same version and runtime policies. Budget up to
-`replicas × (max_connections + 1)` database connections, plus administration
-and other applications; the extra connection is dedicated to heartbeat renewal.
+- **Graceful shutdown (`SIGTERM`/`SIGINT`)** flushes queued commits and expires
+  `scheduler_lease` immediately so a standby takes over within roughly one poll
+  interval.
+- **Crash or network partition** recovers once `lease_duration_ms` elapses on
+  the database clock. If a stalled leader wakes after losing its lease, its next
+  write or renewal is fenced and the process exits so the supervisor restarts it
+  cleanly as a standby.
+- **Routing:** In Kubernetes, a standard Service routes exclusively to the
+  `/readyz`-passing leader. Without a readiness-aware load balancer, pass a
+  comma-separated endpoint list (`ANYSERVE_ENDPOINT="http://cp1:50052,http://cp2:50052"`);
+  Rust and Python clients/workers probe sequentially on `UNAVAILABLE` and stick
+  to the active leader.
+- **Retries across failover:** An attempt already started when a leader crashes
+  counts toward `attempt_count`; keep `max_attempts >= 2` (default `3`) and
+  idempotent handlers so recovered durable jobs execute on the new leader.
 
-Durable Submit, GetJob, Watch, ListJobs, Cancel and Console job queries work across
-replicas. Lifecycle and bounded progress events share database cursors; retries
-and receipt replay survive ownership changes. Final outputs are stored once,
-and Console reads only bounded prefixes. Use URI objects for large media; no
-automatic object-storage upload or SQLite-to-PG data migration is performed.
-Execution remains at least once: handlers need idempotency for external effects.
-Fencing prevents an expired worker result from replacing the committed outcome;
-it cannot undo effects already performed by that worker.
+## Edge sites
 
-Worker Session and Attempt streams need the same backend. Use the matching SDK,
-which shares one HTTP/2 connection in PG mode, and a TCP/L4 load balancer such as
-a Kubernetes ClusterIP Service. An L7 proxy that independently balances RPCs
-must provide equivalent affinity. Upgrade existing worker images with the server.
-Ephemeral Invoke/Submit and worker sessions remain local to their serving replica;
-when `[cluster].internal_grpc_addr` and `[cluster].peer_token` / `peer_token_env` are
-configured on PG replicas, `PeerMesh` automatically maintains authenticated bidirectional
-directory links (discovering peer endpoints strictly from the trusted PostgreSQL `nodes`
-table) to wake peers on durable admissions and forward ephemeral `Invoke` single-hop
-to a replica with ready workers when local capacity is absent. Keep `[cluster]` peer
-tokens separate from client/worker tokens and restrict internal replica addresses to a
-private VPC or TLS (`https://`). When no peer token is configured, `PeerMesh` is not
-exposed and no peer-sync tasks run. Durable Submit always works across any replica and backs up
-with PostgreSQL Group-Commit frame batching (`EventBatcher`). In PG mode, ephemeral
-jobs use generated `ephemeral:` IDs; caller-chosen IDs are reserved for durable Submit
-and may not use that prefix.
-Metrics and pool counters (`anyserve_pool_sessions`, `anyserve_pool_free_slots`,
-`anyserve_pool_active_leases`, `anyserve_pool_desired_additional_slots`) expose
-per-`(namespace, interface, pool)` pressure on `/metrics` for autoscalers such as KEDA.
+At factory, warehouse, or robot edge sites, run a single `anyserve serve`
+process with a local SQLite journal under `systemd` or K3s (`replicaCount=1`).
+Local hardware failure is handled by supervisor restart (seconds) or by
+configuring `pool_tiers` with `spillover_after_ms` to spill queued work to a
+site-rack or cloud worker pool rather than operating multi-node PG HA on the edge.
 
-For Helm, create a Secret from a private file containing `ANYSERVE_DATABASE_URL`,
-then install a separate PG release (the chart does not install PostgreSQL):
+For Kubernetes with PostgreSQL, create a Secret containing `ANYSERVE_DATABASE_URL`
+and install the chart (which does not install PostgreSQL itself):
 
 ```bash
 kubectl create secret generic anyserve-pg --from-env-file=/secure/anyserve-pg.env
 helm install anyserve-pg deploy/helm/anyserve \
   --set journal.backend=postgres --set journal.postgres.existingSecret=anyserve-pg \
-  --set replicaCount=3 --set auth.existingSecret=anyserve-tokens
+  --set replicaCount=2 --set auth.existingSecret=anyserve-tokens
 ```
 
 The PG release creates no journal PVC. Keep an existing SQLite release and its
-volume until its work has drained and any required data migration is complete.
+volume until its work has drained.
 
 ## Containers
 
@@ -158,9 +135,9 @@ helm install anyserve deploy/helm/anyserve \
 | `image.repository`, `image.tag`, `image.pullPolicy` | GHCR repository, chart `appVersion` tag, `IfNotPresent` |
 | `auth.existingSecret`, `auth.clientTokens`, `auth.workerTokens` | Empty; both token lists empty disables auth |
 | `journal.enabled`, `journal.size`, `journal.storageClass` | `true`, `1Gi`, cluster default storage class |
-| `journal.backend`, `replicaCount` | `sqlite`, `1`; multiple replicas require `postgres` |
+| `journal.backend`, `replicaCount` | `sqlite`, `1`; `replicaCount > 1` runs leader + standby on `postgres` |
 | `journal.postgres.existingSecret`, `journal.postgres.secretKey` | Existing database URL Secret, `ANYSERVE_DATABASE_URL` |
-| `journal.postgres.schema`, `leaseDurationMs`, `pollIntervalMs`, `maxConnections` | `anyserve`, `15000`, `100`, `16`; one extra heartbeat connection per replica |
+| `journal.postgres.schema`, `leaseDurationMs`, `pollIntervalMs`, `maxConnections` | `anyserve`, `5000`, `100`, `8` |
 | `runtime` | Scalar `[runtime]` overrides; empty map |
 | `service.type`, `service.grpcPort`, `service.httpPort` | `ClusterIP`, `50052`, `3001` |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | Control-plane pod scheduling and resources; unset |
@@ -231,23 +208,23 @@ Reconstruct sessions or model caches at the application layer after failover.
   before copying the database with its SQLite sidecars or starting its replacement.
   Start one matching binary with the same journal, then check known job IDs,
   readiness and worker connectivity before restoring traffic.
-- **PostgreSQL:** roll control-plane replicas one at a time, checking readiness
-  and shared results after each replacement. Graceful exit releases membership;
-  a crash requires lease expiry before takeover. Reconnect workers with the
-  matching SDK and check their distribution across replicas. Back up and restore
+- **PostgreSQL:** roll control-plane instances one at a time, checking `/readyz`
+  on the active leader after each replacement. Graceful exit relinquishes the
+  scheduler lease immediately; a crash requires `lease_duration_ms` before
+  standby takeover. Workers reconnect automatically. Back up and restore
   PostgreSQL using the database deployment's own procedures.
 
 Shutdown stops admission and sends Drain; it does not guarantee every handler
 finishes before exit. Unfinished durable jobs can execute again within their
 remaining attempt budget. Downtime consumes wall-clock deadlines, and takeover
 still needs an eligible worker. Invoke, ephemeral jobs and worker-local state
-do not recover through the shared journal.
+do not recover through the journal.
 
 | State | Survives with a persistent journal? |
 |---|---|
 | Committed durable input, attempt count, final result | Yes, until journal retention expires |
 | Invoke and ephemeral Submit | No |
-| Retained durable progress and lifecycle events | PostgreSQL: yes; SQLite: no |
+| Live progress and intermediate lifecycle events | No (held in memory; terminal outcome replays from journal) |
 | Worker-local state | No |
 
 ## Operations
@@ -261,13 +238,12 @@ at the deployment's ingress or proxy.
 
 | Signal | Next check |
 |---|---|
-| `/readyz` returns 503 | Shutdown or journal write availability |
+| `/readyz` returns 503 | Instance is on standby, shutting down, or journal writes are unavailable |
 | Ready but calls queue | Matching interfaces, worker connectivity, free slots and capacity |
 | SQLite journal lock failure | Previous process still owns that path |
-| Durable admission fails | Journal capacity and write availability; recover a frozen replica by restart, then reconcile uncertain Submit with the same job ID/specification |
-| SQLite GetJob works but ListJobs omits a job | In-memory retention expired; read the durable result by ID |
-| PG counters differ from job lists | Counters are replica-local; durable job lists cover the shared schema |
-| PG replica exits after lease loss | Check database connectivity and restart policy; use another healthy replica for durable work |
+| Durable admission fails | Journal capacity and write availability; recover a frozen instance by restart, then reconcile uncertain Submit with the same job ID/specification |
+| GetJob works but ListJobs omits a job | In-memory retention expired; read the durable result by ID |
+| PG leader exits after lease loss | Check database connectivity and restart policy; standby takes over once lease expires |
 | Cursor expired | Event history was evicted or belongs to a prior generation; read current state by ID |
 
 Metrics cover Runtime jobs, interfaces, workers, byte budgets and journal.

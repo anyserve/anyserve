@@ -49,6 +49,7 @@ pub(crate) struct JobIndex {
 }
 
 impl JobIndex {
+    #[cfg(test)]
     pub(crate) fn unfinished_ids(&self) -> impl Iterator<Item = &str> + Clone {
         self.namespaces
             .values()

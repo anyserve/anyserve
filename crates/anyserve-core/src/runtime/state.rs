@@ -359,10 +359,6 @@ impl State {
         Self::inc_in(&mut self.accepting, namespace, interface);
     }
 
-    pub(crate) fn dec_accepting(&mut self, namespace: &str, interface: &str) {
-        Self::dec_in(&mut self.accepting, namespace, interface);
-    }
-
     pub(crate) fn in_flight_key_count(&self, namespace: &str, ckey: &str) -> usize {
         Self::count_in(&self.in_flight_concurrency, namespace, ckey)
     }
@@ -520,7 +516,6 @@ pub(crate) struct Job {
     pub id: String,
     pub raw_id: String,
     pub namespace: String,
-    pub ownership_epoch: Option<i64>,
     pub spec: Arc<JobSpec>,
     pub durability: Durability,
     pub spec_hash: String,
