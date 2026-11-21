@@ -4,20 +4,36 @@ mod session;
 use anyhow::{Context, Result, anyhow};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyDict, PyString};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 pyo3::create_exception!(_native, RpcError, PyRuntimeError);
-use pyo3::types::PyDict;
 use tokio::runtime::{Builder, Runtime};
-
-use execution::field;
 
 type SharedRuntime = Arc<Runtime>;
 
-struct PyObjectRef {
-    inline: Option<Vec<u8>>,
-    uri: Option<String>,
-    metadata: Option<HashMap<String, String>>,
+pub(crate) struct PyObjectRef {
+    pub(crate) inline: Option<Vec<u8>>,
+    pub(crate) uri: Option<String>,
+    pub(crate) metadata: Option<HashMap<String, String>>,
+}
+
+pub(crate) fn extract_bytes(value: Borrowed<'_, '_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(b) = value.cast::<PyBytes>() {
+        return Ok(b.as_bytes().to_vec());
+    }
+    value.extract::<Vec<u8>>()
+}
+
+pub(crate) fn metadata_to_py<'py>(
+    py: Python<'py>,
+    map: &HashMap<String, String>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if map.is_empty() {
+        Ok(PyDict::new(py))
+    } else {
+        Ok(map.into_pyobject(py)?)
+    }
 }
 
 impl<'a, 'py> FromPyObject<'a, 'py> for PyObjectRef {
@@ -25,11 +41,28 @@ impl<'a, 'py> FromPyObject<'a, 'py> for PyObjectRef {
 
     fn extract(object: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
         let object = object.cast::<PyDict>()?;
-        Ok(Self {
-            inline: field!(object, "inline", Option<Vec<u8>>, None),
-            uri: field!(object, "uri", Option<String>, None),
-            metadata: field!(object, "metadata", Option<HashMap<String, String>>, None),
-        })
+        let mut out = Self {
+            inline: None,
+            uri: None,
+            metadata: None,
+        };
+        for (k, v) in object.iter() {
+            if v.is_none() {
+                continue;
+            }
+            let Ok(key) = k.cast::<PyString>() else {
+                continue;
+            };
+            match key.to_str()? {
+                "inline" => out.inline = Some(extract_bytes(v.as_borrowed())?),
+                "uri" => out.uri = Some(v.extract()?),
+                "metadata" if !v.cast::<PyDict>().is_ok_and(|d| d.is_empty()) => {
+                    out.metadata = Some(v.extract()?);
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 }
 

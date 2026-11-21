@@ -20,7 +20,9 @@ use super::api::{
 use super::events::{JobLog, Permit};
 use super::identity::decode_scoped_id;
 use super::input::InputLog;
-use super::state::{Attempt, FinishStatus, Job, Lease, Phase, QueueKey, State, TerminalPlan};
+use super::state::{
+    Attempt, FinishStatus, Job, JobWaiter, Lease, Phase, QueueKey, Session, State, TerminalPlan,
+};
 use super::{Inner, JournalStatus, TimerKey};
 use crate::error::RuntimeError;
 use crate::journal::{AcceptRecord, AttemptStartRecord, CommitOutcome, JournalOp, TerminalRecord};
@@ -71,6 +73,20 @@ fn without_payload(spec: &JobSpec) -> JobSpec {
         params: Bytes::new(),
         policy: spec.policy.clone(),
         metadata: spec.metadata.clone(),
+    }
+}
+
+fn notify_job_waiters(waiters: &mut Vec<JobWaiter>, job: &Job) {
+    if waiters.is_empty() {
+        return;
+    }
+    if waiters.len() == 1 {
+        let _ = waiters.pop().expect("non-empty").send(Ok(job.view(false)));
+        return;
+    }
+    let view = job.view(false);
+    for waiter in waiters.drain(..) {
+        let _ = waiter.send(Ok(view.clone()));
     }
 }
 
@@ -389,10 +405,8 @@ impl Inner {
             CommitOutcome::Committed => {
                 self.accepted_locked(&mut st, job_id, now);
                 let job = st.jobs.get_mut(job_id).expect("job exists");
-                let view = job.view(false);
-                for waiter in job.accept_waiters.drain(..) {
-                    let _ = waiter.send(Ok(view.clone()));
-                }
+                let mut waiters = std::mem::take(&mut job.accept_waiters);
+                notify_job_waiters(&mut waiters, job);
                 self.dispatch_locked(&mut st, now);
             }
             // It may be on disk: keep the id reserved and the job frozen.
@@ -590,7 +604,7 @@ impl Inner {
         if queue_keys.is_empty() {
             return;
         }
-        let durable_ok = self.journal_writable();
+        let mut durable_ok: Option<bool> = None;
         let mut rotation_pending = false;
         let priority_cap = self.config.priority_levels.saturating_sub(1);
         for (namespace, interface) in queue_keys {
@@ -634,7 +648,9 @@ impl Inner {
                 let Some(job) = st.jobs.get(&key.job_id) else {
                     continue;
                 };
-                if job.not_before_ms > now || (job.durability == Durability::Durable && !durable_ok)
+                if job.not_before_ms > now
+                    || (job.durability == Durability::Durable
+                        && !*durable_ok.get_or_insert_with(|| self.journal_writable()))
                 {
                     continue;
                 }
@@ -645,12 +661,12 @@ impl Inner {
                         continue;
                     }
                 }
-                let prio = job.spec.policy.priority.min(priority_cap);
-                let fairness_key = job.spec.policy.fairness_key.clone();
                 let mut rng = st.rng;
                 let picked = pick_session(st, job, policy, &mut candidates, now, &mut rng);
                 st.rng = rng;
                 if let Some(session_id) = picked {
+                    let prio = job.spec.policy.priority.min(priority_cap);
+                    let fairness_key = job.spec.policy.fairness_key.clone();
                     self.begin_attempt_locked(st, &key.job_id, &session_id, now);
                     if let Some(queue) = st.queue_mut(&namespace, &interface) {
                         queue.rotate_key_to_back(prio, &fairness_key);
@@ -1385,10 +1401,11 @@ impl Inner {
             CommitOutcome::Committed => {
                 // Taking the plan must preserve the public state so the terminal
                 // transition removes the original entry from the read indexes.
-                let previous = *plan.previous.clone();
-                let Phase::Terminating(plan) = std::mem::replace(&mut job.phase, previous) else {
+                let Phase::Terminating(mut plan) = std::mem::replace(&mut job.phase, Phase::Queued)
+                else {
                     unreachable!()
                 };
+                job.phase = std::mem::replace(&mut *plan.previous, Phase::Queued);
                 self.apply_terminal_locked(&mut st, job_id, *plan, now);
             }
             CommitOutcome::RolledBack(reason) => {
@@ -1480,10 +1497,8 @@ impl Inner {
             Vec::new()
         };
         job.output_bytes = output_bytes;
-        let view = job.view(false);
-        for waiter in job.waiters.drain(..) {
-            let _ = waiter.send(Ok(view.clone()));
-        }
+        let mut waiters = std::mem::take(&mut job.waiters);
+        notify_job_waiters(&mut waiters, job);
         for waiter in job.finish_waiters.drain(..) {
             let _ = waiter.send(Ok(FinishStatus::Committed));
         }
@@ -1664,6 +1679,50 @@ fn tier_rank_for_session(
     (elapsed_ms >= ms(tiers[idx].spillover_after)).then_some(Reverse(idx))
 }
 
+fn session_rank(
+    demand: &super::api::Demand,
+    tiers: &[PoolTier],
+    session: &Session,
+    elapsed_ms: u64,
+    spill_open: bool,
+) -> Option<(Reverse<usize>, usize)> {
+    let tier_rank = tier_rank_for_session(tiers, &session.pool, elapsed_ms)?;
+    if !demand
+        .required_attributes
+        .iter()
+        .all(|(key, value)| session.attributes.get(key) == Some(value))
+    {
+        return None;
+    }
+    let matches = demand
+        .preferred_attributes
+        .iter()
+        .filter(|(key, value)| session.attributes.get(*key) == Some(value))
+        .count();
+    if !spill_open && matches < demand.preferred_attributes.len() {
+        return None;
+    }
+    session
+        .fits(&demand.required_capacity)
+        .then_some((tier_rank, matches))
+}
+
+fn pick_two_choices(best: &[&Session], rng: &mut u64) -> Option<String> {
+    match best.len() {
+        0 => None,
+        1 => Some(best[0].id.clone()),
+        n => {
+            let first = (next_random(rng) % n as u64) as usize;
+            let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
+            if second >= first {
+                second += 1;
+            }
+            let (a, b) = (best[first], best[second]);
+            Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
+        }
+    }
+}
+
 /// Picks a session for `job`: avoids previously failed workers/sessions and
 /// workers in cooldown, prefers earlier unlocked pool tiers, matches the most
 /// preferred attributes, routes `affinity_key` via bounded-load Rendezvous
@@ -1685,33 +1744,17 @@ fn pick_session(
     };
     let tiers = policy.map(|p| p.pool_tiers.as_slice()).unwrap_or(&[]);
     let elapsed_ms = now.saturating_sub(job.queued_since_ms);
-    let mut best: Vec<&super::state::Session> = Vec::new();
+    let mut best: Vec<&Session> = Vec::new();
     let mut best_rank = (false, false, Reverse(usize::MAX), 0usize);
     candidates.retain(|id| {
         let Some(session) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
             return false;
         };
-        let Some(tier_rank) = tier_rank_for_session(tiers, &session.pool, elapsed_ms) else {
+        let Some((tier_rank, matches)) =
+            session_rank(demand, tiers, session, elapsed_ms, spill_open)
+        else {
             return true;
         };
-        if !demand
-            .required_attributes
-            .iter()
-            .all(|(key, value)| session.attributes.get(key) == Some(value))
-        {
-            return true;
-        }
-        let matches = demand
-            .preferred_attributes
-            .iter()
-            .filter(|(key, value)| session.attributes.get(*key) == Some(value))
-            .count();
-        if !spill_open && matches < demand.preferred_attributes.len() {
-            return true;
-        }
-        if !session.fits(&demand.required_capacity) {
-            return true;
-        }
         let healthy = !job.failed_workers.contains(&session.worker_id)
             && !job.rejected_sessions.contains(&session.id);
         let not_in_cooldown = now >= session.cooldown_until_ms;
@@ -1777,14 +1820,7 @@ fn pick_session(
     {
         return Some(primary.id.clone());
     }
-    let n = best.len();
-    let first = (next_random(rng) % n as u64) as usize;
-    let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
-    if second >= first {
-        second += 1;
-    }
-    let (a, b) = (best[first], best[second]);
-    Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
+    pick_two_choices(&best, rng)
 }
 
 /// Zero-allocation session selector for immediate ephemeral dispatch (`elapsed_ms == 0`).
@@ -1804,35 +1840,17 @@ fn pick_direct_session(
 
     if !demand.affinity_key.is_empty() {
         let mut best_rank = (false, Reverse(usize::MAX), 0usize);
-        let mut under_load: Option<((u64, &str), &super::state::Session)> = None;
-        let mut fallback: Option<((u64, &str), &super::state::Session)> = None;
+        let mut under_load: Option<((u64, &str), &Session)> = None;
+        let mut fallback: Option<((u64, &str), &Session)> = None;
         for id in sessions {
             let Some(s) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
                 continue;
             };
-            let Some(tier_rank) = tier_rank_for_session(tiers, &s.pool, 0) else {
+            let Some((tier_rank, matches)) = session_rank(demand, tiers, s, 0, spill_open) else {
                 continue;
             };
-            if !demand
-                .required_attributes
-                .iter()
-                .all(|(k, v)| s.attributes.get(k) == Some(v))
-            {
-                continue;
-            }
-            let matches = demand
-                .preferred_attributes
-                .iter()
-                .filter(|(k, v)| s.attributes.get(*k) == Some(v))
-                .count();
-            if !spill_open && matches < demand.preferred_attributes.len() {
-                continue;
-            }
-            if !s.fits(&demand.required_capacity) {
-                continue;
-            }
             let rank = (now >= s.cooldown_until_ms, tier_rank, matches);
-            if under_load.is_none() && fallback.is_none() || rank > best_rank {
+            if (under_load.is_none() && fallback.is_none()) || rank > best_rank {
                 best_rank = rank;
                 under_load = None;
                 fallback = None;
@@ -1851,41 +1869,24 @@ fn pick_direct_session(
                 }
             }
         }
-        if !best_rank.0 {
-            return None;
-        }
-        return under_load.or(fallback).map(|(_, s)| s.id.clone());
+        return best_rank
+            .0
+            .then(|| under_load.or(fallback).map(|(_, s)| s.id.clone()))
+            .flatten();
     }
 
-    let mut stack: [Option<&super::state::Session>; 32] = [None; 32];
+    let mut stack_buf: [std::mem::MaybeUninit<&Session>; 32] =
+        [const { std::mem::MaybeUninit::uninit() }; 32];
     let mut stack_len = 0usize;
-    let mut overflow: Vec<&super::state::Session> = Vec::new();
+    let mut overflow: Vec<&Session> = Vec::new();
     let mut best_rank = (false, Reverse(usize::MAX), 0usize);
     for id in sessions {
         let Some(s) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
             continue;
         };
-        let Some(tier_rank) = tier_rank_for_session(tiers, &s.pool, 0) else {
+        let Some((tier_rank, matches)) = session_rank(demand, tiers, s, 0, spill_open) else {
             continue;
         };
-        if !demand
-            .required_attributes
-            .iter()
-            .all(|(k, v)| s.attributes.get(k) == Some(v))
-        {
-            continue;
-        }
-        let matches = demand
-            .preferred_attributes
-            .iter()
-            .filter(|(k, v)| s.attributes.get(*k) == Some(v))
-            .count();
-        if !spill_open && matches < demand.preferred_attributes.len() {
-            continue;
-        }
-        if !s.fits(&demand.required_capacity) {
-            continue;
-        }
         let rank = (now >= s.cooldown_until_ms, tier_rank, matches);
         if (stack_len == 0 && overflow.is_empty()) || rank > best_rank {
             best_rank = rank;
@@ -1894,11 +1895,15 @@ fn pick_direct_session(
         }
         if rank == best_rank {
             if stack_len < 32 && overflow.is_empty() {
-                stack[stack_len] = Some(s);
+                stack_buf[stack_len].write(s);
                 stack_len += 1;
             } else {
                 if overflow.is_empty() {
-                    overflow.extend(stack[..stack_len].iter().flatten().copied());
+                    // SAFETY: `stack_buf[..stack_len]` was initialized before advancing `stack_len`.
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(stack_buf.as_ptr().cast::<&Session>(), stack_len)
+                    };
+                    overflow.extend_from_slice(slice);
                 }
                 overflow.push(s);
             }
@@ -1909,27 +1914,11 @@ fn pick_direct_session(
         return None;
     }
     if overflow.is_empty() {
-        match stack_len {
-            0 => None,
-            1 => Some(stack[0].unwrap().id.clone()),
-            n => {
-                let first = (next_random(rng) % n as u64) as usize;
-                let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
-                if second >= first {
-                    second += 1;
-                }
-                let (a, b) = (stack[first].unwrap(), stack[second].unwrap());
-                Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
-            }
-        }
+        // SAFETY: `stack_buf[..stack_len]` was initialized when `stack_len` incremented.
+        let slice =
+            unsafe { std::slice::from_raw_parts(stack_buf.as_ptr().cast::<&Session>(), stack_len) };
+        pick_two_choices(slice, rng)
     } else {
-        let n = overflow.len();
-        let first = (next_random(rng) % n as u64) as usize;
-        let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
-        if second >= first {
-            second += 1;
-        }
-        let (a, b) = (overflow[first], overflow[second]);
-        Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
+        pick_two_choices(&overflow, rng)
     }
 }

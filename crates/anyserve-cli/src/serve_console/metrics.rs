@@ -5,18 +5,12 @@ use std::fmt::Write;
 use anyserve_core::runtime::Runtime;
 
 pub(super) fn render(runtime: &Runtime) -> String {
-    let stats = runtime.stats();
-    let health = runtime.health();
+    let snapshot = runtime.snapshot();
+    let health = snapshot.health;
+    let stats = snapshot.stats;
     let config = runtime.config();
-    let workers = runtime.list_workers();
-    let mut live_workers = 0usize;
-    let mut active_leases = 0u64;
-    for worker in &workers {
-        if worker.connected && !worker.draining {
-            live_workers += 1;
-        }
-        active_leases += u64::from(worker.active_leases);
-    }
+    let live_workers = snapshot.workers.healthy;
+    let active_leases = snapshot.workers.active_leases;
 
     let mut out = String::with_capacity(2048);
     out.push_str("# HELP anyserve_runtime_ready Whether the runtime accepts new work.\n# TYPE anyserve_runtime_ready gauge\n");

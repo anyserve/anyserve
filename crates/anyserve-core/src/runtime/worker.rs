@@ -614,16 +614,19 @@ impl Runtime {
                         frame.sequence, attempt.last_frame_seq
                     )));
                 }
-                let attempt_id = attempt.attempt_id.clone();
                 loop {
-                    match job.log.append_output(
-                        attempt_id.clone(),
-                        frame.data.clone(),
-                        metadata.clone(),
-                        frame.progress,
-                        now,
-                        reclaimed,
-                    ) {
+                    let append_res = {
+                        let attempt = job.attempt.as_ref().expect("attempt");
+                        job.log.append_output(
+                            &attempt.attempt_id,
+                            &frame.data,
+                            &metadata,
+                            frame.progress,
+                            now,
+                            reclaimed,
+                        )
+                    };
+                    match append_res {
                         Ok(sequence) => {
                             let streamed = job.streamed;
                             let attempt = job.attempt.as_mut().expect("attempt");
@@ -772,7 +775,6 @@ impl Runtime {
             }
             let job_id = lease.job_id.clone();
             let job = st.jobs.get_mut(&job_id).expect("leased job");
-            let (tx, rx) = oneshot::channel();
             match &job.phase {
                 Phase::Terminating(plan)
                     if plan
@@ -786,7 +788,9 @@ impl Runtime {
                             "a different outcome is being recorded for this lease".to_string(),
                         ));
                     }
+                    let (tx, rx) = oneshot::channel();
                     job.finish_waiters.push(tx);
+                    Some(rx)
                 }
                 Phase::Assigned | Phase::Running
                     if job.attempt.as_ref().is_some_and(|a| a.lease_id == lease_id) =>
@@ -794,10 +798,7 @@ impl Runtime {
                     let receipt = Some((lease_id.clone(), digest.clone()));
                     match error {
                         None => {
-                            let attempt_session_id =
-                                job.attempt.as_ref().map(|a| a.session_id.clone());
-                            job.finish_waiters.push(tx);
-                            if let Some(sid) = attempt_session_id
+                            if let Some(sid) = job.attempt.as_ref().map(|a| a.session_id.clone())
                                 && let Some(session) = st.sessions.get_mut(&sid)
                             {
                                 session.consecutive_failures = 0;
@@ -814,6 +815,15 @@ impl Runtime {
                                 },
                                 now,
                             );
+                            let Some(job) = st.jobs.get_mut(&job_id) else {
+                                return Ok(FinishStatus::Committed);
+                            };
+                            if job.is_terminal() {
+                                return Ok(FinishStatus::Committed);
+                            }
+                            let (tx, rx) = oneshot::channel();
+                            job.finish_waiters.push(tx);
+                            Some(rx)
                         }
                         Some(error) => {
                             let error = if error.code.is_empty() {
@@ -829,19 +839,19 @@ impl Runtime {
                                 receipt,
                                 now,
                             );
-                            let is_terminal = st.jobs.get(&job_id).is_some_and(|j| j.is_terminal());
                             if retried {
                                 inner.dispatch_locked(&mut st, now);
                                 return Ok(FinishStatus::Committed);
                             }
-                            if is_terminal {
+                            let Some(job) = st.jobs.get_mut(&job_id) else {
+                                return Ok(FinishStatus::Committed);
+                            };
+                            if job.is_terminal() {
                                 return Ok(FinishStatus::Committed);
                             }
-                            st.jobs
-                                .get_mut(&job_id)
-                                .expect("job")
-                                .finish_waiters
-                                .push(tx);
+                            let (tx, rx) = oneshot::channel();
+                            job.finish_waiters.push(tx);
+                            Some(rx)
                         }
                     }
                 }
@@ -851,7 +861,6 @@ impl Runtime {
                     ));
                 }
             }
-            Some(rx)
         };
         match receiver {
             Some(receiver) => receiver

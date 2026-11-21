@@ -335,7 +335,7 @@ pub struct Execution {
     pub(crate) job_id: String,
     pub(crate) events: EventStream,
     pub(crate) input: Option<InputSink>,
-    pub(crate) _guard: Box<dyn Send + Sync>,
+    pub(crate) _guard: super::CancelOnDrop,
 }
 
 impl Execution {
@@ -479,6 +479,23 @@ pub struct JournalStats {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerStats {
+    pub total: usize,
+    pub healthy: usize,
+    pub draining: usize,
+    pub active_leases: u64,
+    pub total_capacity: Capacity,
+    pub last_seen_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub health: Health,
+    pub stats: RuntimeStats,
+    pub workers: WorkerStats,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeStats {
     pub generation: u64,
     pub queued: usize,
@@ -503,7 +520,7 @@ pub struct RuntimeStats {
 
 /// Size limits. Every inline budget stays below the 64 MiB gRPC message limit
 /// with room for metadata and framing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub max_control_message_bytes: u32,
     pub max_chunk_bytes: u32,

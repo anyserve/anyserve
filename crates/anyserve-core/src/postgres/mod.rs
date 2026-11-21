@@ -20,7 +20,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::RuntimeError;
 use crate::journal::{
     BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle, Recovery,
-    StoredJob, StoredJobPreview, StoredSpec, job_from_row, object_from_row, state_text,
+    StoredJob, StoredJobPreview, StoredSpecRef, job_from_row, metadata_to_json, object_from_row,
+    state_text,
 };
 use crate::runtime::api::{
     INSPECTION_PREVIEW_BYTES, JobState, JournalConfig, JournalStats, Object, ObjectPreview,
@@ -949,7 +950,10 @@ async fn writer_loop(
                         )
                         .await;
                         pending.fetch_sub(1, Ordering::Relaxed);
-                        let _ = reply.send(outcomes.into_iter().next().expect("one outcome"));
+                        let outcome = outcomes
+                            .and_then(|v| v.into_iter().next())
+                            .unwrap_or(CommitOutcome::Committed);
+                        let _ = reply.send(outcome);
                     }
                 }
                 rx.close();
@@ -1006,19 +1010,30 @@ async fn writer_loop(
                 )
                 .await;
                 let elapsed = started.elapsed();
+                let batch_len = batch.len();
+                let committed = match &outcomes {
+                    None => batch_len as u64,
+                    Some(v) => v.iter().filter(|o| **o == CommitOutcome::Committed).count() as u64,
+                };
                 {
                     let mut st = stats.lock().expect("PG stats poisoned");
                     st.committed_batches += 1;
-                    st.committed_ops += outcomes
-                        .iter()
-                        .filter(|o| **o == CommitOutcome::Committed)
-                        .count() as u64;
-                    st.last_batch_size = batch.len();
+                    st.committed_ops += committed;
+                    st.last_batch_size = batch_len;
                     st.last_commit_micros = elapsed.as_micros() as u64;
                 }
-                pending.fetch_sub(batch.len(), Ordering::Relaxed);
-                for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
-                    let _ = reply.send(outcome);
+                pending.fetch_sub(batch_len, Ordering::Relaxed);
+                match outcomes {
+                    None => {
+                        for (_, reply) in batch {
+                            let _ = reply.send(CommitOutcome::Committed);
+                        }
+                    }
+                    Some(outcomes) => {
+                        for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
+                            let _ = reply.send(outcome);
+                        }
+                    }
                 }
             }
         }
@@ -1059,21 +1074,16 @@ async fn execute_single_statement(
     let mut tm_attempt_id: Vec<Option<&str>> = Vec::new();
     let mut tm_worker_id: Vec<Option<&str>> = Vec::new();
 
-    let mut obj_job_id: Vec<&str> = Vec::new();
-    let mut obj_role: Vec<&str> = Vec::new();
-    let mut obj_idx: Vec<i64> = Vec::new();
-    let mut obj_uri: Vec<Option<&str>> = Vec::new();
-    let mut obj_content: Vec<Option<&[u8]>> = Vec::new();
-    let mut obj_meta: Vec<String> = Vec::new();
+    let mut objs = PgObjects::default();
 
     for op in ops {
         match op {
             JournalOp::Accept(r) => {
                 let (ns, _) = decode_scoped_id(&r.job_id);
-                let stored = StoredSpec {
-                    demand: r.spec.demand.clone(),
-                    policy: r.spec.policy.clone(),
-                    metadata: r.spec.metadata.clone(),
+                let stored = StoredSpecRef {
+                    demand: &r.spec.demand,
+                    policy: &r.spec.policy,
+                    metadata: &r.spec.metadata,
                 };
                 let spec_json = serde_json::to_string(&stored)
                     .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
@@ -1083,27 +1093,16 @@ async fn execute_single_statement(
                 acc_spec.push(spec_json);
                 acc_max_att.push(i64::from(r.max_attempts));
                 acc_at.push(r.created_at_ms.min(i64::MAX as u64) as i64);
-                for (idx, obj) in r.spec.inputs.iter().enumerate() {
-                    let (uri, content, meta) = match obj {
-                        Object::Inline { data, metadata } => (None, Some(data.as_ref()), metadata),
-                        Object::Uri { uri, metadata } => (Some(uri.as_str()), None, metadata),
-                    };
-                    let meta_json = serde_json::to_string(meta)
-                        .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
-                    obj_job_id.push(r.job_id.as_str());
-                    obj_role.push("input");
-                    obj_idx.push(idx as i64);
-                    obj_uri.push(uri);
-                    obj_content.push(content);
-                    obj_meta.push(meta_json);
-                }
+                objs.push_slice(&r.job_id, "input", &r.spec.inputs)?;
                 if !r.spec.params.is_empty() {
-                    obj_job_id.push(r.job_id.as_str());
-                    obj_role.push("params");
-                    obj_idx.push(0);
-                    obj_uri.push(None);
-                    obj_content.push(Some(r.spec.params.as_ref()));
-                    obj_meta.push("{}".to_string());
+                    objs.push_row(
+                        &r.job_id,
+                        "params",
+                        0,
+                        None,
+                        Some(&r.spec.params),
+                        "{}".into(),
+                    );
                 }
             }
             JournalOp::AttemptStart(r) => {
@@ -1127,20 +1126,7 @@ async fn execute_single_statement(
                 tm_digest.push(r.outcome_digest.as_deref());
                 tm_attempt_id.push(r.attempt_id.as_deref());
                 tm_worker_id.push(r.worker_id.as_deref());
-                for (idx, obj) in r.outputs.iter().enumerate() {
-                    let (uri, content, meta) = match obj {
-                        Object::Inline { data, metadata } => (None, Some(data.as_ref()), metadata),
-                        Object::Uri { uri, metadata } => (Some(uri.as_str()), None, metadata),
-                    };
-                    let meta_json = serde_json::to_string(meta)
-                        .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
-                    obj_job_id.push(r.job_id.as_str());
-                    obj_role.push("output");
-                    obj_idx.push(idx as i64);
-                    obj_uri.push(uri);
-                    obj_content.push(content);
-                    obj_meta.push(meta_json);
-                }
+                objs.push_slice(&r.job_id, "output", &r.outputs)?;
             }
             JournalOp::Probe => {}
         }
@@ -1167,12 +1153,12 @@ async fn execute_single_statement(
         .bind(&tm_digest)
         .bind(&tm_attempt_id)
         .bind(&tm_worker_id)
-        .bind(&obj_job_id)
-        .bind(&obj_role)
-        .bind(&obj_idx)
-        .bind(&obj_uri)
-        .bind(&obj_content)
-        .bind(&obj_meta)
+        .bind(&objs.job_id)
+        .bind(&objs.role)
+        .bind(&objs.idx)
+        .bind(&objs.uri)
+        .bind(&objs.content)
+        .bind(&objs.meta)
         .fetch_one(write_pool)
         .await
         .map_err(|err| {
@@ -1230,6 +1216,68 @@ async fn verify_op(pool: &PgPool, op: &JournalOp) -> Result<bool> {
     })
 }
 
+#[derive(Default)]
+struct PgObjects<'a> {
+    job_id: Vec<&'a str>,
+    role: Vec<&'static str>,
+    idx: Vec<i64>,
+    uri: Vec<Option<&'a str>>,
+    content: Vec<Option<&'a [u8]>>,
+    meta: Vec<String>,
+}
+
+impl<'a> PgObjects<'a> {
+    fn push_row(
+        &mut self,
+        job_id: &'a str,
+        role: &'static str,
+        idx: i64,
+        uri: Option<&'a str>,
+        content: Option<&'a [u8]>,
+        meta: String,
+    ) {
+        self.job_id.push(job_id);
+        self.role.push(role);
+        self.idx.push(idx);
+        self.uri.push(uri);
+        self.content.push(content);
+        self.meta.push(meta);
+    }
+
+    fn push_slice(
+        &mut self,
+        job_id: &'a str,
+        role: &'static str,
+        objects: &'a [Object],
+    ) -> std::result::Result<(), SingleStmtError> {
+        for (idx, obj) in objects.iter().enumerate() {
+            let (uri, content, meta) = match obj {
+                Object::Inline { data, metadata } => (None, Some(data.as_ref()), metadata),
+                Object::Uri { uri, metadata } => (Some(uri.as_str()), None, metadata),
+            };
+            let meta_json = metadata_to_json(meta)
+                .map_err(|e| SingleStmtError::Sql(e.to_string()))?
+                .into_owned();
+            self.push_row(job_id, role, idx as i64, uri, content, meta_json);
+        }
+        Ok(())
+    }
+}
+
+fn op_committed(
+    op: &JournalOp,
+    accepted: &HashSet<String>,
+    started: &HashSet<String>,
+    terminal: &HashSet<String>,
+) -> bool {
+    match op {
+        JournalOp::Accept(r) => accepted.contains(&r.job_id),
+        JournalOp::AttemptStart(r) => started.contains(&r.job_id),
+        JournalOp::Terminal(r) => terminal.contains(&r.job_id),
+        JournalOp::Probe => true,
+    }
+}
+
 async fn commit_batch(
     write_pool: &PgPool,
     read_pool: &PgPool,
@@ -1237,39 +1285,80 @@ async fn commit_batch(
     term: u64,
     ops: &[&JournalOp],
     active_lost_tx: &ActiveTermSender,
-) -> Vec<CommitOutcome> {
+) -> Option<Vec<CommitOutcome>> {
+    commit_batch_inner(
+        write_pool,
+        read_pool,
+        holder_id,
+        term,
+        ops,
+        active_lost_tx,
+        true,
+    )
+    .await
+}
+
+async fn commit_batch_inner(
+    write_pool: &PgPool,
+    read_pool: &PgPool,
+    holder_id: &str,
+    term: u64,
+    ops: &[&JournalOp],
+    active_lost_tx: &ActiveTermSender,
+    allow_split: bool,
+) -> Option<Vec<CommitOutcome>> {
     match execute_single_statement(write_pool, holder_id, term, ops).await {
         Ok((false, _, _, _)) => {
             signal_term_lost(active_lost_tx, term);
-            vec![
-                CommitOutcome::Fenced("PostgreSQL scheduler lease expired or superseded".into());
+            Some(vec![
+                CommitOutcome::Fenced(
+                    "PostgreSQL scheduler lease expired or superseded".into()
+                );
                 ops.len()
-            ]
+            ])
         }
-        Ok((true, accepted, started, terminal)) => ops
-            .iter()
-            .map(|op| match op {
-                JournalOp::Accept(r) if accepted.contains(&r.job_id) => CommitOutcome::Committed,
-                JournalOp::AttemptStart(r) if started.contains(&r.job_id) => {
-                    CommitOutcome::Committed
-                }
-                JournalOp::Terminal(r) if terminal.contains(&r.job_id) => CommitOutcome::Committed,
-                JournalOp::Probe => CommitOutcome::Committed,
-                _ => CommitOutcome::RolledBack("job is not open in PostgreSQL journal".into()),
-            })
-            .collect(),
-        Err(SingleStmtError::Sql(err)) if ops.len() == 1 => {
-            vec![CommitOutcome::RolledBack(err)]
+        Ok((true, accepted, started, terminal)) => {
+            if ops
+                .iter()
+                .all(|op| op_committed(op, &accepted, &started, &terminal))
+            {
+                return None;
+            }
+            Some(
+                ops.iter()
+                    .map(|op| {
+                        if op_committed(op, &accepted, &started, &terminal) {
+                            CommitOutcome::Committed
+                        } else {
+                            CommitOutcome::RolledBack(
+                                "job is not open in PostgreSQL journal".into(),
+                            )
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        Err(SingleStmtError::Sql(err)) if !allow_split || ops.len() == 1 => {
+            Some(vec![CommitOutcome::RolledBack(err); ops.len()])
         }
         Err(SingleStmtError::Sql(_)) => {
             let mut out = Vec::with_capacity(ops.len());
             for op in ops {
-                out.push(
-                    commit_batch_single(write_pool, read_pool, holder_id, term, op, active_lost_tx)
-                        .await,
-                );
+                let outcome = Box::pin(commit_batch_inner(
+                    write_pool,
+                    read_pool,
+                    holder_id,
+                    term,
+                    &[op],
+                    active_lost_tx,
+                    false,
+                ))
+                .await
+                .and_then(|mut v| v.pop())
+                .unwrap_or(CommitOutcome::Committed);
+                out.push(outcome);
             }
-            out
+            Some(out)
         }
         Err(SingleStmtError::Transport(err)) => {
             let mut out = Vec::with_capacity(ops.len());
@@ -1290,42 +1379,8 @@ async fn commit_batch(
                 // Database connectivity lost; exit immediately so standby takes over cleanly.
                 signal_term_lost(active_lost_tx, term);
             }
-            out
+            Some(out)
         }
-    }
-}
-
-async fn commit_batch_single(
-    write_pool: &PgPool,
-    read_pool: &PgPool,
-    holder_id: &str,
-    term: u64,
-    op: &JournalOp,
-    active_lost_tx: &ActiveTermSender,
-) -> CommitOutcome {
-    match execute_single_statement(write_pool, holder_id, term, &[op]).await {
-        Ok((false, _, _, _)) => {
-            signal_term_lost(active_lost_tx, term);
-            CommitOutcome::Fenced("PostgreSQL scheduler lease expired or superseded".into())
-        }
-        Ok((true, accepted, started, terminal)) => match op {
-            JournalOp::Accept(r) if accepted.contains(&r.job_id) => CommitOutcome::Committed,
-            JournalOp::AttemptStart(r) if started.contains(&r.job_id) => CommitOutcome::Committed,
-            JournalOp::Terminal(r) if terminal.contains(&r.job_id) => CommitOutcome::Committed,
-            JournalOp::Probe => CommitOutcome::Committed,
-            _ => CommitOutcome::RolledBack("job is not open in PostgreSQL journal".into()),
-        },
-        Err(SingleStmtError::Sql(err)) => CommitOutcome::RolledBack(err),
-        Err(SingleStmtError::Transport(err)) => match verify_op(read_pool, op).await {
-            Ok(true) => CommitOutcome::Committed,
-            Ok(false) => CommitOutcome::RolledBack(err),
-            Err(verify_err) => {
-                signal_term_lost(active_lost_tx, term);
-                CommitOutcome::Unknown(format!(
-                    "PostgreSQL write failed ({err}) and could not be verified: {verify_err:#}"
-                ))
-            }
-        },
     }
 }
 

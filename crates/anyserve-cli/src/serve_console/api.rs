@@ -141,6 +141,7 @@ pub(crate) struct HistorySummary {
 pub(crate) struct WorkerRollup {
     pub(crate) total: usize,
     pub(crate) healthy: usize,
+    pub(crate) draining: usize,
     pub(crate) unavailable: usize,
     pub(crate) active_leases: u64,
     pub(crate) total_capacity: BTreeMap<String, i64>,

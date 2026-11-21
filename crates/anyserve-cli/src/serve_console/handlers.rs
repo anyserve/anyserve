@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyserve_core::auth::AuthPolicy;
+use anyserve_core::auth::{AuthPolicy, DEFAULT_NAMESPACE};
 use anyserve_core::error::{ErrorKind, RuntimeError};
 use anyserve_core::now_ms;
-use anyserve_core::runtime::api::{JobFilter, JobPreview, JobScan, JobState};
+use anyserve_core::runtime::api::{JobFilter, JobScan, JobState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -19,14 +19,13 @@ use axum::{Json, Router};
 
 use super::api::{
     AnalyticsQuery, AnalyticsResponse, AnalyticsSource, ApiError, AppState, BudgetsSummary,
-    CancelJobResponse, ControlPlaneSummary, HistorySummary, InterfaceSummary, JobDetail,
-    JobDetailResponse, JobsQuery, JobsResponse, NamespaceQuery, OverviewResponse, PoolSummary,
-    QueueSummary, WorkersResponse,
+    CancelJobResponse, ControlPlaneSummary, HistorySummary, InterfaceSummary, JobDetailResponse,
+    JobsQuery, JobsResponse, NamespaceQuery, OverviewResponse, PoolSummary, QueueSummary,
+    WorkersResponse,
 };
 use super::snapshot::{
-    INLINE_PREVIEW_LIMIT_BYTES, attempts_from_events, duration_ms, event_summary, health_summary,
-    inline_preview, interface_policy_summary, job_summary, journal_stats_summary,
-    object_preview_summary, object_ref_summary, output_preview, worker_rollup, worker_summary,
+    duration_ms, health_summary, interface_policy_summary, job_detail_response, job_summary,
+    journal_stats_summary, worker_rollup, worker_summary,
 };
 
 pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
@@ -102,10 +101,10 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
     state.runtime.ensure_active_leader().map_err(api_error)?;
-    let health = state.runtime.health();
-    let stats = state.runtime.stats();
+    let snapshot = state.runtime.snapshot();
+    let health = snapshot.health;
+    let stats = snapshot.stats;
     let config = state.runtime.config();
-    let workers = state.runtime.list_workers();
 
     let interface_names: BTreeSet<&str> = stats
         .interfaces
@@ -181,7 +180,7 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
             cancelled: stats.cancelled,
             total: stats.succeeded + stats.failed + stats.cancelled,
         },
-        workers: worker_rollup(&workers),
+        workers: worker_rollup(snapshot.workers),
         interfaces,
         pools,
         refreshed_at_ms: now_ms(),
@@ -221,66 +220,15 @@ async fn get_job(
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
     let namespace = normalize_optional_filter(query.namespace);
-    let JobPreview {
-        job,
-        spec,
-        events,
-        outputs,
-    } = match namespace.as_deref() {
-        Some(ns) => state.runtime.inspect_job_preview_in(ns, &job_id).await,
-        None => state.runtime.inspect_job_preview(&job_id).await,
-    }
-    .map_err(api_error)?;
-
-    let attempts = attempts_from_events(&events);
-    let incomplete = attempts.len() < job.attempt_count as usize
-        || events.first().is_some_and(|event| {
-            !matches!(event.kind, anyserve_core::runtime::api::EventKind::Accepted)
-        });
-    let latest_worker_id = job
-        .current_worker_id
-        .as_deref()
-        .or_else(|| attempts.last().map(|attempt| attempt.worker_id.as_str()));
-    let latest_worker = latest_worker_id.and_then(|worker_id| {
-        state
-            .runtime
-            .list_workers()
-            .into_iter()
-            .find(|worker| worker.namespace == job.namespace && worker.worker_id == worker_id)
-            .map(worker_summary)
-    });
-    let output_preview = output_preview(&events, &outputs);
-    let event_summaries = events.iter().map(event_summary).collect();
-    let output_summaries = outputs.iter().map(object_preview_summary).collect();
-    let (demand, policy, params_size_bytes, params_preview, params_truncated, inputs) =
-        match spec.as_ref() {
-            Some(spec) => (
-                Some(spec.demand.clone()),
-                Some(spec.policy.clone()),
-                Some(spec.params.len()),
-                inline_preview(&spec.params),
-                spec.params.len() > INLINE_PREVIEW_LIMIT_BYTES,
-                spec.inputs.iter().map(object_ref_summary).collect(),
-            ),
-            None => (None, None, None, None, false, Vec::new()),
-        };
-    Ok(Json(JobDetailResponse {
-        job: JobDetail {
-            summary: job_summary(job),
-            demand,
-            policy,
-            params_size_bytes,
-            params_preview,
-            params_truncated,
-            inputs,
-            outputs: output_summaries,
-            output_preview,
-        },
-        attempts,
-        events: event_summaries,
-        history_incomplete: incomplete,
-        latest_worker,
-    }))
+    let ns = namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE);
+    let preview = state
+        .runtime
+        .inspect_job_preview_in(ns, &job_id)
+        .await
+        .map_err(api_error)?;
+    Ok(Json(job_detail_response(preview, |ns, worker_id| {
+        state.runtime.find_worker(ns, worker_id)
+    })))
 }
 
 async fn cancel_job(
@@ -289,21 +237,12 @@ async fn cancel_job(
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<CancelJobResponse>, ApiError> {
     let namespace = normalize_optional_filter(query.namespace);
-    let job = match namespace.as_deref() {
-        Some(ns) => {
-            state
-                .runtime
-                .cancel_in(ns, &job_id, "cancelled from console".into())
-                .await
-        }
-        None => {
-            state
-                .runtime
-                .cancel(&job_id, "cancelled from console".into())
-                .await
-        }
-    }
-    .map_err(api_error)?;
+    let ns = namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE);
+    let job = state
+        .runtime
+        .cancel_in(ns, &job_id, "cancelled from console".into())
+        .await
+        .map_err(api_error)?;
     Ok(Json(CancelJobResponse {
         job: job_summary(job),
     }))

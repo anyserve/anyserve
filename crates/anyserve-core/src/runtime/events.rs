@@ -284,9 +284,9 @@ impl JobLog {
     /// `notify_appended` once it has let go of its own locks.
     pub(crate) fn append_output(
         &self,
-        attempt_id: String,
-        data: Bytes,
-        metadata: Metadata,
+        attempt_id: &str,
+        data: &Bytes,
+        metadata: &Metadata,
         progress: bool,
         at_ms: u64,
         last_try: bool,
@@ -295,17 +295,17 @@ impl JobLog {
         if inner.finished {
             return Ok(inner.last_sequence);
         }
-        let size = EVENT_OVERHEAD + data.len() + metadata_bytes(&metadata);
+        let size = EVENT_OVERHEAD + data.len() + metadata_bytes(metadata);
         let sequence = inner.last_sequence + 1;
         if self.reserve(&mut inner, size) {
             let event = ExecutionEvent {
                 job_id: self.job_id.clone(),
                 sequence,
-                attempt_id: Some(attempt_id),
+                attempt_id: Some(attempt_id.to_owned()),
                 at_ms,
                 kind: EventKind::Output {
-                    data,
-                    metadata,
+                    data: data.clone(),
+                    metadata: metadata.clone(),
                     progress,
                 },
             };
@@ -335,21 +335,51 @@ impl JobLog {
     /// `after` that was already dropped gives `Err` with the oldest readable
     /// sequence.
     pub(crate) fn read_after(&self, after: u64) -> Result<(Vec<ExecutionEvent>, bool), u64> {
-        let inner = self.lock();
-        if after != 0 && after < inner.evicted_through {
-            return Err(inner.evicted_through + 1);
+        self.read_after_for_primary(after, false)
+            .map(|(events, finished, _)| (events, finished))
+    }
+
+    /// Same as `read_after`, and when `track_primary` is true with a single
+    /// non-terminal event, marks that event consumed under the same lock.
+    pub(crate) fn read_after_for_primary(
+        &self,
+        after: u64,
+        track_primary: bool,
+    ) -> Result<(Vec<ExecutionEvent>, bool, bool), u64> {
+        let (events, finished, marked) = {
+            let mut inner = self.lock();
+            if after != 0 && after < inner.evicted_through {
+                return Err(inner.evicted_through + 1);
+            }
+            if after >= inner.last_sequence {
+                return Ok((Vec::new(), inner.finished, false));
+            }
+            let start = inner
+                .events
+                .partition_point(|(event, _)| event.sequence <= after);
+            let mut events = Vec::with_capacity(inner.events.len() - start);
+            for (event, _) in inner.events.range(start..) {
+                events.push(event.clone());
+            }
+            let mut marked = None;
+            if track_primary
+                && events.len() == 1
+                && !matches!(events[0].kind, EventKind::Finished { .. })
+                && let Some(consumed) = inner.primary.as_mut()
+                && events[0].sequence > *consumed
+            {
+                *consumed = events[0].sequence;
+                marked = Some(events[0].sequence);
+            }
+            (events, inner.finished, marked)
+        };
+        if let Some(sequence) = marked
+            && self.consumed.receiver_count() > 0
+        {
+            self.consumed.send_replace(sequence);
         }
-        if after >= inner.last_sequence {
-            return Ok((Vec::new(), inner.finished));
-        }
-        let start = inner
-            .events
-            .partition_point(|(event, _)| event.sequence <= after);
-        let mut events = Vec::with_capacity(inner.events.len() - start);
-        for (event, _) in inner.events.range(start..) {
-            events.push(event.clone());
-        }
-        Ok((events, inner.finished))
+        let already_marked = track_primary && events.len() == 1;
+        Ok((events, finished, already_marked))
     }
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
@@ -386,16 +416,9 @@ impl JobLog {
         }
     }
 
-    /// Removes what a finished log no longer needs to serve: every event
-    /// before `Finished`, except those a primary consumer has not read yet.
-    /// Only a prefix goes, so a later reader with an older cursor gets
-    /// `CursorExpired`, never a silent gap. The removed events are returned
-    /// for the caller to free outside its locks.
-    pub(crate) fn compact_finished(&self) -> Vec<ExecutionEvent> {
-        let mut inner = self.lock();
-        let mut removed = Vec::new();
+    fn compact_locked(&self, inner: &mut LogInner, removed: &mut Vec<ExecutionEvent>) {
         if !inner.finished {
-            return removed;
+            return;
         }
         let finished_at = inner.last_sequence;
         let keep_from = inner
@@ -406,9 +429,40 @@ impl JobLog {
             .front()
             .is_some_and(|(event, _)| event.sequence < keep_from)
         {
-            removed.push(self.evict_front(&mut inner));
+            removed.push(self.evict_front(inner));
         }
+    }
+
+    /// Removes what a finished log no longer needs to serve: every event
+    /// before `Finished`, except those a primary consumer has not read yet.
+    /// Only a prefix goes, so a later reader with an older cursor gets
+    /// `CursorExpired`, never a silent gap. The removed events are returned
+    /// for the caller to free outside its locks.
+    pub(crate) fn compact_finished(&self) -> Vec<ExecutionEvent> {
+        let mut inner = self.lock();
+        let mut removed = Vec::new();
+        self.compact_locked(&mut inner, &mut removed);
         removed
+    }
+
+    /// Clears the primary consumer, compacts if finished and unfollowed, and
+    /// returns whether the log has finished — all in one lock acquisition.
+    pub(crate) fn release_primary_and_check_finished(&self) -> bool {
+        let mut removed = Vec::new();
+        let finished = {
+            let mut inner = self.lock();
+            inner.primary = None;
+            if self.compactable.load(Ordering::Acquire) && self.follower_count() == 0 {
+                self.compact_locked(&mut inner, &mut removed);
+            }
+            inner.finished
+        };
+        drop(removed);
+        if self.consumed.receiver_count() > 0 {
+            self.consumed
+                .send_modify(|value| *value = value.wrapping_add(1));
+        }
+        finished
     }
 
     /// Readers currently following this log; each holds a `changed` receiver.
@@ -436,10 +490,6 @@ impl JobLog {
         } else {
             Vec::new()
         }
-    }
-
-    pub(crate) fn is_finished(&self) -> bool {
-        self.lock().finished
     }
 
     pub(crate) fn bytes(&self) -> usize {
@@ -470,9 +520,9 @@ mod tests {
 
     fn output_try(log: &JobLog, size: usize, last_try: bool) -> Result<u64, LogFull> {
         log.append_output(
-            "a".to_string(),
-            Bytes::from(vec![0; size]),
-            Metadata::new(),
+            "a",
+            &Bytes::from(vec![0; size]),
+            &Metadata::new(),
             false,
             0,
             last_try,

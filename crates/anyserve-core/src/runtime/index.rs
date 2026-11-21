@@ -201,45 +201,40 @@ impl JobIndex {
         limit: usize,
     ) -> (Vec<&str>, usize) {
         let mut selected: Vec<&BTreeSet<OrderKey>> = Vec::new();
+        fn collect_states<'a>(
+            selected: &mut Vec<&'a BTreeSet<OrderKey>>,
+            filter_states: &[JobState],
+            jobs: &'a ByState,
+        ) {
+            for (state, set) in STATES.iter().zip(jobs) {
+                if filter_states.is_empty() || filter_states.contains(state) {
+                    selected.push(set);
+                }
+            }
+        }
         match (&filter.namespace, &filter.interface) {
             (Some(ns), Some(name)) => {
                 if let Some(interface) =
                     self.namespaces.get(ns).and_then(|i| i.interfaces.get(name))
                 {
-                    for (state, set) in STATES.iter().zip(&interface.jobs) {
-                        if filter.states.is_empty() || filter.states.contains(state) {
-                            selected.push(set);
-                        }
-                    }
+                    collect_states(&mut selected, &filter.states, &interface.jobs);
                 }
             }
             (Some(ns), None) => {
                 if let Some(index) = self.namespaces.get(ns) {
-                    for (state, set) in STATES.iter().zip(&index.jobs) {
-                        if filter.states.is_empty() || filter.states.contains(state) {
-                            selected.push(set);
-                        }
-                    }
+                    collect_states(&mut selected, &filter.states, &index.jobs);
                 }
             }
             (None, Some(name)) => {
                 for index in self.namespaces.values() {
                     if let Some(interface) = index.interfaces.get(name) {
-                        for (state, set) in STATES.iter().zip(&interface.jobs) {
-                            if filter.states.is_empty() || filter.states.contains(state) {
-                                selected.push(set);
-                            }
-                        }
+                        collect_states(&mut selected, &filter.states, &interface.jobs);
                     }
                 }
             }
             (None, None) => {
                 for index in self.namespaces.values() {
-                    for (state, set) in STATES.iter().zip(&index.jobs) {
-                        if filter.states.is_empty() || filter.states.contains(state) {
-                            selected.push(set);
-                        }
-                    }
+                    collect_states(&mut selected, &filter.states, &index.jobs);
                 }
             }
         }
@@ -314,7 +309,11 @@ impl JobIndex {
                     .first()
                     .map(|(since, _)| now.saturating_sub(*since))
                     .unwrap_or(0);
-                let entry = merged.entry(name.clone()).or_default();
+                let entry = if let Some(entry) = merged.get_mut(name.as_str()) {
+                    entry
+                } else {
+                    merged.entry(name.clone()).or_default()
+                };
                 entry.queued += index.jobs[0].len();
                 entry.running += index.jobs[1].len();
                 entry.oldest_queued_age_ms = entry.oldest_queued_age_ms.max(oldest);

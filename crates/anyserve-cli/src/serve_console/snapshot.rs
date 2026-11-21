@@ -1,13 +1,12 @@
 use super::api::{
-    AttemptSummary, HealthSummary, InlinePreviewSummary, InterfacePolicySummary, JobEventSummary,
-    JobSummary, JournalHealthSummary, JournalStatsSummary, ObjectRefSummary, PoolTierSummary,
-    WorkerLoadSummary, WorkerRollup, WorkerSummary,
+    AttemptSummary, HealthSummary, InlinePreviewSummary, InterfacePolicySummary, JobDetail,
+    JobDetailResponse, JobEventSummary, JobSummary, JournalHealthSummary, JournalStatsSummary,
+    ObjectRefSummary, PoolTierSummary, WorkerLoadSummary, WorkerRollup, WorkerSummary,
 };
 use anyserve_core::runtime::api::{
-    Durability, EventKind, ExecutionEvent, Health, InterfacePolicy, JobState, JobView,
-    JournalHealth, JournalStats, Metadata, Object, ObjectPreview, WorkerView,
+    Durability, EventKind, ExecutionEvent, Health, InterfacePolicy, JobPreview, JobState, JobView,
+    JournalHealth, JournalStats, Metadata, Object, ObjectPreview, WorkerStats, WorkerView,
 };
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub(crate) use anyserve_core::runtime::api::INSPECTION_PREVIEW_BYTES as INLINE_PREVIEW_LIMIT_BYTES;
@@ -73,31 +72,71 @@ pub(crate) fn interface_policy_summary(policy: &InterfacePolicy) -> InterfacePol
     }
 }
 
-pub(crate) fn worker_rollup(workers: &[WorkerView]) -> WorkerRollup {
-    let mut healthy = 0usize;
-    let mut active_leases = 0u64;
-    let mut total_capacity: BTreeMap<String, i64> = BTreeMap::new();
-    let mut last_seen_at_ms: Option<u64> = None;
-
-    for worker in workers {
-        active_leases += u64::from(worker.active_leases);
-        last_seen_at_ms =
-            Some(last_seen_at_ms.map_or(worker.last_seen_ms, |max| max.max(worker.last_seen_ms)));
-        if worker.connected && !worker.draining {
-            healthy += 1;
-            for (name, value) in &worker.total_capacity {
-                *total_capacity.entry(name.clone()).or_default() += value;
-            }
-        }
-    }
-
+pub(crate) fn worker_rollup(workers: WorkerStats) -> WorkerRollup {
     WorkerRollup {
-        total: workers.len(),
-        healthy,
-        unavailable: workers.len() - healthy,
-        active_leases,
-        total_capacity,
-        last_seen_at_ms,
+        total: workers.total,
+        healthy: workers.healthy,
+        draining: workers.draining,
+        unavailable: workers.total.saturating_sub(workers.healthy),
+        active_leases: workers.active_leases,
+        total_capacity: workers.total_capacity,
+        last_seen_at_ms: workers.last_seen_at_ms,
+    }
+}
+
+pub(crate) fn job_detail_response(
+    preview: JobPreview,
+    lookup_worker: impl FnOnce(&str, &str) -> Option<WorkerView>,
+) -> JobDetailResponse {
+    let JobPreview {
+        job,
+        spec,
+        events,
+        outputs,
+    } = preview;
+    let attempts = attempts_from_events(&events);
+    let incomplete = attempts.len() < job.attempt_count as usize
+        || events
+            .first()
+            .is_some_and(|event| !matches!(event.kind, EventKind::Accepted));
+    let latest_worker_id = job
+        .current_worker_id
+        .as_deref()
+        .or_else(|| attempts.last().map(|attempt| attempt.worker_id.as_str()));
+    let latest_worker = latest_worker_id
+        .and_then(|worker_id| lookup_worker(&job.namespace, worker_id))
+        .map(worker_summary);
+    let output_preview = output_preview(&events, &outputs);
+    let event_summaries = events.iter().map(event_summary).collect();
+    let output_summaries = outputs.iter().map(object_preview_summary).collect();
+    let (demand, policy, params_size_bytes, params_preview, params_truncated, inputs) =
+        match spec.as_ref() {
+            Some(spec) => (
+                Some(spec.demand.clone()),
+                Some(spec.policy.clone()),
+                Some(spec.params.len()),
+                inline_preview(&spec.params),
+                spec.params.len() > INLINE_PREVIEW_LIMIT_BYTES,
+                spec.inputs.iter().map(object_ref_summary).collect(),
+            ),
+            None => (None, None, None, None, false, Vec::new()),
+        };
+    JobDetailResponse {
+        job: JobDetail {
+            summary: job_summary(job),
+            demand,
+            policy,
+            params_size_bytes,
+            params_preview,
+            params_truncated,
+            inputs,
+            outputs: output_summaries,
+            output_preview,
+        },
+        attempts,
+        events: event_summaries,
+        history_incomplete: incomplete,
+        latest_worker,
     }
 }
 

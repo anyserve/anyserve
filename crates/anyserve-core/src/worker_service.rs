@@ -193,7 +193,7 @@ impl Worker for WorkerGrpcService {
                 terminal_replay: matches!(link, AttemptLink::Replay { .. }),
             }))))
             .await;
-        let limits = self.runtime.config().limits.clone();
+        let limits = self.runtime.config().limits;
         let link = match link {
             AttemptLink::Live {
                 lease_id,
@@ -547,11 +547,12 @@ async fn receive_uploads(
     idle: Duration,
 ) {
     let budget = runtime.result_budget();
-    let mut results = ResultAssembler::new(limits.clone(), Arc::clone(&budget), runtime.clone());
+    let mut results = ResultAssembler::new(limits, Arc::clone(&budget), runtime.clone());
     let mut last_frame = match &link {
         AttemptLink::Live { resume_from, .. } => *resume_from,
         AttemptLink::Replay { .. } => 0,
     };
+    let mut pending_finish = None;
     loop {
         let message = match inbound.message().await {
             Ok(Some(pb::AttemptUp { msg: Some(msg) })) => msg,
@@ -599,19 +600,7 @@ async fn receive_uploads(
                 }))
             }),
             pb::attempt_up::Msg::Finish(finish) => {
-                let assembled = std::mem::replace(
-                    &mut results,
-                    ResultAssembler::new(limits.clone(), Arc::clone(&budget), runtime.clone()),
-                );
-                let reply = match assembled.finish(finish) {
-                    Ok((outcome, outputs)) => runtime
-                        .finish_attempt(&link, outcome, outputs)
-                        .await
-                        .map(finish_to_proto)
-                        .map_err(Status::from),
-                    Err(status) => Err(status),
-                };
-                let _ = tx.send(reply).await;
+                pending_finish = Some(finish);
                 break;
             }
         };
@@ -620,8 +609,20 @@ async fn receive_uploads(
             break;
         }
     }
-    // The answer is final: end the response and give back any partial
-    // result, then let the worker close its side.
-    drop((tx, results));
+    if let Some(finish) = pending_finish {
+        let reply = match results.finish(finish) {
+            Ok((outcome, outputs)) => runtime
+                .finish_attempt(&link, outcome, outputs)
+                .await
+                .map(finish_to_proto)
+                .map_err(Status::from),
+            Err(status) => Err(status),
+        };
+        let _ = tx.send(reply).await;
+    } else {
+        // The answer is final: free any partial result before draining inbound.
+        drop(results);
+    }
+    drop(tx);
     drain(inbound, idle).await;
 }

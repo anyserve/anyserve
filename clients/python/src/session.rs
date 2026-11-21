@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyserve_client::execution::{Attempt, AttemptClient, WorkerSession, v2};
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tokio::sync::{mpsc, watch};
@@ -10,14 +11,14 @@ use tonic::Streaming;
 
 use crate::execution::{error, field, objects_from_py, objects_to_py};
 use crate::{
-    PyObjectRef, SharedRuntime, build_runtime, connection_error, lock_shared, status_error,
+    SharedRuntime, build_runtime, connection_error, extract_bytes, metadata_to_py, status_error,
 };
 
 #[pyclass(module = "anyserve._native")]
 pub struct WorkerConnection {
     runtime: SharedRuntime,
     control: mpsc::Sender<v2::WorkerMessage>,
-    messages: Arc<Mutex<Option<Streaming<v2::ServerMessage>>>>,
+    messages: Mutex<Option<Streaming<v2::ServerMessage>>>,
     data: AttemptClient,
     limits: v2::Limits,
     heartbeat_timeout: Duration,
@@ -102,7 +103,7 @@ impl WorkerConnection {
             Ok(Self {
                 runtime,
                 control,
-                messages: Arc::new(Mutex::new(Some(session.messages))),
+                messages: Mutex::new(Some(session.messages)),
                 data: session.data,
                 limits,
                 heartbeat_timeout: Duration::from_millis(u64::from(welcome.heartbeat_timeout_ms)),
@@ -119,14 +120,15 @@ impl WorkerConnection {
         if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
             return Err(error("timeout_secs must be finite and positive"));
         }
-        let runtime = Arc::clone(&self.runtime);
-        let messages = Arc::clone(&self.messages);
-        let message = py.detach(move || {
-            let mut messages = lock_shared(&messages, "worker messages").map_err(error)?;
+        let message = py.detach(|| {
+            let mut messages = self
+                .messages
+                .lock()
+                .map_err(|_| error("worker messages lock poisoned"))?;
             let Some(messages) = messages.as_mut() else {
                 return Err(error("worker session is closed"));
             };
-            runtime.block_on(async {
+            self.runtime.block_on(async {
                 match tokio::time::timeout(
                     Duration::from_secs_f64(timeout_secs),
                     messages.message(),
@@ -144,14 +146,15 @@ impl WorkerConnection {
             return Ok(None);
         };
         let dict = PyDict::new(py);
+        let kind_key = intern!(py, "type");
         match message {
             v2::server_message::Msg::Assign(inner) => {
-                dict.set_item("type", "assignment")?;
-                dict.set_item("lease_id", &inner.lease_id)?;
-                dict.set_item("job_id", &inner.job_id)?;
+                dict.set_item(kind_key, intern!(py, "assignment"))?;
+                dict.set_item(intern!(py, "lease_id"), &inner.lease_id)?;
+                dict.set_item(intern!(py, "job_id"), &inner.job_id)?;
                 let (cancelled, _) = watch::channel(false);
                 dict.set_item(
-                    "assignment",
+                    intern!(py, "assignment"),
                     Assignment {
                         runtime: Arc::clone(&self.runtime),
                         inner,
@@ -163,16 +166,18 @@ impl WorkerConnection {
                 )?;
             }
             v2::server_message::Msg::Cancel(cancel) => {
-                dict.set_item("type", "cancel")?;
-                dict.set_item("lease_id", cancel.lease_id)?;
-                dict.set_item("reason", cancel.reason)?;
+                dict.set_item(kind_key, intern!(py, "cancel"))?;
+                dict.set_item(intern!(py, "lease_id"), cancel.lease_id)?;
+                dict.set_item(intern!(py, "reason"), cancel.reason)?;
             }
             v2::server_message::Msg::Fence(fence) => {
-                dict.set_item("type", "fence")?;
-                dict.set_item("lease_id", fence.lease_id)?;
-                dict.set_item("reason", fence.reason)?;
+                dict.set_item(kind_key, intern!(py, "fence"))?;
+                dict.set_item(intern!(py, "lease_id"), fence.lease_id)?;
+                dict.set_item(intern!(py, "reason"), fence.reason)?;
             }
-            v2::server_message::Msg::Drain(_) => dict.set_item("type", "drain")?,
+            v2::server_message::Msg::Drain(_) => {
+                dict.set_item(kind_key, intern!(py, "drain"))?;
+            }
             v2::server_message::Msg::Welcome(_) => return Err(error("duplicate Welcome")),
         }
         Ok(Some(dict.unbind()))
@@ -216,9 +221,11 @@ impl WorkerConnection {
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.heartbeat.abort();
-        let messages = Arc::clone(&self.messages);
-        py.detach(move || {
-            *lock_shared(&messages, "worker messages").map_err(error)? = None;
+        py.detach(|| {
+            *self
+                .messages
+                .lock()
+                .map_err(|_| error("worker messages lock poisoned"))? = None;
             Ok(())
         })
     }
@@ -226,11 +233,9 @@ impl WorkerConnection {
 
 impl WorkerConnection {
     fn send(&self, py: Python<'_>, msg: v2::worker_message::Msg) -> PyResult<()> {
-        let control = self.control.clone();
-        let runtime = Arc::clone(&self.runtime);
-        py.detach(move || {
-            runtime
-                .block_on(control.send(v2::WorkerMessage { msg: Some(msg) }))
+        py.detach(|| {
+            self.runtime
+                .block_on(self.control.send(v2::WorkerMessage { msg: Some(msg) }))
                 .map_err(error)
         })
     }
@@ -289,18 +294,14 @@ impl Assignment {
 }
 impl Assignment {
     fn open_mode(&self, py: Python<'_>, buffered: bool) -> PyResult<WorkerAttempt> {
-        let runtime = Arc::clone(&self.runtime);
         let mut data = self.data.clone();
-        let assignment = self.inner.clone();
-        let limits = self.limits;
-        let heartbeat_timeout = self.heartbeat_timeout;
         let mut cancelled = self.cancelled.subscribe();
-        let attempt = py.detach(move || {
-            runtime.block_on(async {
+        let attempt = py.detach(|| {
+            self.runtime.block_on(async {
                 tokio::select! {
                     attempt = async {
-                        if buffered { Attempt::open(&mut data, &assignment, &limits, heartbeat_timeout).await }
-                        else { Attempt::open_stream(&mut data, &assignment, &limits, heartbeat_timeout).await }
+                        if buffered { Attempt::open(&mut data, &self.inner, &self.limits, self.heartbeat_timeout).await }
+                        else { Attempt::open_stream(&mut data, &self.inner, &self.limits, self.heartbeat_timeout).await }
                     } => attempt.map_err(status_error),
                     _ = wait_for_cancel(&mut cancelled) => Err(error("attempt cancelled")),
                 }
@@ -310,7 +311,7 @@ impl Assignment {
         Ok(WorkerAttempt {
             terminal_replay,
             runtime: Arc::clone(&self.runtime),
-            inner: Arc::new(Mutex::new(attempt)),
+            inner: Mutex::new((attempt, cancelled)),
             assignment: self.inner.clone(),
             data: self.data.clone(),
             limits: self.limits,
@@ -324,7 +325,7 @@ pub struct WorkerAttempt {
     #[pyo3(get)]
     terminal_replay: bool,
     runtime: SharedRuntime,
-    inner: Arc<Mutex<Attempt>>,
+    inner: Mutex<(Attempt, watch::Receiver<bool>)>,
     assignment: v2::Assign,
     data: AttemptClient,
     limits: v2::Limits,
@@ -351,11 +352,12 @@ impl WorkerAttempt {
     }
     #[getter]
     fn inputs(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyList>> {
-        let inner = Arc::clone(&self.inner);
-        let inputs = py.detach(move || {
+        let inputs = py.detach(|| {
             Ok::<_, PyErr>(
-                lock_shared(&inner, "worker attempt")
-                    .map_err(error)?
+                self.inner
+                    .lock()
+                    .map_err(|_| error("worker attempt lock poisoned"))?
+                    .0
                     .inputs
                     .clone(),
             )
@@ -364,11 +366,12 @@ impl WorkerAttempt {
     }
     #[getter]
     fn params(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
-        let inner = Arc::clone(&self.inner);
-        let bytes = py.detach(move || {
+        let bytes = py.detach(|| {
             Ok::<_, PyErr>(
-                lock_shared(&inner, "worker attempt")
-                    .map_err(error)?
+                self.inner
+                    .lock()
+                    .map_err(|_| error("worker attempt lock poisoned"))?
+                    .0
                     .params
                     .clone(),
             )
@@ -376,27 +379,35 @@ impl WorkerAttempt {
         Ok(PyBytes::new(py, &bytes).unbind())
     }
     fn input_chunk(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        let runtime = Arc::clone(&self.runtime);
-        let inner = Arc::clone(&self.inner);
-        let mut cancelled = self.cancelled.subscribe();
-        let input = py.detach(move || {
-            let mut inner = lock_shared(&inner, "worker attempt").map_err(error)?;
-            runtime.block_on(async {
+        if *self.cancelled.borrow() {
+            return Err(error("attempt cancelled"));
+        }
+        let input = py.detach(|| {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| error("worker attempt lock poisoned"))?;
+            let (attempt, cancelled) = &mut *inner;
+            self.runtime.block_on(async {
                 tokio::select! {
-                    input = inner.input_chunk() => input.map_err(status_error),
-                    _ = wait_for_cancel(&mut cancelled) => Err(error("attempt cancelled")),
+                    biased;
+                    input = attempt.input_chunk() => input.map_err(status_error),
+                    _ = wait_for_cancel(cancelled) => Err(error("attempt cancelled")),
                 }
             })
         })?;
         input
             .map(|input| {
                 let dict = PyDict::new(py);
-                dict.set_item("data", PyBytes::new(py, &input.data))?;
-                dict.set_item("object_index", input.object_index)?;
-                dict.set_item("uri", input.uri)?;
-                dict.set_item("metadata", input.metadata)?;
-                dict.set_item("parameter_chunk", input.parameter_chunk)?;
-                dict.set_item("object_end", input.object_end)?;
+                dict.set_item(intern!(py, "data"), PyBytes::new(py, &input.data))?;
+                dict.set_item(intern!(py, "object_index"), input.object_index)?;
+                dict.set_item(intern!(py, "uri"), input.uri)?;
+                dict.set_item(
+                    intern!(py, "metadata"),
+                    metadata_to_py(py, &input.metadata)?,
+                )?;
+                dict.set_item(intern!(py, "parameter_chunk"), input.parameter_chunk)?;
+                dict.set_item(intern!(py, "object_end"), input.object_end)?;
                 Ok(dict.unbind())
             })
             .transpose()
@@ -409,28 +420,38 @@ impl WorkerAttempt {
     fn frame(
         &self,
         py: Python<'_>,
-        data: Vec<u8>,
+        data: &Bound<'_, PyAny>,
         metadata: Option<HashMap<String, String>>,
         progress: bool,
     ) -> PyResult<()> {
-        let runtime = Arc::clone(&self.runtime);
-        let inner = Arc::clone(&self.inner);
-        let mut cancelled = self.cancelled.subscribe();
-        py.detach(move || {
-            let mut inner = lock_shared(&inner, "worker attempt").map_err(error)?;
-            runtime.block_on(async {
+        if *self.cancelled.borrow() {
+            return Err(error("attempt cancelled"));
+        }
+        let data = extract_bytes(data.as_borrowed())?;
+        py.detach(|| {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| error("worker attempt lock poisoned"))?;
+            let (attempt, cancelled) = &mut *inner;
+            self.runtime.block_on(async {
                 tokio::select! {
-                    sent = inner.frame(data.into(), metadata.unwrap_or_default(), progress) => sent.map_err(status_error),
-                    _ = wait_for_cancel(&mut cancelled) => Err(error("attempt cancelled")),
+                    biased;
+                    sent = attempt.frame(data.into(), metadata.unwrap_or_default(), progress) => sent.map_err(status_error),
+                    _ = wait_for_cancel(cancelled) => Err(error("attempt cancelled")),
                 }
             })
         })
     }
     #[pyo3(signature = (outputs=None))]
-    fn complete(&self, py: Python<'_>, outputs: Option<Vec<PyObjectRef>>) -> PyResult<()> {
+    fn complete(&self, py: Python<'_>, outputs: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let outputs = match outputs {
+            Some(items) => objects_from_py(items)?,
+            None => Vec::new(),
+        };
         self.finish(
             py,
-            objects_from_py(outputs.unwrap_or_default())?,
+            outputs,
             v2::finish::Outcome::Succeeded(v2::Succeeded {}),
         )
     }
@@ -454,18 +475,21 @@ impl WorkerAttempt {
         outputs: Vec<v2::Object>,
         outcome: v2::finish::Outcome,
     ) -> PyResult<()> {
-        let runtime = Arc::clone(&self.runtime);
-        let inner = Arc::clone(&self.inner);
-        let assignment = self.assignment.clone();
-        let limits = self.limits;
+        if *self.cancelled.borrow() {
+            return Err(error("attempt cancelled"));
+        }
         let mut data = self.data.clone();
-        let mut cancelled = self.cancelled.subscribe();
-        py.detach(move || {
-            let mut inner = lock_shared(&inner, "worker attempt").map_err(error)?;
-            runtime.block_on(async {
+        py.detach(|| {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| error("worker attempt lock poisoned"))?;
+            let (attempt, cancelled) = &mut *inner;
+            self.runtime.block_on(async {
                 tokio::select! {
-                    result = inner.commit(&mut data, &assignment, &limits, &outputs, outcome) => result.map_err(status_error),
-                    _ = wait_for_cancel(&mut cancelled) => Err(error("attempt cancelled")),
+                    biased;
+                    result = attempt.commit(&mut data, &self.assignment, &self.limits, &outputs, outcome) => result.map_err(status_error),
+                    _ = wait_for_cancel(cancelled) => Err(error("attempt cancelled")),
                 }
             })
         })

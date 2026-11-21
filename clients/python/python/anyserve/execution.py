@@ -276,27 +276,42 @@ def _spec(
 ) -> dict[str, Any]:
     if isinstance(inputs, bytes):
         inputs = [{"inline": inputs, "metadata": {}}]
-    if options is None:
-        return {"interface": interface, "inputs": inputs, "durability": durability}
-    return {
+    spec: dict[str, Any] = {
         "interface": interface,
         "inputs": inputs,
         "durability": durability,
-        "required_attributes": options.required_attributes,
-        "preferred_attributes": options.preferred_attributes,
-        "required_capacity": options.required_capacity,
-        "metadata": options.metadata,
-        "params": options.params,
-        "priority": options.priority,
-        "queue_timeout_ms": options.queue_timeout_ms,
-        "execution_timeout_ms": options.execution_timeout_ms,
-        "total_timeout_ms": options.total_timeout_ms,
-        "spillover_after_ms": options.spillover_after_ms,
-        "max_attempts": options.max_attempts,
-        "affinity_key": options.affinity_key,
-        "fairness_key": options.fairness_key,
-        "concurrency_key": options.concurrency_key,
     }
+    if options is None:
+        return spec
+    if options.required_attributes:
+        spec["required_attributes"] = options.required_attributes
+    if options.preferred_attributes:
+        spec["preferred_attributes"] = options.preferred_attributes
+    if options.required_capacity:
+        spec["required_capacity"] = options.required_capacity
+    if options.metadata:
+        spec["metadata"] = options.metadata
+    if options.params:
+        spec["params"] = options.params
+    if options.priority:
+        spec["priority"] = options.priority
+    if options.queue_timeout_ms:
+        spec["queue_timeout_ms"] = options.queue_timeout_ms
+    if options.execution_timeout_ms:
+        spec["execution_timeout_ms"] = options.execution_timeout_ms
+    if options.total_timeout_ms:
+        spec["total_timeout_ms"] = options.total_timeout_ms
+    if options.spillover_after_ms:
+        spec["spillover_after_ms"] = options.spillover_after_ms
+    if options.max_attempts:
+        spec["max_attempts"] = options.max_attempts
+    if options.affinity_key:
+        spec["affinity_key"] = options.affinity_key
+    if options.fairness_key:
+        spec["fairness_key"] = options.fairness_key
+    if options.concurrency_key:
+        spec["concurrency_key"] = options.concurrency_key
+    return spec
 
 
 def _terminal_outputs(events: Iterator[dict[str, Any]]) -> list[dict[str, Any]]:

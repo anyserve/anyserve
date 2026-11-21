@@ -24,8 +24,8 @@ use tokio::sync::{Notify, oneshot, watch};
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
     InputSink, InterfaceStats, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview,
-    JobSpec, JobState, JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeStats,
-    SubmitOutcome, SubmitRequest, WorkerView, codes,
+    JobSpec, JobState, JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeSnapshot,
+    RuntimeStats, SubmitOutcome, SubmitRequest, WorkerStats, WorkerView, codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
@@ -644,7 +644,7 @@ async fn maintenance_loop(me: Weak<Inner>) {
 }
 
 /// Cancels an `Invoke` job when its `Execution` is dropped before the end.
-struct CancelOnDrop {
+pub(crate) struct CancelOnDrop {
     me: Weak<Inner>,
     job_id: String,
     log: Arc<JobLog>,
@@ -652,13 +652,10 @@ struct CancelOnDrop {
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        self.log.set_primary(false);
         // The caller's own follower is already gone (the event stream drops
-        // before this guard); nothing it left unread is needed any more.
-        self.log.compact_if_unfollowed();
-        // The usual case: the caller read through Finished. Nothing to cancel,
-        // so the global lock is not needed.
-        if self.log.is_finished() {
+        // before this guard); clear primary, compact if unfollowed, and check
+        // finished under one log lock.
+        if self.log.release_primary_and_check_finished() {
             return;
         }
         if let Some(inner) = self.me.upgrade() {
@@ -679,9 +676,6 @@ impl Drop for CancelOnDrop {
 pub struct Runtime {
     pub(crate) inner: Arc<Inner>,
 }
-
-/// Called for each event just before a follower yields it.
-type EventHook = Arc<dyn Fn(&ExecutionEvent) + Send + Sync>;
 
 /// One reader of a job log. Its receiver counts it as a follower; when the
 /// reader finishes or goes away, the last follower of a finished ephemeral job
@@ -721,7 +715,7 @@ fn follow(
     log: Arc<JobLog>,
     changes: watch::Receiver<u64>,
     after: u64,
-    on_yield: Option<EventHook>,
+    track_consumed: bool,
     skip_gaps: bool,
 ) -> EventStream {
     EventStream::new(async_stream::stream! {
@@ -732,7 +726,7 @@ fn follow(
         let mut after = after;
         loop {
             follower.mark_seen();
-            match log.read_after(after) {
+            match log.read_after_for_primary(after, track_consumed) {
                 Err(oldest) if skip_gaps => {
                     after = oldest - 1;
                     continue;
@@ -741,13 +735,13 @@ fn follow(
                     yield Err(RuntimeError::cursor_expired(oldest));
                     return;
                 }
-                Ok((events, finished)) => {
+                Ok((events, finished, consumed_inline)) => {
                     for event in events {
                         after = event.sequence;
-                        if let Some(callback) = &on_yield {
-                            callback(&event);
-                        }
                         let last = matches!(event.kind, EventKind::Finished { .. });
+                        if track_consumed && !consumed_inline && !last {
+                            log.mark_consumed(event.sequence);
+                        }
                         yield Ok(event);
                         if last {
                             return;
@@ -785,14 +779,15 @@ fn view_from_stored(stored: StoredJob, include_outputs: bool) -> JobView {
     }
 }
 
-fn check_namespace(namespace: &str) -> Result<String, RuntimeError> {
-    let ns = if namespace.trim().is_empty() {
+fn check_namespace(namespace: &str) -> Result<&str, RuntimeError> {
+    let trimmed = namespace.trim();
+    let ns = if trimmed.is_empty() {
         DEFAULT_NAMESPACE
     } else {
-        namespace.trim()
+        trimmed
     };
     validate_namespace(ns).map_err(|status| RuntimeError::invalid(status.message()))?;
-    Ok(ns.to_string())
+    Ok(ns)
 }
 
 impl Runtime {
@@ -1039,7 +1034,7 @@ impl Runtime {
         // memory; generated ids cannot.
         let mut cold_checked = requested.is_none() || self.inner.journal.is_none();
         let raw_id = requested.unwrap_or_else(machine::new_id);
-        let scoped_id = identity::encode_scoped_id(&namespace, &raw_id);
+        let scoped_id = identity::encode_scoped_id(namespace, &raw_id);
         let conflict = |existing: &str| -> Result<(), RuntimeError> {
             if existing.is_empty() {
                 return Err(RuntimeError::conflict(format!(
@@ -1099,7 +1094,7 @@ impl Runtime {
                         });
                     }
                     let spec = spec.take().expect("a job is inserted at most once");
-                    let input_permit = self.inner.admit(&st, &namespace, &spec)?;
+                    let input_permit = self.inner.admit(&st, namespace, &spec)?;
                     self.inner.insert_job(
                         &mut st,
                         scoped_id.clone(),
@@ -1147,7 +1142,7 @@ impl Runtime {
                     if let Some(existing) = stored {
                         conflict(&existing)?;
                         return Ok(SubmitOutcome {
-                            job: self.get_job_in(&namespace, &raw_id, false).await?,
+                            job: self.get_job_in(namespace, &raw_id, false).await?,
                             created: false,
                         });
                     }
@@ -1169,7 +1164,7 @@ impl Runtime {
         let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
         let (spec, max_attempts) = self.normalize(request.spec, Durability::Ephemeral)?;
         let raw_id = machine::new_id();
-        let scoped_id = identity::encode_scoped_id(&namespace, &raw_id);
+        let scoped_id = identity::encode_scoped_id(namespace, &raw_id);
         let limits = &self.inner.config.limits;
         let input = (request.input == InputMode::Streaming).then(|| {
             let used = spec
@@ -1186,12 +1181,12 @@ impl Runtime {
         let (log, changes) = {
             let mut st = self.inner.lock();
             let now = now_ms();
-            let input_permit = self.inner.admit(&st, &namespace, &spec)?;
+            let input_permit = self.inner.admit(&st, namespace, &spec)?;
             let mut spec_slot = Some(spec);
             let mut permit_slot = Some(input_permit);
             match self.inner.invoke_ephemeral_direct_locked(
                 &mut st,
-                &namespace,
+                namespace,
                 raw_id.clone(),
                 scoped_id.clone(),
                 &mut spec_slot,
@@ -1223,20 +1218,15 @@ impl Runtime {
                 }
             }
         };
-        // A streamed consumer's reading position releases back-pressure.
-        let on_yield = Some({
-            let log = Arc::clone(&log);
-            Arc::new(move |event: &ExecutionEvent| log.mark_consumed(event.sequence)) as EventHook
-        });
         Ok(Execution {
             job_id: raw_id,
-            events: follow(Arc::clone(&log), changes, 0, on_yield, false),
+            events: follow(Arc::clone(&log), changes, 0, true, false),
             input: input.map(|log| InputSink { log }),
-            _guard: Box::new(CancelOnDrop {
+            _guard: CancelOnDrop {
                 me: Arc::downgrade(&self.inner),
                 job_id: scoped_id,
                 log,
-            }),
+            },
         })
     }
 
@@ -1256,7 +1246,7 @@ impl Runtime {
     ) -> Result<EventStream, RuntimeError> {
         self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         let st = self.inner.lock();
         if let Some(job) = st.jobs.get(&scoped_id) {
             let changes = job.log.subscribe();
@@ -1264,7 +1254,7 @@ impl Runtime {
                 Arc::clone(&job.log),
                 changes,
                 after_sequence,
-                None,
+                false,
                 false,
             ));
         }
@@ -1274,6 +1264,7 @@ impl Runtime {
         drop(st);
         // Possibly an evicted durable job: replay its acceptance and outcome.
         let runtime = self.clone();
+        let ns = ns.to_string();
         let raw = job_id.to_string();
         Ok(EventStream::new(async_stream::stream! {
             match runtime.get_job_in(&ns, &raw, true).await {
@@ -1309,7 +1300,7 @@ impl Runtime {
     ) -> Result<(Vec<ExecutionEvent>, bool), RuntimeError> {
         self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         let log = {
             let st = self.inner.lock();
             match st.jobs.get(&scoped_id) {
@@ -1330,7 +1321,7 @@ impl Runtime {
         if self.inner.journal.is_none() {
             return Err(RuntimeError::not_found("job", job_id));
         }
-        let job = self.get_job_in(&ns, job_id, true).await?;
+        let job = self.get_job_in(ns, job_id, true).await?;
         Ok((self.replayed_events(&job, after_sequence), true))
     }
 
@@ -1342,7 +1333,7 @@ impl Runtime {
 
     pub fn spec_in(&self, namespace: &str, job_id: &str) -> Result<Arc<JobSpec>, RuntimeError> {
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         let st = self.inner.lock();
         st.jobs
             .get(&scoped_id)
@@ -1402,7 +1393,7 @@ impl Runtime {
     ) -> Result<JobView, RuntimeError> {
         self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         {
             let st = self.inner.lock();
             if let Some(job) = st.jobs.get(&scoped_id) {
@@ -1473,12 +1464,12 @@ impl Runtime {
     ) -> Result<JobInspection, RuntimeError> {
         self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         loop {
             if let Some(retained) = self.inspect_retained_job(&scoped_id, job_id)? {
                 return Ok(retained);
             }
-            let job = self.get_job_in(&ns, job_id, true).await?;
+            let job = self.get_job_in(ns, job_id, true).await?;
             if !job.state.is_terminal() {
                 // Admission raced the lookup: read its live log on the next pass.
                 continue;
@@ -1505,7 +1496,7 @@ impl Runtime {
     ) -> Result<JobPreview, RuntimeError> {
         self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         loop {
             if let Some(JobInspection {
                 mut job,
@@ -1568,7 +1559,7 @@ impl Runtime {
     ) -> Result<JobView, RuntimeError> {
         self.ensure_active_leader()?;
         let ns = check_namespace(namespace)?;
-        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        let scoped_id = identity::encode_scoped_id(ns, job_id);
         let receiver = {
             let mut st = self.inner.lock();
             let now = now_ms();
@@ -1584,7 +1575,7 @@ impl Runtime {
             }
         };
         match receiver {
-            None => self.get_job_in(&ns, job_id, false).await,
+            None => self.get_job_in(ns, job_id, false).await,
             Some(receiver) => receiver
                 .await
                 .map_err(|_| RuntimeError::unavailable("runtime stopped"))?,
@@ -1650,23 +1641,7 @@ impl Runtime {
         let mut workers: Vec<WorkerView> = st
             .sessions
             .values()
-            .map(|session| WorkerView {
-                session_id: session.id.clone(),
-                worker_id: session.worker_id.clone(),
-                namespace: session.namespace.clone(),
-                pool: session.pool.clone(),
-                interfaces: session.interfaces.iter().cloned().collect(),
-                attributes: session.attributes.clone(),
-                total_capacity: session.total_capacity.clone(),
-                max_concurrency: session.max_concurrency,
-                active_leases: session.active.len() as u32,
-                free_slots: session.free_slots(),
-                load: session.load.clone(),
-                draining: session.draining,
-                connected: session.tx.is_some(),
-                connected_at_ms: session.connected_at_ms,
-                last_seen_ms: session.last_seen_ms,
-            })
+            .map(state::Session::worker_view)
             .collect();
         drop(st);
         workers.sort_by(|a, b| {
@@ -1677,9 +1652,16 @@ impl Runtime {
         workers
     }
 
-    pub fn health(&self) -> Health {
-        let journal = self.inner.journal_health();
+    pub fn find_worker(&self, namespace: &str, worker_id: &str) -> Option<WorkerView> {
         let st = self.inner.lock();
+        st.sessions
+            .values()
+            .filter(|session| session.namespace == namespace && session.worker_id == worker_id)
+            .min_by(|a, b| a.id.cmp(&b.id))
+            .map(state::Session::worker_view)
+    }
+
+    fn health_locked(&self, st: &State, journal: api::JournalHealth) -> Health {
         let live = !self.inner.lease_lost.load(Ordering::Acquire);
         let active = self.inner.leader_active.load(Ordering::Acquire);
         Health {
@@ -1695,9 +1677,46 @@ impl Runtime {
         }
     }
 
+    pub fn health(&self) -> Health {
+        let journal = self.inner.journal_health();
+        let st = self.inner.lock();
+        self.health_locked(&st, journal)
+    }
+
     pub fn stats(&self) -> RuntimeStats {
         let now = now_ms();
         let st = self.inner.lock();
+        let (stats, _) = self.stats_locked(&st, now, false);
+        drop(st);
+        RuntimeStats {
+            journal: self.inner.journal.as_ref().map(|journal| journal.stats()),
+            ..stats
+        }
+    }
+
+    /// Reads health, runtime stats, and worker rollup under a single state lock
+    /// without cloning or sorting `Vec<WorkerView>`.
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        let journal = self.inner.journal_health();
+        let now = now_ms();
+        let st = self.inner.lock();
+        let health = self.health_locked(&st, journal);
+        let (mut stats, workers) = self.stats_locked(&st, now, true);
+        drop(st);
+        stats.journal = self.inner.journal.as_ref().map(|journal| journal.stats());
+        RuntimeSnapshot {
+            health,
+            stats,
+            workers,
+        }
+    }
+
+    fn stats_locked(
+        &self,
+        st: &State,
+        now: u64,
+        with_worker_stats: bool,
+    ) -> (RuntimeStats, WorkerStats) {
         let mut interfaces = st.job_index.interfaces(now);
         let [queued, running, succeeded, failed, cancelled] = st.job_index.counts();
         let generation = st.generation;
@@ -1705,8 +1724,31 @@ impl Runtime {
         let sessions = st.sessions.len();
         let mut pools_tmp: HashMap<(&str, &str, &str), PoolStats> = HashMap::new();
         let mut session_lease_ifaces: HashMap<&str, usize> = HashMap::new();
+        let mut workers = WorkerStats::default();
         for session in st.sessions.values() {
             let free = session.free_slots() as u64;
+            if with_worker_stats {
+                workers.total += 1;
+                workers.active_leases += session.active.len() as u64;
+                workers.last_seen_at_ms = Some(
+                    workers
+                        .last_seen_at_ms
+                        .map_or(session.last_seen_ms, |max| max.max(session.last_seen_ms)),
+                );
+                if session.draining {
+                    workers.draining += 1;
+                }
+                if session.tx.is_some() && !session.draining {
+                    workers.healthy += 1;
+                    for (name, value) in &session.total_capacity {
+                        if let Some(total) = workers.total_capacity.get_mut(name.as_str()) {
+                            *total += value;
+                        } else {
+                            workers.total_capacity.insert(name.clone(), *value);
+                        }
+                    }
+                }
+            }
             if session.interfaces.len() > 1 && !session.active.is_empty() {
                 session_lease_ifaces.clear();
                 for lease_id in &session.active {
@@ -1793,23 +1835,25 @@ impl Runtime {
                 ((ns.to_string(), iface.to_string(), pool.to_string()), stats)
             })
             .collect();
-        drop(st);
-        RuntimeStats {
-            generation,
-            queued,
-            running,
-            succeeded,
-            failed,
-            cancelled,
-            retained_jobs,
-            sessions,
-            interfaces,
-            pools,
-            journal: self.inner.journal.as_ref().map(|journal| journal.stats()),
-            input_bytes: self.inner.input_budget.used(),
-            result_bytes: self.inner.result_budget.used(),
-            event_bytes: self.inner.event_budget.used(),
-        }
+        (
+            RuntimeStats {
+                generation,
+                queued,
+                running,
+                succeeded,
+                failed,
+                cancelled,
+                retained_jobs,
+                sessions,
+                interfaces,
+                pools,
+                journal: None,
+                input_bytes: self.inner.input_budget.used(),
+                result_bytes: self.inner.result_budget.used(),
+                event_bytes: self.inner.event_budget.used(),
+            },
+            workers,
+        )
     }
 
     /// Stops accepting work, asks workers to drain, flushes queued commits, and

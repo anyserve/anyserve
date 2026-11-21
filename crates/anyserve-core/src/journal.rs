@@ -7,6 +7,7 @@
 
 mod preview;
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -249,6 +250,21 @@ pub(crate) struct StoredSpec {
     pub demand: Demand,
     pub policy: ExecutionPolicy,
     pub metadata: Metadata,
+}
+
+#[derive(Serialize)]
+pub(crate) struct StoredSpecRef<'a> {
+    pub demand: &'a Demand,
+    pub policy: &'a ExecutionPolicy,
+    pub metadata: &'a Metadata,
+}
+
+pub(crate) fn metadata_to_json(metadata: &Metadata) -> Result<Cow<'_, str>> {
+    if metadata.is_empty() {
+        Ok(Cow::Borrowed("{}"))
+    } else {
+        Ok(Cow::Owned(serde_json::to_string(metadata)?))
+    }
 }
 
 enum Request {
@@ -940,6 +956,7 @@ async fn insert_objects(
             Object::Inline { data, metadata } => (None, Some(&data[..]), metadata),
             Object::Uri { uri, metadata } => (Some(uri.as_str()), None, metadata),
         };
+        let metadata_json = metadata_to_json(metadata)?;
         sqlx::query(
             "INSERT INTO journal_objects (job_id, role, idx, uri, content, metadata_json)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -949,7 +966,7 @@ async fn insert_objects(
         .bind(index as i64)
         .bind(uri)
         .bind(content)
-        .bind(serde_json::to_string(metadata)?)
+        .bind(metadata_json.as_ref())
         .execute(&mut **tx)
         .await?;
     }
@@ -960,10 +977,10 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
     match op {
         JournalOp::Accept(record) => {
             let spec = &record.spec;
-            let stored = StoredSpec {
-                demand: spec.demand.clone(),
-                policy: spec.policy.clone(),
-                metadata: spec.metadata.clone(),
+            let stored = StoredSpecRef {
+                demand: &spec.demand,
+                policy: &spec.policy,
+                metadata: &spec.metadata,
             };
             sqlx::query(
                 "INSERT INTO journal_jobs (job_id, state, spec_hash, spec_json, attempt_count,
@@ -1122,12 +1139,15 @@ async fn resolve_commit_failure(
     outcomes
 }
 
-async fn commit_batch(conn: &mut SqliteConnection, ops: &[&JournalOp]) -> Vec<CommitOutcome> {
+async fn commit_batch(
+    conn: &mut SqliteConnection,
+    ops: &[&JournalOp],
+) -> Option<Vec<CommitOutcome>> {
     match apply_batch(conn, ops).await {
-        Ok(()) => vec![CommitOutcome::Committed; ops.len()],
-        Err(Failure::Commit(error)) => resolve_commit_failure(conn, ops, &error).await,
+        Ok(()) => None,
+        Err(Failure::Commit(error)) => Some(resolve_commit_failure(conn, ops, &error).await),
         Err(Failure::Statement(error)) if ops.len() == 1 => {
-            vec![CommitOutcome::RolledBack(error)]
+            Some(vec![CommitOutcome::RolledBack(error)])
         }
         // Isolate the failing operation so it cannot sink the others.
         Err(Failure::Statement(_)) => {
@@ -1141,7 +1161,7 @@ async fn commit_batch(conn: &mut SqliteConnection, ops: &[&JournalOp]) -> Vec<Co
                     }
                 });
             }
-            outcomes
+            Some(outcomes)
         }
     }
 }
@@ -1181,27 +1201,42 @@ async fn purge(conn: &mut SqliteConnection, before_ms: u64) -> Result<usize> {
 
 async fn flush_batch(
     conn: &mut SqliteConnection,
-    batch: Vec<(JournalOp, oneshot::Sender<CommitOutcome>)>,
+    batch: &mut Vec<(JournalOp, oneshot::Sender<CommitOutcome>)>,
     pending: &AtomicUsize,
     stats: &Mutex<JournalStats>,
 ) {
     let started = Instant::now();
     let ops: Vec<&JournalOp> = batch.iter().map(|(op, _)| op).collect();
     let outcomes = commit_batch(conn, &ops).await;
+    drop(ops);
     let elapsed = started.elapsed();
+    let batch_len = batch.len();
+    let committed = match &outcomes {
+        None => batch_len as u64,
+        Some(outcomes) => outcomes
+            .iter()
+            .filter(|outcome| **outcome == CommitOutcome::Committed)
+            .count() as u64,
+    };
     {
         let mut stats = stats.lock().expect("journal stats poisoned");
         stats.committed_batches += 1;
-        stats.committed_ops += outcomes
-            .iter()
-            .filter(|outcome| **outcome == CommitOutcome::Committed)
-            .count() as u64;
-        stats.last_batch_size = batch.len();
+        stats.committed_ops += committed;
+        stats.last_batch_size = batch_len;
         stats.last_commit_micros = elapsed.as_micros() as u64;
     }
-    pending.fetch_sub(batch.len(), Ordering::Relaxed);
-    for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
-        let _ = reply.send(outcome);
+    pending.fetch_sub(batch_len, Ordering::Relaxed);
+    match outcomes {
+        None => {
+            for (_, reply) in batch.drain(..) {
+                let _ = reply.send(CommitOutcome::Committed);
+            }
+        }
+        Some(outcomes) => {
+            for ((_, reply), outcome) in batch.drain(..).zip(outcomes) {
+                let _ = reply.send(outcome);
+            }
+        }
     }
 }
 
@@ -1214,6 +1249,7 @@ async fn writer(
     _lock: File,
 ) {
     let mut deferred = None;
+    let mut batch = Vec::with_capacity(max_batch.max(1));
     loop {
         let request = match deferred.take() {
             Some(request) => request,
@@ -1225,18 +1261,16 @@ async fn writer(
         match request {
             Request::Close { reply } => {
                 // Finish everything queued before the close request, batched.
-                let mut batch = Vec::new();
                 while let Ok(request) = rx.try_recv() {
                     if let Request::Op { op, reply } = request {
                         batch.push((op, reply));
                         if batch.len() >= max_batch {
-                            flush_batch(&mut conn, std::mem::take(&mut batch), &pending, &stats)
-                                .await;
+                            flush_batch(&mut conn, &mut batch, &pending, &stats).await;
                         }
                     }
                 }
                 if !batch.is_empty() {
-                    flush_batch(&mut conn, batch, &pending, &stats).await;
+                    flush_batch(&mut conn, &mut batch, &pending, &stats).await;
                 }
                 rx.close();
                 let _ = conn.close().await;
@@ -1247,7 +1281,7 @@ async fn writer(
                 let _ = reply.send(purge(&mut conn, before_ms).await);
             }
             Request::Op { op, reply } => {
-                let mut batch = vec![(op, reply)];
+                batch.push((op, reply));
                 while batch.len() < max_batch {
                     match rx.try_recv() {
                         Ok(Request::Op { op, reply }) => batch.push((op, reply)),
@@ -1258,7 +1292,7 @@ async fn writer(
                         Err(_) => break,
                     }
                 }
-                flush_batch(&mut conn, batch, &pending, &stats).await;
+                flush_batch(&mut conn, &mut batch, &pending, &stats).await;
             }
         }
     }

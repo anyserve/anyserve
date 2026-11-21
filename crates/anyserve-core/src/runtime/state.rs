@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::api::{
     Capacity, Durability, ErrorInfo, ExecutionEvent, JobSpec, JobState, JobView, Metadata, Object,
-    WorkerLoad,
+    WorkerLoad, WorkerView,
 };
 use super::events::{JobLog, Permit};
 use super::index::JobIndex;
@@ -673,9 +673,32 @@ impl Session {
     pub(crate) fn attach(&mut self, lease_id: String, capacity: &Capacity) {
         if self.active.insert(lease_id) {
             for (name, value) in capacity {
-                let held = self.reserved.entry(name.clone()).or_insert(0);
-                *held = held.saturating_add(*value);
+                if let Some(held) = self.reserved.get_mut(name) {
+                    *held = held.saturating_add(*value);
+                } else {
+                    self.reserved.insert(name.clone(), *value);
+                }
             }
+        }
+    }
+
+    pub(crate) fn worker_view(&self) -> WorkerView {
+        WorkerView {
+            session_id: self.id.clone(),
+            worker_id: self.worker_id.clone(),
+            namespace: self.namespace.clone(),
+            pool: self.pool.clone(),
+            interfaces: self.interfaces.iter().cloned().collect(),
+            attributes: self.attributes.clone(),
+            total_capacity: self.total_capacity.clone(),
+            max_concurrency: self.max_concurrency,
+            active_leases: self.active.len() as u32,
+            free_slots: self.free_slots(),
+            load: self.load.clone(),
+            draining: self.draining,
+            connected: self.tx.is_some(),
+            connected_at_ms: self.connected_at_ms,
+            last_seen_ms: self.last_seen_ms,
         }
     }
 

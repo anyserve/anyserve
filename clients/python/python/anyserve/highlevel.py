@@ -175,7 +175,7 @@ def serve(
             merged_capacity[k] = merged_capacity.get(k, 0) + v if len(specs) > 1 else v
     merged_capacity["slot"] = total_concurrency
     session_pool = pool if pool is not None else specs[0].pool
-    active: dict[str, tuple[Any, Future]] = {}
+    active: dict[str, tuple[Any, Future, dict[str, int]]] = {}
     active_lock = threading.Lock()
     # Leases whose terminal message is being sent. The control plane frees the
     # slot when it commits that message and may assign the next job before the
@@ -207,9 +207,10 @@ def serve(
 
     def report_capacity(current: Any) -> None:
         with credit_lock:
-            entries = _active_snapshot(active, active_lock)
-            free = 0 if session_draining or any(item.cancelled for _, (item, _) in entries) else total_concurrency - len(entries)
-            current.credit(free)
+            with active_lock:
+                busy = len(active)
+                blocked = session_draining or any(entry[0].cancelled for entry in active.values())
+            current.credit(0 if blocked else total_concurrency - busy)
 
     def completed(lease_id: str, future: Future) -> None:
         with active_lock:
@@ -255,8 +256,9 @@ def serve(
                         )
                     session_draining = False
                     session_id = conn.session_id
-                    for lease_id, (assignment, _) in _active_snapshot(active, active_lock):
-                        if lease_id not in conn.resumed_lease_ids:
+                    for item in _active_values(active, active_lock):
+                        assignment = item[0]
+                        if assignment.lease_id not in conn.resumed_lease_ids:
                             assignment.cancel()
                 except RuntimeError as exc:
                     if getattr(exc, "status_code", None) in _PERMANENT_RPC_CODES:
@@ -277,19 +279,23 @@ def serve(
                     assignment = message["assignment"]
                     iface = getattr(assignment, "interface", specs[0].interface)
                     target = by_interface.get(iface)
+                    req_cap = assignment.reserved_capacity
                     with active_lock:
-                        entries = [item for item in active.items() if item[0] not in finishing]
-                    used: dict[str, int] = {}
-                    for _, (held, _) in entries:
-                        for resource, amount in held.reserved_capacity.items():
-                            used[resource] = used.get(resource, 0) + amount
+                        busy = 0
+                        used: dict[str, int] = {}
+                        for lid, (_, _, held_cap) in active.items():
+                            if lid in finishing:
+                                continue
+                            busy += 1
+                            for resource, amount in held_cap.items():
+                                used[resource] = used.get(resource, 0) + amount
                     accepted = (
                         target is not None
                         and not session_draining
-                        and len(entries) < total_concurrency
+                        and busy < total_concurrency
                         and all(
                             used.get(resource, 0) + amount <= merged_capacity.get(resource, 0)
-                            for resource, amount in assignment.reserved_capacity.items()
+                            for resource, amount in req_cap.items()
                         )
                     )
                     reason = (
@@ -305,7 +311,7 @@ def serve(
                             lambda lease_id=lease_id: mark_finishing(lease_id),
                         )
                         with active_lock:
-                            active[lease_id] = (assignment, future)
+                            active[lease_id] = (assignment, future, req_cap)
                         future.add_done_callback(lambda done, lease_id=lease_id: completed(lease_id, done))
                     else:
                         report_capacity(conn)
@@ -344,8 +350,8 @@ def serve(
                     conn.drain()
             except RuntimeError:
                 pass
-        for _, (assignment, _) in _active_snapshot(active, active_lock):
-            assignment.cancel()
+        for item in _active_values(active, active_lock):
+            item[0].cancel()
         executor.shutdown(wait=True, cancel_futures=True)
         if conn is not None:
             if preempting_shutdown:
@@ -358,9 +364,9 @@ def _active_ids(active: dict, lock: threading.Lock) -> list[str]:
         return list(active)
 
 
-def _active_snapshot(active: dict, lock: threading.Lock) -> list:
+def _active_values(active: dict, lock: threading.Lock) -> list:
     with lock:
-        return list(active.items())
+        return list(active.values())
 
 
 async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> None:
@@ -386,9 +392,15 @@ def _process_assignment(
         else:
             inputs = attempt.inputs
             if spec.uri_resolver is None:
-                if any("inline" not in item for item in inputs):
-                    raise ValueError("serve(...) requires inline inputs")
-                raw = b"".join(item["inline"] for item in inputs)
+                if len(inputs) == 1:
+                    item = inputs[0]
+                    if "inline" not in item:
+                        raise ValueError("serve(...) requires inline inputs")
+                    raw = item["inline"]
+                else:
+                    if any("inline" not in item for item in inputs):
+                        raise ValueError("serve(...) requires inline inputs")
+                    raw = b"".join(item["inline"] for item in inputs)
             else:
                 parts: list[bytes] = []
                 for item in inputs:
@@ -454,6 +466,8 @@ def _decode_payload(codec: str, payload: bytes) -> Any:
 
 def _encode_payload(codec: str, value: Any) -> bytes:
     if codec == _CODEC_BYTES:
+        if type(value) is bytes:
+            return value
         if not isinstance(value, (bytes, bytearray)):
             raise TypeError("bytes codec requires the handler to return bytes")
         return bytes(value)
