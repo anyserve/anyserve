@@ -33,12 +33,13 @@ pub struct WorkerConnection {
 #[pymethods]
 impl WorkerConnection {
     #[new]
-    #[pyo3(signature = (endpoint, hello, token=None))]
+    #[pyo3(signature = (endpoint, hello, token=None, namespace=None))]
     fn new(
         py: Python<'_>,
         endpoint: String,
         hello: &Bound<'_, PyDict>,
         token: Option<String>,
+        namespace: Option<String>,
     ) -> PyResult<Self> {
         let hello = v2::Hello {
             worker_id: field!(hello, "worker_id", String, String::new()),
@@ -50,14 +51,21 @@ impl WorkerConnection {
             held_lease_ids: field!(hello, "held_lease_ids", Vec<String>, Vec::new()),
             sdk_version: env!("CARGO_PKG_VERSION").to_owned(),
             metadata: field!(hello, "metadata", HashMap<String, String>, HashMap::new()),
+            pool: field!(hello, "pool", String, String::new()),
         };
         let token = token.or_else(|| std::env::var(anyserve_client::TOKEN_ENV).ok());
+        let namespace = namespace.or_else(|| std::env::var(anyserve_client::NAMESPACE_ENV).ok());
         py.detach(move || {
             let runtime = Arc::new(build_runtime().map_err(error)?);
             let (session, welcome) = runtime.block_on(async {
-                let mut session = WorkerSession::connect(&endpoint, token.as_deref(), hello)
-                    .await
-                    .map_err(connection_error)?;
+                let mut session = WorkerSession::connect_with_namespace(
+                    &endpoint,
+                    token.as_deref(),
+                    namespace.as_deref(),
+                    hello,
+                )
+                .await
+                .map_err(connection_error)?;
                 let welcome = match session.messages.message().await.map_err(status_error)? {
                     Some(v2::ServerMessage {
                         msg: Some(v2::server_message::Msg::Welcome(welcome)),
@@ -199,8 +207,12 @@ impl WorkerConnection {
             v2::worker_message::Msg::CancelAck(v2::CancelAck { lease_id }),
         )
     }
-    fn drain(&self, py: Python<'_>) -> PyResult<()> {
-        self.send(py, v2::worker_message::Msg::Draining(v2::Draining {}))
+    #[pyo3(signature = (preempting=false))]
+    fn drain(&self, py: Python<'_>, preempting: bool) -> PyResult<()> {
+        self.send(
+            py,
+            v2::worker_message::Msg::Draining(v2::Draining { preempting }),
+        )
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.heartbeat.abort();

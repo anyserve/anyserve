@@ -2,7 +2,7 @@
 //! always under the single runtime lock.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, Bound, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use anyserve_proto::v2 as pb;
@@ -16,6 +16,8 @@ use super::events::{JobLog, Permit};
 use super::index::JobIndex;
 use super::input::InputLog;
 use crate::error::RuntimeError;
+
+pub(crate) const DEFAULT_FAIRNESS_KEY: &str = "_default";
 
 pub(crate) type JobWaiter = oneshot::Sender<Result<JobView, RuntimeError>>;
 pub(crate) type FinishWaiter = oneshot::Sender<Result<FinishStatus, RuntimeError>>;
@@ -35,23 +37,241 @@ pub(crate) struct QueueKey {
 }
 
 #[derive(Default)]
+pub(crate) struct PriorityFairQueue {
+    pub ring: VecDeque<String>,
+    pub subqueues: HashMap<String, BTreeSet<QueueKey>>,
+    pub total_len: usize,
+}
+
+impl PriorityFairQueue {
+    pub(crate) fn insert(&mut self, fairness_key: &str, key: QueueKey) {
+        let fkey = if fairness_key.is_empty() {
+            DEFAULT_FAIRNESS_KEY
+        } else {
+            fairness_key
+        };
+        let subqueue = self.subqueues.entry(fkey.to_string()).or_default();
+        let was_empty = subqueue.is_empty();
+        if subqueue.insert(key) {
+            self.total_len += 1;
+            if was_empty {
+                self.ring.push_back(fkey.to_string());
+            }
+        }
+    }
+
+    pub(crate) fn remove(&mut self, fairness_key: &str, key: &QueueKey) -> bool {
+        let fkey = if fairness_key.is_empty() {
+            DEFAULT_FAIRNESS_KEY
+        } else {
+            fairness_key
+        };
+        let Some(subqueue) = self.subqueues.get_mut(fkey) else {
+            return false;
+        };
+        if subqueue.remove(key) {
+            self.total_len -= 1;
+            if subqueue.is_empty() {
+                self.subqueues.remove(fkey);
+                self.ring.retain(|k| k != fkey);
+            }
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn rotate_key_to_back(&mut self, fairness_key: &str) {
+        let fkey = if fairness_key.is_empty() {
+            DEFAULT_FAIRNESS_KEY
+        } else {
+            fairness_key
+        };
+        if let Some(pos) = self.ring.iter().position(|k| k == fkey)
+            && self.ring.len() > 1
+            && pos == 0
+            && let Some(front) = self.ring.pop_front()
+        {
+            self.ring.push_back(front);
+        }
+    }
+
+    /// Collects up to `limit` queued entries by visiting active `fairness_key`
+    /// subqueues in round-robin order.
+    pub(crate) fn collect_fair(&self, limit: usize) -> Vec<QueueKey> {
+        if self.total_len == 0 || limit == 0 {
+            return Vec::new();
+        }
+        let mut iters: Vec<_> = self
+            .ring
+            .iter()
+            .filter_map(|k| self.subqueues.get(k).map(|q| q.iter()))
+            .collect();
+        let mut out = Vec::with_capacity(limit.min(self.total_len));
+        while out.len() < limit && !iters.is_empty() {
+            let mut progressed = false;
+            iters.retain_mut(|iter| {
+                if out.len() >= limit {
+                    return true;
+                }
+                if let Some(item) = iter.next() {
+                    out.push(item.clone());
+                    progressed = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if !progressed {
+                break;
+            }
+        }
+        out
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct InterfaceQueue {
+    pub levels: Vec<PriorityFairQueue>,
+    pub total_len: usize,
+}
+
+impl InterfaceQueue {
+    pub(crate) fn len(&self) -> usize {
+        self.total_len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        priority_levels: usize,
+        priority: u32,
+        fairness_key: &str,
+        key: QueueKey,
+    ) {
+        let levels = priority_levels.max(1);
+        if self.levels.len() < levels {
+            self.levels.resize_with(levels, PriorityFairQueue::default);
+        }
+        let idx = (priority as usize).min(levels - 1);
+        let before = self.levels[idx].total_len;
+        self.levels[idx].insert(fairness_key, key);
+        self.total_len += self.levels[idx].total_len - before;
+    }
+
+    pub(crate) fn remove(&mut self, priority: u32, fairness_key: &str, key: &QueueKey) {
+        let idx = (priority as usize).min(self.levels.len().saturating_sub(1));
+        if let Some(level) = self.levels.get_mut(idx)
+            && level.remove(fairness_key, key)
+        {
+            self.total_len -= 1;
+        }
+    }
+
+    pub(crate) fn rotate_key_to_back(&mut self, priority: u32, fairness_key: &str) {
+        let idx = (priority as usize).min(self.levels.len().saturating_sub(1));
+        if let Some(level) = self.levels.get_mut(idx) {
+            level.rotate_key_to_back(fairness_key);
+        }
+    }
+
+    pub(crate) fn collect_candidates(&self, limit: usize) -> Vec<QueueKey> {
+        let mut out = Vec::new();
+        for level in self.levels.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if level.total_len == 0 {
+                continue;
+            }
+            out.extend(level.collect_fair(limit - out.len()));
+        }
+        out
+    }
+
+    /// Collects the rotating scan window past `DISPATCH_SCAN` so unmatchable
+    /// jobs at the head never starve jobs deeper in a large queue.
+    pub(crate) fn collect_window(
+        &self,
+        cursor: Option<&QueueKey>,
+        limit: usize,
+    ) -> (Vec<QueueKey>, Option<QueueKey>) {
+        if limit == 0 || self.total_len == 0 {
+            return (Vec::new(), None);
+        }
+        let mut out = Vec::with_capacity(limit);
+        for (prio_idx, level) in self.levels.iter().enumerate().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if level.total_len == 0 {
+                continue;
+            }
+            let level_prio = Reverse(prio_idx as u32);
+            if let Some(cur) = cursor
+                && level_prio < cur.priority
+            {
+                continue;
+            }
+            let mut iters: Vec<_> = level
+                .subqueues
+                .values()
+                .map(|q| match cursor {
+                    Some(cur) if cur.priority == level_prio => {
+                        q.range((Bound::Excluded(cur.clone()), Bound::Unbounded))
+                    }
+                    _ => q.range(..),
+                })
+                .collect();
+            let mut heap: BinaryHeap<Reverse<(&QueueKey, usize)>> = BinaryHeap::new();
+            for (idx, iter) in iters.iter_mut().enumerate() {
+                if let Some(k) = iter.next() {
+                    heap.push(Reverse((k, idx)));
+                }
+            }
+            while out.len() < limit {
+                let Some(Reverse((key, idx))) = heap.pop() else {
+                    break;
+                };
+                out.push(key.clone());
+                if let Some(next_key) = iters[idx].next() {
+                    heap.push(Reverse((next_key, idx)));
+                }
+            }
+        }
+        let next_cursor = if out.len() == limit {
+            out.last().cloned()
+        } else {
+            None
+        };
+        (out, next_cursor)
+    }
+}
+
+pub(crate) type NsIfaceMap<T> = HashMap<String, HashMap<String, T>>;
+
+#[derive(Default)]
 pub(crate) struct State {
     pub generation: u64,
     pub jobs: HashMap<String, Job>,
     pub job_index: JobIndex,
-    /// Queued jobs per interface, highest priority then oldest first.
-    pub queues: HashMap<String, BTreeSet<QueueKey>>,
+    /// Queued jobs per `namespace -> interface`, priority + round-robin fairness order.
+    pub queues: NsIfaceMap<InterfaceQueue>,
+    /// Where the scan past the dispatch head left off per `namespace -> interface`.
+    pub scan_cursor: NsIfaceMap<QueueKey>,
     pub queue_seq: u64,
-    /// Where the rotating part of the next dispatch scan starts, per interface.
-    pub scan_cursor: HashMap<String, QueueKey>,
-    /// Durable jobs awaiting their acceptance commit, per interface.
-    pub accepting: HashMap<String, usize>,
+    /// Durable jobs awaiting their acceptance commit, per `namespace -> interface`.
+    pub accepting: NsIfaceMap<usize>,
     /// Jobs not yet terminal, including those being accepted.
     pub unfinished_jobs: usize,
+    /// Active in-flight attempts keyed by `namespace -> concurrency_key`.
+    pub in_flight_concurrency: NsIfaceMap<usize>,
     pub sessions: HashMap<String, Session>,
-    pub sessions_by_interface: HashMap<String, HashSet<String>>,
+    pub sessions_by_interface: NsIfaceMap<HashSet<String>>,
     pub leases: HashMap<String, Lease>,
-    /// Completion receipts of jobs held in memory: lease id -> (job id,
+    /// Completion receipts of jobs held in memory: lease id -> (scoped job id,
     /// outcome digest). Receipts of evicted durable jobs are read from the
     /// journal.
     pub finished_leases: HashMap<String, (String, String)>,
@@ -64,6 +284,99 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub(crate) fn queue(&self, namespace: &str, interface: &str) -> Option<&InterfaceQueue> {
+        self.queues.get(namespace).and_then(|m| m.get(interface))
+    }
+
+    pub(crate) fn queue_mut(
+        &mut self,
+        namespace: &str,
+        interface: &str,
+    ) -> Option<&mut InterfaceQueue> {
+        self.queues
+            .get_mut(namespace)
+            .and_then(|m| m.get_mut(interface))
+    }
+
+    pub(crate) fn queue_or_insert(
+        &mut self,
+        namespace: &str,
+        interface: &str,
+    ) -> &mut InterfaceQueue {
+        if !self.queues.contains_key(namespace) {
+            self.queues.insert(namespace.to_string(), HashMap::new());
+        }
+        let m = self
+            .queues
+            .get_mut(namespace)
+            .expect("namespace map inserted");
+        if !m.contains_key(interface) {
+            m.insert(interface.to_string(), InterfaceQueue::default());
+        }
+        m.get_mut(interface).expect("interface queue inserted")
+    }
+
+    pub(crate) fn count_in(map: &NsIfaceMap<usize>, namespace: &str, key: &str) -> usize {
+        map.get(namespace)
+            .and_then(|m| m.get(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn inc_in(map: &mut NsIfaceMap<usize>, namespace: &str, key: &str) {
+        if let Some(m) = map.get_mut(namespace) {
+            if let Some(c) = m.get_mut(key) {
+                *c += 1;
+            } else {
+                m.insert(key.to_string(), 1);
+            }
+            return;
+        }
+        map.entry(namespace.to_string())
+            .or_default()
+            .insert(key.to_string(), 1);
+    }
+
+    pub(crate) fn dec_in(map: &mut NsIfaceMap<usize>, namespace: &str, key: &str) {
+        if let Some(m) = map.get_mut(namespace) {
+            if let Some(c) = m.get_mut(key) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    m.remove(key);
+                }
+            }
+            if m.is_empty() {
+                map.remove(namespace);
+            }
+        }
+    }
+
+    pub(crate) fn accepting_count(&self, namespace: &str, interface: &str) -> usize {
+        Self::count_in(&self.accepting, namespace, interface)
+    }
+
+    pub(crate) fn inc_accepting(&mut self, namespace: &str, interface: &str) {
+        Self::inc_in(&mut self.accepting, namespace, interface);
+    }
+
+    pub(crate) fn in_flight_key_count(&self, namespace: &str, ckey: &str) -> usize {
+        Self::count_in(&self.in_flight_concurrency, namespace, ckey)
+    }
+
+    pub(crate) fn inc_in_flight_key(&mut self, namespace: &str, ckey: &str) {
+        Self::inc_in(&mut self.in_flight_concurrency, namespace, ckey);
+    }
+
+    pub(crate) fn interface_sessions(
+        &self,
+        namespace: &str,
+        interface: &str,
+    ) -> Option<&HashSet<String>> {
+        self.sessions_by_interface
+            .get(namespace)
+            .and_then(|m| m.get(interface))
+    }
+
     pub(crate) fn insert_job(&mut self, job: Job) {
         self.job_index.insert(&job);
         self.jobs.insert(job.id.clone(), job);
@@ -90,22 +403,33 @@ impl State {
     }
 
     pub(crate) fn index_session(&mut self, id: &str) {
+        let ns = self.sessions[id].namespace.clone();
+        let ns_map = self.sessions_by_interface.entry(ns).or_default();
         for interface in &self.sessions[id].interfaces {
-            self.sessions_by_interface
-                .entry(interface.clone())
-                .or_default()
-                .insert(id.to_string());
+            if let Some(ids) = ns_map.get_mut(interface.as_str()) {
+                ids.insert(id.to_string());
+            } else {
+                let mut set = HashSet::new();
+                set.insert(id.to_string());
+                ns_map.insert(interface.clone(), set);
+            }
         }
     }
 
     pub(crate) fn unindex_session(&mut self, id: &str) {
         if let Some(session) = self.sessions.get(id) {
-            for interface in &session.interfaces {
-                if let Some(ids) = self.sessions_by_interface.get_mut(interface) {
-                    ids.remove(id);
-                    if ids.is_empty() {
-                        self.sessions_by_interface.remove(interface);
+            let ns = &session.namespace;
+            if let Some(ns_map) = self.sessions_by_interface.get_mut(ns.as_str()) {
+                for interface in &session.interfaces {
+                    if let Some(ids) = ns_map.get_mut(interface.as_str()) {
+                        ids.remove(id);
+                        if ids.is_empty() {
+                            ns_map.remove(interface.as_str());
+                        }
                     }
+                }
+                if ns_map.is_empty() {
+                    self.sessions_by_interface.remove(ns.as_str());
                 }
             }
         }
@@ -184,11 +508,14 @@ pub(crate) struct Attempt {
     pub inputs_via_attempt: bool,
     pub last_frame_seq: u64,
     pub exposed: bool,
+    pub concurrency_counted: bool,
 }
 
 pub(crate) struct Job {
+    /// Internal scoped storage ID (`encode_scoped_id(namespace, raw_id)`).
     pub id: String,
-    pub ownership_epoch: Option<i64>,
+    pub raw_id: String,
+    pub namespace: String,
     pub spec: Arc<JobSpec>,
     pub durability: Durability,
     pub spec_hash: String,
@@ -205,7 +532,10 @@ pub(crate) struct Job {
     pub not_before_ms: u64,
     /// Deadline timers scheduled for this job; cancelled when it ends.
     pub timers: Vec<u64>,
-    pub rejected_by: HashSet<String>,
+    /// Sessions that explicitly rejected this job (`AssignReply.accepted = false`).
+    pub rejected_sessions: HashSet<String>,
+    /// Worker IDs that failed, timed out, crashed on, or rejected this job.
+    pub failed_workers: BTreeSet<String>,
     pub cancel_requested: Option<String>,
     /// A commit for this job had an unknown outcome; the id stays reserved
     /// and the job frozen until a restart reconciles it with the journal.
@@ -248,7 +578,8 @@ impl Job {
 
     pub(crate) fn view(&self, include_outputs: bool) -> JobView {
         JobView {
-            job_id: self.id.clone(),
+            job_id: self.raw_id.clone(),
+            namespace: self.namespace.clone(),
             state: self.state(),
             durability: self.durability,
             interface: self.spec.demand.interface.clone(),
@@ -289,6 +620,9 @@ pub(crate) struct Lease {
 pub(crate) struct Session {
     pub id: String,
     pub worker_id: String,
+    pub namespace: String,
+    pub pool: String,
+    pub forced_pool: Option<String>,
     pub interfaces: BTreeSet<String>,
     pub attributes: Metadata,
     pub metadata: Metadata,
@@ -310,6 +644,8 @@ pub(crate) struct Session {
     pub connected_at_ms: u64,
     pub last_seen_ms: u64,
     pub disconnected_at_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    pub cooldown_until_ms: u64,
 }
 
 impl Session {
@@ -375,10 +711,12 @@ impl Session {
 #[cfg(test)]
 pub(crate) fn assert_reservations(st: &State) {
     super::index::assert_matches_jobs(st);
-    let mut expected_interfaces: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut expected_interfaces: NsIfaceMap<HashSet<String>> = HashMap::new();
     for session in st.sessions.values() {
         for interface in &session.interfaces {
             expected_interfaces
+                .entry(session.namespace.clone())
+                .or_default()
                 .entry(interface.clone())
                 .or_default()
                 .insert(session.id.clone());

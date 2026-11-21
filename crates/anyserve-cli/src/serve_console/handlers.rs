@@ -59,6 +59,7 @@ async fn analytics_jobs(
             to_ms: query.to_ms,
             limit: query.limit.unwrap_or(250),
             cursor: query.cursor,
+            namespace: None,
         })
         .await
         .map_err(api_error)?;
@@ -100,7 +101,8 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
         super::metrics::render(&state.runtime),
     )
 }
-async fn overview(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn overview(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    state.runtime.ensure_active_leader().map_err(api_error)?;
     let stats = state.runtime.stats();
     let workers: Vec<_> = state
         .runtime
@@ -109,7 +111,7 @@ async fn overview(State(state): State<AppState>) -> Json<serde_json::Value> {
         .map(worker_summary)
         .collect();
     let healthy: Vec<_> = workers.iter().filter(|worker| worker.healthy).collect();
-    Json(json!({
+    Ok(Json(json!({
         "runtime": state.mode,
         "queue": {"queued": stats.queued, "running": stats.running, "active": stats.queued + stats.running},
         "history": {
@@ -133,7 +135,7 @@ async fn overview(State(state): State<AppState>) -> Json<serde_json::Value> {
             "free_slots": interface.free_slots
         })).collect::<Vec<_>>(),
         "refreshed_at_ms": now_ms()
-    }))
+    })))
 }
 async fn list_jobs(
     State(state): State<AppState>,
@@ -224,18 +226,19 @@ async fn cancel_job(
         job: job_summary(&job),
     }))
 }
-async fn list_workers(State(state): State<AppState>) -> Json<WorkersResponse> {
+async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkersResponse>, ApiError> {
+    state.runtime.ensure_active_leader().map_err(api_error)?;
     let workers: Vec<_> = state
         .runtime
         .list_workers()
         .iter()
         .map(worker_summary)
         .collect();
-    Json(WorkersResponse {
+    Ok(Json(WorkersResponse {
         healthy: workers.iter().filter(|worker| worker.healthy).count(),
         total: workers.len(),
         workers,
-    })
+    }))
 }
 async fn cors_middleware(
     State(state): State<AppState>,

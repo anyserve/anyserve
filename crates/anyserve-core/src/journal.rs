@@ -23,7 +23,7 @@ use sqlx::sqlite::{
     SqliteSynchronous,
 };
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, Transaction};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::RuntimeError;
 use crate::runtime::api::{
@@ -31,6 +31,140 @@ use crate::runtime::api::{
     Object, ObjectPreview,
 };
 use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
+
+pub(crate) type BoxFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+pub(crate) type StoredJobPreview = (StoredJob, Vec<ObjectPreview>);
+
+type RelinquishFn = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// Ownership handle for an active scheduler lease.
+pub(crate) struct LeaseHandle {
+    lost: watch::Receiver<bool>,
+    _keep_alive: Option<watch::Sender<bool>>,
+    relinquish: Mutex<Option<RelinquishFn>>,
+}
+
+impl LeaseHandle {
+    /// Never-expiring local lease (for single-process file-locked SQLite).
+    pub(crate) fn always_held() -> Self {
+        let (tx, rx) = watch::channel(false);
+        Self {
+            lost: rx,
+            _keep_alive: Some(tx),
+            relinquish: Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn new(
+        lost: watch::Receiver<bool>,
+        relinquish: impl FnOnce() -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            lost,
+            _keep_alive: None,
+            relinquish: Mutex::new(Some(Box::new(relinquish))),
+        }
+    }
+
+    pub(crate) fn lost(&self) -> watch::Receiver<bool> {
+        self.lost.clone()
+    }
+
+    pub(crate) async fn relinquish(&self) {
+        let callback = self
+            .relinquish
+            .lock()
+            .expect("lease relinquish poisoned")
+            .take();
+        if let Some(cb) = callback {
+            cb().await;
+        }
+    }
+}
+
+pub(crate) struct Leadership {
+    pub term: u64,
+    pub recovery: Recovery,
+    pub lease: LeaseHandle,
+}
+
+/// Internal storage and leader-lease abstraction shared by SQLite and PostgreSQL.
+pub(crate) trait JournalBackend: Send + Sync {
+    /// Attempts once to acquire leadership and read a consistent recovery
+    /// snapshot under `term`. Returns `Ok(None)` when another live instance
+    /// currently holds the lease.
+    fn try_acquire_leadership(&self) -> BoxFuture<'_, Result<Option<Leadership>>>;
+
+    fn standby_poll_interval(&self) -> Duration {
+        Duration::from_millis(200)
+    }
+
+    fn acquire_leadership(
+        &self,
+        mut stop: watch::Receiver<bool>,
+    ) -> BoxFuture<'_, Result<Option<Leadership>>> {
+        Box::pin(async move {
+            loop {
+                if *stop.borrow() {
+                    return Ok(None);
+                }
+                match self.try_acquire_leadership().await {
+                    Ok(Some(leadership)) => return Ok(Some(leadership)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "leadership acquisition attempt failed; retrying");
+                    }
+                }
+                tokio::select! {
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() {
+                            return Ok(None);
+                        }
+                    }
+                    _ = tokio::time::sleep(self.standby_poll_interval()) => {}
+                }
+            }
+        })
+    }
+
+    fn enqueue(
+        &self,
+        term: u64,
+        op: JournalOp,
+    ) -> Result<oneshot::Receiver<CommitOutcome>, RuntimeError>;
+
+    fn spec_hash<'a>(&'a self, job_id: &'a str) -> BoxFuture<'a, Result<Option<String>>>;
+
+    fn receipt<'a>(&'a self, lease_id: &'a str) -> BoxFuture<'a, Result<Option<(String, String)>>>;
+
+    fn load_job<'a>(
+        &'a self,
+        job_id: &'a str,
+        include_outputs: bool,
+        result_budget: Arc<ByteBudget>,
+    ) -> BoxFuture<'a, Result<Option<StoredJob>>>;
+
+    fn load_job_preview<'a>(
+        &'a self,
+        job_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredJobPreview>>>;
+
+    fn scan_jobs<'a>(
+        &'a self,
+        from_ms: u64,
+        to_ms: u64,
+        before: Option<(u64, String)>,
+        namespace: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<StoredJob>>>;
+
+    fn purge<'a>(&'a self, term: u64, before_ms: u64) -> BoxFuture<'a, Result<usize>>;
+
+    fn stats(&self) -> JournalStats;
+
+    fn close(&self) -> BoxFuture<'_, ()>;
+}
 
 #[derive(Debug)]
 pub(crate) enum JournalOp {
@@ -56,7 +190,6 @@ pub(crate) struct AttemptStartRecord {
     /// The job's attempt count once this start is committed.
     pub attempt_number: u32,
     pub at_ms: u64,
-    pub ownership_epoch: Option<i64>,
     pub attempt_id: Option<String>,
     pub worker_id: Option<String>,
 }
@@ -73,9 +206,6 @@ pub(crate) struct TerminalRecord {
     /// Server-computed digest of the winning outcome (`result_digest` column).
     pub outcome_digest: Option<String>,
     pub at_ms: u64,
-    pub ownership_epoch: Option<i64>,
-    /// PostgreSQL retries are committed before returning the job to the queue.
-    pub retry_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +234,7 @@ pub(crate) struct StoredJob {
     pub outputs: Vec<Object>,
     pub last_attempt_id: Option<String>,
     pub last_worker_id: Option<String>,
+    pub failed_workers: std::collections::BTreeSet<String>,
 }
 
 pub(crate) struct Recovery {
@@ -195,29 +326,56 @@ impl Journal {
         from_ms: u64,
         to_ms: u64,
         before: Option<(u64, String)>,
+        namespace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<StoredJob>> {
-        let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
-        query
-            .push(" INDEXED BY journal_jobs_history WHERE state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
-            .push_bind(from_ms as i64)
-            .push(" AND created_at_ms < ")
-            .push_bind(to_ms as i64);
-        if let Some((at, id)) = before {
+        let mut cursor = before.map(|(at, id)| match namespace {
+            Some(ns) => (at, crate::runtime::identity::encode_scoped_id(ns, &id)),
+            None => (at, id),
+        });
+        let mut out = Vec::with_capacity(limit);
+        let batch_size = limit.clamp(1, 250);
+        loop {
+            let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
             query
-                .push(" AND (created_at_ms, job_id) < (")
-                .push_bind(at as i64)
-                .push(", ")
-                .push_bind(id)
-                .push(")");
+                .push(" INDEXED BY journal_jobs_history WHERE state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
+                .push_bind(from_ms as i64)
+                .push(" AND created_at_ms < ")
+                .push_bind(to_ms as i64);
+            if let Some((at, id)) = &cursor {
+                query
+                    .push(" AND (created_at_ms, job_id) < (")
+                    .push_bind(*at as i64)
+                    .push(", ")
+                    .push_bind(id)
+                    .push(")");
+            }
+            let rows = query
+                .push(" ORDER BY created_at_ms DESC, job_id DESC LIMIT ")
+                .push_bind(batch_size as i64)
+                .build()
+                .fetch_all(&self.read_pool)
+                .await?;
+            let done = rows.len() < batch_size;
+            for row in &rows {
+                let job = job_from_row(row)?;
+                cursor = Some((job.created_at_ms, job.job_id.clone()));
+                if let Some(expected_ns) = namespace {
+                    let (row_ns, _) = crate::runtime::identity::decode_scoped_id(&job.job_id);
+                    if row_ns != expected_ns {
+                        continue;
+                    }
+                }
+                out.push(job);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            if done {
+                break;
+            }
         }
-        let rows = query
-            .push(" ORDER BY created_at_ms DESC, job_id DESC LIMIT ")
-            .push_bind(limit as i64)
-            .build()
-            .fetch_all(&self.read_pool)
-            .await?;
-        rows.iter().map(job_from_row).collect()
+        Ok(out)
     }
 
     /// Opens (creating if needed) the journal, starts a new generation and
@@ -467,6 +625,109 @@ impl Journal {
     }
 }
 
+pub(crate) struct SqliteJournal {
+    inner: Journal,
+    term: u64,
+    initial: Mutex<Option<Recovery>>,
+}
+
+impl SqliteJournal {
+    pub(crate) async fn open(config: &JournalConfig) -> Result<Arc<dyn JournalBackend>> {
+        let (inner, recovery) = Journal::open(config).await?;
+        let term = recovery.generation;
+        Ok(Arc::new(Self {
+            inner,
+            term,
+            initial: Mutex::new(Some(recovery)),
+        }))
+    }
+}
+
+impl JournalBackend for SqliteJournal {
+    fn try_acquire_leadership(&self) -> BoxFuture<'_, Result<Option<Leadership>>> {
+        let recovery = self.initial.lock().expect("sqlite initial poisoned").take();
+        let term = self.term;
+        Box::pin(async move {
+            Ok(recovery.map(|recovery| Leadership {
+                term,
+                recovery,
+                lease: LeaseHandle::always_held(),
+            }))
+        })
+    }
+
+    fn enqueue(
+        &self,
+        term: u64,
+        op: JournalOp,
+    ) -> Result<oneshot::Receiver<CommitOutcome>, RuntimeError> {
+        if term != self.term {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(CommitOutcome::Fenced(format!(
+                "stale SQLite term {term} (current {})",
+                self.term
+            )));
+            return Ok(rx);
+        }
+        self.inner.enqueue(op)
+    }
+
+    fn spec_hash<'a>(&'a self, job_id: &'a str) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(self.inner.spec_hash(job_id))
+    }
+
+    fn receipt<'a>(&'a self, lease_id: &'a str) -> BoxFuture<'a, Result<Option<(String, String)>>> {
+        Box::pin(self.inner.receipt(lease_id))
+    }
+
+    fn load_job<'a>(
+        &'a self,
+        job_id: &'a str,
+        include_outputs: bool,
+        result_budget: Arc<ByteBudget>,
+    ) -> BoxFuture<'a, Result<Option<StoredJob>>> {
+        Box::pin(self.inner.load_job(job_id, include_outputs, result_budget))
+    }
+
+    fn load_job_preview<'a>(
+        &'a self,
+        job_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredJobPreview>>> {
+        Box::pin(self.inner.load_job_preview(job_id))
+    }
+
+    fn scan_jobs<'a>(
+        &'a self,
+        from_ms: u64,
+        to_ms: u64,
+        before: Option<(u64, String)>,
+        namespace: Option<&'a str>,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<StoredJob>>> {
+        Box::pin(
+            self.inner
+                .scan_jobs(from_ms, to_ms, before, namespace, limit),
+        )
+    }
+
+    fn purge<'a>(&'a self, term: u64, before_ms: u64) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            if term != self.term {
+                return Err(anyhow!("stale SQLite term {term}"));
+            }
+            self.inner.purge(before_ms).await
+        })
+    }
+
+    fn stats(&self) -> JournalStats {
+        self.inner.stats()
+    }
+
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(self.inner.close())
+    }
+}
+
 fn acquire_lock(path: &Path) -> Result<File> {
     let mut lock_path = PathBuf::from(path.as_os_str());
     lock_path.as_mut_os_string().push(".lock");
@@ -643,6 +904,7 @@ where
         outputs: Vec::new(),
         last_attempt_id: row.try_get("last_attempt_id")?,
         last_worker_id: row.try_get("last_worker_id")?,
+        failed_workers: Default::default(),
     })
 }
 
@@ -729,10 +991,16 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
         }
         JournalOp::AttemptStart(record) => {
             let updated = sqlx::query(
-                "UPDATE journal_jobs SET attempt_count = attempt_count + 1, updated_at_ms = ?
+                "UPDATE journal_jobs
+                 SET attempt_count = attempt_count + 1,
+                     updated_at_ms = ?,
+                     last_attempt_id = COALESCE(?, last_attempt_id),
+                     last_worker_id = COALESCE(?, last_worker_id)
                  WHERE job_id = ? AND state = 'queued'",
             )
             .bind(record.at_ms as i64)
+            .bind(&record.attempt_id)
+            .bind(&record.worker_id)
             .bind(&record.job_id)
             .execute(&mut **tx)
             .await?;
@@ -997,7 +1265,6 @@ mod tests {
             job_id: job_id.to_string(),
             attempt_number,
             at_ms: 2,
-            ownership_epoch: None,
             attempt_id: None,
             worker_id: None,
         })
@@ -1068,8 +1335,6 @@ mod tests {
                     winning_lease_id: None,
                     outcome_digest: None,
                     at_ms: 2,
-                    ownership_epoch: None,
-                    retry_at_ms: None,
                 }))
             )
             .await,
@@ -1241,7 +1506,7 @@ mod tests {
                 SELECT ?, ?, spec_hash, spec_json, max_attempts, ?, 99 FROM journal_jobs WHERE job_id = 'result'")
                 .bind(id).bind(state).bind(at).execute(&mut conn).await.unwrap();
         }
-        let page = journal.scan_jobs(1, 3, None, 2).await.unwrap();
+        let page = journal.scan_jobs(1, 3, None, None, 2).await.unwrap();
         assert_eq!(
             page.iter()
                 .map(|job| job.job_id.as_str())
@@ -1253,7 +1518,7 @@ mod tests {
             .await
             .unwrap();
         let page = journal
-            .scan_jobs(1, 3, Some((2, "y".into())), 2)
+            .scan_jobs(1, 3, Some((2, "y".into())), None, 2)
             .await
             .unwrap();
         assert_eq!(
@@ -1350,8 +1615,6 @@ mod tests {
                         winning_lease_id: None,
                         outcome_digest: None,
                         at_ms: 3,
-                        ownership_epoch: None,
-                        retry_at_ms: None,
                     })),
                 )
                 .await

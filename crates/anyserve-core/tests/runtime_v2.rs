@@ -443,6 +443,7 @@ async fn submit_is_idempotent_by_fingerprint() {
     let server = serve(config()).await;
     let request = |input: &[u8]| SubmitRequest {
         job_id: Some("job-1".to_string()),
+        namespace: None,
         conflict: ConflictPolicy::UseExisting,
         spec: JobSpec {
             policy: api::ExecutionPolicy {
@@ -726,6 +727,7 @@ async fn durable_jobs_survive_restart_and_completion_is_idempotent() {
             to_ms: job.created_at_ms + 1,
             limit: 1,
             cursor: None,
+            namespace: None,
         })
         .await
         .unwrap();
@@ -823,6 +825,7 @@ async fn streaming_input_reaches_the_worker() {
     let mut execution = server
         .runtime
         .invoke(InvokeRequest {
+            namespace: None,
             spec: spec(b"head"),
             input: InputMode::Streaming,
         })
@@ -2681,6 +2684,7 @@ async fn paginated_queries_match_individual_jobs_after_transitions() {
                         interface: interface.clone(),
                         limit: 3,
                         page_token: token,
+                        ..Default::default()
                     })
                     .await
                     .unwrap();

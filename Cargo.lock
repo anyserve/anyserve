@@ -119,6 +119,7 @@ dependencies = [
  "anyserve-core",
  "anyserve-proto",
  "axum",
+ "bytes",
  "clap",
  "futures",
  "reqwest",

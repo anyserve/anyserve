@@ -1,631 +1,1194 @@
-use super::*;
-use crate::journal::{AcceptRecord, AttemptStartRecord, TerminalRecord};
-use crate::runtime::api::{ConflictPolicy, ErrorInfo, EventKind, JobSpec, JobState, Object};
+//! Shared dual-backend (`SqliteJournal` + `PgJournal`) scheduling/recovery tests
+//! and real PostgreSQL 18 single-leader failover & fencing drills.
 
-async fn node() -> (Arc<Postgres>, PgPool) {
-    let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL")
-        .expect("set ANYSERVE_TEST_POSTGRES_URL to a disposable PostgreSQL database");
-    let mut config = JournalConfig::postgres(&url);
-    let pg = config.postgres.as_mut().unwrap();
-    pg.schema = format!("test_{}", uuid::Uuid::new_v4().simple());
-    pg.lease_duration = Duration::from_secs(3);
-    (
-        Postgres::open(&config).await.unwrap(),
-        PgPool::connect(&url).await.unwrap(),
-    )
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use anyserve_client::ExecutionClient;
+use anyserve_client::execution::{Attempt as ClientAttempt, WorkerSession};
+use anyserve_proto::v2 as pb;
+use anyserve_proto::v2::client_server::ClientServer;
+use bytes::Bytes;
+use futures::StreamExt;
+use sqlx::postgres::PgPoolOptions;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Code;
+use tonic::transport::Server;
+
+use super::PgJournal;
+use crate::client_service::ClientGrpcService;
+use crate::error::ErrorKind;
+use crate::journal::JournalBackend;
+use crate::runtime::Runtime;
+use crate::runtime::api::*;
+use crate::worker_service::WorkerGrpcService;
+
+const TIMEOUT: Duration = Duration::from_secs(15);
+
+struct GrpcHarness {
+    runtime: Runtime,
+    endpoint: String,
+    _stop: tokio::sync::oneshot::Sender<()>,
 }
 
-async fn close(pg: Arc<Postgres>, admin: PgPool) {
-    pg.close().await;
-    sqlx::query(&format!("DROP SCHEMA \"{}\" CASCADE", pg.config.schema))
-        .execute(&admin)
-        .await
-        .unwrap();
-    admin.close().await;
-}
-
-fn acceptance(id: &str, total_timeout: Option<Duration>) -> AcceptRecord {
-    let mut spec = JobSpec::default();
-    spec.policy.total_timeout = total_timeout;
-    AcceptRecord {
-        job_id: id.into(),
-        spec_hash: "same-spec".into(),
-        spec: Arc::new(spec),
-        max_attempts: 2,
-        created_at_ms: 1,
+async fn start_grpc(runtime: Runtime) -> GrpcHarness {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let client = ClientServer::new(ClientGrpcService::new(runtime.clone()))
+        .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
+    let worker = WorkerGrpcService::server(runtime.clone());
+    tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(client)
+            .add_service(worker)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    GrpcHarness {
+        runtime,
+        endpoint: format!("http://{addr}"),
+        _stop: tx,
     }
 }
 
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_scan_preserves_state_subsets_and_mixed_filters() {
-    use JobState::{Cancelled, Failed, Queued, Running, Succeeded};
+struct TestSchema {
+    url: String,
+    schema: String,
+}
 
-    let (pg, admin) = node().await;
-    for (index, id) in ["queued", "running", "succeeded", "failed", "cancelled"]
-        .into_iter()
-        .enumerate()
-    {
-        let mut record = acceptance(id, None);
-        record.spec = Arc::new(JobSpec {
-            demand: crate::runtime::api::Demand {
-                interface: if index % 2 == 0 { "alpha" } else { "beta" }.into(),
+impl TestSchema {
+    async fn create(prefix: &str) -> Self {
+        let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL")
+            .expect("ANYSERVE_TEST_POSTGRES_URL must be set for ignored postgres_ tests");
+        let schema = format!(
+            "as_{}_{}",
+            prefix,
+            uuid::Uuid::new_v4().simple().to_string()[..12].to_lowercase()
+        );
+        Self { url, schema }
+    }
+
+    fn journal_config(&self, lease_ms: u64, poll_ms: u64) -> JournalConfig {
+        let mut cfg = JournalConfig::postgres(self.url.clone());
+        let pg = cfg.postgres.as_mut().unwrap();
+        pg.schema = self.schema.clone();
+        pg.lease_duration = Duration::from_millis(lease_ms);
+        pg.poll_interval = Duration::from_millis(poll_ms);
+        pg.max_connections = 4;
+        cfg
+    }
+
+    async fn drop_schema(&self) {
+        if let Ok(pool) = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.url)
+            .await
+        {
+            let _ = sqlx::query(&format!(
+                "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                self.schema
+            ))
+            .execute(&pool)
+            .await;
+            pool.close().await;
+        }
+    }
+}
+
+fn durable_spec(interface: &str, payload: &[u8]) -> JobSpec {
+    let mut spec = JobSpec::default();
+    spec.demand.interface = interface.to_string();
+    spec.policy.durability = Some(Durability::Durable);
+    spec.inputs
+        .push(Object::inline(Bytes::copy_from_slice(payload)));
+    spec.params = Bytes::from_static(b"params-v1");
+    spec
+}
+
+async fn spawn_echo_worker(
+    endpoint: &str,
+    worker_id: &str,
+    pool: &str,
+    interfaces: &[&str],
+    max_concurrency: u32,
+    delay: Duration,
+    in_flight_tracker: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+) -> tokio::task::JoinHandle<()> {
+    let mut session = WorkerSession::connect(
+        endpoint,
+        None,
+        pb::Hello {
+            worker_id: worker_id.to_string(),
+            pool: pool.to_string(),
+            interfaces: interfaces.iter().map(|s| (*s).to_string()).collect(),
+            max_concurrency,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let welcome = match session.messages.message().await.unwrap().unwrap().msg {
+        Some(pb::server_message::Msg::Welcome(w)) => w,
+        other => panic!("expected Welcome, got {other:?}"),
+    };
+    let limits = welcome.limits.unwrap();
+    let hb_timeout = Duration::from_millis(u64::from(welcome.heartbeat_timeout_ms));
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = session.messages.message().await {
+            let Some(pb::server_message::Msg::Assign(assign)) = msg.msg else {
+                continue;
+            };
+            let _ = session
+                .control
+                .send(pb::WorkerMessage {
+                    msg: Some(pb::worker_message::Msg::AssignReply(pb::AssignReply {
+                        lease_id: assign.lease_id.clone(),
+                        accepted: true,
+                        reject_reason: String::new(),
+                    })),
+                })
+                .await;
+            if let Some((cur, peak)) = &in_flight_tracker {
+                let prev = cur.fetch_add(1, Ordering::SeqCst);
+                peak.fetch_max(prev + 1, Ordering::SeqCst);
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let mut attempt = ClientAttempt::open(&mut session.data, &assign, &limits, hb_timeout)
+                .await
+                .unwrap();
+            let mut body = assign.params.to_vec();
+            if let Some(first) = assign.inline_inputs.first()
+                && let Some(pb::object::Body::Inline(data)) = &first.body
+            {
+                body = data.to_vec();
+            }
+            if let Some((cur, _)) = &in_flight_tracker {
+                cur.fetch_sub(1, Ordering::SeqCst);
+            }
+            let _ = attempt
+                .finish(
+                    &[pb::Object {
+                        body: Some(pb::object::Body::Inline(Bytes::from(body))),
+                        ..Default::default()
+                    }],
+                    pb::finish::Outcome::Succeeded(pb::Succeeded {}),
+                )
+                .await;
+            let _ = session
+                .control
+                .send(pb::WorkerMessage {
+                    msg: Some(pb::worker_message::Msg::Credit(pb::Credit {
+                        free_slots: max_concurrency,
+                    })),
+                })
+                .await;
+        }
+    })
+}
+
+async fn wait_succeeded(runtime: &Runtime, job_id: &str) -> JobView {
+    tokio::time::timeout(TIMEOUT, async {
+        let mut stream = runtime.watch(job_id, 0).unwrap();
+        while let Some(ev) = stream.next().await {
+            if let EventKind::Finished { state, error, .. } = ev.unwrap().kind {
+                assert_eq!(state, JobState::Succeeded, "job {job_id} failed: {error:?}");
+                break;
+            }
+        }
+        runtime.get_job(job_id, true).await.unwrap()
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for job {job_id}"))
+}
+
+/// Exact same scheduling, durability, cold-read, receipt-replay, purge, and 50/50
+/// recovery suite executed against both `SqliteJournal` and `PgJournal`.
+async fn run_unified_backend_suite(make_journal: impl Fn() -> JournalConfig) {
+    let mut interfaces = BTreeMap::new();
+    interfaces.insert(
+        "serial.v1".to_string(),
+        InterfacePolicy {
+            max_in_flight_per_key: Some(1),
+            ..Default::default()
+        },
+    );
+    interfaces.insert(
+        "tiered.v1".to_string(),
+        InterfacePolicy {
+            pool_tiers: vec![
+                PoolTier {
+                    pool: "edge".into(),
+                    spillover_after: Duration::ZERO,
+                    reconnect_grace: None,
+                },
+                PoolTier {
+                    pool: "cloud".into(),
+                    spillover_after: Duration::from_millis(60),
+                    reconnect_grace: None,
+                },
+            ],
+            ..Default::default()
+        },
+    );
+    let base_config = || RuntimeConfig {
+        journal: Some(make_journal()),
+        default_initial_backoff: Duration::from_millis(5),
+        default_max_backoff: Duration::from_millis(20),
+        default_max_attempts: 3,
+        max_terminal_jobs: 2,
+        interfaces: interfaces.clone(),
+        ..Default::default()
+    };
+
+    let server = start_grpc(Runtime::start(base_config()).await.unwrap()).await;
+    assert!(server.runtime.is_leader_active());
+
+    // 1. Priority + round-robin fairness_key on durable jobs.
+    for i in 0..8 {
+        let mut s = durable_spec("fair.v1", b"bulk");
+        s.policy.fairness_key = "tenant-bulk".into();
+        server
+            .runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("bulk-{i}")),
+                spec: s,
                 ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    let mut interactive = durable_spec("fair.v1", b"interactive");
+    interactive.policy.fairness_key = "tenant-interactive".into();
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("interactive-0".into()),
+            spec: interactive,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut urgent = durable_spec("fair.v1", b"urgent");
+    urgent.policy.priority = 3;
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("urgent-0".into()),
+            spec: urgent,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let mut fair_session = WorkerSession::connect(
+        &server.endpoint,
+        None,
+        pb::Hello {
+            worker_id: "fair-w".into(),
+            interfaces: vec!["fair.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let welcome = match fair_session.messages.message().await.unwrap().unwrap().msg {
+        Some(pb::server_message::Msg::Welcome(w)) => w,
+        other => panic!("expected Welcome: {other:?}"),
+    };
+    let limits = welcome.limits.unwrap();
+    let hb = Duration::from_millis(u64::from(welcome.heartbeat_timeout_ms));
+    let mut order = Vec::new();
+    for _ in 0..10 {
+        let assign = loop {
+            if let Some(pb::server_message::Msg::Assign(a)) =
+                fair_session.messages.message().await.unwrap().unwrap().msg
+            {
+                break a;
+            }
+        };
+        order.push(assign.job_id.clone());
+        let _ = fair_session
+            .control
+            .send(pb::WorkerMessage {
+                msg: Some(pb::worker_message::Msg::AssignReply(pb::AssignReply {
+                    lease_id: assign.lease_id.clone(),
+                    accepted: true,
+                    reject_reason: String::new(),
+                })),
+            })
+            .await;
+        let mut att = ClientAttempt::open(&mut fair_session.data, &assign, &limits, hb)
+            .await
+            .unwrap();
+        att.finish(
+            &[pb::Object {
+                body: Some(pb::object::Body::Inline(Bytes::from(vec![b'z'; 16 * 1024]))),
+                ..Default::default()
+            }],
+            pb::finish::Outcome::Succeeded(pb::Succeeded {}),
+        )
+        .await
+        .unwrap();
+        let _ = fair_session
+            .control
+            .send(pb::WorkerMessage {
+                msg: Some(pb::worker_message::Msg::Credit(pb::Credit {
+                    free_slots: 1,
+                })),
+            })
+            .await;
+    }
+    assert_eq!(order[0], "urgent-0", "strict priority must run first");
+    assert!(
+        order[1] == "interactive-0" || order[2] == "interactive-0",
+        "round-robin fairness_key must schedule interactive job in first pass: {order:?}"
+    );
+    drop(fair_session);
+
+    // 2. Cold idempotency, 4 KiB bounded preview without touching result_budget, and scan_job_metadata.
+    // Because max_terminal_jobs == 2, "urgent-0" was evicted from memory to cold journal!
+    assert!(server.runtime.spec("urgent-0").is_err());
+    let before_budget = server.runtime.stats().result_bytes;
+    let preview = server
+        .runtime
+        .inspect_job_preview("urgent-0")
+        .await
+        .unwrap();
+    assert_eq!(preview.job.state, JobState::Succeeded);
+    assert_eq!(preview.outputs.len(), 1);
+    assert_eq!(preview.outputs[0].size_bytes, Some(16 * 1024));
+    assert_eq!(
+        preview.outputs[0].prefix.inline_len(),
+        INSPECTION_PREVIEW_BYTES
+    );
+    assert_eq!(server.runtime.stats().result_bytes, before_budget);
+
+    let dup = server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("urgent-0".into()),
+            spec: {
+                let mut u = durable_spec("fair.v1", b"urgent");
+                u.policy.priority = 3;
+                u
             },
             ..Default::default()
-        });
-        pg.accept(record, ConflictPolicy::UseExisting, None)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE jobs SET state=$1,created_at_ms=$2 WHERE job_id=$1")
-            .bind(id)
-            .bind(1000 + index as i64)
-            .execute(&pg.pool)
-            .await
-            .unwrap();
-    }
-    for (states, expected) in [
-        (
-            vec![],
-            vec!["cancelled", "failed", "succeeded", "running", "queued"],
-        ),
-        (vec![Queued], vec!["queued"]),
-        (vec![Running], vec!["running"]),
-        (vec![Succeeded], vec!["succeeded"]),
-        (vec![Failed], vec!["failed"]),
-        (vec![Cancelled], vec!["cancelled"]),
-        (vec![Queued, Running], vec!["running", "queued"]),
-        (
-            vec![Succeeded, Failed, Cancelled],
-            vec!["cancelled", "failed", "succeeded"],
-        ),
-        (vec![Queued, Succeeded], vec!["succeeded", "queued"]),
-        (vec![Running, Cancelled], vec!["cancelled", "running"]),
-        (vec![Queued, Queued], vec!["queued"]),
-    ] {
-        let jobs = pg
-            .scan_jobs(0, u64::MAX, None, &states, None, 10)
-            .await
-            .unwrap();
-        assert_eq!(
-            jobs.iter()
-                .map(|job| job.job_id.as_str())
-                .collect::<Vec<_>>(),
-            expected,
-            "{states:?}"
-        );
-    }
-    for (states, expected) in [
-        (vec![Queued, Running], vec!["queued"]),
-        (
-            vec![Succeeded, Failed, Cancelled],
-            vec!["cancelled", "succeeded"],
-        ),
-        (vec![Queued, Failed], vec!["queued"]),
-    ] {
-        let jobs = pg
-            .scan_jobs(0, u64::MAX, None, &states, Some("alpha"), 10)
-            .await
-            .unwrap();
-        assert_eq!(
-            jobs.iter()
-                .map(|job| job.job_id.as_str())
-                .collect::<Vec<_>>(),
-            expected,
-            "{states:?}"
-        );
-    }
-    let jobs = pg
-        .scan_jobs(
-            1001,
-            1004,
-            Some((1003, "failed".into())),
-            &[Succeeded, Failed, Cancelled],
-            None,
-            1,
-        )
-        .await
-        .unwrap();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].job_id, "succeeded");
-    close(pg, admin).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_accept_uses_database_time_and_saturates_deadlines() {
-    let (pg, admin) = node().await;
-    for (id, timeout) in [
-        ("unlimited", None),
-        ("immediate", Some(Duration::ZERO)),
-        ("bounded", Some(Duration::from_millis(17))),
-        ("overflow", Some(Duration::MAX)),
-    ] {
-        let (accepted, created) = pg
-            .accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
-            .await
-            .unwrap();
-        assert!(created);
-        assert_eq!(accepted.job_id, id);
-        assert_eq!(accepted.state, JobState::Queued);
-        assert_eq!(accepted.attempt_count, 0);
-        assert_eq!(accepted.spec_hash, "same-spec");
-        assert_eq!(accepted.spec.policy.total_timeout, timeout);
-        let (replayed, created) = pg
-            .accept(acceptance(id, timeout), ConflictPolicy::UseExisting, None)
-            .await
-            .unwrap();
-        assert!(!created);
-        assert_eq!(replayed.created_at_ms, accepted.created_at_ms);
-        let row = sqlx::query(
-            "SELECT created_at_ms,updated_at_ms,queued_at_ms,total_deadline_ms,event_sequence,
-             (SELECT at_ms FROM events WHERE job_id=jobs.job_id AND sequence=1) AS event_at,
-             (extract(epoch FROM clock_timestamp())*1000)::bigint AS db_now
-             FROM jobs WHERE job_id=$1",
-        )
-        .bind(id)
-        .fetch_one(&pg.pool)
-        .await
-        .unwrap();
-        let created: i64 = row.get("created_at_ms");
-        assert_eq!(accepted.created_at_ms, created as u64);
-        assert!(created > 1 && created <= row.get::<i64, _>("db_now"));
-        assert_eq!(created, row.get::<i64, _>("updated_at_ms"));
-        assert_eq!(created, row.get::<i64, _>("queued_at_ms"));
-        assert_eq!(created, row.get::<i64, _>("event_at"));
-        assert_eq!(row.get::<i64, _>("event_sequence"), 1);
-        let expected = match id {
-            "unlimited" => None,
-            "immediate" => Some(created),
-            "bounded" => Some(created + 17),
-            _ => Some(i64::MAX),
-        };
-        assert_eq!(row.get::<Option<i64>, _>("total_deadline_ms"), expected);
-    }
-    let mut different = acceptance("unlimited", None);
-    different.spec_hash = "different-spec".into();
-    assert!(
-        pg.accept(different, ConflictPolicy::UseExisting, None)
-            .await
-            .is_err()
-    );
-    close(pg, admin).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_attempt_and_terminal_share_database_time_with_events() {
-    let (pg, admin) = node().await;
-    for (id, retry_at) in [
-        ("finished", None),
-        ("past-retry", Some(1)),
-        ("future-retry", Some(117)),
-        ("overflow-retry", Some(u64::MAX)),
-    ] {
-        pg.accept(acceptance(id, None), ConflictPolicy::Fail, None)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE jobs SET owner_id=$2,ownership_epoch=7 WHERE job_id=$1")
-            .bind(id)
-            .bind(&pg.node_id)
-            .execute(&pg.pool)
-            .await
-            .unwrap();
-        let start = |epoch| {
-            JournalOp::AttemptStart(AttemptStartRecord {
-                job_id: id.into(),
-                attempt_number: 1,
-                at_ms: 1,
-                ownership_epoch: Some(epoch),
-                attempt_id: Some("attempt".into()),
-                worker_id: Some("worker".into()),
-            })
-        };
-        assert!(matches!(pg.apply(start(6)).await, CommitOutcome::Fenced(_)));
-        assert_eq!(pg.apply(start(7)).await, CommitOutcome::Committed);
-        let (started, assigned): (i64, i64) = sqlx::query_as(
-            "SELECT updated_at_ms,at_ms FROM jobs JOIN events USING(job_id)
-             WHERE job_id=$1 AND sequence=2",
-        )
-        .bind(id)
-        .fetch_one(&pg.pool)
-        .await
-        .unwrap();
-        assert!(started > 1);
-        assert_eq!(started, assigned);
-
-        let terminal = |epoch| {
-            JournalOp::Terminal(Box::new(TerminalRecord {
-                job_id: id.into(),
-                state: if retry_at.is_some() {
-                    JobState::Queued
-                } else {
-                    JobState::Succeeded
-                },
-                outputs: vec![Object::inline("output")],
-                error: retry_at.map(|_| ErrorInfo::new("RETRY", "retry", true)),
-                attempt_id: Some("attempt".into()),
-                worker_id: Some("worker".into()),
-                winning_lease_id: retry_at.is_none().then(|| "lease".into()),
-                outcome_digest: retry_at.is_none().then(|| "digest".into()),
-                at_ms: 100,
-                ownership_epoch: Some(epoch),
-                retry_at_ms: retry_at,
-            }))
-        };
-        assert!(matches!(
-            pg.apply(terminal(6)).await,
-            CommitOutcome::Fenced(_)
-        ));
-        assert_eq!(pg.apply(terminal(7)).await, CommitOutcome::Committed);
-        let row = sqlx::query(
-            "SELECT updated_at_ms,queued_at_ms,not_before_ms,event_sequence,owner_id,
-             (SELECT at_ms FROM events WHERE job_id=jobs.job_id AND sequence=3) AS event_at,
-             (extract(epoch FROM clock_timestamp())*1000)::bigint AS db_now
-             FROM jobs WHERE job_id=$1",
-        )
-        .bind(id)
-        .fetch_one(&pg.pool)
-        .await
-        .unwrap();
-        let updated: i64 = row.get("updated_at_ms");
-        assert!(updated >= started && updated <= row.get::<i64, _>("db_now"));
-        assert_eq!(updated, row.get::<i64, _>("queued_at_ms"));
-        assert_eq!(updated, row.get::<i64, _>("event_at"));
-        assert_eq!(row.get::<i64, _>("event_sequence"), 3);
-        assert_eq!(row.get::<Option<String>, _>("owner_id"), None);
-        let expected = match id {
-            "finished" => 0,
-            "past-retry" => updated,
-            "future-retry" => updated + 17,
-            _ => i64::MAX,
-        };
-        assert_eq!(row.get::<i64, _>("not_before_ms"), expected);
-    }
-    let (output, digest): (Vec<u8>, String) = sqlx::query_as(
-        "SELECT content,digest FROM objects JOIN receipts USING(job_id)
-         WHERE job_id='finished' AND role='output'",
-    )
-    .fetch_one(&pg.pool)
-    .await
-    .unwrap();
-    assert_eq!(output, b"output");
-    assert_eq!(digest, "digest");
-    let (replayed, created) = pg
-        .accept(
-            acceptance("finished", None),
-            ConflictPolicy::UseExisting,
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(!created);
-    assert_eq!(replayed.state, JobState::Succeeded);
-    assert_eq!(replayed.attempt_count, 1);
-    assert_eq!(replayed.last_attempt_id.as_deref(), Some("attempt"));
-    assert_eq!(replayed.last_worker_id.as_deref(), Some("worker"));
-    assert!(replayed.outputs.is_empty());
-    close(pg, admin).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_attempt_start_is_fenced_and_atomic_with_assigned_event() {
-    let (pg, admin) = node().await;
-    pg.accept(acceptance("atomic-start", None), ConflictPolicy::Fail, None)
-        .await
-        .unwrap();
-    let start = |epoch| {
-        JournalOp::AttemptStart(AttemptStartRecord {
-            job_id: "atomic-start".into(),
-            attempt_number: 1,
-            at_ms: 1,
-            ownership_epoch: Some(epoch),
-            attempt_id: Some("attempt".into()),
-            worker_id: Some("worker".into()),
         })
-    };
-    let snapshot = "SELECT jsonb_build_object('job',to_jsonb(jobs),'events',
-        (SELECT jsonb_agg(to_jsonb(events) ORDER BY sequence) FROM events
-         WHERE events.job_id=jobs.job_id))::text FROM jobs WHERE job_id='atomic-start'";
-    for (owner, epoch) in [("another-owner", 7), (pg.node_id.as_str(), 6)] {
-        sqlx::query("UPDATE jobs SET owner_id=$1,ownership_epoch=7 WHERE job_id='atomic-start'")
-            .bind(owner)
-            .execute(&pg.pool)
-            .await
-            .unwrap();
-        let before: String = sqlx::query_scalar(snapshot)
-            .fetch_one(&pg.pool)
-            .await
-            .unwrap();
-        assert!(matches!(
-            pg.apply(start(epoch)).await,
-            CommitOutcome::Fenced(_)
-        ));
-        let after: String = sqlx::query_scalar(snapshot)
-            .fetch_one(&pg.pool)
-            .await
-            .unwrap();
-        assert_eq!(after, before, "fenced start changed the job or events");
-    }
-    let before: String = sqlx::query_scalar(snapshot)
-        .fetch_one(&pg.pool)
         .await
         .unwrap();
-    // Fail Assigned insertion after the guarded UPDATE has matched the job.
-    sqlx::query("ALTER TABLE events ADD CONSTRAINT reject_assigned CHECK (sequence<>2)")
-        .execute(&pg.pool)
-        .await
-        .unwrap();
-    assert!(matches!(
-        pg.apply(start(7)).await,
-        CommitOutcome::RolledBack(reason) if reason.contains("reject_assigned")
-    ));
-    let after: String = sqlx::query_scalar(snapshot)
-        .fetch_one(&pg.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        after, before,
-        "failed event insertion did not roll back the job"
-    );
-    sqlx::query("ALTER TABLE events DROP CONSTRAINT reject_assigned")
-        .execute(&pg.pool)
-        .await
-        .unwrap();
-    assert_eq!(pg.apply(start(7)).await, CommitOutcome::Committed);
-    assert!(matches!(pg.apply(start(7)).await, CommitOutcome::Fenced(_)));
-    let (count, kind): (i64, String) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM events),kind_json FROM events
-         WHERE job_id='atomic-start' AND sequence=2",
-    )
-    .fetch_one(&pg.pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 2);
-    assert_eq!(
-        serde_json::from_str::<EventKind>(&kind).unwrap(),
-        EventKind::Assigned {
-            worker_id: "worker".into(),
-            attempt_number: 1,
-        }
-    );
-    close(pg, admin).await;
-}
+    assert!(!dup.created);
+    assert_eq!(dup.job.state, JobState::Succeeded);
 
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_terminal_rechecks_state_after_row_lock_wait() {
-    let (pg, admin) = node().await;
-    pg.accept(acceptance("terminal-epq", None), ConflictPolicy::Fail, None)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE jobs SET owner_id=$1,ownership_epoch=7 WHERE job_id='terminal-epq'")
-        .bind(&pg.node_id)
-        .execute(&pg.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        pg.apply(JournalOp::AttemptStart(AttemptStartRecord {
-            job_id: "terminal-epq".into(),
-            attempt_number: 1,
-            at_ms: 1,
-            ownership_epoch: Some(7),
-            attempt_id: Some("attempt".into()),
-            worker_id: Some("worker".into()),
-        }))
-        .await,
-        CommitOutcome::Committed
-    );
-    let snapshot = "SELECT jsonb_build_object(
-        'jobs',(SELECT jsonb_agg(to_jsonb(jobs) ORDER BY job_id) FROM jobs),
-        'events',(SELECT jsonb_agg(to_jsonb(events) ORDER BY job_id,sequence) FROM events),
-        'objects',(SELECT jsonb_agg(to_jsonb(objects) ORDER BY job_id,role,idx) FROM objects),
-        'receipts',(SELECT jsonb_agg(to_jsonb(receipts) ORDER BY lease_id) FROM receipts))::text";
-    // Give the short test lease a fresh confirmed deadline before blocking a write.
-    pg.heartbeat().await.unwrap();
-    let mut blocker = pg.pool.begin().await.unwrap();
-    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *blocker)
-        .await
-        .unwrap();
-    // Change only state: owner, epoch and attempt still match the pending finish.
-    assert_eq!(
-        sqlx::query(
-            "UPDATE jobs SET state='cancelled' WHERE job_id='terminal-epq'
-            AND owner_id=$1 AND ownership_epoch=7 AND state='running'"
-        )
-        .bind(&pg.node_id)
-        .execute(&mut *blocker)
-        .await
-        .unwrap()
-        .rows_affected(),
-        1
-    );
-    let expected: String = sqlx::query_scalar(snapshot)
-        .fetch_one(&mut *blocker)
-        .await
-        .unwrap();
-    let terminal = {
-        let pg = Arc::clone(&pg);
-        tokio::spawn(async move {
-            pg.apply(JournalOp::Terminal(Box::new(TerminalRecord {
-                job_id: "terminal-epq".into(),
-                state: JobState::Succeeded,
-                outputs: vec![Object::inline("late output")],
-                error: None,
-                attempt_id: Some("attempt".into()),
-                worker_id: Some("worker".into()),
-                winning_lease_id: Some("late-lease".into()),
-                outcome_digest: Some("late-digest".into()),
-                at_ms: 1,
-                ownership_epoch: Some(7),
-                retry_at_ms: None,
-            })))
-            .await
+    let conflict_err = server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("urgent-0".into()),
+            spec: durable_spec("fair.v1", b"different-input"),
+            ..Default::default()
         })
-    };
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity
-                 WHERE application_name=$1 AND wait_event_type='Lock'
-                   AND $2=ANY(pg_blocking_pids(pid)))",
+        .await
+        .unwrap_err();
+    assert_eq!(conflict_err.kind, ErrorKind::Conflict);
+
+    let now_scan = crate::now_ms();
+    let archived = server
+        .runtime
+        .scan_job_metadata(JobScan {
+            archived: true,
+            from_ms: now_scan.saturating_sub(3_600_000),
+            to_ms: now_scan + 10_000,
+            limit: 50,
+            cursor: None,
+            namespace: None,
+        })
+        .await
+        .unwrap();
+    assert!(archived.jobs.len() >= 10);
+
+    // 3. Concurrency-key serialization across 3 concurrent workers.
+    let cur = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut serial_workers = Vec::new();
+    for idx in 0..3 {
+        serial_workers.push(
+            spawn_echo_worker(
+                &server.endpoint,
+                &format!("serial-{idx}"),
+                "",
+                &["serial.v1"],
+                2,
+                Duration::from_millis(20),
+                Some((Arc::clone(&cur), Arc::clone(&peak))),
             )
-            .bind(format!("anyserve:{}", pg.node_id))
-            .bind(blocker_pid)
-            .fetch_one(&admin)
+            .await,
+        );
+    }
+    for i in 0..4 {
+        let mut s = durable_spec("serial.v1", b"step");
+        s.policy.concurrency_key = "arm-left".into();
+        server
+            .runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("serial-{i}")),
+                spec: s,
+                ..Default::default()
+            })
             .await
             .unwrap();
-            if waiting {
-                break;
+    }
+    for i in 0..4 {
+        wait_succeeded(&server.runtime, &format!("serial-{i}")).await;
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), 1);
+
+    // 4. Pool-tier spillover onto cloud worker.
+    let cloud_worker = spawn_echo_worker(
+        &server.endpoint,
+        "cloud-tier-w",
+        "cloud",
+        &["tiered.v1"],
+        2,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("tiered-job-1".into()),
+            spec: durable_spec("tiered.v1", b"spill-payload"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let tiered_done = wait_succeeded(&server.runtime, "tiered-job-1").await;
+    assert_eq!(
+        tiered_done.current_worker_id.as_deref(),
+        Some("cloud-tier-w")
+    );
+
+    // 5. Failed-worker avoidance on durable jobs (15/15 succeed despite 1 broken worker).
+    let mut bad_session = WorkerSession::connect(
+        &server.endpoint,
+        None,
+        pb::Hello {
+            worker_id: "flaky-w".into(),
+            interfaces: vec!["avoid.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let bad_welcome = match bad_session.messages.message().await.unwrap().unwrap().msg {
+        Some(pb::server_message::Msg::Welcome(w)) => w,
+        other => panic!("expected Welcome: {other:?}"),
+    };
+    let bad_limits = bad_welcome.limits.unwrap();
+    let bad_hb = Duration::from_millis(u64::from(bad_welcome.heartbeat_timeout_ms));
+    let bad_task = tokio::spawn(async move {
+        while let Ok(Some(msg)) = bad_session.messages.message().await {
+            if let Some(pb::server_message::Msg::Assign(assign)) = msg.msg {
+                let _ = bad_session
+                    .control
+                    .send(pb::WorkerMessage {
+                        msg: Some(pb::worker_message::Msg::AssignReply(pb::AssignReply {
+                            lease_id: assign.lease_id.clone(),
+                            accepted: true,
+                            reject_reason: String::new(),
+                        })),
+                    })
+                    .await;
+                let mut att =
+                    ClientAttempt::open(&mut bad_session.data, &assign, &bad_limits, bad_hb)
+                        .await
+                        .unwrap();
+                let _ = att
+                    .finish(
+                        &[],
+                        pb::finish::Outcome::Failed(pb::ErrorInfo {
+                            code: "worker_failed".into(),
+                            message: "transient gpu fault".into(),
+                            retryable: true,
+                        }),
+                    )
+                    .await;
+                let _ = bad_session
+                    .control
+                    .send(pb::WorkerMessage {
+                        msg: Some(pb::worker_message::Msg::Credit(pb::Credit {
+                            free_slots: 1,
+                        })),
+                    })
+                    .await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    let good_a = spawn_echo_worker(
+        &server.endpoint,
+        "good-a",
+        "",
+        &["avoid.v1"],
+        2,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    let good_b = spawn_echo_worker(
+        &server.endpoint,
+        "good-b",
+        "",
+        &["avoid.v1"],
+        2,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    for i in 0..15 {
+        server
+            .runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("avoid-{i}")),
+                spec: durable_spec("avoid.v1", b"ok"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    for i in 0..15 {
+        wait_succeeded(&server.runtime, &format!("avoid-{i}")).await;
+    }
+
+    for h in serial_workers {
+        h.abort();
+    }
+    cloud_worker.abort();
+    bad_task.abort();
+    good_a.abort();
+    good_b.abort();
+
+    // 6. 50/50 durable recovery across restart (including mid-flight started attempts) + receipt replay + purge.
+    for i in 0..50 {
+        server
+            .runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("rec-{i:02}")),
+                spec: durable_spec("recover.v1", format!("payload-{i:02}").as_bytes()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    // Start 2 attempts without finishing before restart.
+    let mut stalled_worker = WorkerSession::connect(
+        &server.endpoint,
+        None,
+        pb::Hello {
+            worker_id: "crashed-before-restart".into(),
+            interfaces: vec!["recover.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = stalled_worker.messages.message().await.unwrap();
+    let mut started_count = 0;
+    while started_count < 2 {
+        if let Some(pb::server_message::Msg::Assign(_)) = stalled_worker
+            .messages
+            .message()
+            .await
+            .unwrap()
+            .unwrap()
+            .msg
+        {
+            started_count += 1;
+        }
+    }
+    drop(stalled_worker);
+    let term1 = server.runtime.generation();
+    server.runtime.shutdown().await;
+    drop(server);
+
+    // Restart on the same journal -> generation advances, 50/50 durable jobs recover and finish!
+    let server2 = start_grpc(Runtime::start(base_config()).await.unwrap()).await;
+    assert!(server2.runtime.generation() > term1);
+    let rec_w1 = spawn_echo_worker(
+        &server2.endpoint,
+        "rec-w1",
+        "",
+        &["recover.v1"],
+        4,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    let rec_w2 = spawn_echo_worker(
+        &server2.endpoint,
+        "rec-w2",
+        "",
+        &["recover.v1"],
+        4,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    for i in 0..50 {
+        let view = wait_succeeded(&server2.runtime, &format!("rec-{i:02}")).await;
+        let expected = format!("payload-{i:02}");
+        match &view.outputs.unwrap()[0] {
+            Object::Inline { data, .. } => assert_eq!(data.as_ref(), expected.as_bytes()),
+            other => panic!("expected inline output, got {other:?}"),
+        }
+    }
+    // Verify purge cleans up terminal rows cleanly.
+    let purged = server2
+        .runtime
+        .inner
+        .journal
+        .as_ref()
+        .unwrap()
+        .purge(server2.runtime.generation(), crate::now_ms() + 60_000)
+        .await
+        .unwrap();
+    assert!(purged >= 50, "expected >= 50 purged jobs, got {purged}");
+    rec_w1.abort();
+    rec_w2.abort();
+    server2.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn sqlite_unified_backend_scheduling_and_recovery_suite() {
+    let dir = PathBuf::from(format!(
+        "/tmp/anyserve-unified-sqlite-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("journal.sqlite");
+    run_unified_backend_suite(|| {
+        let mut cfg = JournalConfig::new(&db_path);
+        cfg.full_sync = false;
+        cfg
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_unified_backend_scheduling_and_recovery_suite() {
+    let schema = TestSchema::create("pg_unified").await;
+    run_unified_backend_suite(|| schema.journal_config(5_000, 80)).await;
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_standby_gate_and_graceful_relinquish_takeover() {
+    let schema = TestSchema::create("pg_standby").await;
+    let make_rt = || {
+        let j = schema.journal_config(4_000, 50);
+        RuntimeConfig {
+            journal: Some(j),
+            ..Default::default()
+        }
+    };
+
+    let cp1 = start_grpc(Runtime::start(make_rt()).await.unwrap()).await;
+    let cp2 = start_grpc(Runtime::start(make_rt()).await.unwrap()).await;
+
+    let (leader, standby) = if cp1.runtime.is_leader_active() {
+        (&cp1, &cp2)
+    } else {
+        (&cp2, &cp1)
+    };
+    assert!(leader.runtime.health().ready);
+    assert!(standby.runtime.health().live);
+    assert!(!standby.runtime.health().ready);
+
+    // Direct call to standby must return Unavailable on both Client and Worker services.
+    let mut direct_standby = ExecutionClient::connect(&standby.endpoint).await.unwrap();
+    let standby_err = direct_standby
+        .list(pb::ListJobsRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(standby_err.code(), Code::Unavailable);
+    let worker_standby_err = WorkerSession::connect(
+        &standby.endpoint,
+        None,
+        pb::Hello {
+            worker_id: "probe".into(),
+            interfaces: vec!["ha.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .err()
+    .expect("standby must reject worker session");
+    assert!(
+        format!("{worker_standby_err:#}").contains("standby")
+            || format!("{worker_standby_err:#}").contains("Unavailable"),
+        "unexpected standby worker error: {worker_standby_err:#}"
+    );
+
+    // Multi-endpoint client & worker skip standby and stick to active leader!
+    let multi_endpoint = format!("{},{}", standby.endpoint, leader.endpoint);
+    let mut client = ExecutionClient::connect(&multi_endpoint).await.unwrap();
+    let sub = client
+        .submit(
+            Some("ha-graceful-1".into()),
+            pb::JobSpec {
+                demand: Some(pb::Demand {
+                    interface: "ha.v1".into(),
+                    ..Default::default()
+                }),
+                policy: Some(pb::ExecutionPolicy {
+                    durability: pb::Durability::Durable as i32,
+                    ..Default::default()
+                }),
+                inputs: vec![pb::Object {
+                    body: Some(pb::object::Body::Inline(Bytes::from_static(
+                        b"before-stepdown",
+                    ))),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(sub.created);
+
+    // Graceful shutdown of leader relinquishes scheduler_lease immediately -> standby takes over!
+    let mut standby_leader_rx = standby.runtime.subscribe_leadership();
+    let term1 = leader.runtime.generation();
+    leader.runtime.shutdown().await;
+
+    tokio::time::timeout(TIMEOUT, async {
+        while !*standby_leader_rx.borrow_and_update() {
+            standby_leader_rx.changed().await.unwrap();
         }
     })
     .await
-    .expect("terminal write must wait for the state-changing transaction");
-    blocker.commit().await.unwrap();
-    let outcome = tokio::time::timeout(Duration::from_secs(1), terminal)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Fenced(_)));
-    assert!(pg.healthy(), "local lease expired during the guard test");
-    assert!(
-        sqlx::query_scalar::<_, bool>(
-            "SELECT expires_at>clock_timestamp() FROM nodes WHERE node_id=$1",
+    .expect("standby must take over promptly after graceful relinquish");
+
+    assert!(standby.runtime.is_leader_active());
+    assert_eq!(standby.runtime.generation(), term1 + 1);
+    assert!(standby.runtime.health().ready);
+
+    // Multi-endpoint worker & existing ExecutionClient automatically switch to the new leader!
+    let worker_handle = spawn_echo_worker(
+        &multi_endpoint,
+        "ha-worker-after-switch",
+        "",
+        &["ha.v1"],
+        2,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    let done = wait_succeeded(&standby.runtime, "ha-graceful-1").await;
+    assert_eq!(done.state, JobState::Succeeded);
+
+    let via_client = client.get("ha-graceful-1", true).await.unwrap();
+    assert_eq!(via_client.state, pb::JobState::Succeeded as i32);
+
+    worker_handle.abort();
+    standby.runtime.shutdown().await;
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_abrupt_crash_takeover_preserves_every_acknowledged_job() {
+    let schema = TestSchema::create("pg_crash").await;
+    let j1_cfg = schema.journal_config(800, 50);
+    let pg1 = PgJournal::open_concrete(&j1_cfg).await.unwrap();
+    let cp1 = start_grpc(
+        Runtime::start_with_backend(
+            RuntimeConfig {
+                journal: Some(j1_cfg),
+                default_max_attempts: 3,
+                ..Default::default()
+            },
+            Some(Arc::clone(&pg1) as Arc<dyn JournalBackend>),
         )
-        .bind(&pg.node_id)
-        .fetch_one(&pg.pool)
         .await
         .unwrap(),
-        "database lease expired during the guard test"
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(snapshot)
-            .fetch_one(&pg.pool)
-            .await
-            .unwrap(),
-        expected,
-        "fenced terminal write changed the job, events, objects or receipts"
-    );
-    close(pg, admin).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_heartbeat_recovers_within_confirmed_lease() {
-    let (pg, admin) = node().await;
-    let deadline = *pg.valid_until.lock().unwrap();
-    // Occupying the dedicated connection forces the first renewal to time out.
-    let connection = pg.heartbeat_pool.acquire().await.unwrap();
-    let heartbeat = {
-        let pg = Arc::clone(&pg);
-        tokio::spawn(async move { pg.heartbeat().await })
-    };
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert!(!heartbeat.is_finished());
-    assert!(pg.healthy());
-    assert_eq!(*pg.valid_until.lock().unwrap(), deadline);
-    drop(connection);
-    tokio::time::timeout(Duration::from_secs(1), heartbeat)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(pg.healthy());
-    assert!(*pg.valid_until.lock().unwrap() > deadline);
-    close(pg, admin).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_heartbeat_cannot_extend_unconfirmed_lease() {
-    let (pg, admin) = node().await;
-    let deadline = Instant::now() + Duration::from_millis(400);
-    *pg.valid_until.lock().unwrap() = deadline;
-    let connection = pg.heartbeat_pool.acquire().await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), pg.heartbeat())
-            .await
-            .unwrap()
-            .is_err()
-    );
-    assert!(!pg.healthy());
-    assert_eq!(*pg.valid_until.lock().unwrap(), deadline);
-    drop(connection);
-    // Even a still-valid database row cannot revive a locally fenced identity.
-    assert!(pg.heartbeat().await.is_err());
-    close(pg, admin).await;
-}
-
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_heartbeat_fences_expired_database_membership() {
-    let (pg, admin) = node().await;
-    sqlx::query(
-        "UPDATE nodes SET expires_at=clock_timestamp()-interval '1 second' WHERE node_id=$1",
     )
-    .bind(&pg.node_id)
-    .execute(&pg.pool)
-    .await
-    .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(500), pg.heartbeat())
-            .await
-            .unwrap()
-            .is_err()
-    );
-    assert!(!pg.healthy());
-    close(pg, admin).await;
-}
+    .await;
+    assert!(cp1.runtime.is_leader_active());
 
-#[tokio::test]
-#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
-async fn postgres_cluster_heartbeat_lock_wait_cannot_revive_expired_membership() {
-    let (pg, admin) = node().await;
-    let deadline = *pg.valid_until.lock().unwrap();
-    let mut lock = pg.pool.begin().await.unwrap();
-    sqlx::query("SELECT node_id FROM nodes WHERE node_id=$1 FOR UPDATE")
-        .bind(&pg.node_id)
-        .execute(&mut *lock)
+    let cp2 = start_grpc(
+        Runtime::start(RuntimeConfig {
+            journal: Some(schema.journal_config(800, 50)),
+            default_max_attempts: 3,
+            ..Default::default()
+        })
         .await
-        .unwrap();
-    tokio::time::sleep_until((deadline - Duration::from_secs(1)).into()).await;
-    let heartbeat = {
-        let pg = Arc::clone(&pg);
-        tokio::spawn(async move { pg.heartbeat().await })
-    };
-    tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock')",
-            )
-            .bind(format!("anyserve:{}", pg.node_id))
-            .fetch_one(&admin)
+        .unwrap(),
+    )
+    .await;
+    assert!(!cp2.runtime.is_leader_active());
+
+    for i in 0..20 {
+        cp1.runtime
+            .submit(SubmitRequest {
+                job_id: Some(format!("crash-job-{i:02}")),
+                spec: durable_spec("crash.v1", format!("item-{i:02}").as_bytes()),
+                ..Default::default()
+            })
             .await
             .unwrap();
-            if waiting {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Start 3 attempts on CP1 and hold them unfinished when CP1 abruptly crashes (no relinquish).
+    let mut half_worker = WorkerSession::connect(
+        &cp1.endpoint,
+        None,
+        pb::Hello {
+            worker_id: "doomed-worker".into(),
+            interfaces: vec!["crash.v1".into()],
+            max_concurrency: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = half_worker.messages.message().await.unwrap();
+    let mut assigned_before_crash = Vec::new();
+    while assigned_before_crash.len() < 3 {
+        if let Some(pb::server_message::Msg::Assign(a)) =
+            half_worker.messages.message().await.unwrap().unwrap().msg
+        {
+            assigned_before_crash.push(a.job_id);
+        }
+    }
+
+    let mut cp2_leader_rx = cp2.runtime.subscribe_leadership();
+    // Simulate kill -9: close CP1's pools and pause renewal WITHOUT calling relinquish()!
+    pg1.abort_without_relinquish().await;
+    drop(half_worker);
+
+    tokio::time::timeout(TIMEOUT, async {
+        while !*cp2_leader_rx.borrow_and_update() {
+            cp2_leader_rx.changed().await.unwrap();
         }
     })
     .await
+    .expect("standby must acquire lease after crashed leader's lease expires");
+
+    assert_eq!(cp2.runtime.generation(), 2);
+    let rec_worker = spawn_echo_worker(
+        &cp2.endpoint,
+        "survivor-worker",
+        "",
+        &["crash.v1"],
+        4,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+
+    for i in 0..20 {
+        let id = format!("crash-job-{i:02}");
+        let view = wait_succeeded(&cp2.runtime, &id).await;
+        assert_eq!(view.state, JobState::Succeeded);
+        if assigned_before_crash.contains(&id) {
+            assert_eq!(
+                view.attempt_count, 2,
+                "mid-flight job {id} must record attempt 2"
+            );
+        } else {
+            assert_eq!(view.attempt_count, 1);
+        }
+    }
+
+    rec_worker.abort();
+    cp2.runtime.shutdown().await;
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_stalled_leader_fenced_on_single_statement_write_and_exits() {
+    let schema = TestSchema::create("pg_fenced").await;
+    let j1_cfg = schema.journal_config(700, 50);
+    let pg1 = PgJournal::open_concrete(&j1_cfg).await.unwrap();
+    let cp1 = Runtime::start_with_backend(
+        RuntimeConfig {
+            journal: Some(j1_cfg),
+            ..Default::default()
+        },
+        Some(Arc::clone(&pg1) as Arc<dyn JournalBackend>),
+    )
+    .await
     .unwrap();
-    tokio::time::sleep_until((deadline + Duration::from_millis(100)).into()).await;
-    assert!(heartbeat.await.unwrap().is_err());
-    assert!(!pg.healthy());
-    lock.rollback().await.unwrap();
-    // Wait for the cancelled query and transaction rollback to drain.
-    drop(pg.heartbeat_pool.acquire().await.unwrap());
-    let expired: bool =
-        sqlx::query_scalar("SELECT expires_at<=clock_timestamp() FROM nodes WHERE node_id=$1")
-            .bind(&pg.node_id)
-            .fetch_one(&pg.pool)
-            .await
+    assert_eq!(cp1.generation(), 1);
+
+    let cp2 = Runtime::start(RuntimeConfig {
+        journal: Some(schema.journal_config(700, 50)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut cp2_leader_rx = cp2.subscribe_leadership();
+
+    // Freeze CP1 renewal (simulating SIGSTOP past lease TTL).
+    pg1.set_pause_renewal(true);
+
+    tokio::time::timeout(TIMEOUT, async {
+        while !*cp2_leader_rx.borrow_and_update() {
+            cp2_leader_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("CP2 must take over once CP1 stalls past lease_duration");
+    assert_eq!(cp2.generation(), 2);
+
+    // CP2 writes a legitimate durable job under generation 2.
+    cp2.submit(SubmitRequest {
+        job_id: Some("new-leader-job".into()),
+        spec: durable_spec("fence.v1", b"valid"),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Now CP1 wakes up ("SIGCONT") and tries to commit a durable job under stale generation 1.
+    // Single-statement CTE FOR SHARE check must reject it, write ZERO rows, and trigger lease_loss!
+    let stale_err = cp1
+        .submit(SubmitRequest {
+            job_id: Some("stale-leader-job".into()),
+            spec: durable_spec("fence.v1", b"must-not-persist"),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(stale_err.kind, ErrorKind::PersistenceUnavailable);
+
+    tokio::time::timeout(Duration::from_secs(2), cp1.wait_for_lease_loss())
+        .await
+        .expect("fenced batch write must trigger wait_for_lease_loss immediately");
+    assert!(!cp1.health().live);
+    assert!(!cp1.health().ready);
+
+    // Verify stale-leader-job was NEVER written to PostgreSQL.
+    let not_found = cp2.get_job("stale-leader-job", false).await.unwrap_err();
+    assert_eq!(not_found.kind, ErrorKind::NotFound);
+    assert_eq!(
+        cp2.get_job("new-leader-job", false).await.unwrap().state,
+        JobState::Queued
+    );
+
+    cp2.shutdown().await;
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_severed_database_connection_triggers_leader_self_exit_and_standby_takeover() {
+    let schema = TestSchema::create("pg_netcut").await;
+    let parsed: sqlx::postgres::PgConnectOptions = schema.url.parse().unwrap();
+    let pg_host = parsed.get_host().to_string();
+    let pg_port = parsed.get_port();
+
+    // Local TCP proxy for CP1 so we can sever all its PostgreSQL TCP connections on demand.
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let cut = Arc::new(AtomicBool::new(false));
+    let (cut_tx, cut_rx) = watch::channel(false);
+    let cut_accept = Arc::clone(&cut);
+    let proxy_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut client_sock, _)) = proxy_listener.accept().await else {
+                break;
+            };
+            if cut_accept.load(Ordering::Acquire) {
+                drop(client_sock);
+                continue;
+            }
+            let target = format!("{pg_host}:{pg_port}");
+            let mut kill_rx = cut_rx.clone();
+            tokio::spawn(async move {
+                let Ok(mut upstream) = TcpStream::connect(&target).await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = copy_bidirectional(&mut client_sock, &mut upstream) => {}
+                    _ = kill_rx.changed() => {}
+                }
+            });
+        }
+    });
+
+    let proxied_url = {
+        // Replace host:port in URL with proxy_addr while preserving credentials and db name.
+        let rest = schema
+            .url
+            .strip_prefix("postgresql://")
+            .or_else(|| schema.url.strip_prefix("postgres://"))
             .unwrap();
-    assert!(expired);
-    close(pg, admin).await;
+        let (userinfo, host_and_db) = rest.rsplit_once('@').unwrap();
+        let (_, db_part) = host_and_db.split_once('/').unwrap();
+        format!("postgresql://{userinfo}@{proxy_addr}/{db_part}")
+    };
+
+    let mut cp1_journal = JournalConfig::postgres(proxied_url);
+    {
+        let pg = cp1_journal.postgres.as_mut().unwrap();
+        pg.schema = schema.schema.clone();
+        pg.lease_duration = Duration::from_millis(800);
+        pg.poll_interval = Duration::from_millis(50);
+        pg.max_connections = 4;
+    }
+
+    let cp1 = Runtime::start(RuntimeConfig {
+        journal: Some(cp1_journal),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(cp1.is_leader_active());
+    cp1.submit(SubmitRequest {
+        job_id: Some("before-netcut".into()),
+        spec: durable_spec("net.v1", b"survives-netcut"),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let cp2 = start_grpc(
+        Runtime::start(RuntimeConfig {
+            journal: Some(schema.journal_config(800, 50)),
+            ..Default::default()
+        })
+        .await
+        .unwrap(),
+    )
+    .await;
+    let mut cp2_leader_rx = cp2.runtime.subscribe_leadership();
+
+    // Sever CP1 -> PostgreSQL TCP connections completely!
+    cut.store(true, Ordering::Release);
+    cut_tx.send_replace(true);
+    proxy_task.abort();
+
+    // CP1 must detect lost lease renewal and self-fence (`wait_for_lease_loss`), while CP2 takes over!
+    tokio::time::timeout(TIMEOUT, cp1.wait_for_lease_loss())
+        .await
+        .expect("CP1 must detect severed DB connection and signal lease loss");
+    assert!(!cp1.health().live);
+
+    tokio::time::timeout(TIMEOUT, async {
+        while !*cp2_leader_rx.borrow_and_update() {
+            cp2_leader_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("CP2 must acquire leadership after CP1's severed lease expires");
+
+    let w = spawn_echo_worker(
+        &cp2.endpoint,
+        "netcut-worker",
+        "",
+        &["net.v1"],
+        2,
+        Duration::ZERO,
+        None,
+    )
+    .await;
+    let view = wait_succeeded(&cp2.runtime, "before-netcut").await;
+    assert_eq!(view.state, JobState::Succeeded);
+
+    w.abort();
+    cp2.runtime.shutdown().await;
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_legacy_schemas_are_rejected_cleanly() {
+    let schema_v2 = TestSchema::create("pg_legacy_v2").await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_v2.url)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA \"{}\"", schema_v2.schema))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TABLE \"{}\".cluster_schema (version BIGINT PRIMARY KEY)",
+        schema_v2.schema
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO \"{}\".cluster_schema VALUES (2)",
+        schema_v2.schema
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err_v2 = match Runtime::start(RuntimeConfig {
+        journal: Some(schema_v2.journal_config(5_000, 100)),
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(_) => panic!("v2 schema must be rejected"),
+        Err(err) => format!("{err:#}"),
+    };
+    assert!(
+        err_v2.contains("incompatible PostgreSQL schema version 2"),
+        "unexpected error: {err_v2}"
+    );
+
+    let schema_nodes = TestSchema::create("pg_legacy_nodes").await;
+    sqlx::query(&format!("CREATE SCHEMA \"{}\"", schema_nodes.schema))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TABLE \"{}\".nodes (node_id TEXT PRIMARY KEY)",
+        schema_nodes.schema
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let err_nodes = match Runtime::start(RuntimeConfig {
+        journal: Some(schema_nodes.journal_config(5_000, 100)),
+        ..Default::default()
+    })
+    .await
+    {
+        Ok(_) => panic!("legacy nodes table must be rejected"),
+        Err(err) => format!("{err:#}"),
+    };
+    assert!(
+        err_nodes.contains("incompatible legacy tables"),
+        "unexpected error: {err_nodes}"
+    );
+
+    pool.close().await;
+    schema_v2.drop_schema().await;
+    schema_nodes.drop_schema().await;
 }

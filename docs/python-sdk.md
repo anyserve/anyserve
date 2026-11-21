@@ -6,23 +6,29 @@ server, or `pip install ./clients/python` from this checkout.
 ## Client
 
 ```python
-from anyserve import AnyserveClient, ExecutionOptions, inline_object, uri_object
+from anyserve import AnyserveClient, AsyncAnyserveClient, ExecutionOptions, inline_object, uri_object
 
-client = AnyserveClient()  # endpoint=None, token=None
+client = AnyserveClient()  # endpoint=None, token=None, namespace=None
 output = client.call("demo.echo.v1", b"hello",
                      options=ExecutionOptions(total_timeout_ms=5000))
 ```
 
-`AnyserveClient` is an alias of `ExecutionClient`. Endpoint resolution is the
-explicit argument, then `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`.
+`AnyserveClient` is an alias of `ExecutionClient`; `AsyncAnyserveClient` wraps the
+same operations for `asyncio` applications (`await client.call(...)`,
+`async with await client.invoke(...) as events: ...`). Endpoint resolution is
+the explicit argument, then `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`
+(comma-separated URLs probe sequentially on `UNAVAILABLE` and stick to the
+active leader).
 Token resolution is `token=`, then `ANYSERVE_TOKEN`; use a client-role token.
+Namespace defaults to `namespace=`, then `ANYSERVE_NAMESPACE`, then `"default"`
+(when scoped token auth is configured, the server derives namespace from the token).
 
 `inputs` accepts bytes or a list of object dictionaries. `inline_object(data,
 metadata=None)` builds `{"inline": bytes, "metadata": dict}`;
-`uri_object(uri, metadata=None)` builds `{"uri": str, "metadata": dict}`.
-URI content is fetched by application code. The default `@worker` handler only
-accepts inline objects; use `streaming_input=True` and inspect fragment `uri`
-fields when a worker needs to fetch URI content.
+`uri_object(uri, metadata=None, *, sha256=None, size_bytes=None, content_type=None)`
+attaches content digests (`anyserve.sha256` / `anyserve.size_bytes`) so
+transient presigned URLs still deduplicate under `job_id` idempotency. Set
+`@worker(..., uri_resolver=...)` to resolve URI inputs into bytes.
 
 | Method | Result |
 |---|---|
@@ -91,13 +97,16 @@ All maps default to `{}`, `params` to `b""` and numbers to zero.
 | `total_timeout_ms: int` | Limit the entire job; zero leaves it unset |
 | `spillover_after_ms: int` | Hold for all preferences before allowing partial matches; zero ranks immediately |
 | `max_attempts: int` | Includes the first attempt; zero uses the server default (3), one disables retries; default ceiling is 20 |
+| `affinity_key: str` | Sticky bounded-load Rendezvous routing preference (`< 0.85` utilization), excluding failed workers |
+| `fairness_key: str` | Two-level Priority + per-key round-robin queue key preventing bulk bursts from starving peer tenants |
+| `concurrency_key: str` | Per-key in-flight serialization / cap across workers |
 
 Once a non-progress output event is exposed, an interrupted attempt ends with
 `output_interrupted` instead of switching workers behind the reader's back.
 
 ## Jobs and events
 
-Jobs contain `job_id`, `state`, `durability`, `interface`, `attempt_count`,
+Jobs contain `job_id`, `namespace`, `state`, `durability`, `interface`, `attempt_count`,
 `current_attempt_id`, `current_worker_id`, `created_at_ms`, `updated_at_ms`,
 `outputs`, `metadata`, `spec_hash` and `error`. State is `queued`, `running`,
 `succeeded`, `failed` or `cancelled`. `error` is `None` or a dictionary with
@@ -114,10 +123,10 @@ Every event has `job_id`, `sequence`, `attempt_id`, `at_ms` and `type`:
 | `finished` | `state`, `outputs`, `error` |
 
 Sequence zero starts at the earliest retained event. Expired nonzero cursors
-report cursor expiry. SQLite and ephemeral event history is held in memory;
-PostgreSQL durable events survive restart and ownership changes, within retention
-limits. `get()` and `result()` can read a retained durable result after older
-events expire. See [recovery behavior](deployment.md#restart-and-backup).
+report cursor expiry. Live event history is held in memory; once evicted or
+after a leader restart, `watch()` replays acceptance and the committed terminal
+outcome from the journal. `get()` and `result()` can read a retained durable
+result after older events expire. See [recovery behavior](deployment.md#restart-and-backup).
 
 Runtime error codes include `queue_timeout`, `execution_timeout`, `total_timeout`,
 `cancelled`, `worker_failed`, `worker_lost`, `worker_rejected`,
@@ -140,13 +149,14 @@ serve(echo)
 
 `@worker` requires `interface=`. Optional keywords are `attributes`, `capacity`
 and `metadata` (empty maps), `codec="bytes"` (`"json"` decodes/encodes JSON),
-`max_active_leases=1`, `pass_context=False` and `streaming_input=False`.
-Handlers are synchronous; a return value becomes terminal output and a generator
-yields live output frames.
+`max_active_leases=1`, `pass_context=False`, `streaming_input=False`, `pool=""`,
+and `uri_resolver=None`. Handlers may be synchronous
+functions, synchronous generators, `async def` coroutines, or `async` generators.
 
-`serve(handler, endpoint=None, *, worker_id=None, token=None,
-reconnect_interval_secs=1.0, connection=None)` blocks until stopped or a permanent
-connection error. Endpoint/token defaults match the client, but workers need a
+`serve(handler_or_handlers, endpoint=None, *, worker_id=None, token=None,
+namespace=None, pool=None, reconnect_interval_secs=1.0, connection=None)`
+blocks until stopped or a permanent connection error, and can multiplex a list
+of `@worker` handlers onto one session (`serve([h1, h2], endpoint=...)`). Endpoint/token defaults match the client, but workers need a
 worker-role token. The default ID is hostname plus process ID; `connection` is
 an optional transport supplied by embedded callers. Transport failures reconnect;
 authentication and invalid-argument failures propagate.

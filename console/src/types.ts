@@ -9,7 +9,7 @@ export interface RuntimeModeSummary {
   code:
     | "memory"
     | "memory_plus_sqlite"
-    | "postgres_cluster";
+    | "memory_plus_postgres";
   label: string;
   journal: "disabled" | "sqlite" | "postgres";
 }

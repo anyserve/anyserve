@@ -1,7 +1,7 @@
 //! Read indexes maintained alongside job transitions under the runtime lock.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::api::{InterfaceStats, JobFilter, JobState};
 use super::state::Job;
@@ -35,17 +35,25 @@ struct InterfaceIndex {
 }
 
 #[derive(Default)]
-pub(crate) struct JobIndex {
+struct NamespaceIndex {
     jobs: ByState,
     interfaces: BTreeMap<String, InterfaceIndex>,
-    created: BTreeSet<(u64, String)>,
+    /// Keyed by `(created_at_ms, raw_job_id)` -> `scoped_job_id`.
+    created: BTreeMap<(u64, String), String>,
+}
+
+#[derive(Default)]
+pub(crate) struct JobIndex {
+    namespaces: HashMap<String, NamespaceIndex>,
+    counts: [usize; 5],
 }
 
 impl JobIndex {
+    #[cfg(test)]
     pub(crate) fn unfinished_ids(&self) -> impl Iterator<Item = &str> + Clone {
-        self.jobs[slot(JobState::Queued)]
-            .iter()
-            .chain(self.jobs[slot(JobState::Running)].iter())
+        self.namespaces
+            .values()
+            .flat_map(|ns| ns.jobs[0].iter().chain(ns.jobs[1].iter()))
             .map(|(_, id)| id.as_str())
     }
 
@@ -54,33 +62,49 @@ impl JobIndex {
     }
 
     pub(crate) fn insert(&mut self, job: &Job) {
-        self.created.insert((job.created_at_ms, job.id.clone()));
+        self.namespaces
+            .entry(job.namespace.clone())
+            .or_default()
+            .created
+            .insert((job.created_at_ms, job.raw_id.clone()), job.id.clone());
         self.insert_state(job);
     }
 
     pub(crate) fn insert_state(&mut self, job: &Job) {
         let state = slot(job.state());
         let key = (Reverse(job.updated_at_ms), job.id.clone());
-        self.jobs[state].insert(key.clone());
-        let interface = self
+        self.counts[state] += 1;
+        let ns = self.namespaces.entry(job.namespace.clone()).or_default();
+        ns.jobs[state].insert(key.clone());
+        let ns_iface = ns
             .interfaces
             .entry(job.spec.demand.interface.clone())
             .or_default();
-        interface.jobs[state].insert(key);
+        ns_iface.jobs[state].insert(key);
         if job.state() == JobState::Queued {
-            interface
+            ns_iface
                 .queued_since
                 .insert((job.queued_since_ms, job.id.clone()));
         }
     }
 
     pub(crate) fn remove(&mut self, job: &Job, prune: bool) {
-        self.created.remove(&(job.created_at_ms, job.id.clone()));
+        if let Some(ns) = self.namespaces.get_mut(&job.namespace) {
+            ns.created.remove(&(job.created_at_ms, job.raw_id.clone()));
+        }
         self.remove_position(job, Self::position(job), prune);
+        if prune
+            && let Some(ns) = self.namespaces.get(&job.namespace)
+            && ns.jobs.iter().all(BTreeSet::is_empty)
+            && ns.created.is_empty()
+        {
+            self.namespaces.remove(&job.namespace);
+        }
     }
 
     pub(crate) fn scan(
         &self,
+        namespace: Option<&str>,
         from_ms: u64,
         to_ms: u64,
         before: Option<(u64, String)>,
@@ -92,54 +116,131 @@ impl JobIndex {
         if upper <= lower {
             return Vec::new();
         }
-        self.created
-            .range((Included(lower), Excluded(upper)))
-            .rev()
-            .take(limit)
-            .map(|(_, id)| id.as_str())
-            .collect()
+        if let Some(ns) = namespace {
+            return match self.namespaces.get(ns) {
+                Some(index) => index
+                    .created
+                    .range((Included(lower), Excluded(upper)))
+                    .rev()
+                    .take(limit)
+                    .map(|(_, scoped)| scoped.as_str())
+                    .collect(),
+                None => Vec::new(),
+            };
+        }
+        if self.namespaces.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        if self.namespaces.len() == 1
+            && let Some((ns_name, index)) = self.namespaces.iter().next()
+            && ns_name == crate::auth::DEFAULT_NAMESPACE
+        {
+            return index
+                .created
+                .range((Included(lower), Excluded(upper)))
+                .rev()
+                .take(limit)
+                .map(|(_, scoped)| scoped.as_str())
+                .collect();
+        }
+        let max_upper = (to_ms, String::new());
+        let mut items: Vec<(u64, &str)> = Vec::new();
+        for index in self.namespaces.values() {
+            for ((ts, _raw), scoped) in index
+                .created
+                .range((Included(lower.clone()), Excluded(max_upper.clone())))
+                .rev()
+            {
+                let key = (*ts, scoped.as_str());
+                if (*ts, scoped.as_str()) >= (upper.0, upper.1.as_str()) {
+                    continue;
+                }
+                items.push(key);
+                if items.len() >= limit * 2 {
+                    break;
+                }
+            }
+        }
+        items.sort_by(|a, b| b.cmp(a));
+        items.truncate(limit);
+        items.into_iter().map(|(_, id)| id).collect()
     }
 
     pub(crate) fn remove_position(&mut self, job: &Job, position: Position, prune: bool) {
         let (previous_state, updated_at_ms, queued_since_ms) = position;
         let state = slot(previous_state);
+        self.counts[state] = self.counts[state].saturating_sub(1);
         let key = (Reverse(updated_at_ms), job.id.clone());
-        self.jobs[state].remove(&key);
         let name = &job.spec.demand.interface;
-        if let Some(interface) = self.interfaces.get_mut(name) {
-            interface.jobs[state].remove(&key);
-            if previous_state == JobState::Queued {
-                interface
-                    .queued_since
-                    .remove(&(queued_since_ms, job.id.clone()));
-            }
-            if prune && interface.jobs.iter().all(BTreeSet::is_empty) {
-                self.interfaces.remove(name);
+        if let Some(ns) = self.namespaces.get_mut(&job.namespace) {
+            ns.jobs[state].remove(&key);
+            if let Some(ns_iface) = ns.interfaces.get_mut(name) {
+                ns_iface.jobs[state].remove(&key);
+                if previous_state == JobState::Queued {
+                    ns_iface
+                        .queued_since
+                        .remove(&(queued_since_ms, job.id.clone()));
+                }
+                if prune && ns_iface.jobs.iter().all(BTreeSet::is_empty) {
+                    ns.interfaces.remove(name);
+                }
             }
         }
     }
 
-    /// Merge at most five already sorted state indexes. Only the requested
-    /// page's views need cloning; duplicate state filters do not duplicate jobs.
+    /// Merge sorted state indexes across selected namespace/interface sets.
     pub(crate) fn page(
         &self,
         filter: &JobFilter,
         offset: usize,
         limit: usize,
     ) -> (Vec<&str>, usize) {
-        let jobs = match &filter.interface {
-            Some(name) => match self.interfaces.get(name) {
-                Some(interface) => &interface.jobs,
-                None => return (Vec::new(), 0),
-            },
-            None => &self.jobs,
-        };
-        let selected: Vec<_> = STATES
-            .iter()
-            .zip(jobs)
-            .filter(|(state, _)| filter.states.is_empty() || filter.states.contains(state))
-            .map(|(_, jobs)| jobs)
-            .collect();
+        let mut selected: Vec<&BTreeSet<OrderKey>> = Vec::new();
+        match (&filter.namespace, &filter.interface) {
+            (Some(ns), Some(name)) => {
+                if let Some(interface) =
+                    self.namespaces.get(ns).and_then(|i| i.interfaces.get(name))
+                {
+                    for (state, set) in STATES.iter().zip(&interface.jobs) {
+                        if filter.states.is_empty() || filter.states.contains(state) {
+                            selected.push(set);
+                        }
+                    }
+                }
+            }
+            (Some(ns), None) => {
+                if let Some(index) = self.namespaces.get(ns) {
+                    for (state, set) in STATES.iter().zip(&index.jobs) {
+                        if filter.states.is_empty() || filter.states.contains(state) {
+                            selected.push(set);
+                        }
+                    }
+                }
+            }
+            (None, Some(name)) => {
+                for index in self.namespaces.values() {
+                    if let Some(interface) = index.interfaces.get(name) {
+                        for (state, set) in STATES.iter().zip(&interface.jobs) {
+                            if filter.states.is_empty() || filter.states.contains(state) {
+                                selected.push(set);
+                            }
+                        }
+                    }
+                }
+            }
+            (None, None) => {
+                for index in self.namespaces.values() {
+                    for (state, set) in STATES.iter().zip(&index.jobs) {
+                        if filter.states.is_empty() || filter.states.contains(state) {
+                            selected.push(set);
+                        }
+                    }
+                }
+            }
+        }
+        if selected.is_empty() {
+            return (Vec::new(), 0);
+        }
         let total = selected.iter().map(|jobs| jobs.len()).sum();
         let mut cursors: Vec<_> = selected.iter().map(|jobs| jobs.iter().peekable()).collect();
         let ordered = std::iter::from_fn(|| {
@@ -155,28 +256,25 @@ impl JobIndex {
     }
 
     pub(crate) fn counts(&self) -> [usize; 5] {
-        std::array::from_fn(|i| self.jobs[i].len())
+        self.counts
     }
 
     pub(crate) fn interfaces(&self, now: u64) -> BTreeMap<String, InterfaceStats> {
-        self.interfaces
-            .iter()
-            .map(|(name, index)| {
-                (
-                    name.clone(),
-                    InterfaceStats {
-                        queued: index.jobs[0].len(),
-                        running: index.jobs[1].len(),
-                        oldest_queued_age_ms: index
-                            .queued_since
-                            .first()
-                            .map(|(since, _)| now.saturating_sub(*since))
-                            .unwrap_or(0),
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect()
+        let mut merged: BTreeMap<String, InterfaceStats> = BTreeMap::new();
+        for ns in self.namespaces.values() {
+            for (name, index) in &ns.interfaces {
+                let oldest = index
+                    .queued_since
+                    .first()
+                    .map(|(since, _)| now.saturating_sub(*since))
+                    .unwrap_or(0);
+                let entry = merged.entry(name.clone()).or_default();
+                entry.queued += index.jobs[0].len();
+                entry.running += index.jobs[1].len();
+                entry.oldest_queued_age_ms = entry.oldest_queued_age_ms.max(oldest);
+            }
+        }
+        merged
     }
 }
 
@@ -191,7 +289,11 @@ pub(crate) fn assert_matches_jobs(st: &super::state::State) {
             .collect()
     );
     assert_eq!(
-        st.job_index.created,
+        st.job_index
+            .namespaces
+            .values()
+            .flat_map(|ns| ns.created.iter().map(|((ts, _), id)| (*ts, id.clone())))
+            .collect::<BTreeSet<_>>(),
         st.jobs
             .values()
             .map(|job| (job.created_at_ms, job.id.clone()))

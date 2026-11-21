@@ -26,6 +26,12 @@ worker_tokens = []
 # Read comma-separated tokens from named environment variables:
 # client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
 # worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+# Optional scoped tokens binding role + tenant namespace (+ worker forced_pool):
+# [[auth.scoped_tokens]]
+# token_env = "ANYSERVE_ROBOT_A_WORKER_TOKEN"
+# role = "worker"
+# namespace = "robot-fleet-a"
+# forced_pool = "jetson-local"
 
 # Omit this section to disable management HTTP.
 [console]
@@ -45,8 +51,10 @@ retention_secs = 604800
 [runtime]
 heartbeat_interval_ms = 5000
 heartbeat_timeout_ms = 15000
+# reconnect_grace_ms = 15000
 max_attempts = 3
 max_queue = 10000
+# default_max_in_flight_per_key = 1
 max_pending_jobs = 100000
 max_pending_bytes = 2147483648
 max_event_bytes = 1073741824
@@ -63,14 +71,33 @@ event_log_max_bytes = 8388608
 # [runtime.interfaces."demo.echo.v1"]
 # max_queue = 100
 # queue_timeout_ms = 1000
+# max_in_flight_per_key = 1
+#
+# [[runtime.interfaces."demo.echo.v1".pool_tiers]]
+# pool = "jetson-local"
+# spillover_after_ms = 0
+# reconnect_grace_ms = 1000
+#
+# [[runtime.interfaces."demo.echo.v1".pool_tiers]]
+# pool = "cloud-burst"
+# spillover_after_ms = 200
 ```
 
 Token lists and their environment sources are combined. An environment key names
-the variable to read; it does not contain the token itself. With both role lists
-empty, authentication is disabled. Once enabled, clients need client-role tokens
-and workers need worker-role tokens. TLS protects gRPC; terminate management HTTP
-TLS at your ingress or proxy. CORS origins control browser access independently
-of authentication.
+the variable to read; it does not contain the token itself. With client/worker/scoped
+lists all empty, client/worker authentication is disabled and the `x-anyserve-namespace`
+header is caller-asserted with no tenant isolation. Once enabled, clients need
+client-role tokens, workers need worker-role tokens, and tenant isolation comes from
+`[[auth.scoped_tokens]]`. The management HTTP API (`/api/*`, `/metrics`) requires an
+operator token from `[auth].client_tokens` (scoped tenant tokens and worker tokens
+receive `403 Forbidden`).
+
+When a job sets a non-empty `concurrency_key` and neither `runtime.default_max_in_flight_per_key`
+nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, the scheduler defaults to `1`
+(per-key serialization within each namespace).
+
+TLS protects gRPC; terminate management HTTP TLS at your ingress or proxy. CORS
+origins control browser access independently of authentication.
 
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
@@ -80,8 +107,7 @@ private CA.
 ## Limits and retention
 
 `max_queue` limits queued/accepting jobs per interface; `max_pending_jobs` limits
-unfinished jobs in each Runtime. In PG mode these limit replica-local admission
-and loaded work, not the shared backlog. Admission beyond these limits returns
+unfinished jobs in the active Runtime. Admission beyond these limits returns
 `RESOURCE_EXHAUSTED`. Heartbeat timeout closes a silent session, then gives its
 leases another heartbeat-timeout interval to reconnect. Cancellation keeps a
 worker reservation until acknowledgement or `cancel_grace_ms` expires.
@@ -103,21 +129,20 @@ Each job also has `event_log_max_events` and `event_log_max_bytes` limits.
 the event byte budget; admission, attempt and retained-job limits bound them.
 
 `terminal_retention_secs` and `max_terminal_jobs` limit terminal jobs in memory.
-Durable results remain readable by ID until journal retention expires. SQLite
-ListJobs lists jobs still in memory; PostgreSQL lists shared durable jobs and
-local ephemeral jobs. `full_sync=false` selects SQLite NORMAL sync,
+Durable results remain readable by ID until journal retention expires. ListJobs
+lists jobs currently held in memory. `full_sync=false` selects SQLite NORMAL sync,
 which weakens durability under power loss. Journal queue capacity bounds pending
-operations; `max_batch` controls group commits.
+operations; `max_batch` controls group commits for both SQLite and PostgreSQL.
 
-For multiple active replicas, select `backend="postgres"`, omit `path`, and set
+For leader-standby high availability, select `backend="postgres"`, omit `path`, and set
 `url_env="ANYSERVE_DATABASE_URL"`. Optional PG keys are `schema="anyserve"`,
-`lease_duration_ms=15000` (3–300 seconds), `poll_interval_ms=100` (at least 10 ms
-and at most one quarter of the lease), and `max_connections=16` (at least 2).
-Each replica also opens one dedicated heartbeat connection. `full_sync=false`
-and the embedded SQLite `max_bytes` cap are rejected for PG. `max_batch` is
-SQLite-only; PG commits independent transactions concurrently. `--journal PATH`
-explicitly selects SQLite and `--ephemeral` disables persistence. See
-[PG deployment](deployment.md#postgresql-active-active) for ownership and load balancing.
+`lease_duration_ms=5000` (500–300,000 ms), `poll_interval_ms=100` (10 ms up to half
+the lease), and `max_connections=8` (at least 2, plus dedicated write and lease
+connections). `full_sync=false` and the embedded SQLite `max_bytes` cap are rejected
+for PG. PostgreSQL uses schema v3 (`scheduler_lease`, `jobs`, `objects`) and rejects
+legacy v1/v2 schemas at startup. `--journal PATH` explicitly selects SQLite and
+`--ephemeral` disables persistence. See
+[PG deployment](deployment.md#postgresql-high-availability) for failover and routing.
 
 For evicted durable jobs, Console previews read at most 4 KiB per inline output
 directly from the journal, preserving the original size without reserving
@@ -142,7 +167,7 @@ bodies and media are excluded.
 
 | Boundary | Behavior |
 |---|---|
-| Source | Completed durable history, or current retained jobs; in PG mode the latter means shared queued/running durable jobs |
+| Source | Completed durable history, or current retained jobs in memory |
 | Time range | Creation time, at most 31 days; custom inputs use local time with second precision |
 | Load | 10,000 jobs by default; at most 100,000 jobs or 32 MiB of serialized metadata |
 | API | Authenticated `/api/analytics/jobs`, up to 250 rows per page with creation-time/job-ID cursors |
@@ -171,6 +196,7 @@ logging flags. Job commands read the client token from `ANYSERVE_TOKEN`.
 | Command | Flags / arguments |
 |---|---|
 | `serve` | `--config PATH`, `--grpc-host HOST`, `--grpc-port PORT`, `--grpc-tls-enabled[=true\|false]`, `--grpc-cert-file PATH`, `--grpc-key-file PATH`, `--journal PATH`, `--ephemeral` |
+| `connect` | `--interface NAME` (repeatable), `--upstream URL`, `--health-url URL`, `--worker-id ID`, `--pool POOL`, `--token TOKEN`, `--namespace NS`, `--max-concurrency N`, `--attr KEY=VAL`, `--capacity KEY=INT`, `--stream-sse` |
 | `job ls` (alias `list`) | Repeatable `--state queued\|running\|succeeded\|failed\|cancelled`, `--limit N` (100), `--page-token TOKEN` |
 | `job inspect` | `JOB_ID` |
 | `job cancel` | One or more `JOB_ID` arguments, or `--stdin` for IDs from standard input |

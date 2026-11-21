@@ -1,9 +1,10 @@
 """Execution API for live inference and recoverable asynchronous jobs."""
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import asdict, dataclass, field
-from typing import Any, Iterator
+from typing import Any, AsyncIterator, Iterator
 
 from ._native import ExecutionTransport
 
@@ -28,6 +29,9 @@ class ExecutionOptions:
     total_timeout_ms: int = 0
     spillover_after_ms: int = 0
     max_attempts: int = 0
+    affinity_key: str = ""
+    fairness_key: str = ""
+    concurrency_key: str = ""
 
 
 class ExecutionEvents(Iterator[dict[str, Any]]):
@@ -68,8 +72,19 @@ class StreamingInvocation(ExecutionEvents):
 
 
 class ExecutionClient:
-    def __init__(self, endpoint: str | None = None, *, token: str | None = None) -> None:
-        self._transport = ExecutionTransport(resolve_endpoint(endpoint), token)
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        *,
+        token: str | None = None,
+        namespace: str | None = None,
+    ) -> None:
+        if namespace is None:
+            self._transport = ExecutionTransport(resolve_endpoint(endpoint), token)
+        else:
+            self._transport = ExecutionTransport(
+                resolve_endpoint(endpoint), token, namespace
+            )
 
     def submit(
         self, interface: str, inputs: bytes | list[dict[str, Any]] = b"", *,
@@ -134,6 +149,125 @@ class ExecutionClient:
             return _outputs(job)
         with self.watch(job_id, after_sequence=0) as events:
             return _terminal_outputs(events)
+
+
+def _next_or_sentinel(iterator: Iterator[dict[str, Any]], sentinel: object) -> Any:
+    return next(iterator, sentinel)
+
+
+class AsyncExecutionEvents(AsyncIterator[dict[str, Any]]):
+    """Async iterator wrapper over ExecutionEvents; closing cancels unfinished Invoke."""
+
+    def __init__(self, events: ExecutionEvents) -> None:
+        self._events = events
+        self._sentinel = object()
+
+    def __aiter__(self) -> AsyncExecutionEvents:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        item = await asyncio.to_thread(_next_or_sentinel, self._events, self._sentinel)
+        if item is self._sentinel:
+            raise StopAsyncIteration
+        return item
+
+    def close(self) -> None:
+        self._events.close()
+
+    async def aclose(self) -> None:
+        self._events.close()
+
+    async def __aenter__(self) -> AsyncExecutionEvents:
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        self.close()
+
+
+class AsyncExecutionClient:
+    """Asyncio-friendly client wrapping ExecutionClient off the event loop."""
+
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        *,
+        token: str | None = None,
+        namespace: str | None = None,
+    ) -> None:
+        self._sync = ExecutionClient(endpoint, token=token, namespace=namespace)
+
+    async def submit(
+        self,
+        interface: str,
+        inputs: bytes | list[dict[str, Any]] = b"",
+        *,
+        job_id: str | None = None,
+        durability: str = "durable",
+        options: ExecutionOptions | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._sync.submit,
+            interface,
+            inputs,
+            job_id=job_id,
+            durability=durability,
+            options=options,
+        )
+
+    async def invoke(
+        self,
+        interface: str,
+        inputs: bytes | list[dict[str, Any]] = b"",
+        *,
+        options: ExecutionOptions | None = None,
+    ) -> AsyncExecutionEvents:
+        events = await asyncio.to_thread(
+            self._sync.invoke, interface, inputs, options=options
+        )
+        return AsyncExecutionEvents(events)
+
+    async def execute(
+        self,
+        interface: str,
+        inputs: bytes | list[dict[str, Any]] = b"",
+        *,
+        options: ExecutionOptions | None = None,
+    ) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(
+            self._sync.execute, interface, inputs, options=options
+        )
+
+    async def call(
+        self,
+        interface: str,
+        payload: bytes = b"",
+        *,
+        options: ExecutionOptions | None = None,
+    ) -> bytes:
+        return await asyncio.to_thread(
+            self._sync.call, interface, payload, options=options
+        )
+
+    async def get(self, job_id: str, *, include_outputs: bool = True) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._sync.get, job_id, include_outputs=include_outputs
+        )
+
+    async def cancel(
+        self, job_id: str, reason: str = "caller cancelled"
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(self._sync.cancel, job_id, reason)
+
+    async def watch(
+        self, job_id: str, *, after_sequence: int = 0
+    ) -> AsyncExecutionEvents:
+        events = await asyncio.to_thread(
+            self._sync.watch, job_id, after_sequence=after_sequence
+        )
+        return AsyncExecutionEvents(events)
+
+    async def result(self, job_id: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._sync.result, job_id)
 
 
 def _spec(

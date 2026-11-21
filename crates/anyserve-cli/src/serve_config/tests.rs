@@ -150,6 +150,8 @@ fn unknown_keys_and_sections_are_rejected() {
         "[server]\nheartbeat_ttl_secs=30",
         "[server.storage]\nbackend='sqlite'",
         "[gateway]\nenabled=true",
+        "[cluster]\npeer_token='cluster-secret'",
+        "[journal]\ninternal_grpc_addr='http://127.0.0.1:50052'",
     ] {
         let message = format!("{:#}", config(raw, ServeOverrides::default()).unwrap_err());
         assert!(message.contains("unknown field"), "{message}");

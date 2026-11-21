@@ -11,6 +11,7 @@ message Demand {
   map<string, string> required_attributes = 2;
   map<string, string> preferred_attributes = 3;
   map<string, int64> required_capacity = 4;
+  string affinity_key = 5;
 }
 enum Durability { DURABILITY_UNSPECIFIED = 0; EPHEMERAL = 1; DURABLE = 2; }
 message ExecutionPolicy {
@@ -21,6 +22,8 @@ message ExecutionPolicy {
   uint64 total_timeout_ms = 5;         // schedule_to_close
   uint64 spillover_after_ms = 6;
   uint32 max_attempts = 7;             // 0 = server default
+  string fairness_key = 8;
+  string concurrency_key = 9;
 }
 message JobSpec {
   Demand demand = 1;
@@ -37,6 +40,7 @@ message Job {
   uint64 created_at_ms = 8; uint64 updated_at_ms = 9; ErrorInfo error = 10;
   repeated Object outputs = 11;        // filled only when include_outputs is set and the job is terminal
   map<string, string> metadata = 12; string spec_hash = 13;
+  string namespace = 14;
 }
 
 // ---------- Client ----------
@@ -96,6 +100,7 @@ message Hello {
   uint32 max_concurrency = 6; string sdk_version = 7;
   repeated string held_lease_ids = 8;  // Leases held during a reconnect.
   map<string, string> metadata = 9;
+  string pool = 10;
 }
 message Credit { uint32 free_slots = 1; }
 message Heartbeat { Load load = 1; }
@@ -106,7 +111,7 @@ message Load {
 }
 message AssignReply { string lease_id = 1; bool accepted = 2; string reject_reason = 3; }
 message CancelAck { string lease_id = 1; }
-message Draining {}
+message Draining { bool preempting = 1; }
 
 message ServerMessage {
   oneof msg { Welcome welcome = 1; Assign assign = 2; Cancel cancel = 3; Fence fence = 4; Drain drain = 5; }

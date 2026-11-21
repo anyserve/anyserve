@@ -20,9 +20,8 @@ function localDate(value: number): string {
   return new Date(value - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
 }
 
-export default function ExplorePane({ journalEnabled, distributed = false, onAuthenticationError }: {
+export default function ExplorePane({ journalEnabled, onAuthenticationError }: {
   journalEnabled: boolean | null;
-  distributed?: boolean;
   onAuthenticationError: (error: unknown) => void;
 }) {
   const [chosenSource, setSource] = useState<AnalyticsSource | null>(null);
@@ -197,7 +196,7 @@ export default function ExplorePane({ journalEnabled, distributed = false, onAut
           <button className="explore__primary" type="submit" disabled={busy || journalEnabled === null}>Load data</button>
           {busy ? <button type="button" onClick={cancel}>Cancel</button> : null}
         </form>
-        <p className="explore__hint">{source === "archive" ? "Completed durable jobs, including jobs no longer retained in memory." : distributed ? "Queued and running durable jobs across the cluster." : "Active and recent jobs still held in memory, including ephemeral jobs."} Payloads are excluded. Loads are manual and capped at 32 MiB.</p>
+        <p className="explore__hint">{source === "archive" ? "Completed durable jobs, including jobs no longer retained in memory." : "Active and recent jobs still held in memory, including ephemeral jobs."} Payloads are excluded. Loads are manual and capped at 32 MiB.</p>
         <p className="explore__status" role="status">{status}</p>
         {dataset ? <p className="explore__hint">Loaded {dataset.source === "archive" ? "durable history" : "retained jobs"}: {formatTimestamp(dataset.from)} – {formatTimestamp(dataset.to)}. States reflect each page's read time. Duration includes queue time.</p> : null}
         {dataset?.limited ? <p className="explore__notice">This dataset is partial: the row or byte limit was reached. Queries cover only these newest loaded jobs. Narrow the time range for complete statistics.</p> : null}

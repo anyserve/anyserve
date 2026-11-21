@@ -16,7 +16,7 @@ pub(crate) async fn require_client_token(
     if matches!(request.uri().path(), "/healthz" | "/readyz") {
         return next.run(request).await;
     }
-    match policy.authorize_client_headers(request.headers()) {
+    match policy.authorize_operator_headers(request.headers()) {
         Ok(()) => next.run(request).await,
         Err(status) => {
             let code = if status.code() == tonic::Code::PermissionDenied {

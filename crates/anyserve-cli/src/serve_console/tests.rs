@@ -125,6 +125,86 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
 }
 
 #[tokio::test]
+async fn console_rejects_scoped_tenant_tokens() {
+    use anyserve_core::auth::{Role, ScopedToken};
+
+    let runtime = test_runtime().await;
+    let job = runtime
+        .submit(SubmitRequest {
+            namespace: Some("tenant-a".into()),
+            spec: test_job_spec("demo.auth.v1"),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+    let policy = AuthPolicy::new(["operator-client".into()], ["operator-worker".into()])
+        .with_scoped_tokens([
+            ScopedToken {
+                token: "scoped-a-client".into(),
+                role: Role::Client,
+                namespace: "tenant-a".into(),
+                subject: "tenant-a".into(),
+                forced_pool: None,
+            },
+            ScopedToken {
+                token: "scoped-default-client".into(),
+                role: Role::Client,
+                namespace: "default".into(),
+                subject: "default".into(),
+                forced_pool: None,
+            },
+        ]);
+    let (base_url, handle) = spawn_test_server_with_auth(runtime, policy).await;
+    let client = reqwest::Client::new();
+
+    for token in [
+        "scoped-a-client",
+        "scoped-default-client",
+        "operator-worker",
+    ] {
+        for path in [
+            "/metrics",
+            "/api/overview",
+            "/api/jobs",
+            "/api/workers",
+            "/api/analytics/jobs?source=retained&from_ms=0&to_ms=1",
+            &format!("/api/jobs/{}", job.job_id),
+        ] {
+            let status = client
+                .get(format!("{base_url}{path}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            assert_eq!(status, 403, "token {token} must be forbidden on {path}");
+        }
+        let status = client
+            .post(format!("{base_url}/api/jobs/{}/cancel", job.job_id))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 403, "token {token} cancel must be forbidden");
+    }
+
+    let ok = client
+        .get(format!("{base_url}/api/jobs"))
+        .bearer_auth("operator-client")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert_eq!(ok, 200);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn analytics_pages_metadata_and_validates_ranges_and_sources() {
     let runtime = test_runtime().await;
     let before = anyserve_core::now_ms().saturating_sub(1000);
