@@ -1,10 +1,8 @@
 import { useMemo, useState } from "react";
 
-import { formatDuration, formatNumber, truncateMiddle } from "./format";
-import { t, type Lang } from "./i18n";
-import { IconSearch } from "./icons";
-import { InspectorSection, MetaItem } from "./pane-inspector-details";
-import { EmptyState, PanelHeader, StatsRow, WorkerStateBadge } from "./pane-tables";
+import { formatDuration, formatNumber, formatPool } from "./format";
+import { InspectorSection, InspectorShell, MetaGrid } from "./pane-inspector";
+import { EmptyState, PanelHeader, SearchInput, SelectField, StatsRow, TierChain, WorkerMiniList } from "./pane-tables";
 import type { InterfaceSummary, PoolSummary, WorkerSummary } from "./types";
 
 interface PoolsPaneProps {
@@ -15,7 +13,6 @@ interface PoolsPaneProps {
   onSelectPool: (poolKey: string) => void;
   onViewJobs: (interfaceName: string, namespace: string) => void;
   onOpenWorker: (workerId: string) => void;
-  lang: Lang;
 }
 
 export function poolKey(pool: PoolSummary): string {
@@ -23,75 +20,32 @@ export function poolKey(pool: PoolSummary): string {
 }
 
 export function PoolsPane(props: PoolsPaneProps) {
-  const {
-    pools,
-    interfaces,
-    workers,
-    selectedPoolKey,
-    onSelectPool,
-    onViewJobs,
-    onOpenWorker,
-    lang,
-  } = props;
-
+  const { pools, interfaces, workers, selectedPoolKey, onSelectPool, onViewJobs, onOpenWorker } = props;
   const [namespaceFilter, setNamespaceFilter] = useState("all");
   const [interfaceFilter, setInterfaceFilter] = useState("all");
   const [search, setSearch] = useState("");
 
-  const namespaceOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of pools) set.add(p.namespace);
-    return Array.from(set).sort();
-  }, [pools]);
-
-  const interfaceOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const p of pools) set.add(p.interface);
-    return Array.from(set).sort();
-  }, [pools]);
+  const namespaceOptions = useMemo(() => ["all", ...Array.from(new Set(pools.map((p) => p.namespace))).sort()], [pools]);
+  const interfaceOptions = useMemo(() => ["all", ...Array.from(new Set(pools.map((p) => p.interface))).sort()], [pools]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return pools.filter((item) => {
       if (namespaceFilter !== "all" && item.namespace !== namespaceFilter) return false;
       if (interfaceFilter !== "all" && item.interface !== interfaceFilter) return false;
-      if (
-        q &&
-        !item.pool.toLowerCase().includes(q) &&
-        !item.interface.toLowerCase().includes(q) &&
-        !item.namespace.toLowerCase().includes(q)
-      ) {
-        return false;
-      }
-      return true;
+      return !q || [formatPool(item.pool), item.interface, item.namespace].some((s) => s.toLowerCase().includes(q));
     });
   }, [pools, namespaceFilter, interfaceFilter, search]);
 
-  const activePool =
-    filtered.find((item) => poolKey(item) === selectedPoolKey) ?? filtered[0] ?? null;
-
-  const activeInterfacePolicy = useMemo(() => {
-    if (!activePool) return null;
-    return interfaces.find((item) => item.name === activePool.interface)?.policy ?? null;
-  }, [activePool, interfaces]);
-
+  const activePool = filtered.find((item) => poolKey(item) === selectedPoolKey) ?? filtered[0] ?? null;
+  const activePolicy = useMemo(() => (activePool ? interfaces.find((i) => i.name === activePool.interface)?.policy ?? null : null), [activePool, interfaces]);
   const matchingWorkers = useMemo(() => {
     if (!activePool) return [];
-    return workers.filter((worker) => {
-      const workerPool = worker.pool ?? "default";
-      const workerNs = worker.namespace ?? "default";
-      return (
-        workerPool === activePool.pool &&
-        workerNs === activePool.namespace &&
-        worker.interfaces.includes(activePool.interface)
-      );
-    });
+    return workers.filter(
+      (w) => formatPool(w.pool) === formatPool(activePool.pool) && (w.namespace ?? "default") === activePool.namespace && w.interfaces.includes(activePool.interface),
+    );
   }, [activePool, workers]);
-
-  const configuredSpillovers = useMemo(
-    () => interfaces.filter((item) => (item.policy?.pool_tiers.length ?? 0) > 0),
-    [interfaces],
-  );
+  const configuredSpillovers = useMemo(() => interfaces.filter((item) => (item.policy?.pool_tiers.length ?? 0) > 0), [interfaces]);
 
   const totals = useMemo(
     () =>
@@ -112,107 +66,64 @@ export function PoolsPane(props: PoolsPaneProps) {
       <section className="panel">
         <StatsRow
           stats={[
-            { label: t(lang, "pools.stat.pools"), value: filtered.length },
-            { label: t(lang, "pools.stat.sessions"), value: totals.sessions },
-            { label: t(lang, "pools.stat.activeLeases"), value: totals.activeLeases },
-            { label: t(lang, "pools.stat.freeSlots"), value: totals.freeSlots },
-            { label: t(lang, "pools.stat.desiredSlots"), value: totals.desiredSlots },
+            { label: "Pools", value: filtered.length },
+            { label: "Sessions", value: totals.sessions },
+            { label: "Active leases", value: totals.activeLeases },
+            { label: "Free slots", value: totals.freeSlots },
+            { label: "Desired slots", value: totals.desiredSlots },
           ]}
         />
-
-        <PanelHeader title={t(lang, "pools.title")} meta={t(lang, "pools.subtitle")} />
+        <PanelHeader title="Pools" meta={formatNumber(filtered.length)} />
 
         <div className="panel__toolbar panel__toolbar--wrap">
           <div className="toolbar-filters">
-            <label className="field">
-              <span className="field__label">{t(lang, "pools.filter.namespace")}</span>
-              <select
-                className="field__control"
-                value={namespaceFilter}
-                onChange={(event) => setNamespaceFilter(event.target.value)}
-              >
-                <option value="all">{t(lang, "jobs.filter.allNamespaces")}</option>
-                {namespaceOptions.map((ns) => (
-                  <option key={ns} value={ns}>
-                    {ns}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="field">
-              <span className="field__label">{t(lang, "pools.filter.interface")}</span>
-              <select
-                className="field__control"
-                value={interfaceFilter}
-                onChange={(event) => setInterfaceFilter(event.target.value)}
-              >
-                <option value="all">{t(lang, "jobs.filter.allInterfaces")}</option>
-                {interfaceOptions.map((iface) => (
-                  <option key={iface} value={iface}>
-                    {iface}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div className="search-box">
-              <IconSearch className="search-box__icon" />
-              <input
-                type="search"
-                className="search-box__input"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder={t(lang, "pools.filter.searchPlaceholder")}
-                aria-label={t(lang, "pools.filter.searchPlaceholder")}
-              />
-            </div>
+            <SelectField
+              label="Namespace"
+              value={namespaceFilter}
+              options={namespaceOptions.map((ns) => ({ value: ns, label: ns === "all" ? "All namespaces" : ns }))}
+              onChange={setNamespaceFilter}
+            />
+            <SelectField
+              label="Interface"
+              value={interfaceFilter}
+              options={interfaceOptions.map((iface) => ({ value: iface, label: iface === "all" ? "All interfaces" : iface }))}
+              onChange={setInterfaceFilter}
+            />
+            <SearchInput value={search} placeholder="Search pool, interface, namespace…" onChange={setSearch} />
           </div>
         </div>
 
         <div className="pools-stack">
           {filtered.length === 0 ? (
-            <EmptyState message={t(lang, "pools.empty")} />
+            <EmptyState message="No active pools match the current filters" />
           ) : (
             <div className="table-wrap">
-              <table className="table table--interactive">
+              <table className="table table--fixed table--interactive">
                 <thead>
                   <tr>
-                    <th>{t(lang, "pools.table.pool")}</th>
-                    <th>{t(lang, "pools.table.namespace")}</th>
-                    <th>{t(lang, "pools.table.interface")}</th>
-                    <th>{t(lang, "pools.table.sessions")}</th>
-                    <th>{t(lang, "pools.table.leases")}</th>
-                    <th>{t(lang, "pools.table.freeSlots")}</th>
-                    <th>{t(lang, "pools.table.desired")}</th>
+                    <th style={{ width: "18%" }}>Pool</th>
+                    <th style={{ width: "14%" }}>Namespace</th>
+                    <th style={{ width: "21%" }}>Interface</th>
+                    <th style={{ width: "12%" }}>Sessions</th>
+                    <th style={{ width: "11%" }}>Leases</th>
+                    <th style={{ width: "10%" }}>Free</th>
+                    <th style={{ width: "14%" }}>Desired</th>
                   </tr>
                 </thead>
                 <tbody>
                   {filtered.map((item) => {
                     const key = poolKey(item);
-                    const isSelected = activePool ? poolKey(activePool) === key : false;
+                    const poolName = formatPool(item.pool);
                     return (
-                      <tr
-                        key={key}
-                        className={isSelected ? "is-selected" : ""}
-                        onClick={() => onSelectPool(key)}
-                      >
-                        <td className="table__primary table__mono">{item.pool}</td>
-                        <td>
-                          <span className="tag-inline">{item.namespace}</span>
-                        </td>
-                        <td className="table__mono">{item.interface}</td>
+                      <tr key={key} className={activePool && poolKey(activePool) === key ? "is-selected" : ""} onClick={() => onSelectPool(key)}>
+                        <td className="table__primary mono ellipsis" title={poolName}>{poolName}</td>
+                        <td><span className="tag ellipsis" title={item.namespace}>{item.namespace}</span></td>
+                        <td className="mono ellipsis" title={item.interface}>{item.interface}</td>
                         <td className="num">{formatNumber(item.sessions)}</td>
                         <td className="num">{formatNumber(item.active_leases)}</td>
                         <td className="num">{formatNumber(item.free_slots)}</td>
                         <td className="num">
-                          {item.desired_additional_slots > 0 ? (
-                            <span className="pill-sub pill-sub--warn">
-                              +{formatNumber(item.desired_additional_slots)}
-                            </span>
-                          ) : (
-                            "0"
-                          )}
+                          {item.desired_additional_slots > 0 ? <span className="tag tag--warn">+{formatNumber(item.desired_additional_slots)}</span> : "0"}
                         </td>
                       </tr>
                     );
@@ -224,24 +135,17 @@ export function PoolsPane(props: PoolsPaneProps) {
 
           {configuredSpillovers.length > 0 ? (
             <section className="sub-section">
-              <div className="sub-section__header">
-                <h2>{t(lang, "pools.tiersConfig.title")}</h2>
-                <span>{t(lang, "pools.tiersConfig.subtitle")}</span>
-              </div>
+              <div className="sub-section__header"><h2>Configured Spillover Tier Policies</h2></div>
               <div className="spillover-rules">
                 {configuredSpillovers.map((iface) => (
                   <div key={iface.name} className="spillover-rule-row">
-                    <span className="table__mono spillover-rule-row__iface">{iface.name}</span>
+                    <span className="mono spillover-rule-row__iface">{iface.name}</span>
                     <div className="tier-chain-inline">
                       {iface.policy!.pool_tiers.map((tier, idx) => (
-                        <span key={`${tier.pool}-${idx}`} className="tag-inline">
-                          #{idx + 1} {tier.pool}
-                          {tier.spillover_after_ms > 0
-                            ? ` · +${formatDuration(tier.spillover_after_ms)}`
-                            : ""}
-                          {tier.reconnect_grace_ms != null
-                            ? ` · grace ${formatDuration(tier.reconnect_grace_ms)}`
-                            : ""}
+                        <span key={`${tier.pool}-${idx}`} className="tag">
+                          #{idx + 1} {formatPool(tier.pool)}
+                          {tier.spillover_after_ms > 0 ? ` · +${formatDuration(tier.spillover_after_ms)}` : ""}
+                          {tier.reconnect_grace_ms != null ? ` · grace ${formatDuration(tier.reconnect_grace_ms)}` : ""}
                         </span>
                       ))}
                     </div>
@@ -253,115 +157,44 @@ export function PoolsPane(props: PoolsPaneProps) {
         </div>
       </section>
 
-      <aside className="panel panel--aside panel--detail">
-        {!activePool ? (
+      <InspectorShell
+        isEmpty={!activePool}
+        emptyTitle="Pool Inspector"
+        emptyHint="Select a pool"
+        emptyMessage="Select a pool entry to inspect autoscaling demand, spillover tier order, and workers."
+        title={activePool ? formatPool(activePool.pool) : ""}
+        subtitle={activePool ? `${activePool.namespace} · ${activePool.interface}` : null}
+        actions={
+          activePool ? (
+            <button type="button" className="button button--primary" onClick={() => onViewJobs(activePool.interface, activePool.namespace)}>
+              View Jobs
+            </button>
+          ) : null
+        }
+      >
+        {activePool ? (
           <>
-            <div className="panel__header">
-              <div className="panel__header-title">
-                <h1>{t(lang, "pools.inspector.title")}</h1>
-                <span>{t(lang, "pools.inspector.select")}</span>
-              </div>
-            </div>
-            <EmptyState message={t(lang, "pools.inspector.empty")} />
-          </>
-        ) : (
-          <>
-            <div className="panel__header panel__header--stack">
-              <div className="inspector__identity">
-                <h1>{activePool.pool}</h1>
-                <span>
-                  {activePool.namespace} · {activePool.interface}
-                </span>
-              </div>
-              <div className="inspector__actions">
-                <button
-                  type="button"
-                  className="button button--primary"
-                  onClick={() => onViewJobs(activePool.interface, activePool.namespace)}
-                >
-                  {t(lang, "common.viewJobs")}
-                </button>
-              </div>
-            </div>
-
-            <div className="meta-grid">
-              <MetaItem label={t(lang, "pools.table.sessions")} value={formatNumber(activePool.sessions)} />
-              <MetaItem
-                label={t(lang, "pools.table.leases")}
-                value={formatNumber(activePool.active_leases)}
-              />
-              <MetaItem
-                label={t(lang, "pools.table.freeSlots")}
-                value={formatNumber(activePool.free_slots)}
-              />
-              <MetaItem
-                label={t(lang, "pools.table.desired")}
-                value={formatNumber(activePool.desired_additional_slots)}
-              />
-            </div>
-
-            <InspectorSection title={t(lang, "pools.inspector.spillover")}>
-              {activeInterfacePolicy && activeInterfacePolicy.pool_tiers.length > 0 ? (
-                <div className="tier-chain">
-                  {activeInterfacePolicy.pool_tiers.map((tier, idx) => {
-                    const isCurrent = tier.pool === activePool.pool;
-                    return (
-                      <div
-                        key={`${tier.pool}-${idx}`}
-                        className={`tier-node${isCurrent ? " is-current" : ""}`}
-                      >
-                        <span className="tier-node__rank">#{idx + 1}</span>
-                        <div className="tier-node__body">
-                          <strong className="table__mono">{tier.pool}</strong>
-                          <span>
-                            {tier.spillover_after_ms === 0
-                              ? t(lang, "interfaces.tiers.primary")
-                              : t(lang, "interfaces.tiers.spillover", {
-                                  ms: formatDuration(tier.spillover_after_ms),
-                                })}
-                            {tier.reconnect_grace_ms != null
-                              ? ` · ${t(lang, "interfaces.tiers.grace", {
-                                  ms: formatDuration(tier.reconnect_grace_ms),
-                                })}`
-                              : ""}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+            <MetaGrid
+              items={[
+                { label: "Sessions", value: formatNumber(activePool.sessions) },
+                { label: "Active leases", value: formatNumber(activePool.active_leases) },
+                { label: "Free slots", value: formatNumber(activePool.free_slots) },
+                { label: "Desired additional", value: formatNumber(activePool.desired_additional_slots) },
+              ]}
+            />
+            <InspectorSection title="Spillover Tier Position">
+              {activePolicy && activePolicy.pool_tiers.length > 0 ? (
+                <TierChain tiers={activePolicy.pool_tiers} highlightPool={activePool.pool} />
               ) : (
-                <EmptyState message={t(lang, "pools.inspector.noPolicy")} compact />
+                <EmptyState message="No explicit pool_tiers spillover configured for this interface." inline />
               )}
             </InspectorSection>
-
-            <InspectorSection title={t(lang, "pools.inspector.workers")}>
-              {matchingWorkers.length === 0 ? (
-                <EmptyState message={t(lang, "pools.inspector.noWorkers")} compact />
-              ) : (
-                <div className="worker-mini-list">
-                  {matchingWorkers.map((worker) => (
-                    <button
-                      key={worker.worker_id}
-                      type="button"
-                      className="worker-mini-row"
-                      onClick={() => onOpenWorker(worker.worker_id)}
-                    >
-                      <span className="table__mono">{truncateMiddle(worker.worker_id, 24)}</span>
-                      <span className="worker-mini-row__meta">
-                        <span className="num">
-                          {worker.active_leases}/{worker.max_concurrency}
-                        </span>
-                        <WorkerStateBadge worker={worker} lang={lang} />
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
+            <InspectorSection title="Workers in Pool">
+              <WorkerMiniList workers={matchingWorkers} emptyMessage="No workers matched for this pool." showLeases onSelect={onOpenWorker} />
             </InspectorSection>
           </>
-        )}
-      </aside>
+        ) : null}
+      </InspectorShell>
     </div>
   );
 }

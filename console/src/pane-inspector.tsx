@@ -1,274 +1,293 @@
+import type { ReactNode } from "react";
+
+import { QUEUE_STATES } from "./app-constants";
 import {
+  formatBytes,
   formatCapacityMap,
   formatDuration,
+  formatNumber,
+  formatObjectMeta,
+  formatPayloadPreview,
   formatRustDuration,
   formatTimestamp,
   latestAttemptWorker,
-  truncateMiddle,
 } from "./format";
-import { QUEUE_STATES } from "./app-constants";
-import { t, type Lang } from "./i18n";
-import { EmptyState, StateBadge } from "./pane-tables";
-import {
-  CodeBlock,
-  InlineList,
-  InspectorGroup,
-  InspectorSection,
-  MetaItem,
-  ObjectRefList,
-} from "./pane-inspector-details";
-import { AttemptsTimeline, EventsTimeline } from "./pane-inspector-timeline";
-import type { JobDetailResponse } from "./types";
+import { EmptyState, PanelHeader, StateBadge } from "./pane-tables";
+import type { JobDetailResponse, ObjectRefSummary } from "./types";
 
-export function JobInspector(props: {
-  detail: JobDetailResponse | null;
-  isCancelling?: boolean;
-  onCancel?: (jobId: string, namespace?: string) => Promise<void>;
-  lang?: Lang;
+export interface MetaField { label: string; value: string; mono?: boolean; tag?: string; }
+
+export function MetaGrid({ items }: { items: MetaField[] }) {
+  return (
+    <div className="meta-grid">
+      {items.map((item) => (
+        <div key={item.label} className="meta-item">
+          <span>{item.label}</span>
+          <strong className={item.mono ? "meta-item__value mono" : "meta-item__value"}>
+            {item.value}
+            {item.tag ? <> <em className="tag">{item.tag}</em></> : null}
+          </strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function InspectorShell(props: {
+  title: string; subtitle?: string | null; emptyTitle?: string; emptyHint?: string;
+  emptyMessage?: string; isEmpty?: boolean; actions?: ReactNode; children?: ReactNode;
 }) {
-  const { detail, isCancelling = false, onCancel, lang = "en" } = props;
-
-  if (!detail) {
+  if (props.isEmpty) {
     return (
       <aside className="panel panel--aside">
-        <div className="panel__header">
-          <div className="panel__header-title">
-            <h1>{t(lang, "inspector.title")}</h1>
-            <span>{t(lang, "inspector.selectJob")}</span>
-          </div>
-        </div>
-        <EmptyState message={t(lang, "inspector.empty")} />
+        <PanelHeader title={props.emptyTitle ?? props.title} meta={props.emptyHint} />
+        <EmptyState message={props.emptyMessage ?? "Select an item to inspect."} />
       </aside>
     );
   }
-
-  const { job } = detail;
-  const canCancel = QUEUE_STATES.includes(job.state);
-  const demand = job.demand;
-  const policy = job.policy;
-  const durabilityLabel =
-    job.durability ??
-    (policy?.durability ? policy.durability.toLowerCase() : null) ??
-    t(lang, "common.na");
-
-  const demandValues: string[] = [];
-  if (demand) {
-    if (demand.affinity_key) {
-      demandValues.push(`${t(lang, "inspector.affinityKey")}: ${demand.affinity_key}`);
-    }
-    if (Object.keys(demand.required_capacity).length > 0) {
-      demandValues.push(
-        `${t(lang, "inspector.requiredCapacity")}: ${formatCapacityMap(demand.required_capacity)}`,
-      );
-    }
-    if (Object.keys(demand.required_attributes).length > 0) {
-      demandValues.push(
-        `${t(lang, "inspector.requiredAttrs")}: ${formatCapacityMap(demand.required_attributes)}`,
-      );
-    }
-    if (Object.keys(demand.preferred_attributes).length > 0) {
-      demandValues.push(
-        `${t(lang, "inspector.preferredAttrs")}: ${formatCapacityMap(demand.preferred_attributes)}`,
-      );
-    }
-    if (demandValues.length === 0) {
-      demandValues.push(`${t(lang, "inspector.requiredCapacity")}: ${t(lang, "common.none")}`);
-    }
-  }
-
-  const policyValues: string[] = [];
-  if (policy) {
-    policyValues.push(`${t(lang, "inspector.priority")}: ${policy.priority}`);
-    policyValues.push(`${t(lang, "inspector.durability")}: ${durabilityLabel}`);
-    policyValues.push(
-      `${t(lang, "inspector.maxAttempts")}: ${policy.max_attempts ?? t(lang, "common.default")}`,
-    );
-    if (policy.fairness_key) {
-      policyValues.push(`${t(lang, "inspector.fairnessKey")}: ${policy.fairness_key}`);
-    }
-    if (policy.concurrency_key) {
-      policyValues.push(`${t(lang, "inspector.concurrencyKey")}: ${policy.concurrency_key}`);
-    }
-    if (policy.queue_timeout) {
-      policyValues.push(
-        `${t(lang, "inspector.queueTimeout")}: ${formatRustDuration(policy.queue_timeout)}`,
-      );
-    }
-    if (policy.execution_timeout) {
-      policyValues.push(
-        `${t(lang, "inspector.execTimeout")}: ${formatRustDuration(policy.execution_timeout)}`,
-      );
-    }
-    if (policy.total_timeout) {
-      policyValues.push(
-        `${t(lang, "inspector.totalTimeout")}: ${formatRustDuration(policy.total_timeout)}`,
-      );
-    }
-    if (policy.spillover_after) {
-      policyValues.push(
-        `${t(lang, "inspector.spilloverAfter")}: ${formatRustDuration(policy.spillover_after)}`,
-      );
-    }
-  }
-
   return (
-    <aside className="panel panel--aside panel--detail">
+    <aside className="panel panel--aside">
       <div className="panel__header panel__header--stack">
         <div className="inspector__identity">
-          <h1>{truncateMiddle(job.job_id, 34)}</h1>
-          <span>
-            {job.interface_name}
-            {job.namespace ? ` · ${job.namespace}` : ""}
-          </span>
+          <h1>{props.title}</h1>
+          {props.subtitle ? <span>{props.subtitle}</span> : null}
         </div>
+        {props.actions ? <div className="inspector__actions">{props.actions}</div> : null}
+      </div>
+      {props.children}
+    </aside>
+  );
+}
 
-        <div className="inspector__actions">
-          <StateBadge state={job.state} lang={lang} />
-          {job.durability ? <span className="tag-inline">{job.durability}</span> : null}
-          {canCancel && onCancel ? (
-            <button
-              type="button"
-              className="button button--danger"
-              disabled={isCancelling}
-              onClick={() => void onCancel(job.job_id, job.namespace)}
-            >
-              {isCancelling ? t(lang, "inspector.cancelling") : t(lang, "inspector.cancelJob")}
+export function InspectorSection({ title, children }: { title: string; children: ReactNode }) {
+  return <section className="inspector__section"><div className="inspector__label">{title}</div>{children}</section>;
+}
+
+export function InspectorGroup({ title, meta, children }: { title: string; meta?: string; children: ReactNode }) {
+  return (
+    <section className="inspector__group">
+      <div className="inspector__group-header"><h2>{title}</h2>{meta ? <span>{meta}</span> : null}</div>
+      {children}
+    </section>
+  );
+}
+
+export function KeyValueGrid({ entries, emptyMessage }: { entries: Record<string, string | number>; emptyMessage: string }) {
+  const items = Object.entries(entries);
+  if (items.length === 0) return <EmptyState message={emptyMessage} inline />;
+  return (
+    <div className="kv-list">
+      {items.map(([k, v]) => (
+        <div key={k} className="kv-item"><span className="kv-item__key">{k}</span><code className="kv-item__val">{String(v)}</code></div>
+      ))}
+    </div>
+  );
+}
+
+function PayloadPreview({ raw, contentType }: { raw: string; contentType?: string | null }) {
+  const formatted = formatPayloadPreview(raw, contentType);
+  return (
+    <div className="payload-preview">
+      {formatted.streamText ? (
+        <div>
+          <div className="stream-preview__head">Streamed text · {formatted.frameCount} SSE frames</div>
+          <pre className="code-block">{formatted.streamText}</pre>
+        </div>
+      ) : null}
+      <pre className="code-block">{formatted.text}</pre>
+    </div>
+  );
+}
+
+function ObjectRefList({ objects }: { objects: ObjectRefSummary[] }) {
+  return (
+    <div className="timeline">
+      {objects.map((obj, idx) => (
+        <div key={`${obj.kind}-${obj.uri ?? idx}`} className="timeline__item">
+          <div className="timeline__title">{obj.kind}{obj.content_type ? ` · ${obj.content_type}` : ""}</div>
+          <div className="timeline__subtitle">{obj.uri ?? formatObjectMeta(obj)}</div>
+          {obj.preview ? <PayloadPreview raw={obj.preview} contentType={obj.content_type} /> : null}
+          {!obj.preview && obj.uri == null ? <div className="timeline__meta">Preview unavailable</div> : null}
+          {obj.truncated ? <div className="timeline__meta">Preview truncated</div> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+interface TimelineItem {
+  key: string; title: string; subtitle: string; meta: string;
+  badge?: { label: string; tone: "warn" | "danger" } | null; detail?: string | null;
+}
+
+function Timeline({ items, emptyMessage }: { items: TimelineItem[]; emptyMessage: string }) {
+  if (items.length === 0) return <EmptyState message={emptyMessage} inline />;
+  return (
+    <div className="timeline">
+      {items.map((item) => (
+        <div key={item.key} className="timeline__item">
+          <div className="timeline__title">
+            <span>{item.title}</span>
+            {item.badge ? <span className={`tag tag--${item.badge.tone}`}>{item.badge.label}</span> : null}
+          </div>
+          <div className="timeline__subtitle">{item.subtitle}</div>
+          <div className="timeline__meta">{item.meta}</div>
+          {item.detail ? <div className="timeline__error">{item.detail}</div> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function JobInspector({ detail, isCancelling = false, onCancel }: {
+  detail: JobDetailResponse | null; isCancelling?: boolean; onCancel?: (jobId: string, namespace?: string) => Promise<void>;
+}) {
+  if (!detail) {
+    return <InspectorShell isEmpty emptyTitle="Inspector" emptyHint="Select a job" emptyMessage="Job details appear here." title="" />;
+  }
+
+  const { job } = detail;
+  const { demand, policy } = job;
+  const durabilityLabel = job.durability ?? policy?.durability?.toLowerCase() ?? "N/A";
+  const demandValues = demand
+    ? [
+        demand.affinity_key && `Affinity key: ${demand.affinity_key}`,
+        Object.keys(demand.required_capacity).length > 0 && `Required capacity: ${formatCapacityMap(demand.required_capacity)}`,
+        Object.keys(demand.required_attributes).length > 0 && `Required attrs: ${formatCapacityMap(demand.required_attributes)}`,
+        Object.keys(demand.preferred_attributes).length > 0 && `Preferred attrs: ${formatCapacityMap(demand.preferred_attributes)}`,
+      ].filter((v): v is string => Boolean(v))
+    : [];
+  const policyValues = policy
+    ? [
+        `Priority: ${policy.priority}`,
+        `Durability: ${durabilityLabel}`,
+        `Max attempts: ${policy.max_attempts ?? "Default"}`,
+        policy.fairness_key && `Fairness key: ${policy.fairness_key}`,
+        policy.concurrency_key && `Concurrency key: ${policy.concurrency_key}`,
+        policy.queue_timeout && `Queue timeout: ${formatRustDuration(policy.queue_timeout)}`,
+        policy.execution_timeout && `Exec timeout: ${formatRustDuration(policy.execution_timeout)}`,
+        policy.total_timeout && `Total timeout: ${formatRustDuration(policy.total_timeout)}`,
+        policy.spillover_after && `Spillover after: ${formatRustDuration(policy.spillover_after)}`,
+      ].filter((v): v is string => Boolean(v))
+    : [];
+  const hasParams = Boolean(job.params_preview) || (job.params_size_bytes != null && job.params_size_bytes > 0);
+  const showOutputs =
+    job.outputs.length > 0 &&
+    !(job.output_preview != null && job.outputs.length === 1 && job.outputs[0].kind === "inline");
+  const hasPayload = hasParams || job.inputs.length > 0 || showOutputs || Boolean(job.output_preview);
+
+  return (
+    <InspectorShell
+      title={job.job_id}
+      subtitle={`${job.interface_name}${job.namespace ? ` · ${job.namespace}` : ""}`}
+      actions={
+        <>
+          <StateBadge state={job.state} />
+          {job.durability ? <span className="tag">{job.durability}</span> : null}
+          {QUEUE_STATES.includes(job.state) && onCancel ? (
+            <button type="button" className="button button--danger" disabled={isCancelling} onClick={() => void onCancel(job.job_id, job.namespace)}>
+              {isCancelling ? "Cancelling" : "Cancel job"}
             </button>
           ) : null}
-        </div>
-      </div>
-
-      <div className="meta-grid">
-        <MetaItem label={t(lang, "inspector.source")} value={job.source ?? t(lang, "common.direct")} />
-        <MetaItem
-          label={t(lang, "inspector.worker")}
-          value={
-            detail.latest_worker?.worker_id ??
-            latestAttemptWorker(detail) ??
-            t(lang, "common.unassigned")
-          }
-          mono
-        />
-        {job.namespace ? (
-          <MetaItem label={t(lang, "inspector.namespace")} value={job.namespace} mono />
-        ) : null}
-        <MetaItem label={t(lang, "inspector.durability")} value={durabilityLabel} />
-        <MetaItem label={t(lang, "inspector.updated")} value={formatTimestamp(job.updated_at_ms)} mono />
-        <MetaItem label={t(lang, "inspector.duration")} value={formatDuration(job.duration_ms)} />
-      </div>
+        </>
+      }
+    >
+      <MetaGrid
+        items={[
+          { label: "Source", value: job.source ?? "direct" },
+          { label: "Worker", value: detail.latest_worker?.worker_id ?? latestAttemptWorker(detail) ?? "Unassigned", mono: true },
+          ...(job.namespace ? [{ label: "Namespace", value: job.namespace, mono: true }] : []),
+          { label: "Durability", value: durabilityLabel },
+          { label: "Updated", value: formatTimestamp(job.updated_at_ms), mono: true },
+          { label: "Duration", value: formatDuration(job.duration_ms) },
+        ]}
+      />
 
       {job.last_error || job.error_code ? (
-        <InspectorSection title={t(lang, "inspector.section.error")}>
+        <InspectorSection title="Error">
           <div className="preview-meta">
-            {job.error_code ? <span className="tag-inline tag-inline--danger">{job.error_code}</span> : null}
+            {job.error_code ? <span className="tag tag--danger">{job.error_code}</span> : null}
             {job.error_retryable != null ? (
-              <span className="tag-inline">
-                {t(lang, job.error_retryable ? "inspector.retryable" : "inspector.nonRetryable")}
+              <span className={`tag ${job.error_retryable ? "tag--warn" : "tag--danger"}`}>
+                {job.error_retryable ? "Retryable" : "Non-retryable"}
               </span>
             ) : null}
           </div>
-          {job.last_error ? <CodeBlock value={job.last_error} /> : null}
+          {job.last_error ? <pre className="code-block">{job.last_error}</pre> : null}
         </InspectorSection>
       ) : null}
 
-      <InspectorGroup
-        title={t(lang, "inspector.group.scheduling")}
-        meta={t(lang, "inspector.group.schedulingMeta")}
-      >
-        <InspectorSection title={t(lang, "inspector.section.demand")}>
+      <InspectorGroup title="Scheduling & Policy">
+        <InspectorSection title="Demand">
           {demand ? (
-            <InlineList values={demandValues} />
-          ) : (
-            <EmptyState message={t(lang, "inspector.specExpired")} compact />
-          )}
+            demandValues.length > 0 ? <div className="inline-list">{demandValues.map((v) => <span key={v}>{v}</span>)}</div> : <EmptyState message="Default demand (no placement constraints)" inline />
+          ) : <EmptyState message="Request specification is no longer retained in memory." inline />}
         </InspectorSection>
-
-        <InspectorSection title={t(lang, "inspector.section.policy")}>
-          {policy ? (
-            <InlineList values={policyValues} />
-          ) : (
-            <EmptyState message={t(lang, "inspector.specExpired")} compact />
-          )}
+        <InspectorSection title="Execution Policy">
+          {policy ? <div className="inline-list">{policyValues.map((v) => <span key={v}>{v}</span>)}</div> : <EmptyState message="Request specification is no longer retained in memory." inline />}
         </InspectorSection>
       </InspectorGroup>
 
-      <InspectorGroup
-        title={t(lang, "inspector.group.payload")}
-        meta={t(lang, "inspector.group.payloadMeta")}
-      >
-        <InspectorSection title={t(lang, "inspector.section.request")}>
-          {job.params_preview ? (
-            <>
-              <InlineList
-                className="preview-meta"
-                values={[
-                  `${job.params_size_bytes ?? 0} B`,
-                  t(lang, job.params_truncated ? "inspector.truncated" : "inspector.full"),
-                ]}
-              />
-              <CodeBlock value={job.params_preview} />
-            </>
-          ) : (
-            <EmptyState message={t(lang, "inspector.noParams")} compact />
-          )}
-        </InspectorSection>
+      <InspectorGroup title="Payload">
+        {!hasPayload ? (
+          <EmptyState message="No retained request or response payloads." inline />
+        ) : (
+          <>
+            {hasParams ? (
+              <InspectorSection title="Request Params">
+                <div className="preview-meta"><span>{formatBytes(job.params_size_bytes)}</span><span>{job.params_truncated ? "truncated" : "full"}</span></div>
+                {job.params_preview ? <PayloadPreview raw={job.params_preview} contentType="application/json" /> : <EmptyState message="Binary or non-text request payload." inline />}
+              </InspectorSection>
+            ) : null}
+            {job.inputs.length > 0 ? <InspectorSection title="Inputs"><ObjectRefList objects={job.inputs} /></InspectorSection> : null}
+            {showOutputs ? <InspectorSection title="Outputs"><ObjectRefList objects={job.outputs} /></InspectorSection> : null}
+            {job.output_preview ? (
+              <InspectorSection title="Response">
+                <div className="preview-meta">
+                  <span>{formatBytes(job.output_preview.size_bytes)}</span>
+                  <span>{job.output_preview.content_type ?? "text/plain"}</span>
+                  <span>{job.output_preview.truncated ? "truncated" : "full"}</span>
+                </div>
+                {job.output_preview.preview ? <PayloadPreview raw={job.output_preview.preview} contentType={job.output_preview.content_type} /> : <EmptyState message="Binary or unavailable response preview." inline />}
+              </InspectorSection>
+            ) : null}
+          </>
+        )}
+      </InspectorGroup>
 
-        <InspectorSection title={t(lang, "inspector.section.inputs")}>
-          <ObjectRefList
-            objects={job.inputs}
-            emptyMessage={t(lang, "inspector.noInputs")}
-            lang={lang}
+      <InspectorGroup title="Execution">
+        <InspectorSection title="Attempts">
+          {detail.history_incomplete ? <p className="inline-notice" role="status">Incomplete history: earlier execution events are no longer retained.</p> : null}
+          <Timeline
+            emptyMessage="No attempts"
+            items={detail.attempts.map((a, idx) => {
+              const isLastFailed = a.state === "failed" && idx === detail.attempts.length - 1;
+              const badge = a.state === "restarted"
+                ? { label: "retryable · retried", tone: "warn" as const }
+                : isLastFailed && job.error_retryable != null
+                  ? { label: job.error_retryable ? "retryable" : "non-retryable", tone: (job.error_retryable ? "warn" : "danger") as "warn" | "danger" }
+                  : null;
+              return {
+                key: a.attempt_id,
+                title: `#${idx + 1} ${a.state} · ${a.worker_id ?? "Unassigned"}`,
+                subtitle: formatTimestamp(a.created_at_ms),
+                meta: a.duration_ms != null ? formatDuration(a.duration_ms) : "in progress",
+                badge,
+                detail: a.last_error,
+              };
+            })}
           />
         </InspectorSection>
-
-        <InspectorSection title={t(lang, "inspector.section.outputs")}>
-          <ObjectRefList
-            objects={job.outputs}
-            emptyMessage={t(lang, "inspector.noOutputs")}
-            lang={lang}
+        <InspectorSection title="Events">
+          <Timeline
+            emptyMessage="No events"
+            items={detail.events.map((e) => ({
+              key: String(e.sequence), title: `#${e.sequence} · ${e.kind}`,
+              subtitle: formatTimestamp(e.created_at_ms), meta: `${formatNumber(e.payload_size_bytes)} B`,
+            }))}
           />
         </InspectorSection>
-
-        <InspectorSection title={t(lang, "inspector.section.response")}>
-          {job.output_preview ? (
-            <>
-              <InlineList
-                className="preview-meta"
-                values={[
-                  `${job.output_preview.size_bytes} B`,
-                  job.output_preview.content_type ?? "unknown content-type",
-                  t(lang, job.output_preview.truncated ? "inspector.truncated" : "inspector.full"),
-                ]}
-              />
-              {job.output_preview.preview ? (
-                <CodeBlock value={job.output_preview.preview} />
-              ) : (
-                <EmptyState message={t(lang, "inspector.responseUnavailable")} compact />
-              )}
-            </>
-          ) : (
-            <EmptyState message={t(lang, "inspector.noResponse")} compact />
-          )}
-        </InspectorSection>
       </InspectorGroup>
-
-      <InspectorGroup
-        title={t(lang, "inspector.group.execution")}
-        meta={t(lang, "inspector.group.executionMeta")}
-      >
-        <InspectorSection title={t(lang, "inspector.section.attempts")}>
-          {detail.history_incomplete ? (
-            <p className="inline-notice" role="status">
-              {t(lang, "inspector.incompleteHistory")}
-            </p>
-          ) : null}
-          <AttemptsTimeline attempts={detail.attempts} lang={lang} />
-        </InspectorSection>
-
-        <InspectorSection title={t(lang, "inspector.section.events")}>
-          <EventsTimeline events={detail.events} lang={lang} />
-        </InspectorSection>
-      </InspectorGroup>
-    </aside>
+    </InspectorShell>
   );
 }
