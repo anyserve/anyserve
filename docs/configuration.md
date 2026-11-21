@@ -26,6 +26,17 @@ worker_tokens = []
 # Read comma-separated tokens from named environment variables:
 # client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
 # worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+# Optional scoped tokens binding role + tenant namespace (+ worker forced_pool):
+# [[auth.scoped_tokens]]
+# token_env = "ANYSERVE_ROBOT_A_WORKER_TOKEN"
+# role = "worker"
+# namespace = "robot-fleet-a"
+# forced_pool = "jetson-local"
+
+# Optional inter-replica PeerMesh configuration (PostgreSQL cluster mode):
+# [cluster]
+# internal_grpc_addr = "https://10.0.1.12:50052"
+# peer_token_env = "ANYSERVE_PEER_TOKEN"
 
 # Omit this section to disable management HTTP.
 [console]
@@ -45,8 +56,10 @@ retention_secs = 604800
 [runtime]
 heartbeat_interval_ms = 5000
 heartbeat_timeout_ms = 15000
+# reconnect_grace_ms = 15000
 max_attempts = 3
 max_queue = 10000
+# default_max_in_flight_per_key = 1
 max_pending_jobs = 100000
 max_pending_bytes = 2147483648
 max_event_bytes = 1073741824
@@ -63,14 +76,46 @@ event_log_max_bytes = 8388608
 # [runtime.interfaces."demo.echo.v1"]
 # max_queue = 100
 # queue_timeout_ms = 1000
+# max_in_flight_per_key = 1
+#
+# [[runtime.interfaces."demo.echo.v1".pool_tiers]]
+# pool = "jetson-local"
+# spillover_after_ms = 0
+# reconnect_grace_ms = 1000
+#
+# [[runtime.interfaces."demo.echo.v1".pool_tiers]]
+# pool = "cloud-burst"
+# spillover_after_ms = 200
+# idle_drain_after_ms = 300000
+# min_sessions = 1
 ```
 
 Token lists and their environment sources are combined. An environment key names
-the variable to read; it does not contain the token itself. With both role lists
-empty, authentication is disabled. Once enabled, clients need client-role tokens
-and workers need worker-role tokens. TLS protects gRPC; terminate management HTTP
-TLS at your ingress or proxy. CORS origins control browser access independently
-of authentication.
+the variable to read; it does not contain the token itself. With client/worker/scoped
+lists all empty, client/worker authentication is disabled and the `x-anyserve-namespace`
+header is caller-asserted with no tenant isolation. Once enabled, clients need
+client-role tokens, workers need worker-role tokens, and tenant isolation comes from
+`[[auth.scoped_tokens]]`. The management HTTP API (`/api/*`, `/metrics`) requires an
+operator token from `[auth].client_tokens` (scoped tenant tokens and worker tokens
+receive `403 Forbidden`).
+
+`[cluster]` authenticates active-active `PeerMesh` control-plane traffic between PG
+replicas using a dedicated `[cluster].peer_token` / `peer_token_env`. When no peer
+token is configured, `PeerMesh` services are not registered and peer-sync loops are
+not started. Client, worker, and scoped tokens are rejected on `PeerMesh` RPCs.
+Use an `https://` `internal_grpc_addr` with a publicly trusted TLS certificate for
+encrypted peer links.
+
+When a job sets a non-empty `concurrency_key` and neither `runtime.default_max_in_flight_per_key`
+nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, all backends (in-memory,
+SQLite, and PostgreSQL) default to `1` (strict per-key serialization within each
+namespace). In PostgreSQL mode, each claim pass excludes saturated `concurrency_key`s
+discovered during that pass across bounded retries so other keys behind a saturated
+key are still claimed; when a single `concurrency_key` may accumulate deep queues, set
+`fairness_key` equal to `concurrency_key` so each key has its own O(log N) fairness bucket.
+
+TLS protects gRPC; terminate management HTTP TLS at your ingress or proxy. CORS
+origins control browser access independently of authentication.
 
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
@@ -171,6 +216,7 @@ logging flags. Job commands read the client token from `ANYSERVE_TOKEN`.
 | Command | Flags / arguments |
 |---|---|
 | `serve` | `--config PATH`, `--grpc-host HOST`, `--grpc-port PORT`, `--grpc-tls-enabled[=true\|false]`, `--grpc-cert-file PATH`, `--grpc-key-file PATH`, `--journal PATH`, `--ephemeral` |
+| `connect` | `--interface NAME` (repeatable), `--upstream URL`, `--health-url URL`, `--worker-id ID`, `--pool POOL`, `--token TOKEN`, `--namespace NS`, `--max-concurrency N`, `--attr KEY=VAL`, `--capacity KEY=INT`, `--stream-sse` |
 | `job ls` (alias `list`) | Repeatable `--state queued\|running\|succeeded\|failed\|cancelled`, `--limit N` (100), `--page-token TOKEN` |
 | `job inspect` | `JOB_ID` |
 | `job cancel` | One or more `JOB_ID` arguments, or `--stdin` for IDs from standard input |

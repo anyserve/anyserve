@@ -12,15 +12,23 @@ use tonic::{Request, Status};
 
 /// Environment variable consulted for a bearer token when none is passed explicitly.
 pub const TOKEN_ENV: &str = "ANYSERVE_TOKEN";
+/// Environment variable consulted for a tenant namespace when none is passed explicitly.
+pub const NAMESPACE_ENV: &str = "ANYSERVE_NAMESPACE";
 
-/// Attaches `authorization: Bearer <token>` to every request when a token is set.
+/// Attaches `authorization: Bearer <token>` and optional `x-anyserve-namespace`
+/// to every request.
 #[derive(Clone, Debug, Default)]
 pub struct BearerAuth {
     header: Option<AsciiMetadataValue>,
+    namespace: Option<AsciiMetadataValue>,
 }
 
 impl BearerAuth {
     pub fn new(token: Option<&str>) -> Result<Self> {
+        Self::with_namespace(token, None)
+    }
+
+    pub fn with_namespace(token: Option<&str>, namespace: Option<&str>) -> Result<Self> {
         let header = token
             .map(str::trim)
             .filter(|token| !token.is_empty())
@@ -30,7 +38,15 @@ impl BearerAuth {
                     .map_err(|_| anyhow!("anyserve token contains invalid characters"))
             })
             .transpose()?;
-        Ok(Self { header })
+        let namespace = namespace
+            .map(str::trim)
+            .filter(|ns| !ns.is_empty())
+            .map(|ns| {
+                ns.parse::<AsciiMetadataValue>()
+                    .map_err(|_| anyhow!("anyserve namespace contains invalid characters"))
+            })
+            .transpose()?;
+        Ok(Self { header, namespace })
     }
 }
 
@@ -40,6 +56,11 @@ impl Interceptor for BearerAuth {
             request
                 .metadata_mut()
                 .insert("authorization", header.clone());
+        }
+        if let Some(ns) = self.namespace.as_ref() {
+            request
+                .metadata_mut()
+                .insert("x-anyserve-namespace", ns.clone());
         }
         Ok(request)
     }

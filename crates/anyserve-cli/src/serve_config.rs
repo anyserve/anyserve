@@ -95,6 +95,7 @@ impl ResolvedServeConfig {
         let server = file_config.server.unwrap_or_default();
         let tls = server.tls.unwrap_or_default();
         let defaults = GrpcConfig::default();
+        let cluster = file_config.cluster.unwrap_or_default().resolve()?;
         let mut runtime = file_config.runtime.unwrap_or_default().resolve();
         runtime.journal = if overrides.ephemeral {
             None
@@ -104,6 +105,22 @@ impl ResolvedServeConfig {
                 .unwrap_or_default()
                 .resolve(overrides.journal_path)?
         };
+        if let Some(pg) = runtime
+            .journal
+            .as_mut()
+            .and_then(|journal| journal.postgres.as_mut())
+        {
+            if let Some(addr) = cluster.internal_grpc_addr {
+                pg.internal_grpc_addr = Some(addr);
+            }
+            if let Some(token) = cluster.peer_token.clone() {
+                pg.peer_token = Some(token);
+            }
+        }
+        let mut auth = file_config.auth.unwrap_or_default().resolve()?;
+        if let Some(token) = cluster.peer_token {
+            auth = auth.with_peer_tokens([token]);
+        }
         let console = file_config.console.and_then(|config| config.resolve());
         let grpc = GrpcConfig {
             host: overrides
@@ -127,7 +144,7 @@ impl ResolvedServeConfig {
             grpc,
             runtime,
             console,
-            auth: file_config.auth.unwrap_or_default().resolve()?,
+            auth,
         })
     }
 

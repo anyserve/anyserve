@@ -11,7 +11,24 @@ use anyserve_proto::v2::{self as pb, client_server::Client};
 use futures::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth::{DEFAULT_NAMESPACE, NAMESPACE_HEADER, Principal, validate_namespace};
 use crate::runtime::{Runtime, api};
+
+fn request_namespace<T>(request: &Request<T>) -> Result<String, Status> {
+    if let Some(principal) = request.extensions().get::<Principal>() {
+        return Ok(principal.namespace.clone());
+    }
+    match request
+        .metadata()
+        .get(NAMESPACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(ns) => validate_namespace(ns).map(str::to_string),
+        None => Ok(DEFAULT_NAMESPACE.to_string()),
+    }
+}
 
 #[derive(Clone)]
 pub struct ClientGrpcService {
@@ -30,6 +47,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::SubmitRequest>,
     ) -> Result<Response<pb::SubmitResponse>, Status> {
+        let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         let conflict = match pb::ConflictPolicy::try_from(request.conflict_policy) {
             Ok(pb::ConflictPolicy::Fail) => api::ConflictPolicy::Fail,
@@ -42,6 +60,7 @@ impl Client for ClientGrpcService {
             .runtime
             .submit(api::SubmitRequest {
                 job_id: nonempty(request.job_id),
+                namespace: Some(namespace),
                 conflict,
                 spec: spec_from_proto(
                     request
@@ -61,6 +80,7 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<Streaming<pb::InvokeRequest>>,
     ) -> Result<Response<Self::InvokeStream>, Status> {
+        let namespace = request_namespace(&request)?;
         let mut incoming = request.into_inner();
         let start = match incoming.message().await?.and_then(|message| message.msg) {
             Some(pb::invoke_request::Msg::Start(start)) => start,
@@ -73,6 +93,7 @@ impl Client for ClientGrpcService {
         let mut execution = self
             .runtime
             .invoke(api::InvokeRequest {
+                namespace: Some(namespace),
                 spec: spec_from_proto(
                     start
                         .spec
@@ -120,10 +141,11 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         let events = self
             .runtime
-            .watch(&request.job_id, request.after_sequence)?;
+            .watch_in(&namespace, &request.job_id, request.after_sequence)?;
         Ok(Response::new(Box::pin(events.map(|event| {
             event.map(event_to_proto).map_err(Status::from)
         }))))
@@ -133,10 +155,11 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::GetJobRequest>,
     ) -> Result<Response<pb::Job>, Status> {
+        let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         Ok(Response::new(job_to_proto(
             self.runtime
-                .get_job(&request.job_id, request.include_outputs)
+                .get_job_in(&namespace, &request.job_id, request.include_outputs)
                 .await?,
         )))
     }
@@ -144,15 +167,19 @@ impl Client for ClientGrpcService {
         &self,
         request: Request<pb::CancelRequest>,
     ) -> Result<Response<pb::Job>, Status> {
+        let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         Ok(Response::new(job_to_proto(
-            self.runtime.cancel(&request.job_id, request.reason).await?,
+            self.runtime
+                .cancel_in(&namespace, &request.job_id, request.reason)
+                .await?,
         )))
     }
     async fn list_jobs(
         &self,
         request: Request<pb::ListJobsRequest>,
     ) -> Result<Response<pb::ListJobsResponse>, Status> {
+        let namespace = request_namespace(&request)?;
         let request = request.into_inner();
         let states = request
             .states
@@ -166,6 +193,7 @@ impl Client for ClientGrpcService {
                 limit: request.limit as usize,
                 page_token: nonempty(request.page_token),
                 interface: None,
+                namespace: Some(namespace),
             })
             .await?;
         Ok(Response::new(pb::ListJobsResponse {
@@ -223,6 +251,7 @@ pub fn spec_from_proto(spec: pb::JobSpec) -> Result<api::JobSpec, Status> {
             required_attributes: demand.required_attributes.into_iter().collect(),
             preferred_attributes: demand.preferred_attributes.into_iter().collect(),
             required_capacity: demand.required_capacity.into_iter().collect(),
+            affinity_key: demand.affinity_key,
         },
         inputs: spec
             .inputs
@@ -239,6 +268,8 @@ pub fn spec_from_proto(spec: pb::JobSpec) -> Result<api::JobSpec, Status> {
             total_timeout: milliseconds(policy.total_timeout_ms),
             spillover_after: milliseconds(policy.spillover_after_ms),
             max_attempts: (policy.max_attempts > 0).then_some(policy.max_attempts),
+            fairness_key: policy.fairness_key,
+            concurrency_key: policy.concurrency_key,
         },
     })
 }
@@ -266,6 +297,7 @@ pub fn object_to_proto(object: api::Object) -> pb::Object {
 pub fn job_to_proto(job: api::JobView) -> pb::Job {
     pb::Job {
         job_id: job.job_id,
+        namespace: job.namespace,
         state: state_to_proto(job.state),
         durability: match job.durability {
             api::Durability::Ephemeral => pb::Durability::Ephemeral as i32,
@@ -356,6 +388,111 @@ fn state_from_proto(state: i32) -> Result<api::JobState, Status> {
         Ok(pb::JobState::Failed) => api::JobState::Failed,
         Ok(pb::JobState::Cancelled) => api::JobState::Cancelled,
         _ => return Err(Status::invalid_argument("unknown job state")),
+    })
+}
+pub fn error_from_proto(error: pb::ErrorInfo) -> api::ErrorInfo {
+    api::ErrorInfo {
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+    }
+}
+pub fn spec_to_proto(spec: &api::JobSpec) -> pb::JobSpec {
+    pb::JobSpec {
+        demand: Some(pb::Demand {
+            interface: spec.demand.interface.clone(),
+            required_attributes: spec
+                .demand
+                .required_attributes
+                .clone()
+                .into_iter()
+                .collect(),
+            preferred_attributes: spec
+                .demand
+                .preferred_attributes
+                .clone()
+                .into_iter()
+                .collect(),
+            required_capacity: spec.demand.required_capacity.clone().into_iter().collect(),
+            affinity_key: spec.demand.affinity_key.clone(),
+        }),
+        inputs: spec.inputs.iter().cloned().map(object_to_proto).collect(),
+        params: spec.params.clone(),
+        metadata: spec.metadata.clone().into_iter().collect(),
+        policy: Some(pb::ExecutionPolicy {
+            durability: match spec.policy.durability {
+                None => pb::Durability::Unspecified as i32,
+                Some(api::Durability::Ephemeral) => pb::Durability::Ephemeral as i32,
+                Some(api::Durability::Durable) => pb::Durability::Durable as i32,
+            },
+            priority: spec.policy.priority,
+            queue_timeout_ms: spec
+                .policy
+                .queue_timeout
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            execution_timeout_ms: spec
+                .policy
+                .execution_timeout
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            total_timeout_ms: spec
+                .policy
+                .total_timeout
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            spillover_after_ms: spec
+                .policy
+                .spillover_after
+                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+            max_attempts: spec.policy.max_attempts.unwrap_or(0),
+            fairness_key: spec.policy.fairness_key.clone(),
+            concurrency_key: spec.policy.concurrency_key.clone(),
+        }),
+    }
+}
+pub fn event_from_proto(event: pb::ExecutionEvent) -> Result<api::ExecutionEvent, Status> {
+    let kind = match event
+        .event
+        .ok_or_else(|| Status::internal("missing execution event variant"))?
+    {
+        pb::execution_event::Event::Accepted(_) => api::EventKind::Accepted,
+        pb::execution_event::Event::Assigned(assigned) => api::EventKind::Assigned {
+            worker_id: assigned.worker_id,
+            attempt_number: assigned.attempt_number,
+        },
+        pb::execution_event::Event::Output(output) => api::EventKind::Output {
+            data: output.data,
+            metadata: output.metadata.into_iter().collect(),
+            progress: output.progress,
+        },
+        pb::execution_event::Event::AttemptRestarted(restarted) => {
+            api::EventKind::AttemptRestarted {
+                previous_attempt_id: restarted.previous_attempt_id,
+                reason: error_from_proto(
+                    restarted
+                        .reason
+                        .ok_or_else(|| Status::internal("missing restart reason"))?,
+                ),
+            }
+        }
+        pb::execution_event::Event::Finished(finished) => api::EventKind::Finished {
+            state: state_from_proto(finished.state)?,
+            outputs: finished
+                .outputs
+                .into_iter()
+                .map(object_from_proto)
+                .collect::<Result<_, _>>()?,
+            error: finished.error.map(error_from_proto),
+        },
+    };
+    Ok(api::ExecutionEvent {
+        job_id: event.job_id,
+        sequence: event.sequence,
+        attempt_id: nonempty(event.attempt_id),
+        at_ms: event.at_ms,
+        kind,
     })
 }
 fn nonempty(value: String) -> Option<String> {

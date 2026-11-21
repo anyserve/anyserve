@@ -16,7 +16,9 @@ pub use anyserve_proto::v2;
 use v2::client_client::ClientClient;
 use v2::worker_client::WorkerClient;
 
-use crate::{BearerAuth, TOKEN_ENV, connect_channel};
+use std::collections::HashMap;
+
+use crate::{BearerAuth, NAMESPACE_ENV, TOKEN_ENV, connect_channel};
 
 mod attempt;
 pub use attempt::Attempt;
@@ -35,13 +37,22 @@ pub struct ExecutionClient {
 impl ExecutionClient {
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let token = std::env::var(TOKEN_ENV).ok();
-        Self::connect_with_token(endpoint, token.as_deref()).await
+        let namespace = std::env::var(NAMESPACE_ENV).ok();
+        Self::connect_with_options(endpoint, token.as_deref(), namespace.as_deref()).await
     }
 
     pub async fn connect_with_token(endpoint: &str, token: Option<&str>) -> Result<Self> {
+        Self::connect_with_options(endpoint, token, None).await
+    }
+
+    pub async fn connect_with_options(
+        endpoint: &str,
+        token: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<Self> {
         let inner = ClientClient::with_interceptor(
             connect_channel(endpoint).await?,
-            BearerAuth::new(token)?,
+            BearerAuth::with_namespace(token, namespace)?,
         )
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
@@ -195,11 +206,20 @@ pub struct WorkerSession {
 
 impl WorkerSession {
     pub async fn connect(endpoint: &str, token: Option<&str>, hello: v2::Hello) -> Result<Self> {
+        Self::connect_with_namespace(endpoint, token, None, hello).await
+    }
+
+    pub async fn connect_with_namespace(
+        endpoint: &str,
+        token: Option<&str>,
+        namespace: Option<&str>,
+        hello: v2::Hello,
+    ) -> Result<Self> {
         let channel = connect_channel(endpoint).await?;
-        let mut control_client =
-            WorkerClient::with_interceptor(channel.clone(), BearerAuth::new(token)?)
-                .max_decoding_message_size(CONTROL_MESSAGE_BYTES)
-                .max_encoding_message_size(CONTROL_MESSAGE_BYTES);
+        let auth = BearerAuth::with_namespace(token, namespace)?;
+        let mut control_client = WorkerClient::with_interceptor(channel.clone(), auth)
+            .max_decoding_message_size(CONTROL_MESSAGE_BYTES)
+            .max_encoding_message_size(CONTROL_MESSAGE_BYTES);
         let (control, requests) = mpsc::channel(SEND_QUEUE);
         control
             .send(v2::WorkerMessage {
@@ -214,10 +234,10 @@ impl WorkerSession {
             .get("anyserve-worker-affinity")
             .is_some_and(|v| v == "connection")
         {
-            AttemptClient::from_channel(channel, token)?
+            AttemptClient::from_channel_with_namespace(channel, token, namespace)?
         } else {
             // Single-instance servers retain separate control/data transports.
-            AttemptClient::connect(endpoint, token).await?
+            AttemptClient::connect_with_namespace(endpoint, token, namespace).await?
         };
         let messages = response.into_inner();
         Ok(Self {
@@ -225,6 +245,37 @@ impl WorkerSession {
             messages,
             data,
         })
+    }
+
+    pub async fn drain(&self, preempting: bool) -> Result<(), Status> {
+        self.control
+            .send(v2::WorkerMessage {
+                msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
+                    preempting,
+                })),
+            })
+            .await
+            .map_err(|_| Status::unavailable("worker control stream closed"))
+    }
+
+    pub async fn update_attributes(
+        &self,
+        attributes: HashMap<String, String>,
+        total_capacity: HashMap<String, i64>,
+        pool: impl Into<String>,
+    ) -> Result<(), Status> {
+        self.control
+            .send(v2::WorkerMessage {
+                msg: Some(v2::worker_message::Msg::UpdateAttributes(
+                    v2::UpdateAttributes {
+                        attributes,
+                        total_capacity,
+                        pool: pool.into(),
+                    },
+                )),
+            })
+            .await
+            .map_err(|_| Status::unavailable("worker control stream closed"))
     }
 }
 
@@ -235,13 +286,26 @@ pub struct AttemptClient {
 
 impl AttemptClient {
     pub async fn connect(endpoint: &str, token: Option<&str>) -> Result<Self> {
-        Self::from_channel(connect_channel(endpoint).await?, token)
+        Self::connect_with_namespace(endpoint, token, None).await
     }
 
-    fn from_channel(channel: Channel, token: Option<&str>) -> Result<Self> {
-        let inner = WorkerClient::with_interceptor(channel, BearerAuth::new(token)?)
-            .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
+    pub async fn connect_with_namespace(
+        endpoint: &str,
+        token: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_channel_with_namespace(connect_channel(endpoint).await?, token, namespace)
+    }
+
+    fn from_channel_with_namespace(
+        channel: Channel,
+        token: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<Self> {
+        let inner =
+            WorkerClient::with_interceptor(channel, BearerAuth::with_namespace(token, namespace)?)
+                .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+                .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
         Ok(Self { inner })
     }
 

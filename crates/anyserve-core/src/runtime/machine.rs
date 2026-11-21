@@ -5,8 +5,7 @@
 //! runtime, never through the RPC that caused them.
 
 use std::cmp::Reverse;
-use std::collections::HashSet;
-use std::ops::Bound;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,9 +14,11 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use super::api::{
-    Durability, ErrorInfo, EventKind, JobSpec, JobState, JournalHealth, Object, codes,
+    BillingEvent, Durability, ErrorInfo, EventKind, InterfacePolicy, JobSpec, JobState,
+    JournalHealth, Object, PoolTier, codes,
 };
 use super::events::{JobLog, Permit};
+use super::identity::decode_scoped_id;
 use super::input::InputLog;
 use super::state::{Attempt, FinishStatus, Job, Lease, Phase, QueueKey, State, TerminalPlan};
 use super::{Inner, JournalStatus, TimerKey};
@@ -192,18 +193,98 @@ impl Inner {
             .unwrap_or(self.config.default_max_queue)
     }
 
+    pub(crate) fn max_in_flight_per_key(&self, interface: &str) -> Option<usize> {
+        self.config
+            .interfaces
+            .get(interface)
+            .and_then(|policy| policy.max_in_flight_per_key)
+            .or(self.config.default_max_in_flight_per_key)
+    }
+
+    pub(crate) fn session_reconnect_grace(&self, session: &super::state::Session) -> Duration {
+        let mut override_grace: Option<Duration> = None;
+        for interface in &session.interfaces {
+            if let Some(policy) = self.config.interfaces.get(interface)
+                && let Some(grace) = policy
+                    .pool_tiers
+                    .iter()
+                    .find(|tier| tier.pool == session.pool)
+                    .and_then(|tier| tier.reconnect_grace)
+            {
+                override_grace = Some(match override_grace {
+                    Some(prev) => prev.min(grace),
+                    None => grace,
+                });
+            }
+        }
+        override_grace
+            .or(self.config.reconnect_grace)
+            .unwrap_or(self.config.heartbeat_timeout)
+    }
+
+    pub(crate) fn release_attempt_concurrency_locked(&self, st: &mut State, job_id: &str) {
+        let Some(job) = st.jobs.get_mut(job_id) else {
+            return;
+        };
+        if let Some(attempt) = job.attempt.as_mut()
+            && std::mem::replace(&mut attempt.concurrency_counted, false)
+        {
+            State::dec_in(
+                &mut st.in_flight_concurrency,
+                &job.namespace,
+                &job.spec.policy.concurrency_key,
+            );
+        }
+    }
+
     /// Admission checks shared by every new job. On success the job's input
     /// bytes are reserved from the input budget by the returned permit.
-    pub(crate) fn admit(&self, st: &State, spec: &JobSpec) -> Result<Permit, RuntimeError> {
+    pub(crate) fn admit(
+        &self,
+        st: &State,
+        namespace: &str,
+        spec: &JobSpec,
+    ) -> Result<Permit, RuntimeError> {
         if st.shutting_down {
             return Err(RuntimeError::unavailable("runtime is shutting down"));
         }
         if st.unfinished_jobs >= self.config.max_pending_jobs {
             return Err(RuntimeError::exhausted("unfinished job limit reached"));
         }
+        if let Some(quota) = &self.config.hooks.quota {
+            let decision = quota.check_admission(namespace, spec)?;
+            let (ns_queued, ns_running) = st.job_index.namespace_active_counts(namespace);
+            if let Some(max_q) = decision.max_queued_jobs
+                && ns_queued >= max_q
+            {
+                return Err(RuntimeError::exhausted(format!(
+                    "namespace '{namespace}' queued job quota reached"
+                )));
+            }
+            if let Some(max_in_flight) = decision.max_in_flight_jobs
+                && (ns_queued + ns_running) >= max_in_flight
+            {
+                return Err(RuntimeError::exhausted(format!(
+                    "namespace '{namespace}' in-flight job quota reached"
+                )));
+            }
+            if let Some(max_bytes) = decision.max_pending_bytes {
+                let ns_bytes: u64 = st
+                    .jobs
+                    .values()
+                    .filter(|j| j.namespace == namespace && !j.is_terminal())
+                    .map(|j| spec_payload_bytes(&j.spec))
+                    .sum();
+                if ns_bytes.saturating_add(spec_payload_bytes(spec)) > max_bytes {
+                    return Err(RuntimeError::exhausted(format!(
+                        "namespace '{namespace}' pending byte quota reached"
+                    )));
+                }
+            }
+        }
         let interface = &spec.demand.interface;
-        let queued = st.queues.get(interface).map(|q| q.len()).unwrap_or(0)
-            + st.accepting.get(interface).copied().unwrap_or(0);
+        let queued = st.queue(namespace, interface).map(|q| q.len()).unwrap_or(0)
+            + st.accepting_count(namespace, interface);
         if queued >= self.max_queue(interface) {
             return Err(RuntimeError::exhausted(format!(
                 "queue for interface '{interface}' is full"
@@ -231,13 +312,18 @@ impl Inner {
         input_permit: Permit,
         now: u64,
     ) {
+        let (namespace, raw_id) = decode_scoped_id(&job_id);
+        let namespace = namespace.to_string();
+        let raw_id = raw_id.to_string();
         st.unfinished_jobs += 1;
-        *st.accepting
-            .entry(spec.demand.interface.clone())
-            .or_default() += 1;
-        let log = self.new_log(st, &job_id);
+        if durability == Durability::Durable {
+            st.inc_accepting(&namespace, &spec.demand.interface);
+        }
+        let log = self.new_log(st, &raw_id);
         let job = Job {
             id: job_id.clone(),
+            raw_id,
+            namespace,
             ownership_epoch: None,
             spec: Arc::new(spec),
             durability,
@@ -254,7 +340,8 @@ impl Inner {
             queued_since_ms: now,
             not_before_ms: 0,
             timers: Vec::new(),
-            rejected_by: HashSet::new(),
+            rejected_sessions: HashSet::new(),
+            failed_workers: BTreeSet::new(),
             cancel_requested: None,
             indeterminate: false,
             outputs: None,
@@ -277,21 +364,39 @@ impl Inner {
 
     /// Makes an accepted job schedulable.
     pub(crate) fn accepted_locked(&self, st: &mut State, job_id: &str, now: u64) {
-        let Some(job) = st.jobs.get_mut(job_id) else {
-            return;
+        let billing_event = {
+            let Some(job) = st.jobs.get_mut(job_id) else {
+                return;
+            };
+            if job.durability == Durability::Durable {
+                State::dec_in(
+                    &mut st.accepting,
+                    &job.namespace,
+                    &job.spec.demand.interface,
+                );
+            }
+            job.log.append(None, EventKind::Accepted, now);
+            if let Some(total) = job.spec.policy.total_timeout {
+                let timer = self.timers.schedule(
+                    job.created_at_ms.saturating_add(ms(total)),
+                    TimerKey::TotalDeadline {
+                        job_id: job_id.to_string(),
+                    },
+                );
+                job.timers.push(timer);
+            }
+            (self.config.hooks.telemetry.is_some() && job.ownership_epoch.is_none()).then(|| {
+                BillingEvent::JobAccepted {
+                    namespace: job.namespace.clone(),
+                    job_id: job.raw_id.clone(),
+                    durability: job.durability,
+                    input_bytes: spec_payload_bytes(&job.spec),
+                    at_ms: now,
+                }
+            })
         };
-        if let Some(count) = st.accepting.get_mut(&job.spec.demand.interface) {
-            *count = count.saturating_sub(1);
-        }
-        job.log.append(None, EventKind::Accepted, now);
-        if let Some(total) = job.spec.policy.total_timeout {
-            let timer = self.timers.schedule(
-                job.created_at_ms.saturating_add(ms(total)),
-                TimerKey::TotalDeadline {
-                    job_id: job_id.to_string(),
-                },
-            );
-            job.timers.push(timer);
+        if let Some(event) = billing_event {
+            st.released.billing.push(event);
         }
         self.enqueue_locked(st, job_id, now);
         if st.jobs[job_id].cancel_requested.is_some() {
@@ -343,6 +448,7 @@ impl Inner {
     }
 
     pub(crate) fn freeze_locked(&self, st: &mut State, job_id: &str, reason: &str) {
+        self.release_attempt_concurrency_locked(st, job_id);
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
@@ -363,7 +469,7 @@ impl Inner {
             lease.cancelling = true;
             let session_id = lease.session_id.clone();
             if let Some(session) = st.sessions.get_mut(&session_id) {
-                session.detach(&lease_id, &lease.reserved);
+                session.detach(&lease_id, &lease.reserved, now);
             }
             self.send_locked(
                 st,
@@ -390,8 +496,12 @@ impl Inner {
     pub(crate) fn remove_unaccepted_locked(&self, st: &mut State, job_id: &str, reason: &str) {
         if let Some(mut job) = st.remove_job(job_id) {
             st.unfinished_jobs -= 1;
-            if let Some(count) = st.accepting.get_mut(&job.spec.demand.interface) {
-                *count = count.saturating_sub(1);
+            if job.durability == Durability::Durable {
+                State::dec_in(
+                    &mut st.accepting,
+                    &job.namespace,
+                    &job.spec.demand.interface,
+                );
             }
             let error = RuntimeError::unavailable(format!("job was not persisted: {reason}"));
             for waiter in job.accept_waiters.drain(..).chain(job.waiters.drain(..)) {
@@ -412,16 +522,29 @@ impl Inner {
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
+        let priority = job.spec.policy.priority.min(priority_cap);
         let key = QueueKey {
-            priority: Reverse(job.spec.policy.priority.min(priority_cap)),
+            priority: Reverse(priority),
             seq,
             job_id: job_id.to_string(),
         };
         job.queue_key = Some(key.clone());
+        let namespace = job.namespace.clone();
         let interface = job.spec.demand.interface.clone();
+        let fairness_key = job.spec.policy.fairness_key.clone();
         let spillover = (!job.spec.demand.preferred_attributes.is_empty())
             .then_some(job.spec.policy.spillover_after)
             .flatten();
+        let has_tier_spillovers = self
+            .config
+            .interfaces
+            .get(&interface)
+            .is_some_and(|policy| {
+                policy
+                    .pool_tiers
+                    .iter()
+                    .any(|tier| !tier.spillover_after.is_zero())
+            });
         let not_before = job.not_before_ms;
         if let Some(timeout) = self.queue_timeout(job) {
             let timer = self.timers.schedule(
@@ -433,7 +556,23 @@ impl Inner {
             );
             job.timers.push(timer);
         }
-        st.queues.entry(interface).or_default().insert(key);
+        if has_tier_spillovers && let Some(policy) = self.config.interfaces.get(&interface) {
+            for tier in &policy.pool_tiers {
+                if !tier.spillover_after.is_zero() {
+                    let timer = self.timers.schedule(
+                        now.saturating_add(ms(tier.spillover_after)),
+                        TimerKey::Dispatch,
+                    );
+                    job.timers.push(timer);
+                }
+            }
+        }
+        st.queue_or_insert(&namespace, &interface).insert(
+            self.config.priority_levels as usize,
+            priority,
+            &fairness_key,
+            key,
+        );
         if let Some(spillover) = spillover {
             self.timers
                 .schedule(now.saturating_add(ms(spillover)), TimerKey::Dispatch);
@@ -447,35 +586,49 @@ impl Inner {
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
-        if let Some(key) = job.queue_key.take()
-            && let Some(queue) = st.queues.get_mut(&job.spec.demand.interface)
+        let Some(key) = job.queue_key.take() else {
+            return;
+        };
+        let priority_cap = self.config.priority_levels.saturating_sub(1);
+        let priority = job.spec.policy.priority.min(priority_cap);
+        let namespace = &job.namespace;
+        let interface = &job.spec.demand.interface;
+        let fairness_key = &job.spec.policy.fairness_key;
+        if let Some(queue) = st
+            .queues
+            .get_mut(namespace.as_str())
+            .and_then(|m| m.get_mut(interface.as_str()))
         {
-            queue.remove(&key);
+            queue.remove(priority, fairness_key, &key);
         }
     }
 
     // ---------------------------------------------------------------- dispatch
 
-    /// Assigns queued jobs to sessions with free slots. Each pass looks at the
-    /// head of every queue plus a window that rotates through the rest, so
-    /// jobs behind many unmatchable ones are still reached; a pass that did
-    /// not finish its rotation schedules the next one.
+    /// Assigns queued jobs to sessions with free slots using two-level Priority
+    /// and Deficit Round-Robin across `fairness_key`s, tiered pools, concurrency
+    /// limits, and bounded-load affinity routing.
     pub(crate) fn dispatch_locked(&self, st: &mut State, now: u64) {
-        if st.shutting_down || st.queues.values().all(|queue| queue.is_empty()) {
+        if st.shutting_down || st.job_index.counts()[0] == 0 {
+            return;
+        }
+        let mut queue_keys: Vec<(String, String)> = Vec::new();
+        for (ns, ifaces) in &st.queues {
+            for (iface, queue) in ifaces {
+                if !queue.is_empty() {
+                    queue_keys.push((ns.clone(), iface.clone()));
+                }
+            }
+        }
+        if queue_keys.is_empty() {
             return;
         }
         let durable_ok = self.journal_writable();
-        let interfaces: Vec<String> = st
-            .queues
-            .iter()
-            .filter(|(_, queue)| !queue.is_empty())
-            .map(|(interface, _)| interface.clone())
-            .collect();
         let mut rotation_pending = false;
-        for interface in interfaces {
+        let priority_cap = self.config.priority_levels.saturating_sub(1);
+        for (namespace, interface) in queue_keys {
             let mut candidates: Vec<String> = st
-                .sessions_by_interface
-                .get(&interface)
+                .interface_sessions(&namespace, &interface)
                 .into_iter()
                 .flatten()
                 .filter(|id| st.sessions.get(*id).is_some_and(|s| s.free_slots() > 0))
@@ -484,30 +637,33 @@ impl Inner {
             if candidates.is_empty() {
                 continue;
             }
-            let queue = &st.queues[&interface];
-            let mut keys: Vec<QueueKey> = queue.iter().take(DISPATCH_SCAN).cloned().collect();
+            let queue = &st.queues[namespace.as_str()][interface.as_str()];
+            let mut keys = queue.collect_candidates(DISPATCH_SCAN);
             if queue.len() > DISPATCH_SCAN {
-                let head_end = keys.last().cloned().expect("non-empty head");
-                let start = st
+                let cursor = st
                     .scan_cursor
-                    .get(&interface)
-                    .filter(|cursor| **cursor > head_end)
-                    .cloned()
-                    .unwrap_or(head_end);
-                let window: Vec<QueueKey> = queue
-                    .range((Bound::Excluded(start), Bound::Unbounded))
-                    .take(DISPATCH_SCAN)
-                    .cloned()
-                    .collect();
-                if window.len() == DISPATCH_SCAN {
+                    .get(namespace.as_str())
+                    .and_then(|m| m.get(interface.as_str()));
+                let (window, next_cursor) = queue.collect_window(cursor, DISPATCH_SCAN);
+                if let Some(next_cursor) = next_cursor {
                     st.scan_cursor
-                        .insert(interface.clone(), window.last().cloned().expect("window"));
+                        .entry(namespace.clone())
+                        .or_default()
+                        .insert(interface.clone(), next_cursor);
                     rotation_pending = true;
-                } else {
-                    st.scan_cursor.remove(&interface);
+                } else if let Some(m) = st.scan_cursor.get_mut(namespace.as_str()) {
+                    m.remove(interface.as_str());
                 }
-                keys.extend(window);
+                let seen: HashSet<String> = keys.iter().map(|k| k.job_id.clone()).collect();
+                for key in window {
+                    if !seen.contains(&key.job_id) {
+                        keys.push(key);
+                    }
+                }
+            } else if let Some(m) = st.scan_cursor.get_mut(namespace.as_str()) {
+                m.remove(interface.as_str());
             }
+            let policy = self.config.interfaces.get(&interface);
             for key in keys {
                 let Some(job) = st.jobs.get(&key.job_id) else {
                     continue;
@@ -516,11 +672,23 @@ impl Inner {
                 {
                     continue;
                 }
+                let ckey = &job.spec.policy.concurrency_key;
+                if !ckey.is_empty() {
+                    let cap = self.max_in_flight_per_key(&interface).unwrap_or(1);
+                    if st.in_flight_key_count(&namespace, ckey) >= cap {
+                        continue;
+                    }
+                }
+                let prio = job.spec.policy.priority.min(priority_cap);
+                let fairness_key = job.spec.policy.fairness_key.clone();
                 let mut rng = st.rng;
-                let picked = pick_session(st, job, &mut candidates, now, &mut rng);
+                let picked = pick_session(st, job, policy, &mut candidates, now, &mut rng);
                 st.rng = rng;
                 if let Some(session_id) = picked {
                     self.begin_attempt_locked(st, &key.job_id, &session_id, now);
+                    if let Some(queue) = st.queue_mut(&namespace, &interface) {
+                        queue.rotate_key_to_back(prio, &fairness_key);
+                    }
                 }
                 if candidates.is_empty() {
                     break;
@@ -532,17 +700,208 @@ impl Inner {
         }
     }
 
+    /// Direct zero-queue ephemeral dispatch path: when no queued backlog exists for
+    /// `(namespace, interface)` and a ready worker matches immediately, transitions
+    /// straight to `Phase::Assigned` and inserts into `JobIndex` once (avoiding
+    /// `InterfaceQueue` + `QueueKey` + redundant `BTreeSet` churn).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn invoke_ephemeral_direct_locked(
+        &self,
+        st: &mut State,
+        namespace: &str,
+        raw_id: String,
+        scoped_id: String,
+        spec: JobSpec,
+        max_attempts: u32,
+        input: Option<Arc<InputLog>>,
+        input_permit: Permit,
+        now: u64,
+    ) -> Result<(Arc<JobLog>, tokio::sync::watch::Receiver<u64>), Permit> {
+        if st.shutting_down
+            || st
+                .queue(namespace, &spec.demand.interface)
+                .is_some_and(|q| !q.is_empty())
+        {
+            return Err(input_permit);
+        }
+        let ckey = &spec.policy.concurrency_key;
+        if !ckey.is_empty() {
+            let cap = self
+                .max_in_flight_per_key(&spec.demand.interface)
+                .unwrap_or(1);
+            if st.in_flight_key_count(namespace, ckey) >= cap {
+                return Err(input_permit);
+            }
+        }
+        let policy = self.config.interfaces.get(&spec.demand.interface);
+        let mut rng = st.rng;
+        let picked = pick_direct_session(st, namespace, &spec, policy, now, &mut rng);
+        st.rng = rng;
+        let Some(session_id) = picked else {
+            return Err(input_permit);
+        };
+
+        st.unfinished_jobs += 1;
+        let limit = self.config.limits.assign_inline_limit as u64;
+        let lease_id = new_id();
+        let attempt_id = new_id();
+        let session = st.sessions.get_mut(&session_id).expect("picked session");
+        let worker_id = session.worker_id.clone();
+        let pool = session.pool.clone();
+        session.attach(lease_id.clone(), &spec.demand.required_capacity);
+        session.assigned_since_report += 1;
+        if let Some(mesh) = &self.peer_mesh {
+            mesh.notify_directory_changed();
+        }
+        let concurrency_counted = if !ckey.is_empty() {
+            st.inc_in_flight_key(namespace, ckey);
+            true
+        } else {
+            false
+        };
+        if self.config.hooks.telemetry.is_some() {
+            st.released.billing.push(BillingEvent::JobAccepted {
+                namespace: namespace.to_string(),
+                job_id: raw_id.clone(),
+                durability: Durability::Ephemeral,
+                input_bytes: spec_payload_bytes(&spec),
+                at_ms: now,
+            });
+        }
+        let log = self.new_log(st, &raw_id);
+        log.set_primary(true);
+        let changes = log.subscribe();
+        log.append(None, EventKind::Accepted, now);
+        log.append(
+            Some(attempt_id.clone()),
+            EventKind::Assigned {
+                worker_id: worker_id.clone(),
+                attempt_number: 1,
+            },
+            now,
+        );
+        let mut timers = Vec::new();
+        if let Some(total) = spec.policy.total_timeout {
+            timers.push(self.timers.schedule(
+                now.saturating_add(ms(total)),
+                TimerKey::TotalDeadline {
+                    job_id: scoped_id.clone(),
+                },
+            ));
+        }
+        if let Some(exec_timeout) = spec.policy.execution_timeout {
+            timers.push(self.timers.schedule(
+                now.saturating_add(ms(exec_timeout)),
+                TimerKey::ExecutionDeadline {
+                    job_id: scoped_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                },
+            ));
+        }
+        let inline_bytes = spec_payload_bytes(&spec)
+            + spec
+                .inputs
+                .iter()
+                .flat_map(|o| o.metadata())
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum::<u64>();
+        let reserved = spec.demand.required_capacity.clone();
+        let job = Job {
+            id: scoped_id.clone(),
+            raw_id,
+            namespace: namespace.to_string(),
+            ownership_epoch: None,
+            spec: Arc::new(spec),
+            durability: Durability::Ephemeral,
+            spec_hash: String::new(),
+            max_attempts,
+            phase: Phase::Assigned,
+            created_at_ms: now,
+            updated_at_ms: now,
+            attempt_count: 1,
+            attempt: Some(Attempt {
+                attempt_id: attempt_id.clone(),
+                lease_id: lease_id.clone(),
+                number: 1,
+                session_id: session_id.clone(),
+                worker_id: worker_id.clone(),
+                pool,
+                started_at_ms: now,
+                inputs_via_attempt: input.is_some() || inline_bytes > limit,
+                last_frame_seq: 0,
+                exposed: false,
+                concurrency_counted,
+            }),
+            last_attempt_id: Some(attempt_id),
+            last_worker_id: Some(worker_id),
+            queue_key: None,
+            queued_since_ms: now,
+            not_before_ms: 0,
+            timers,
+            rejected_sessions: HashSet::new(),
+            failed_workers: BTreeSet::new(),
+            cancel_requested: None,
+            indeterminate: false,
+            outputs: None,
+            error: None,
+            log: Arc::clone(&log),
+            streamed: true,
+            input,
+            input_permit: Some(input_permit),
+            output_bytes: 0,
+            accept_waiters: Vec::new(),
+            waiters: Vec::new(),
+            finish_waiters: Vec::new(),
+            finished_leases: Vec::new(),
+        };
+        let assign = build_assign(st.generation, &job);
+        st.leases.insert(
+            lease_id,
+            Lease {
+                job_id: scoped_id,
+                session_id: session_id.clone(),
+                reserved,
+                cancelling: false,
+            },
+        );
+        st.insert_job(job);
+        self.send_locked(
+            st,
+            &session_id,
+            pb::server_message::Msg::Assign(assign),
+            now,
+        );
+        Ok((log, changes))
+    }
+
     fn begin_attempt_locked(&self, st: &mut State, job_id: &str, session_id: &str, now: u64) {
         self.dequeue_locked(st, job_id);
         let limit = self.config.limits.assign_inline_limit as u64;
         let reserved = st.jobs[job_id].spec.demand.required_capacity.clone();
         let session = st.sessions.get_mut(session_id).expect("picked session");
         let worker_id = session.worker_id.clone();
+        let pool = session.pool.clone();
         let lease_id = new_id();
         let attempt_id = new_id();
         session.attach(lease_id.clone(), &reserved);
         session.assigned_since_report += 1;
         st.update_job(job_id, |job| job.updated_at_ms = now);
+        if let Some(mesh) = &self.peer_mesh {
+            mesh.notify_directory_changed();
+        }
+        let (ckey, ns) = {
+            let job = st.jobs.get(job_id).expect("queued job");
+            (
+                job.spec.policy.concurrency_key.clone(),
+                job.namespace.clone(),
+            )
+        };
+        let concurrency_counted = if !ckey.is_empty() {
+            st.inc_in_flight_key(&ns, &ckey);
+            true
+        } else {
+            false
+        };
         let job = st.jobs.get_mut(job_id).expect("queued job");
         job.attempt_count += 1;
         let inline_bytes = spec_payload_bytes(&job.spec)
@@ -559,10 +918,12 @@ impl Inner {
             number: job.attempt_count,
             session_id: session_id.to_string(),
             worker_id: worker_id.clone(),
+            pool,
             started_at_ms: now,
             inputs_via_attempt: job.input.is_some() || inline_bytes > limit,
             last_frame_seq: 0,
             exposed: false,
+            concurrency_counted,
         });
         job.last_attempt_id = Some(attempt_id);
         job.last_worker_id = Some(worker_id);
@@ -616,6 +977,7 @@ impl Inner {
         {
             session.assigned_since_report = session.assigned_since_report.saturating_sub(1);
         }
+        self.release_attempt_concurrency_locked(st, job_id);
         self.release_lease_locked(st, lease_id);
         let job = st.jobs.get_mut(job_id).expect("job");
         job.attempt = None;
@@ -745,7 +1107,7 @@ fn build_assign(generation: u64, job: &Job) -> pb::Assign {
     pb::Assign {
         lease_id: attempt.lease_id.clone(),
         attempt_id: attempt.attempt_id.clone(),
-        job_id: job.id.clone(),
+        job_id: job.raw_id.clone(),
         attempt_number: attempt.number,
         generation,
         interface: spec.demand.interface.clone(),
@@ -777,8 +1139,8 @@ fn build_assign(generation: u64, job: &Job) -> pb::Assign {
 }
 
 impl Inner {
-    /// Ends the session's current connection; its leases wait one heartbeat
-    /// timeout for a reconnect.
+    /// Ends the session's current connection; its leases wait `reconnect_grace`
+    /// (falling back to `heartbeat_timeout`) for a reconnect.
     pub(crate) fn disconnect_locked(&self, st: &mut State, session_id: &str, now: u64) {
         let Some(session) = st.sessions.get_mut(session_id) else {
             return;
@@ -792,9 +1154,14 @@ impl Inner {
             st.remove_session(session_id);
             return;
         }
+        let grace = self.session_reconnect_grace(session);
         let connection = session.connection;
+        if grace.is_zero() {
+            self.session_expired_locked(st, session_id, connection, now);
+            return;
+        }
         self.timers.schedule(
-            now.saturating_add(ms(self.config.heartbeat_timeout)),
+            now.saturating_add(ms(grace)),
             TimerKey::SessionGrace {
                 session_id: session_id.to_string(),
                 connection,
@@ -816,22 +1183,55 @@ impl Inner {
         receipt: Option<(String, String)>,
         now: u64,
     ) -> bool {
-        let Some(job) = st.jobs.get(job_id) else {
-            return false;
+        let (lease_id, exposed, attempt_session_id, attempt_worker_id, retry) = {
+            let Some(job) = st.jobs.get(job_id) else {
+                return false;
+            };
+            let Some(attempt) = job.attempt.as_ref() else {
+                return false;
+            };
+            let retry = error.retryable
+                && !attempt.exposed
+                && job.cancel_requested.is_none()
+                && !st.shutting_down
+                && job.attempt_count < job.max_attempts;
+            (
+                attempt.lease_id.clone(),
+                attempt.exposed,
+                attempt.session_id.clone(),
+                attempt.worker_id.clone(),
+                retry,
+            )
         };
-        let Some(attempt) = job.attempt.as_ref() else {
-            return false;
+        self.release_attempt_concurrency_locked(st, job_id);
+        st.jobs
+            .get_mut(job_id)
+            .expect("job")
+            .failed_workers
+            .insert(attempt_worker_id);
+        if matches!(
+            error.code.as_str(),
+            codes::WORKER_FAILED
+                | codes::WORKER_REJECTED
+                | codes::EXECUTION_TIMEOUT
+                | codes::WORKER_LOST
+        ) && let Some(session) = st.sessions.get_mut(&attempt_session_id)
+        {
+            session.consecutive_failures = session.consecutive_failures.saturating_add(1);
+            if session.consecutive_failures >= 3 {
+                session.cooldown_until_ms = now.saturating_add(2_000);
+                self.timers
+                    .schedule(session.cooldown_until_ms, TimerKey::Dispatch);
+            }
+        }
+        let backoff_ms = if error.code == codes::WORKER_PREEMPTED {
+            0
+        } else {
+            self.backoff(&st.jobs[job_id])
         };
-        let lease_id = attempt.lease_id.clone();
-        let exposed = attempt.exposed;
-        let retry = error.retryable
-            && !exposed
-            && job.cancel_requested.is_none()
-            && !st.shutting_down
-            && job.attempt_count < job.max_attempts;
         if retry {
-            if job.ownership_epoch.is_some() {
-                let retry_at = now.saturating_add(self.backoff(job));
+            if st.jobs[job_id].ownership_epoch.is_some() {
+                let retry_at = now.saturating_add(backoff_ms);
                 st.jobs.get_mut(job_id).expect("job").not_before_ms = retry_at;
                 let (release_lease, cancel_lease) = match lease_end {
                     LeaseEnd::Release => (Some(lease_id), None),
@@ -853,8 +1253,7 @@ impl Inner {
             }
             let job = st.jobs.get_mut(job_id).expect("job");
             let attempt = job.attempt.take().expect("attempt");
-            let backoff = self.backoff(job);
-            job.not_before_ms = now.saturating_add(backoff);
+            job.not_before_ms = now.saturating_add(backoff_ms);
             job.log.append(
                 Some(attempt.attempt_id.clone()),
                 EventKind::AttemptRestarted {
@@ -872,6 +1271,8 @@ impl Inner {
             self.enqueue_locked(st, job_id, now);
             return true;
         }
+        let job_attempt_count = st.jobs[job_id].attempt_count;
+        let job_max_attempts = st.jobs[job_id].max_attempts;
         let error = if exposed && error.retryable {
             ErrorInfo::new(
                 codes::OUTPUT_INTERRUPTED,
@@ -881,12 +1282,12 @@ impl Inner {
                 ),
                 false,
             )
-        } else if error.retryable && job.attempt_count >= job.max_attempts {
+        } else if error.retryable && job_attempt_count >= job_max_attempts {
             ErrorInfo::new(
                 codes::ATTEMPTS_EXHAUSTED,
                 format!(
                     "{} ({}) after {} attempts",
-                    error.message, error.code, job.attempt_count
+                    error.message, error.code, job_attempt_count
                 ),
                 false,
             )
@@ -929,10 +1330,14 @@ impl Inner {
         if self.postgres.is_some() {
             self.cluster_wakeup.notify_one();
         }
+        if let Some(mesh) = &self.peer_mesh {
+            mesh.notify_directory_changed();
+        }
+        let now = crate::now_ms();
         if let Some(lease) = st.leases.remove(lease_id)
             && let Some(session) = st.sessions.get_mut(&lease.session_id)
         {
-            session.detach(lease_id, &lease.reserved);
+            session.detach(lease_id, &lease.reserved, now);
         }
     }
 
@@ -1113,6 +1518,7 @@ impl Inner {
 
     fn apply_terminal_locked(&self, st: &mut State, job_id: &str, plan: TerminalPlan, now: u64) {
         self.dequeue_locked(st, job_id);
+        self.release_attempt_concurrency_locked(st, job_id);
         st.update_job(job_id, |job| {
             job.phase = Phase::Terminal(plan.state);
             job.updated_at_ms = now;
@@ -1129,9 +1535,24 @@ impl Inner {
         };
         let output_bytes = outputs.iter().map(|o| o.inline_len() as u64).sum::<u64>();
         job.outputs = (plan.state == JobState::Succeeded).then(|| Arc::new(outputs.clone()));
+        let mut attempt_pool = String::new();
+        let mut started_at_ms = job.created_at_ms;
         if let Some(attempt) = job.attempt.take() {
+            attempt_pool = attempt.pool;
+            started_at_ms = attempt.started_at_ms;
             job.last_attempt_id = Some(attempt.attempt_id);
             job.last_worker_id = Some(attempt.worker_id);
+        }
+        if self.config.hooks.telemetry.is_some() {
+            st.released.billing.push(BillingEvent::AttemptFinished {
+                namespace: job.namespace.clone(),
+                job_id: job.raw_id.clone(),
+                pool: attempt_pool,
+                worker_id: job.last_worker_id.clone().unwrap_or_default(),
+                state: plan.state,
+                duration_ms: now.saturating_sub(started_at_ms),
+                output_bytes,
+            });
         }
         // Inputs and params leave with the full spec, freed after the lock.
         let slim = Arc::new(without_payload(&job.spec));
@@ -1310,11 +1731,44 @@ fn next_random(rng: &mut u64) -> u64 {
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
 }
 
-/// Picks a session for `job`: eligible sessions with the most preferred
-/// attributes, then the less loaded of two random ones.
+fn rendezvous_hash(affinity_key: &str, worker_id: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in affinity_key
+        .as_bytes()
+        .iter()
+        .chain([0xffu8].iter())
+        .chain(worker_id.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^ (hash >> 31)
+}
+
+fn tier_rank_for_session(
+    tiers: &[PoolTier],
+    pool: &str,
+    elapsed_ms: u64,
+) -> Option<Reverse<usize>> {
+    if tiers.is_empty() {
+        return Some(Reverse(0));
+    }
+    let idx = tiers.iter().position(|t| t.pool == pool)?;
+    (elapsed_ms >= ms(tiers[idx].spillover_after)).then_some(Reverse(idx))
+}
+
+/// Picks a session for `job`: avoids previously failed workers/sessions and
+/// workers in cooldown, prefers earlier unlocked pool tiers, matches the most
+/// preferred attributes, routes `affinity_key` via bounded-load Rendezvous
+/// Hashing, and otherwise picks the less loaded of two random sessions.
 fn pick_session(
     st: &State,
     job: &Job,
+    policy: Option<&InterfacePolicy>,
     candidates: &mut Vec<String>,
     now: u64,
     rng: &mut u64,
@@ -1326,13 +1780,16 @@ fn pick_session(
         }
         _ => true,
     };
-    // Sessions that rejected this job are used only when no other fits; the
-    // retry backoff already spaced the new attempt out.
+    let tiers = policy.map(|p| p.pool_tiers.as_slice()).unwrap_or(&[]);
+    let elapsed_ms = now.saturating_sub(job.queued_since_ms);
     let mut best: Vec<&super::state::Session> = Vec::new();
-    let mut best_rank = (false, 0usize);
+    let mut best_rank = (false, false, Reverse(usize::MAX), 0usize);
     candidates.retain(|id| {
         let Some(session) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
             return false;
+        };
+        let Some(tier_rank) = tier_rank_for_session(tiers, &session.pool, elapsed_ms) else {
+            return true;
         };
         if !demand
             .required_attributes
@@ -1352,7 +1809,10 @@ fn pick_session(
         if !session.fits(&demand.required_capacity) {
             return true;
         }
-        let rank = (!job.rejected_by.contains(&session.id), matches);
+        let healthy = !job.failed_workers.contains(&session.worker_id)
+            && !job.rejected_sessions.contains(&session.id);
+        let not_in_cooldown = now >= session.cooldown_until_ms;
+        let rank = (healthy, not_in_cooldown, tier_rank, matches);
         if best.is_empty() || rank > best_rank {
             best_rank = rank;
             best.clear();
@@ -1362,17 +1822,204 @@ fn pick_session(
         }
         true
     });
-    match best.len() {
-        0 => None,
-        1 => Some(best[0].id.clone()),
-        n => {
-            let first = (next_random(rng) % n as u64) as usize;
-            let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
-            if second >= first {
-                second += 1;
-            }
-            let (a, b) = (best[first], best[second]);
-            Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
+    if best.is_empty() {
+        return None;
+    }
+    let (best_healthy, best_not_cooled, _, _) = best_rank;
+    if (!best_healthy || !best_not_cooled) && now.saturating_sub(job.queued_since_ms) < 5_000 {
+        let has_better_peer = st
+            .interface_sessions(&job.namespace, &demand.interface)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| st.sessions.get(id))
+            .any(|peer| {
+                peer.tx.is_some()
+                    && !peer.draining
+                    && tier_rank_for_session(tiers, &peer.pool, elapsed_ms).is_some()
+                    && demand
+                        .required_attributes
+                        .iter()
+                        .all(|(key, value)| peer.attributes.get(key) == Some(value))
+                    && demand.required_capacity.iter().all(|(name, needed)| {
+                        *needed <= 0
+                            || peer
+                                .total_capacity
+                                .get(name)
+                                .is_some_and(|total| *total >= *needed)
+                    })
+                    && if !best_healthy {
+                        !job.failed_workers.contains(&peer.worker_id)
+                            && !job.rejected_sessions.contains(&peer.id)
+                    } else {
+                        now >= peer.cooldown_until_ms
+                    }
+            });
+        if has_better_peer {
+            return None;
         }
+    }
+    if best.len() == 1 {
+        return Some(best[0].id.clone());
+    }
+    if !demand.affinity_key.is_empty() {
+        best.sort_by_key(|s| Reverse(rendezvous_hash(&demand.affinity_key, &s.worker_id)));
+        if let Some(primary) = best
+            .iter()
+            .find(|s| (s.active.len() as f64 / s.max_concurrency.max(1) as f64) < 0.85)
+        {
+            return Some(primary.id.clone());
+        }
+    }
+    let n = best.len();
+    let first = (next_random(rng) % n as u64) as usize;
+    let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
+    if second >= first {
+        second += 1;
+    }
+    let (a, b) = (best[first], best[second]);
+    Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
+}
+
+/// Zero-allocation session selector for immediate ephemeral dispatch (`elapsed_ms == 0`).
+fn pick_direct_session(
+    st: &State,
+    namespace: &str,
+    spec: &JobSpec,
+    policy: Option<&InterfacePolicy>,
+    now: u64,
+    rng: &mut u64,
+) -> Option<String> {
+    let demand = &spec.demand;
+    let sessions = st.interface_sessions(namespace, &demand.interface)?;
+    let spill_open = demand.preferred_attributes.is_empty()
+        || spec.policy.spillover_after.is_some_and(|d| d.is_zero());
+    let tiers = policy.map(|p| p.pool_tiers.as_slice()).unwrap_or(&[]);
+
+    if !demand.affinity_key.is_empty() {
+        let mut best_rank = (false, Reverse(usize::MAX), 0usize);
+        let mut under_load: Option<((u64, &str), &super::state::Session)> = None;
+        let mut fallback: Option<((u64, &str), &super::state::Session)> = None;
+        for id in sessions {
+            let Some(s) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
+                continue;
+            };
+            let Some(tier_rank) = tier_rank_for_session(tiers, &s.pool, 0) else {
+                continue;
+            };
+            if !demand
+                .required_attributes
+                .iter()
+                .all(|(k, v)| s.attributes.get(k) == Some(v))
+            {
+                continue;
+            }
+            let matches = demand
+                .preferred_attributes
+                .iter()
+                .filter(|(k, v)| s.attributes.get(*k) == Some(v))
+                .count();
+            if !spill_open && matches < demand.preferred_attributes.len() {
+                continue;
+            }
+            if !s.fits(&demand.required_capacity) {
+                continue;
+            }
+            let rank = (now >= s.cooldown_until_ms, tier_rank, matches);
+            if under_load.is_none() && fallback.is_none() || rank > best_rank {
+                best_rank = rank;
+                under_load = None;
+                fallback = None;
+            }
+            if rank == best_rank {
+                let score = (
+                    rendezvous_hash(&demand.affinity_key, &s.worker_id),
+                    s.worker_id.as_str(),
+                );
+                let healthy_load = (s.active.len() as f64 / s.max_concurrency.max(1) as f64) < 0.85;
+                if healthy_load && under_load.is_none_or(|(best_s, _)| score > best_s) {
+                    under_load = Some((score, s));
+                }
+                if fallback.is_none_or(|(best_s, _)| score > best_s) {
+                    fallback = Some((score, s));
+                }
+            }
+        }
+        return under_load.or(fallback).map(|(_, s)| s.id.clone());
+    }
+
+    let mut stack: [Option<&super::state::Session>; 32] = [None; 32];
+    let mut stack_len = 0usize;
+    let mut overflow: Vec<&super::state::Session> = Vec::new();
+    let mut best_rank = (false, Reverse(usize::MAX), 0usize);
+    for id in sessions {
+        let Some(s) = st.sessions.get(id).filter(|s| s.free_slots() > 0) else {
+            continue;
+        };
+        let Some(tier_rank) = tier_rank_for_session(tiers, &s.pool, 0) else {
+            continue;
+        };
+        if !demand
+            .required_attributes
+            .iter()
+            .all(|(k, v)| s.attributes.get(k) == Some(v))
+        {
+            continue;
+        }
+        let matches = demand
+            .preferred_attributes
+            .iter()
+            .filter(|(k, v)| s.attributes.get(*k) == Some(v))
+            .count();
+        if !spill_open && matches < demand.preferred_attributes.len() {
+            continue;
+        }
+        if !s.fits(&demand.required_capacity) {
+            continue;
+        }
+        let rank = (now >= s.cooldown_until_ms, tier_rank, matches);
+        if (stack_len == 0 && overflow.is_empty()) || rank > best_rank {
+            best_rank = rank;
+            stack_len = 0;
+            overflow.clear();
+        }
+        if rank == best_rank {
+            if stack_len < 32 && overflow.is_empty() {
+                stack[stack_len] = Some(s);
+                stack_len += 1;
+            } else {
+                if overflow.is_empty() {
+                    overflow.extend(stack[..stack_len].iter().flatten().copied());
+                }
+                overflow.push(s);
+            }
+        }
+    }
+    if !best_rank.0 && (stack_len > 0 || !overflow.is_empty()) {
+        // Cooldown peer present: defer to normal queue so `has_better_peer` wait applies.
+        return None;
+    }
+    if overflow.is_empty() {
+        match stack_len {
+            0 => None,
+            1 => Some(stack[0].unwrap().id.clone()),
+            n => {
+                let first = (next_random(rng) % n as u64) as usize;
+                let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
+                if second >= first {
+                    second += 1;
+                }
+                let (a, b) = (stack[first].unwrap(), stack[second].unwrap());
+                Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
+            }
+        }
+    } else {
+        let n = overflow.len();
+        let first = (next_random(rng) % n as u64) as usize;
+        let mut second = (next_random(rng) % (n as u64 - 1)) as usize;
+        if second >= first {
+            second += 1;
+        }
+        let (a, b) = (overflow[first], overflow[second]);
+        Some(if load_score(b) < load_score(a) { b } else { a }.id.clone())
     }
 }

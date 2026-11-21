@@ -70,7 +70,22 @@ fn to_metadata(map: std::collections::HashMap<String, String>) -> Metadata {
 }
 
 impl Runtime {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open_session(&self, hello: pb::Hello) -> Result<SessionHandle, RuntimeError> {
+        self.open_session_for(
+            hello,
+            crate::auth::Principal {
+                role: crate::auth::Role::Worker,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn open_session_for(
+        &self,
+        hello: pb::Hello,
+        principal: crate::auth::Principal,
+    ) -> Result<SessionHandle, RuntimeError> {
         let limits = &self.inner.config.limits;
         let identifier = limits.max_identifier_bytes as usize;
         if hello.interfaces.is_empty() {
@@ -83,6 +98,7 @@ impl Runtime {
                 .any(|i| i.is_empty() || i.len() > identifier)
             || hello.worker_id.len() > identifier
             || hello.resume_session_id.len() > identifier
+            || hello.pool.len() > identifier
         {
             return Err(RuntimeError::invalid(format!(
                 "Hello identifiers must be 1..={identifier} bytes and at most {} interfaces",
@@ -109,6 +125,11 @@ impl Runtime {
         let interfaces: BTreeSet<String> = hello.interfaces.into_iter().collect();
         let total_capacity = hello.total_capacity.into_iter().collect();
         let max_concurrency = hello.max_concurrency.max(1);
+        let pool = principal
+            .forced_pool
+            .clone()
+            .unwrap_or_else(|| hello.pool.clone());
+        let namespace = principal.namespace;
 
         let inner = &self.inner;
         let mut st = inner.lock();
@@ -120,7 +141,9 @@ impl Runtime {
             && st
                 .sessions
                 .get(&hello.resume_session_id)
-                .is_some_and(|session| session.worker_id == worker_id);
+                .is_some_and(|session| {
+                    session.worker_id == worker_id && session.namespace == namespace
+                });
         if !resume && st.sessions.len() >= inner.config.max_sessions {
             return Err(RuntimeError::exhausted("worker session limit reached"));
         }
@@ -136,6 +159,8 @@ impl Runtime {
         if resume {
             st.unindex_session(&session_id);
             let session = st.sessions.get_mut(&session_id).expect("resumed session");
+            session.pool = pool;
+            session.forced_pool = principal.forced_pool;
             session.interfaces = interfaces;
             session.attributes = attributes;
             session.metadata = metadata;
@@ -148,12 +173,16 @@ impl Runtime {
             session.connection = connection;
             session.disconnected_at_ms = None;
             session.last_seen_ms = now;
+            session.idle_since_ms = session.active.is_empty().then_some(now);
         } else {
             st.sessions.insert(
                 session_id.clone(),
                 Session {
                     id: session_id.clone(),
                     worker_id: worker_id.clone(),
+                    namespace,
+                    pool,
+                    forced_pool: principal.forced_pool,
                     interfaces,
                     attributes,
                     metadata,
@@ -170,6 +199,9 @@ impl Runtime {
                     connected_at_ms: now,
                     last_seen_ms: now,
                     disconnected_at_ms: None,
+                    idle_since_ms: Some(now),
+                    consecutive_failures: 0,
+                    cooldown_until_ms: 0,
                 },
             );
         }
@@ -197,7 +229,7 @@ impl Runtime {
             let job_id = lease.job_id.clone();
             let reserved = lease.reserved.clone();
             if let Some(old) = st.sessions.get_mut(&previous) {
-                old.detach(lease_id, &reserved);
+                old.detach(lease_id, &reserved, now);
             }
             st.sessions
                 .get_mut(&session_id)
@@ -252,6 +284,9 @@ impl Runtime {
         }
         inner.dispatch_locked(&mut st, now);
         inner.cluster_wakeup.notify_one();
+        if let Some(mesh) = &inner.peer_mesh {
+            mesh.notify_directory_changed();
+        }
         Ok(SessionHandle {
             session_id,
             connection,
@@ -329,8 +364,69 @@ impl Runtime {
                     };
                 }
             }
-            pb::worker_message::Msg::Draining(_) => {
+            pb::worker_message::Msg::Draining(draining) => {
                 session.draining = true;
+                if draining.preempting {
+                    let leases: Vec<String> = session.active.iter().cloned().collect();
+                    for lease_id in leases {
+                        let Some(lease) = st.leases.get(&lease_id) else {
+                            continue;
+                        };
+                        if lease.cancelling {
+                            continue;
+                        }
+                        let job_id = lease.job_id.clone();
+                        let preemptable = st.jobs.get(&job_id).is_some_and(|job| {
+                            matches!(job.phase, Phase::Assigned | Phase::Running)
+                                && job
+                                    .attempt
+                                    .as_ref()
+                                    .is_some_and(|a| a.lease_id == lease_id && !a.exposed)
+                        });
+                        if preemptable {
+                            inner.attempt_ended_locked(
+                                &mut st,
+                                &job_id,
+                                ErrorInfo::new(
+                                    codes::WORKER_PREEMPTED,
+                                    "worker preempted while draining",
+                                    true,
+                                ),
+                                LeaseEnd::Cancel(codes::WORKER_PREEMPTED.to_string()),
+                                None,
+                                now,
+                            );
+                            may_free_slot = true;
+                        }
+                    }
+                }
+            }
+            pb::worker_message::Msg::UpdateAttributes(update) => {
+                let limits = &inner.config.limits;
+                if update.pool.len() > limits.max_identifier_bytes as usize {
+                    return Err(RuntimeError::invalid(
+                        "UpdateAttributes.pool exceeds max_identifier_bytes",
+                    ));
+                }
+                if update.total_capacity.values().any(|value| *value < 0) {
+                    return Err(RuntimeError::invalid(
+                        "UpdateAttributes.total_capacity cannot be negative",
+                    ));
+                }
+                let attributes = to_metadata(update.attributes);
+                if metadata_size(&attributes) > limits.max_metadata_bytes as usize {
+                    return Err(RuntimeError::invalid(
+                        "UpdateAttributes.attributes exceed max_metadata_bytes",
+                    ));
+                }
+                session.attributes = attributes;
+                if !update.total_capacity.is_empty() {
+                    session.total_capacity = update.total_capacity.into_iter().collect();
+                }
+                if !update.pool.is_empty() && session.forced_pool.is_none() {
+                    session.pool = update.pool;
+                }
+                may_free_slot = true;
             }
             pb::worker_message::Msg::CancelAck(ack) => {
                 if st
@@ -362,7 +458,7 @@ impl Runtime {
                         });
                     }
                 } else if current && matches!(job.phase, Phase::Assigned | Phase::Running) {
-                    job.rejected_by.insert(session_id.to_string());
+                    job.rejected_sessions.insert(session_id.to_string());
                     let reason = if reply.reject_reason.is_empty() {
                         "worker rejected the assignment".to_string()
                     } else {
@@ -382,6 +478,12 @@ impl Runtime {
         }
         if may_free_slot {
             inner.dispatch_locked(&mut st, now);
+            if inner.postgres.is_some() {
+                inner.cluster_wakeup.notify_one();
+            }
+            if let Some(mesh) = &inner.peer_mesh {
+                mesh.notify_directory_changed();
+            }
         }
         Ok(())
     }
@@ -397,6 +499,9 @@ impl Runtime {
             .is_some_and(|session| session.connection == connection)
         {
             inner.disconnect_locked(&mut st, session_id, now_ms());
+            if let Some(mesh) = &inner.peer_mesh {
+                mesh.notify_directory_changed();
+            }
         }
     }
 
@@ -771,7 +876,15 @@ impl Runtime {
                     let receipt = Some((lease_id.clone(), digest.clone()));
                     match error {
                         None => {
+                            let attempt_session_id =
+                                job.attempt.as_ref().map(|a| a.session_id.clone());
                             job.finish_waiters.push(tx);
+                            if let Some(sid) = attempt_session_id
+                                && let Some(session) = st.sessions.get_mut(&sid)
+                            {
+                                session.consecutive_failures = 0;
+                                session.cooldown_until_ms = 0;
+                            }
                             inner.finish_job_locked(
                                 &mut st,
                                 &job_id,
@@ -980,7 +1093,7 @@ mod tests {
             .session_message(
                 &session_id,
                 handle.connection,
-                pb::worker_message::Msg::Draining(pb::Draining {}),
+                pb::worker_message::Msg::Draining(pb::Draining::default()),
             )
             .unwrap();
         let waiting = runtime

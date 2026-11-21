@@ -144,15 +144,52 @@ impl Inner {
                 );
             }
         }
-        let (workers, limit) = {
+        let (workers, policies, limit) = {
             let st = self.lock();
             let mut slots = 0usize;
-            let workers: Vec<_> = st.sessions.values().filter(|s| s.free_slots() > 0).map(|s| {
-                slots = slots.saturating_add(s.free_slots() as usize);
-                let capacity: std::collections::BTreeMap<_,_> = s.total_capacity.iter()
-                    .map(|(k,v)| (k, v.saturating_sub(s.reserved.get(k).copied().unwrap_or(0)))) .collect();
-                json!({ "interfaces": s.interfaces, "attributes": s.attributes, "capacity": capacity })
-            }).collect();
+            let workers: Vec<_> = st
+                .sessions
+                .values()
+                .filter(|s| s.free_slots() > 0)
+                .map(|s| {
+                    slots = slots.saturating_add(s.free_slots() as usize);
+                    let capacity: std::collections::BTreeMap<_, _> = s
+                        .total_capacity
+                        .iter()
+                        .map(|(k, v)| {
+                            (k, v.saturating_sub(s.reserved.get(k).copied().unwrap_or(0)))
+                        })
+                        .collect();
+                    json!({
+                        "worker_id": s.worker_id,
+                        "namespace": s.namespace,
+                        "pool": s.pool,
+                        "interfaces": s.interfaces,
+                        "attributes": s.attributes,
+                        "capacity": capacity
+                    })
+                })
+                .collect();
+            let mut policies_map = serde_json::Map::new();
+            for (iface, policy) in &self.config.interfaces {
+                let tiers: Vec<_> = policy
+                    .pool_tiers
+                    .iter()
+                    .map(|tier| {
+                        json!({
+                            "pool": tier.pool,
+                            "spillover_ms": ms(tier.spillover_after).min(i64::MAX as u64) as i64
+                        })
+                    })
+                    .collect();
+                policies_map.insert(
+                    iface.clone(),
+                    json!({
+                        "max_in_flight_per_key": policy.max_in_flight_per_key.or(self.config.default_max_in_flight_per_key),
+                        "pool_tiers": tiers
+                    }),
+                );
+            }
             let available = self
                 .config
                 .max_pending_jobs
@@ -160,11 +197,12 @@ impl Inner {
             // A small sweep also expires orphaned jobs when no worker is free.
             (
                 json!(workers),
+                serde_json::Value::Object(policies_map),
                 available.min(if slots == 0 { 16 } else { slots }).min(256),
             )
         };
         let claimed = pg
-            .claim(workers, limit, Arc::clone(&self.input_budget))
+            .claim_with_policies(workers, policies, limit, Arc::clone(&self.input_budget))
             .await?;
         let busy = !claimed.is_empty();
         for claimed in claimed {
@@ -196,6 +234,7 @@ impl Inner {
             local.attempt_count = job.attempt_count;
             local.last_attempt_id = job.last_attempt_id;
             local.last_worker_id = job.last_worker_id;
+            local.failed_workers = job.failed_workers;
             self.accepted_locked(&mut st, &id, claimed.queued_at_ms);
             if let Some(error) = claimed.failure {
                 self.finish_job_locked(
@@ -212,6 +251,7 @@ impl Inner {
 
     pub(crate) fn forget_owned_locked(&self, st: &mut State, id: &str, reason: &str) {
         self.dequeue_locked(st, id);
+        self.release_attempt_concurrency_locked(st, id);
         let Some(mut job) = st.remove_job(id) else {
             return;
         };
@@ -219,10 +259,8 @@ impl Inner {
         if !job.is_terminal() {
             st.unfinished_jobs = st.unfinished_jobs.saturating_sub(1);
         }
-        if matches!(job.phase, Phase::Accepting)
-            && let Some(count) = st.accepting.get_mut(&job.spec.demand.interface)
-        {
-            *count = count.saturating_sub(1);
+        if matches!(job.phase, Phase::Accepting) {
+            st.dec_accepting(&job.namespace, &job.spec.demand.interface);
         }
         if let Some(attempt) = &job.attempt
             && st.leases.contains_key(&attempt.lease_id)
@@ -262,7 +300,8 @@ impl Runtime {
     }
 
     pub(super) fn is_postgres_job(&self, id: &str) -> bool {
-        self.inner.postgres.is_some() && !id.starts_with(EPHEMERAL_PREFIX)
+        let (_, raw) = super::identity::decode_scoped_id(id);
+        self.inner.postgres.is_some() && !raw.starts_with(EPHEMERAL_PREFIX)
     }
 
     pub(super) async fn submit_postgres(
@@ -273,12 +312,13 @@ impl Runtime {
         attempts: u32,
         conflict: ConflictPolicy,
     ) -> Result<SubmitOutcome, RuntimeError> {
-        let admission = self.inner.admit(&self.inner.lock(), &spec);
+        let (ns, raw_id) = super::identity::decode_scoped_id(&id);
+        let admission = self.inner.admit(&self.inner.lock(), ns, &spec);
         let permit = match admission {
             Ok(permit) => permit,
             Err(error) => {
                 // Replaying an accepted request needs no new admission capacity.
-                let job = match self.get_job(&id, false).await {
+                let job = match self.get_job_in(ns, raw_id, false).await {
                     Ok(job) => job,
                     Err(read) if read.kind == crate::error::ErrorKind::NotFound => {
                         return Err(error);
@@ -286,7 +326,9 @@ impl Runtime {
                     Err(read) => return Err(read),
                 };
                 if conflict == ConflictPolicy::Fail || job.spec_hash != hash {
-                    return Err(RuntimeError::conflict(format!("job '{id}' already exists")));
+                    return Err(RuntimeError::conflict(format!(
+                        "job '{raw_id}' already exists"
+                    )));
                 }
                 return Ok(SubmitOutcome {
                     job,
@@ -305,7 +347,15 @@ impl Runtime {
                     .and_then(|p| p.queue_timeout)
             })
             .map(|d| ms(d).min(i64::MAX as u64) as i64);
-        let accepted = self.inner.postgres.as_ref().expect("PG").accept(
+        let pg = self.inner.postgres.as_ref().expect("PG");
+        let interface = spec.demand.interface.clone();
+        let input_bytes = spec
+            .inputs
+            .iter()
+            .map(super::api::Object::inline_len)
+            .sum::<usize>() as u64
+            + spec.params.len() as u64;
+        let accepted = pg.accept(
             AcceptRecord {
                 job_id: id.clone(),
                 spec_hash: hash,
@@ -326,6 +376,21 @@ impl Runtime {
             .map_err(read_error)?;
         drop(permit);
         self.inner.cluster_wakeup.notify_one();
+        if created {
+            if let Some(sink) = &self.inner.config.hooks.telemetry {
+                sink.emit(super::api::BillingEvent::JobAccepted {
+                    namespace: ns.to_string(),
+                    job_id: raw_id.to_string(),
+                    durability: Durability::Durable,
+                    input_bytes,
+                    at_ms: job.created_at_ms,
+                });
+            }
+            if let Some(mesh) = &self.inner.peer_mesh {
+                let self_addr = pg.config.internal_grpc_addr.as_deref().unwrap_or("");
+                mesh.broadcast_wakeup(&pg.node_id, self_addr, ns, &interface);
+            }
+        }
         Ok(SubmitOutcome {
             job: view_from_stored(job, false),
             created,
@@ -384,12 +449,13 @@ impl Runtime {
             .postgres
             .as_ref()
             .expect("PG")
-            .scan_jobs(
+            .scan_jobs_in(
                 0,
                 i64::MAX as u64,
                 before.clone(),
                 &filter.states,
                 filter.interface.as_deref(),
+                filter.namespace.as_deref(),
                 limit + 1,
             )
             .await
@@ -409,9 +475,13 @@ impl Runtime {
                             .interface
                             .as_ref()
                             .is_none_or(|i| *i == j.spec.demand.interface)
+                        && filter
+                            .namespace
+                            .as_ref()
+                            .is_none_or(|ns| *ns == j.namespace)
                         && before
                             .as_ref()
-                            .is_none_or(|(at, id)| (j.created_at_ms, &j.id) < (*at, id))
+                            .is_none_or(|(at, id)| (j.created_at_ms, &j.raw_id) < (*at, id))
                 })
                 .map(|j| j.view(false)),
         );

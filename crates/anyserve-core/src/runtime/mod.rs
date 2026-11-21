@@ -6,7 +6,7 @@ mod analytics;
 pub mod api;
 mod distributed;
 pub(crate) mod events;
-mod identity;
+pub(crate) mod identity;
 mod index;
 pub(crate) mod input;
 mod machine;
@@ -14,7 +14,7 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -24,13 +24,14 @@ use tokio::sync::{Notify, oneshot, watch};
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
     InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview, JobSpec, JobState,
-    JobView, ObjectPreview, RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest, WorkerView,
-    codes,
+    JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest,
+    WorkerView, codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
 use self::machine::{LeaseEnd, ms};
 use self::state::{Phase, State, TerminalPlan};
+use crate::auth::{DEFAULT_NAMESPACE, validate_namespace};
 use crate::error::RuntimeError;
 use crate::journal::{Journal, Recovery, StoredJob};
 use crate::now_ms;
@@ -174,6 +175,7 @@ pub(crate) struct Inner {
     pub(crate) journal: Option<Journal>,
     pub(crate) postgres: Option<Arc<crate::postgres::Postgres>>,
     pub(crate) cluster_wakeup: Arc<Notify>,
+    pub(crate) peer_mesh: Option<Arc<crate::cluster::PeerMeshState>>,
     pub(crate) journal_status: Mutex<JournalStatus>,
     pub(crate) timers: Timers,
     /// Event log bytes across all jobs.
@@ -187,27 +189,35 @@ pub(crate) struct Inner {
 
 /// The runtime lock. What the holder moved to `State::released` is dropped
 /// after the lock is let go.
-pub(crate) struct StateGuard<'a>(Option<MutexGuard<'a, State>>);
+pub(crate) struct StateGuard<'a> {
+    state: Option<MutexGuard<'a, State>>,
+    telemetry: Option<&'a Arc<dyn api::TelemetrySink>>,
+}
 
 impl Deref for StateGuard<'_> {
     type Target = State;
 
     fn deref(&self) -> &State {
-        self.0.as_ref().expect("lock held")
+        self.state.as_ref().expect("lock held")
     }
 }
 
 impl DerefMut for StateGuard<'_> {
     fn deref_mut(&mut self) -> &mut State {
-        self.0.as_mut().expect("lock held")
+        self.state.as_mut().expect("lock held")
     }
 }
 
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
-        if let Some(mut st) = self.0.take() {
-            let released = std::mem::take(&mut st.released);
+        if let Some(mut st) = self.state.take() {
+            let mut released = std::mem::take(&mut st.released);
             drop(st);
+            if let Some(sink) = self.telemetry {
+                for event in released.billing.drain(..) {
+                    sink.emit(event);
+                }
+            }
             drop(released);
         }
     }
@@ -215,7 +225,10 @@ impl Drop for StateGuard<'_> {
 
 impl Inner {
     pub(crate) fn lock(&self) -> StateGuard<'_> {
-        StateGuard(Some(self.state.lock().expect("runtime state poisoned")))
+        StateGuard {
+            state: Some(self.state.lock().expect("runtime state poisoned")),
+            telemetry: self.config.hooks.telemetry.as_ref(),
+        }
     }
 
     fn fire(&self, key: TimerKey) {
@@ -365,12 +378,86 @@ impl Inner {
 
     fn maintain(&self) {
         let now = now_ms();
-        self.evict_terminal_locked(&mut self.lock(), now);
+        {
+            let mut st = self.lock();
+            self.evict_terminal_locked(&mut st, now);
+            self.idle_drain_locked(&mut st, now);
+        }
         if matches!(
             *self.journal_status.lock().expect("journal status poisoned"),
             JournalStatus::Degraded(_)
         ) {
             let _ = self.commit(crate::journal::JournalOp::Probe, |_, _| {});
+        }
+    }
+
+    fn idle_drain_locked(&self, st: &mut State, now: u64) {
+        for (interface, policy) in &self.config.interfaces {
+            for tier in &policy.pool_tiers {
+                let Some(idle_after) = tier.idle_drain_after else {
+                    continue;
+                };
+                let idle_ms = ms(idle_after);
+                let mut by_ns: HashMap<String, Vec<(String, Option<u64>)>> = HashMap::new();
+                for session in st.sessions.values() {
+                    if session.tx.is_some()
+                        && !session.draining
+                        && session.pool == tier.pool
+                        && session.interfaces.contains(interface)
+                    {
+                        by_ns
+                            .entry(session.namespace.clone())
+                            .or_default()
+                            .push((session.id.clone(), session.idle_since_ms));
+                    }
+                }
+                for (namespace, mut members) in by_ns {
+                    if members.len() <= tier.min_sessions {
+                        continue;
+                    }
+                    let has_demand = st
+                        .queue(&namespace, interface)
+                        .is_some_and(|q| !q.is_empty())
+                        || st.accepting_count(&namespace, interface) > 0;
+                    if has_demand {
+                        continue;
+                    }
+                    members.sort_by_key(|(_, since)| *since);
+                    let mut remaining = members.len();
+                    for (session_id, idle_since) in members {
+                        if remaining <= tier.min_sessions {
+                            break;
+                        }
+                        if idle_since.is_some_and(|since| now.saturating_sub(since) >= idle_ms) {
+                            let all_interfaces_idle =
+                                st.sessions.get(&session_id).is_some_and(|session| {
+                                    session.active.is_empty()
+                                        && session.interfaces.iter().all(|iface| {
+                                            st.queue(&session.namespace, iface)
+                                                .is_none_or(|q| q.is_empty())
+                                                && st.accepting_count(&session.namespace, iface)
+                                                    == 0
+                                        })
+                                });
+                            if !all_interfaces_idle {
+                                continue;
+                            }
+                            if let Some(session) = st.sessions.get_mut(&session_id) {
+                                session.draining = true;
+                                remaining -= 1;
+                                self.send_locked(
+                                    st,
+                                    &session_id,
+                                    anyserve_proto::v2::server_message::Msg::Drain(
+                                        anyserve_proto::v2::Drain {},
+                                    ),
+                                    now,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -431,7 +518,13 @@ impl Inner {
             job.log.mark_lost_before_base();
             job.attempt_count = stored.attempt_count;
             job.last_attempt_id = stored.last_attempt_id;
-            job.last_worker_id = stored.last_worker_id;
+            job.last_worker_id = stored.last_worker_id.clone();
+            job.failed_workers = stored.failed_workers;
+            if stored.attempt_count > 0
+                && let Some(worker_id) = stored.last_worker_id
+            {
+                job.failed_workers.insert(worker_id);
+            }
             self.accepted_locked(&mut st, &job_id, now);
             let job = &st.jobs[&job_id];
             if job.attempt_count >= job.max_attempts {
@@ -610,8 +703,10 @@ fn follow(
 }
 
 fn view_from_stored(stored: StoredJob, include_outputs: bool) -> JobView {
+    let (namespace, raw_id) = identity::decode_scoped_id(&stored.job_id);
     JobView {
-        job_id: stored.job_id,
+        job_id: raw_id.to_string(),
+        namespace: namespace.to_string(),
         state: stored.state,
         durability: Durability::Durable,
         interface: stored.spec.demand.interface.clone(),
@@ -625,6 +720,16 @@ fn view_from_stored(stored: StoredJob, include_outputs: bool) -> JobView {
         metadata: stored.spec.metadata,
         spec_hash: stored.spec_hash,
     }
+}
+
+fn check_namespace(namespace: &str) -> Result<String, RuntimeError> {
+    let ns = if namespace.trim().is_empty() {
+        DEFAULT_NAMESPACE
+    } else {
+        namespace.trim()
+    };
+    validate_namespace(ns).map_err(|status| RuntimeError::invalid(status.message()))?;
+    Ok(ns.to_string())
 }
 
 impl Runtime {
@@ -658,6 +763,13 @@ impl Runtime {
         let event_budget = config.max_event_bytes;
         let input_budget = config.max_pending_bytes;
         let result_budget = config.max_result_bytes;
+        let peer_enabled = postgres.as_ref().is_some_and(|pg| {
+            pg.config
+                .peer_token
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty())
+        });
+        let peer_mesh = peer_enabled.then(|| Arc::new(crate::cluster::PeerMeshState::new()));
         let inner = Arc::new_cyclic(|me| Inner {
             generation,
             state: Mutex::new(State {
@@ -668,6 +780,7 @@ impl Runtime {
             journal,
             postgres,
             cluster_wakeup: Arc::new(Notify::new()),
+            peer_mesh,
             journal_status: Mutex::new(status),
             timers: Timers::new(),
             event_budget: Arc::new(ByteBudget::new(event_budget)),
@@ -684,6 +797,9 @@ impl Runtime {
         if inner.postgres.is_some() {
             tokio::spawn(distributed::cluster_loop(Arc::downgrade(&inner)));
             tokio::spawn(distributed::heartbeat_loop(Arc::downgrade(&inner)));
+            if inner.peer_mesh.is_some() {
+                tokio::spawn(crate::cluster::peer_sync_loop(Arc::downgrade(&inner)));
+            }
         }
         Ok(Runtime { inner })
     }
@@ -790,6 +906,7 @@ impl Runtime {
 
     /// Accepts a job. Durable jobs return once acceptance is committed.
     pub async fn submit(&self, request: SubmitRequest) -> Result<SubmitOutcome, RuntimeError> {
+        let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
         let durability = request
             .spec
             .policy
@@ -823,11 +940,12 @@ impl Runtime {
                 "PG caller-chosen IDs require durable Submit and cannot start with ephemeral:",
             ));
         }
-        let job_id = requested.unwrap_or_else(|| self.generated_job_id(durability));
+        let raw_id = requested.unwrap_or_else(|| self.generated_job_id(durability));
+        let scoped_id = identity::encode_scoped_id(&namespace, &raw_id);
         if durability == Durability::Durable && self.inner.postgres.is_some() {
             return self
                 .submit_postgres(
-                    job_id,
+                    scoped_id,
                     spec.take().expect("spec"),
                     spec_hash,
                     max_attempts,
@@ -838,17 +956,17 @@ impl Runtime {
         let conflict = |existing: &str| -> Result<(), RuntimeError> {
             if existing.is_empty() {
                 return Err(RuntimeError::conflict(format!(
-                    "job '{job_id}' exists and was not created by an idempotent submission"
+                    "job '{raw_id}' exists and was not created by an idempotent submission"
                 )));
             }
             if existing != spec_hash {
                 return Err(RuntimeError::conflict(format!(
-                    "job '{job_id}' exists with a different specification"
+                    "job '{raw_id}' exists with a different specification"
                 )));
             }
             if request.conflict == api::ConflictPolicy::Fail {
                 return Err(RuntimeError::conflict(format!(
-                    "job '{job_id}' already exists"
+                    "job '{raw_id}' already exists"
                 )));
             }
             Ok(())
@@ -862,10 +980,10 @@ impl Runtime {
             let next = {
                 let mut st = self.inner.lock();
                 let now = now_ms();
-                if let Some(job) = st.jobs.get_mut(&job_id) {
+                if let Some(job) = st.jobs.get_mut(&scoped_id) {
                     if job.indeterminate {
                         return Err(RuntimeError::unavailable(format!(
-                            "job '{job_id}' has an unknown commit outcome until restart"
+                            "job '{raw_id}' has an unknown commit outcome until restart"
                         )));
                     }
                     conflict(&job.spec_hash)?;
@@ -894,10 +1012,10 @@ impl Runtime {
                         });
                     }
                     let spec = spec.take().expect("a job is inserted at most once");
-                    let input_permit = self.inner.admit(&st, &spec)?;
+                    let input_permit = self.inner.admit(&st, &namespace, &spec)?;
                     self.inner.insert_job(
                         &mut st,
-                        job_id.clone(),
+                        scoped_id.clone(),
                         spec,
                         durability,
                         spec_hash.clone(),
@@ -907,7 +1025,7 @@ impl Runtime {
                         now,
                     );
                     if durability == Durability::Ephemeral {
-                        let view = st.jobs[&job_id].view(false);
+                        let view = st.jobs[&scoped_id].view(false);
                         self.inner.dispatch_locked(&mut st, now);
                         Next::Done(Box::new(SubmitOutcome {
                             job: view,
@@ -916,14 +1034,14 @@ impl Runtime {
                     } else {
                         let (tx, rx) = oneshot::channel();
                         st.jobs
-                            .get_mut(&job_id)
+                            .get_mut(&scoped_id)
                             .expect("job")
                             .accept_waiters
                             .push(tx);
-                        if let Err(error) = self.inner.begin_accept(&mut st, &job_id) {
+                        if let Err(error) = self.inner.begin_accept(&mut st, &scoped_id) {
                             self.inner.remove_unaccepted_locked(
                                 &mut st,
-                                &job_id,
+                                &scoped_id,
                                 &error.to_string(),
                             );
                             return Err(error);
@@ -936,13 +1054,13 @@ impl Runtime {
                 Next::Done(outcome) => return Ok(*outcome),
                 Next::ColdCheck => {
                     let journal = self.inner.journal.as_ref().expect("journal");
-                    let stored = journal.spec_hash(&job_id).await.map_err(|error| {
+                    let stored = journal.spec_hash(&scoped_id).await.map_err(|error| {
                         RuntimeError::unavailable(format!("read journal: {error:#}"))
                     })?;
                     if let Some(existing) = stored {
                         conflict(&existing)?;
                         return Ok(SubmitOutcome {
-                            job: self.get_job(&job_id, false).await?,
+                            job: self.get_job_in(&namespace, &raw_id, false).await?,
                             created: false,
                         });
                     }
@@ -958,10 +1076,66 @@ impl Runtime {
         }
     }
 
-    /// Starts an ephemeral execution whose events the caller follows.
+    /// Starts an ephemeral execution whose events the caller follows, routing
+    /// single-hop across PeerMesh if no local worker matches in cluster mode.
     pub async fn invoke(&self, request: InvokeRequest) -> Result<Execution, RuntimeError> {
+        let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
+        if let Some(mesh) = &self.inner.peer_mesh
+            && self.inner.postgres.is_some()
+            && !self.has_local_ready_worker(&namespace, &request.spec.demand)
+        {
+            let policy = self
+                .inner
+                .config
+                .interfaces
+                .get(&request.spec.demand.interface);
+            if let Some((_, peer_addr)) =
+                mesh.find_peer_for_demand(&namespace, &request.spec.demand, policy)
+            {
+                let peer_token = self
+                    .inner
+                    .postgres
+                    .as_ref()
+                    .and_then(|pg| pg.config.peer_token.clone())
+                    .unwrap_or_default();
+                let (spec, _) = self.normalize(request.spec, Durability::Ephemeral)?;
+                let raw_id = self.generated_job_id(Durability::Ephemeral);
+                match crate::cluster::forward_invoke(
+                    peer_addr,
+                    peer_token,
+                    namespace.clone(),
+                    raw_id,
+                    spec.clone(),
+                    request.input,
+                    &self.inner,
+                )
+                .await
+                {
+                    Ok(exec) => return Ok(exec),
+                    Err(err) => {
+                        tracing::debug!(error = %err, "PeerMesh ForwardInvoke failed; falling back to local");
+                        return self
+                            .invoke_local(InvokeRequest {
+                                namespace: Some(namespace),
+                                spec,
+                                input: request.input,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
+        self.invoke_local(request).await
+    }
+
+    pub(crate) async fn invoke_local(
+        &self,
+        request: InvokeRequest,
+    ) -> Result<Execution, RuntimeError> {
+        let namespace = check_namespace(request.namespace.as_deref().unwrap_or_default())?;
         let (spec, max_attempts) = self.normalize(request.spec, Durability::Ephemeral)?;
-        let job_id = self.generated_job_id(Durability::Ephemeral);
+        let raw_id = self.generated_job_id(Durability::Ephemeral);
+        let scoped_id = identity::encode_scoped_id(&namespace, &raw_id);
         let limits = &self.inner.config.limits;
         let input = (request.input == InputMode::Streaming).then(|| {
             let used = spec
@@ -978,25 +1152,40 @@ impl Runtime {
         let (log, changes) = {
             let mut st = self.inner.lock();
             let now = now_ms();
-            let input_permit = self.inner.admit(&st, &spec)?;
-            self.inner.insert_job(
+            let input_permit = self.inner.admit(&st, &namespace, &spec)?;
+            match self.inner.invoke_ephemeral_direct_locked(
                 &mut st,
-                job_id.clone(),
-                spec,
-                Durability::Ephemeral,
-                String::new(),
+                &namespace,
+                raw_id.clone(),
+                scoped_id.clone(),
+                spec.clone(),
                 max_attempts,
                 input.clone(),
                 input_permit,
                 now,
-            );
-            let job = st.jobs.get_mut(&job_id).expect("job");
-            job.streamed = true;
-            let log = Arc::clone(&job.log);
-            log.set_primary(true);
-            let changes = log.subscribe();
-            self.inner.dispatch_locked(&mut st, now);
-            (log, changes)
+            ) {
+                Ok(direct) => direct,
+                Err(returned_permit) => {
+                    self.inner.insert_job(
+                        &mut st,
+                        scoped_id.clone(),
+                        spec,
+                        Durability::Ephemeral,
+                        String::new(),
+                        max_attempts,
+                        input.clone(),
+                        returned_permit,
+                        now,
+                    );
+                    let job = st.jobs.get_mut(&scoped_id).expect("job");
+                    job.streamed = true;
+                    let log = Arc::clone(&job.log);
+                    log.set_primary(true);
+                    let changes = log.subscribe();
+                    self.inner.dispatch_locked(&mut st, now);
+                    (log, changes)
+                }
+            }
         };
         // A streamed consumer's reading position releases back-pressure.
         let on_yield = Some({
@@ -1004,29 +1193,122 @@ impl Runtime {
             Arc::new(move |event: &ExecutionEvent| log.mark_consumed(event.sequence)) as EventHook
         });
         Ok(Execution {
-            job_id: job_id.clone(),
+            job_id: raw_id,
             events: follow(Arc::clone(&log), changes, 0, on_yield, false),
             input: input.map(|log| InputSink { log }),
             _guard: Box::new(CancelOnDrop {
                 me: Arc::downgrade(&self.inner),
-                job_id,
+                job_id: scoped_id,
                 log,
             }),
         })
+    }
+
+    fn has_local_ready_worker(&self, namespace: &str, demand: &api::Demand) -> bool {
+        let st = self.inner.lock();
+        st.interface_sessions(namespace, &demand.interface)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| st.sessions.get(id))
+            .any(|s| {
+                s.free_slots() > 0
+                    && demand
+                        .required_attributes
+                        .iter()
+                        .all(|(k, v)| s.attributes.get(k) == Some(v))
+                    && s.fits(&demand.required_capacity)
+            })
+    }
+
+    pub(crate) fn cluster_directory(&self) -> Vec<anyserve_proto::cluster::PoolSlotSummary> {
+        let st = self.inner.lock();
+        struct Accum {
+            free_slots: u32,
+            min_load: f64,
+            worker_ids: Vec<String>,
+            shared_attrs: Option<std::collections::BTreeMap<String, String>>,
+            max_free_capacity: std::collections::HashMap<String, i64>,
+        }
+        let mut grouped: BTreeMap<(String, String, String), Accum> = BTreeMap::new();
+        for s in st.sessions.values() {
+            let free = s.free_slots();
+            if free == 0 {
+                continue;
+            }
+            let load =
+                s.active.len() as f64 / s.max_concurrency.max(1) as f64 + s.load.utilization * 0.5;
+            for iface in &s.interfaces {
+                let entry = grouped
+                    .entry((s.namespace.clone(), iface.clone(), s.pool.clone()))
+                    .or_insert_with(|| Accum {
+                        free_slots: 0,
+                        min_load: load,
+                        worker_ids: Vec::new(),
+                        shared_attrs: None,
+                        max_free_capacity: std::collections::HashMap::new(),
+                    });
+                entry.free_slots = entry.free_slots.saturating_add(free);
+                entry.min_load = entry.min_load.min(load);
+                if entry.worker_ids.len() < 32 {
+                    entry.worker_ids.push(s.worker_id.clone());
+                }
+                match &mut entry.shared_attrs {
+                    None => entry.shared_attrs = Some(s.attributes.clone()),
+                    Some(shared) => {
+                        shared.retain(|k, v| s.attributes.get(k) == Some(v));
+                    }
+                }
+                for (cap_key, total) in &s.total_capacity {
+                    let free_cap =
+                        total.saturating_sub(s.reserved.get(cap_key).copied().unwrap_or(0));
+                    entry
+                        .max_free_capacity
+                        .entry(cap_key.clone())
+                        .and_modify(|prev| *prev = (*prev).max(free_cap))
+                        .or_insert(free_cap);
+                }
+            }
+        }
+        grouped
+            .into_iter()
+            .map(
+                |((namespace, interface, pool), acc)| anyserve_proto::cluster::PoolSlotSummary {
+                    namespace,
+                    interface,
+                    pool,
+                    free_slots: acc.free_slots,
+                    min_load_score: acc.min_load,
+                    ready_worker_ids: acc.worker_ids,
+                    shared_attributes: acc.shared_attrs.unwrap_or_default().into_iter().collect(),
+                    max_free_capacity: acc.max_free_capacity,
+                },
+            )
+            .collect()
+    }
+
+    pub fn watch(&self, job_id: &str, after_sequence: u64) -> Result<EventStream, RuntimeError> {
+        self.watch_in(DEFAULT_NAMESPACE, job_id, after_sequence)
     }
 
     /// Follows a job's events after `after_sequence` until it finishes.
     /// `after_sequence = 0` starts at the oldest event still held and never
     /// reports `CursorExpired`; a non-zero sequence older than what is held
     /// ends the stream with `CursorExpired{oldest}`.
-    pub fn watch(&self, job_id: &str, after_sequence: u64) -> Result<EventStream, RuntimeError> {
-        if self.is_postgres_job(job_id) {
+    pub fn watch_in(
+        &self,
+        namespace: &str,
+        job_id: &str,
+        after_sequence: u64,
+    ) -> Result<EventStream, RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        if self.is_postgres_job(&scoped_id) {
             let runtime = self.clone();
-            let id = job_id.to_string();
+            let raw = job_id.to_string();
             return Ok(EventStream::new(async_stream::stream! {
                 let mut after = after_sequence;
                 loop {
-                    match runtime.events(&id, after).await {
+                    match runtime.events_in(&ns, &raw, after).await {
                         Err(error) => { yield Err(error); break; }
                         Ok((events, done)) => {
                             for event in events { after = event.sequence; yield Ok(event); }
@@ -1038,7 +1320,7 @@ impl Runtime {
             }));
         }
         let st = self.inner.lock();
-        if let Some(job) = st.jobs.get(job_id) {
+        if let Some(job) = st.jobs.get(&scoped_id) {
             let changes = job.log.subscribe();
             return Ok(follow(
                 Arc::clone(&job.log),
@@ -1054,9 +1336,9 @@ impl Runtime {
         drop(st);
         // Possibly an evicted durable job: replay its acceptance and outcome.
         let runtime = self.clone();
-        let job_id = job_id.to_string();
+        let raw = job_id.to_string();
         Ok(EventStream::new(async_stream::stream! {
-            match runtime.get_job(&job_id, true).await {
+            match runtime.get_job_in(&ns, &raw, true).await {
                 Err(error) => yield Err(error),
                 Ok(job) => {
                     for event in runtime.replayed_events(job, after_sequence) {
@@ -1067,25 +1349,37 @@ impl Runtime {
         }))
     }
 
-    /// Events after `after_sequence`, and whether the job's log has ended.
-    /// Evicted durable jobs are read back from the journal as their
-    /// acceptance and outcome. `after_sequence = 0` starts at the oldest event
-    /// still held and never fails with `CursorExpired`; a non-zero sequence
-    /// older than what is held gets `CursorExpired{oldest}`.
     pub async fn events(
         &self,
         job_id: &str,
         after_sequence: u64,
     ) -> Result<(Vec<ExecutionEvent>, bool), RuntimeError> {
-        if self.is_postgres_job(job_id) {
+        self.events_in(DEFAULT_NAMESPACE, job_id, after_sequence)
+            .await
+    }
+
+    /// Events after `after_sequence`, and whether the job's log has ended.
+    /// Evicted durable jobs are read back from the journal as their
+    /// acceptance and outcome. `after_sequence = 0` starts at the oldest event
+    /// still held and never fails with `CursorExpired`; a non-zero sequence
+    /// older than what is held gets `CursorExpired{oldest}`.
+    pub async fn events_in(
+        &self,
+        namespace: &str,
+        job_id: &str,
+        after_sequence: u64,
+    ) -> Result<(Vec<ExecutionEvent>, bool), RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        if self.is_postgres_job(&scoped_id) {
             let snapshot = self
-                .postgres_snapshot(job_id, ReadMode::Events, Some(after_sequence))
+                .postgres_snapshot(&scoped_id, ReadMode::Events, Some(after_sequence))
                 .await?;
             return Ok((snapshot.events, snapshot.job.state.is_terminal()));
         }
         let log = {
             let st = self.inner.lock();
-            match st.jobs.get(job_id) {
+            match st.jobs.get(&scoped_id) {
                 Some(job) if job.indeterminate => {
                     return Err(RuntimeError::unavailable(format!(
                         "job '{job_id}' has an unknown commit outcome until restart"
@@ -1103,16 +1397,22 @@ impl Runtime {
         if self.inner.journal.is_none() {
             return Err(RuntimeError::not_found("job", job_id));
         }
-        let job = self.get_job(job_id, true).await?;
+        let job = self.get_job_in(&ns, job_id, true).await?;
         Ok((self.replayed_events(job, after_sequence), true))
     }
 
     /// The specification of a job held in memory. Inputs and params are
     /// dropped once the job is terminal.
     pub fn spec(&self, job_id: &str) -> Result<Arc<JobSpec>, RuntimeError> {
+        self.spec_in(DEFAULT_NAMESPACE, job_id)
+    }
+
+    pub fn spec_in(&self, namespace: &str, job_id: &str) -> Result<Arc<JobSpec>, RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
         let st = self.inner.lock();
         st.jobs
-            .get(job_id)
+            .get(&scoped_id)
             .map(|job| Arc::clone(&job.spec))
             .ok_or_else(|| RuntimeError::not_found("job", job_id))
     }
@@ -1150,18 +1450,30 @@ impl Runtime {
         job_id: &str,
         include_outputs: bool,
     ) -> Result<JobView, RuntimeError> {
-        if self.is_postgres_job(job_id) {
+        self.get_job_in(DEFAULT_NAMESPACE, job_id, include_outputs)
+            .await
+    }
+
+    pub async fn get_job_in(
+        &self,
+        namespace: &str,
+        job_id: &str,
+        include_outputs: bool,
+    ) -> Result<JobView, RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        if self.is_postgres_job(&scoped_id) {
             let mode = if include_outputs {
                 ReadMode::Full
             } else {
                 ReadMode::Metadata
             };
-            let snapshot = self.postgres_snapshot(job_id, mode, None).await?;
+            let snapshot = self.postgres_snapshot(&scoped_id, mode, None).await?;
             return Ok(view_from_stored(snapshot.job, include_outputs));
         }
         {
             let st = self.inner.lock();
-            if let Some(job) = st.jobs.get(job_id) {
+            if let Some(job) = st.jobs.get(&scoped_id) {
                 if job.indeterminate {
                     return Err(RuntimeError::unavailable(format!(
                         "job '{job_id}' has an unknown commit outcome until restart"
@@ -1176,7 +1488,7 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| RuntimeError::not_found("job", job_id))?;
         match journal
-            .load_job(job_id, include_outputs, self.result_budget())
+            .load_job(&scoped_id, include_outputs, self.result_budget())
             .await
         {
             Ok(Some(stored)) => Ok(view_from_stored(stored, include_outputs)),
@@ -1188,13 +1500,17 @@ impl Runtime {
         }
     }
 
-    fn inspect_retained_job(&self, job_id: &str) -> Result<Option<JobInspection>, RuntimeError> {
+    fn inspect_retained_job(
+        &self,
+        scoped_id: &str,
+        raw_id: &str,
+    ) -> Result<Option<JobInspection>, RuntimeError> {
         let retained = {
             let st = self.inner.lock();
-            match st.jobs.get(job_id) {
+            match st.jobs.get(scoped_id) {
                 Some(job) if job.indeterminate => {
                     return Err(RuntimeError::unavailable(format!(
-                        "job '{job_id}' has an unknown commit outcome until restart"
+                        "job '{raw_id}' has an unknown commit outcome until restart"
                     )));
                 }
                 Some(job) => Some((job.view(true), Arc::clone(&job.spec), Arc::clone(&job.log))),
@@ -1215,9 +1531,19 @@ impl Runtime {
     /// Reads a detail view without loading a cold result twice for its view
     /// and replayed events. Event cloning happens outside the runtime lock.
     pub async fn inspect_job(&self, job_id: &str) -> Result<JobInspection, RuntimeError> {
-        if self.is_postgres_job(job_id) {
+        self.inspect_job_in(DEFAULT_NAMESPACE, job_id).await
+    }
+
+    pub async fn inspect_job_in(
+        &self,
+        namespace: &str,
+        job_id: &str,
+    ) -> Result<JobInspection, RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        if self.is_postgres_job(&scoped_id) {
             let snapshot = self
-                .postgres_snapshot(job_id, ReadMode::Full, Some(0))
+                .postgres_snapshot(&scoped_id, ReadMode::Full, Some(0))
                 .await?;
             return Ok(JobInspection {
                 job: view_from_stored(snapshot.job, true),
@@ -1226,10 +1552,10 @@ impl Runtime {
             });
         }
         loop {
-            if let Some(retained) = self.inspect_retained_job(job_id)? {
+            if let Some(retained) = self.inspect_retained_job(&scoped_id, job_id)? {
                 return Ok(retained);
             }
-            let job = self.get_job(job_id, true).await?;
+            let job = self.get_job_in(&ns, job_id, true).await?;
             if !job.state.is_terminal() {
                 // Admission raced the lookup: read its live log on the next pass.
                 continue;
@@ -1246,9 +1572,19 @@ impl Runtime {
     /// Management inspection: cold inline outputs are read as bounded prefixes
     /// directly in storage and never consume the business result-byte budget.
     pub async fn inspect_job_preview(&self, job_id: &str) -> Result<JobPreview, RuntimeError> {
-        if self.is_postgres_job(job_id) {
+        self.inspect_job_preview_in(DEFAULT_NAMESPACE, job_id).await
+    }
+
+    pub async fn inspect_job_preview_in(
+        &self,
+        namespace: &str,
+        job_id: &str,
+    ) -> Result<JobPreview, RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        if self.is_postgres_job(&scoped_id) {
             let snapshot = self
-                .postgres_snapshot(job_id, ReadMode::Preview, Some(0))
+                .postgres_snapshot(&scoped_id, ReadMode::Preview, Some(0))
                 .await?;
             return Ok(JobPreview {
                 job: view_from_stored(snapshot.job, false),
@@ -1262,7 +1598,7 @@ impl Runtime {
                 mut job,
                 spec,
                 events,
-            }) = self.inspect_retained_job(job_id)?
+            }) = self.inspect_retained_job(&scoped_id, job_id)?
             {
                 let outputs = job
                     .outputs
@@ -1284,7 +1620,7 @@ impl Runtime {
                 .as_ref()
                 .ok_or_else(|| RuntimeError::not_found("job", job_id))?;
             let (stored, outputs) = journal
-                .load_job_preview(job_id)
+                .load_job_preview(&scoped_id)
                 .await
                 .map_err(|error| {
                     RuntimeError::unavailable(format!("read journal preview: {error:#}"))
@@ -1308,32 +1644,43 @@ impl Runtime {
     /// Cancels a job and returns its final view. Durable jobs return once the
     /// cancellation is committed.
     pub async fn cancel(&self, job_id: &str, reason: String) -> Result<JobView, RuntimeError> {
-        if self.is_postgres_job(job_id) {
+        self.cancel_in(DEFAULT_NAMESPACE, job_id, reason).await
+    }
+
+    pub async fn cancel_in(
+        &self,
+        namespace: &str,
+        job_id: &str,
+        reason: String,
+    ) -> Result<JobView, RuntimeError> {
+        let ns = check_namespace(namespace)?;
+        let scoped_id = identity::encode_scoped_id(&ns, job_id);
+        if self.is_postgres_job(&scoped_id) {
             self.inner
                 .postgres
                 .as_ref()
                 .expect("PG")
-                .cancel(job_id, reason)
+                .cancel(&scoped_id, reason)
                 .await
                 .map_err(distributed::read_error)?;
-            return self.get_job(job_id, false).await;
+            return self.get_job_in(&ns, job_id, false).await;
         }
         let receiver = {
             let mut st = self.inner.lock();
             let now = now_ms();
-            match st.jobs.get_mut(job_id) {
+            match st.jobs.get_mut(&scoped_id) {
                 None => None,
                 Some(_) => Some(Self::start_cancel(
                     &self.inner,
                     &mut st,
-                    job_id,
+                    &scoped_id,
                     reason,
                     now,
                 )?),
             }
         };
         match receiver {
-            None => self.get_job(job_id, false).await,
+            None => self.get_job_in(&ns, job_id, false).await,
             Some(receiver) => receiver
                 .await
                 .map_err(|_| RuntimeError::unavailable("runtime stopped"))?,
@@ -1404,6 +1751,8 @@ impl Runtime {
             .map(|session| WorkerView {
                 session_id: session.id.clone(),
                 worker_id: session.worker_id.clone(),
+                namespace: session.namespace.clone(),
+                pool: session.pool.clone(),
                 interfaces: session.interfaces.iter().cloned().collect(),
                 attributes: session.attributes.clone(),
                 total_capacity: session.total_capacity.clone(),
@@ -1445,11 +1794,52 @@ impl Runtime {
         let st = self.inner.lock();
         let mut interfaces = st.job_index.interfaces(now);
         let [queued, running, succeeded, failed, cancelled] = st.job_index.counts();
+        let mut pools: BTreeMap<(String, String, String), PoolStats> = BTreeMap::new();
         for session in st.sessions.values() {
             for interface in &session.interfaces {
                 let entry = interfaces.entry(interface.clone()).or_default();
                 entry.sessions += 1;
                 entry.free_slots += session.free_slots() as u64;
+
+                let pool_entry = pools
+                    .entry((
+                        session.namespace.clone(),
+                        interface.clone(),
+                        session.pool.clone(),
+                    ))
+                    .or_default();
+                pool_entry.sessions += 1;
+                pool_entry.free_slots += session.free_slots() as u64;
+                pool_entry.active_leases += session
+                    .active
+                    .iter()
+                    .filter(|lease_id| {
+                        st.leases
+                            .get(*lease_id)
+                            .and_then(|lease| st.jobs.get(&lease.job_id))
+                            .is_some_and(|job| job.spec.demand.interface == *interface)
+                    })
+                    .count();
+            }
+        }
+        for (namespace, ifaces) in &st.queues {
+            for (interface, queue) in ifaces {
+                if queue.is_empty() {
+                    continue;
+                }
+                let primary_pool = self
+                    .inner
+                    .config
+                    .interfaces
+                    .get(interface)
+                    .and_then(|policy| policy.pool_tiers.first())
+                    .map(|tier| tier.pool.clone())
+                    .unwrap_or_default();
+                let entry = pools
+                    .entry((namespace.clone(), interface.clone(), primary_pool))
+                    .or_default();
+                entry.desired_additional_slots =
+                    queue.len().saturating_sub(entry.free_slots as usize);
             }
         }
         RuntimeStats {
@@ -1462,6 +1852,7 @@ impl Runtime {
             retained_jobs: st.terminal_order.len(),
             sessions: st.sessions.len(),
             interfaces,
+            pools,
             journal: self
                 .inner
                 .postgres

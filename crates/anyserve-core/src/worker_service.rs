@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::auth::Role;
+use crate::auth::{DEFAULT_NAMESPACE, NAMESPACE_HEADER, Principal, Role, validate_namespace};
 use crate::error::ErrorKind;
 use crate::runtime::Runtime;
 use crate::runtime::api::{ErrorInfo, Limits, Metadata, Object, codes};
@@ -71,6 +71,30 @@ fn finish_to_proto(status: FinishStatus) -> pb::AttemptDown {
     }
 }
 
+fn worker_principal<T>(request: &Request<T>) -> Result<Principal, Status> {
+    require_worker(request)?;
+    if let Some(principal) = request.extensions().get::<Principal>() {
+        return Ok(principal.clone());
+    }
+    let namespace = match request
+        .metadata()
+        .get(NAMESPACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(ns) => validate_namespace(ns)?.to_string(),
+        None => DEFAULT_NAMESPACE.to_string(),
+    };
+    Ok(Principal {
+        namespace,
+        role: Role::Worker,
+        subject: "anonymous".to_string(),
+        forced_pool: None,
+        is_operator: false,
+    })
+}
+
 #[tonic::async_trait]
 impl Worker for WorkerGrpcService {
     type SessionStream = ResponseStream<pb::ServerMessage>;
@@ -80,7 +104,7 @@ impl Worker for WorkerGrpcService {
         &self,
         request: Request<Streaming<pb::WorkerMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
-        require_worker(&request)?;
+        let principal = worker_principal(&request)?;
         let mut inbound = request.into_inner();
         let timeout = self.runtime.config().heartbeat_timeout;
         let hello = match tokio::time::timeout(timeout, inbound.message()).await {
@@ -91,7 +115,7 @@ impl Worker for WorkerGrpcService {
             Ok(Err(status)) => return Err(status),
             Err(_) => return Err(Status::deadline_exceeded("no Hello received")),
         };
-        let handle = self.runtime.open_session(hello)?;
+        let handle = self.runtime.open_session_for(hello, principal)?;
         let runtime = self.runtime.clone();
         let (session_id, connection) = (handle.session_id.clone(), handle.connection);
         tokio::spawn(async move {

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Sequence
 
 HandlerCodec = Literal["bytes", "json"]
 
@@ -13,6 +13,9 @@ class HandlerSpec:
     max_active_leases: int
     pass_context: bool
     streaming_input: bool
+    pool: str = ...
+    auto_fetch_uri: bool = ...
+    uri_resolver: Callable[[str, dict[str, str]], bytes] | None = ...
 
 class WorkerError(Exception):
     retryable: bool
@@ -24,7 +27,18 @@ class WorkerHandler:
 
 def worker(*, interface: str, attributes: dict[str, str] | None = ..., capacity: dict[str, int] | None = ...,
            metadata: dict[str, str] | None = ..., codec: str = ..., max_active_leases: int = ...,
-           pass_context: bool = ..., streaming_input: bool = ...) -> Callable[[Callable[..., Any]], WorkerHandler]: ...
+           pass_context: bool = ..., streaming_input: bool = ..., pool: str = ...,
+           auto_fetch_uri: bool = ..., uri_resolver: Callable[[str, dict[str, str]], bytes] | None = ...) -> Callable[[Callable[..., Any]], WorkerHandler]: ...
 def get_handler_spec(handler: Callable[..., Any]) -> HandlerSpec: ...
-def serve(handler: Callable[..., Any], endpoint: str | None = ..., *, worker_id: str | None = ...,
-          token: str | None = ..., reconnect_interval_secs: float = ..., connection: Any = ...) -> None: ...
+def serve(
+    handler: Callable[..., Any] | Sequence[Callable[..., Any]],
+    endpoint_or_handler: str | Callable[..., Any] | None = ...,
+    *more_handlers: Callable[..., Any],
+    endpoint: str | None = ...,
+    worker_id: str | None = ...,
+    token: str | None = ...,
+    namespace: str | None = ...,
+    pool: str | None = ...,
+    reconnect_interval_secs: float = ...,
+    connection: Any = ...,
+) -> None: ...

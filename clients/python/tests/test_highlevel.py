@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
 from collections import deque
 from unittest.mock import patch
 
-from anyserve import ExecutionClient, RpcError, ExecutionOptions, WorkerError, get_handler_spec, serve, worker
-from anyserve.execution import _terminal_outputs
+from anyserve import (
+    AsyncAnyserveClient,
+    ExecutionClient,
+    RpcError,
+    ExecutionOptions,
+    WorkerError,
+    get_handler_spec,
+    serve,
+    uri_object,
+    worker,
+)
+from anyserve.execution import _spec, _terminal_outputs
 from anyserve.highlevel import _process_assignment
 
 
@@ -436,6 +449,185 @@ class HighLevelTests(unittest.TestCase):
                     client.result("job")
                 self.assertEqual(client._transport.calls, [("get", "job", True), ("watch", "job", 0)])
                 self.assertTrue(client._transport.events.closed)
+
+    def test_async_handler_and_async_generator_are_supported(self):
+        @worker(interface="async.unary")
+        async def handle_unary(payload):
+            await asyncio.sleep(0)
+            return payload + b"!"
+
+        assignment = Assignment(payload=b"hi")
+        _process_assignment(handle_unary, handle_unary.spec, assignment)
+        self.assertEqual(assignment.attempt.outputs, [{"inline": b"hi!", "metadata": {}}])
+
+        @worker(interface="async.stream", codec="json")
+        async def handle_stream(obj):
+            await asyncio.sleep(0)
+            yield {"v": obj["n"] + 1}
+            yield {"v": obj["n"] + 2}
+
+        assignment2 = Assignment(payload=b'{"n":10}')
+        _process_assignment(handle_stream, handle_stream.spec, assignment2)
+        frames = [json.loads(line) for line in b"".join(assignment2.attempt.frames).splitlines()]
+        self.assertEqual(frames, [{"v": 11}, {"v": 12}])
+        self.assertEqual(assignment2.attempt.outputs, [])
+
+    def test_uri_resolver_auto_fetch_and_sha256_verification(self):
+        payload = b"tensor-blob"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        @worker(interface="uri.custom", uri_resolver=lambda uri, meta: payload if uri == "s3://b/k" else b"")
+        def resolve_custom(data):
+            return data.upper()
+
+        a = Assignment()
+        a.attempt.inputs = [uri_object("s3://b/k", sha256=digest)]
+        _process_assignment(resolve_custom, resolve_custom.spec, a)
+        self.assertEqual(a.attempt.outputs, [{"inline": b"TENSOR-BLOB", "metadata": {}}])
+
+        with tempfile.NamedTemporaryFile() as tmp:
+            tmp.write(payload)
+            tmp.flush()
+
+            @worker(interface="uri.auto", auto_fetch_uri=True)
+            def resolve_file(data):
+                return data
+
+            ok_a = Assignment()
+            ok_a.attempt.inputs = [uri_object(f"file://{tmp.name}", sha256=digest)]
+            _process_assignment(resolve_file, resolve_file.spec, ok_a)
+            self.assertEqual(ok_a.attempt.outputs, [{"inline": payload, "metadata": {}}])
+
+            bad_a = Assignment()
+            bad_a.attempt.inputs = [uri_object(f"file://{tmp.name}", sha256="0" * 64)]
+            _process_assignment(resolve_file, resolve_file.spec, bad_a)
+            self.assertIn("SHA-256 mismatch", bad_a.attempt.failure[0])
+            self.assertFalse(bad_a.attempt.failure[1])
+
+    def test_multi_interface_serve_routes_by_interface_and_merges_capacity(self):
+        @worker(interface="iface.a", capacity={"slot": 1}, max_active_leases=1)
+        def ha(payload):
+            return b"A:" + payload
+
+        @worker(interface="iface.b", capacity={"slot": 2}, max_active_leases=2)
+        def hb(payload):
+            return b"B:" + payload
+
+        a1 = Assignment("l1", b"one")
+        a1.interface = "iface.a"
+        a2 = Assignment("l2", b"two")
+        a2.interface = "iface.b"
+
+        class MultiConn:
+            def __init__(self):
+                self.msgs = deque([a1, a2])
+                self.credits = []
+
+            def credit(self, free):
+                self.credits.append(free)
+
+            def accept(self, lease_id, accepted, reason):
+                pass
+
+            def receive(self, timeout):
+                if self.msgs:
+                    a = self.msgs.popleft()
+                    return {"type": "assignment", "lease_id": a.lease_id, "assignment": a}
+                if a1.attempt.outputs is not None and a2.attempt.outputs is not None:
+                    raise KeyboardInterrupt
+                time.sleep(0.001)
+                return None
+
+            def cancel_ack(self, lease_id):
+                pass
+
+            def close(self):
+                pass
+
+            def drain(self):
+                pass
+
+        with self.assertRaises(KeyboardInterrupt):
+            serve([ha, hb], connection=MultiConn())
+        self.assertEqual(a1.attempt.outputs, [{"inline": b"A:one", "metadata": {}}])
+        self.assertEqual(a2.attempt.outputs, [{"inline": b"B:two", "metadata": {}}])
+
+    def test_uri_object_and_scheduling_options_and_async_client(self):
+        obj = uri_object("https://cdn/1?sig=x", sha256="dead", size_bytes=99, content_type="application/octet-stream")
+        self.assertEqual(obj["metadata"]["anyserve.sha256"], "dead")
+        self.assertEqual(obj["metadata"]["anyserve.size_bytes"], "99")
+        self.assertEqual(obj["metadata"]["content_type"], "application/octet-stream")
+
+        opts = ExecutionOptions(affinity_key="rob-1", fairness_key="vip", concurrency_key="arm-l")
+        raw_spec = _spec("vla", b"hello", opts, "ephemeral")
+        self.assertEqual(raw_spec["affinity_key"], "rob-1")
+        self.assertEqual(raw_spec["fairness_key"], "vip")
+        self.assertEqual(raw_spec["concurrency_key"], "arm-l")
+
+        class FakeEvents:
+            def __init__(self):
+                self.closed = False
+                self._items = iter([{"type": "output", "data": b"tok"}, {"type": "finished", "state": "succeeded", "outputs": []}])
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._items)
+
+            def close(self):
+                self.closed = True
+
+        class FakeTransport:
+            def invoke(self, spec):
+                return FakeEvents()
+
+        async def run_check():
+            client = AsyncAnyserveClient.__new__(AsyncAnyserveClient)
+            sync_c = ExecutionClient.__new__(ExecutionClient)
+            sync_c._transport = FakeTransport()
+            client._sync = sync_c
+            seen = []
+            async with await client.invoke("chat", b"hi") as evs:
+                async for ev in evs:
+                    seen.append(ev["type"])
+            self.assertEqual(seen, ["output", "finished"])
+
+        asyncio.run(run_check())
+
+    def test_serve_sigterm_triggers_preemptive_drain_and_restores_handler(self):
+        import os
+        import signal
+
+        @worker(interface="sigterm.v1")
+        def echo(payload: bytes) -> bytes:
+            return payload
+
+        class FakeConn:
+            def __init__(self):
+                self.drain_calls = []
+                self.closed = False
+
+            def credit(self, free):
+                pass
+
+            def receive(self, timeout):
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
+                return None
+
+            def drain(self, preempting=False):
+                self.drain_calls.append(preempting)
+
+            def close(self):
+                self.closed = True
+
+        before = signal.getsignal(signal.SIGTERM)
+        conn = FakeConn()
+        serve(echo, connection=conn)
+        self.assertEqual(conn.drain_calls, [True])
+        self.assertTrue(conn.closed)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
 
 
 if __name__ == "__main__":

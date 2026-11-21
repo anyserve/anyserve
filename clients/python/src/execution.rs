@@ -30,13 +30,23 @@ pub struct ExecutionTransport {
 #[pymethods]
 impl ExecutionTransport {
     #[new]
-    #[pyo3(signature = (endpoint, token=None))]
-    fn new(py: Python<'_>, endpoint: String, token: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (endpoint, token=None, namespace=None))]
+    fn new(
+        py: Python<'_>,
+        endpoint: String,
+        token: Option<String>,
+        namespace: Option<String>,
+    ) -> PyResult<Self> {
         let token = token.or_else(|| std::env::var(anyserve_client::TOKEN_ENV).ok());
+        let namespace = namespace.or_else(|| std::env::var(anyserve_client::NAMESPACE_ENV).ok());
         py.detach(move || {
             let runtime = Arc::new(build_runtime().map_err(error)?);
             let client = runtime
-                .block_on(Client::connect_with_token(&endpoint, token.as_deref()))
+                .block_on(Client::connect_with_options(
+                    &endpoint,
+                    token.as_deref(),
+                    namespace.as_deref(),
+                ))
                 .map_err(connection_error)?;
             Ok(Self { runtime, client })
         })
@@ -281,6 +291,7 @@ fn parse_spec(dict: &Bound<'_, PyDict>) -> PyResult<v2::JobSpec> {
             required_attributes: field!(dict, "required_attributes", HashMap<String, String>, HashMap::new()),
             preferred_attributes: field!(dict, "preferred_attributes", HashMap<String, String>, HashMap::new()),
             required_capacity: field!(dict, "required_capacity", HashMap<String, i64>, HashMap::new()),
+            affinity_key: field!(dict, "affinity_key", String, String::new()),
         }),
         inputs: objects_from_py(inputs)?,
         params: params.into(),
@@ -293,6 +304,8 @@ fn parse_spec(dict: &Bound<'_, PyDict>) -> PyResult<v2::JobSpec> {
             total_timeout_ms: field!(dict, "total_timeout_ms", u64, 0),
             spillover_after_ms: field!(dict, "spillover_after_ms", u64, 0),
             max_attempts: field!(dict, "max_attempts", u32, 0),
+            fairness_key: field!(dict, "fairness_key", String, String::new()),
+            concurrency_key: field!(dict, "concurrency_key", String, String::new()),
         }),
     })
 }
@@ -341,6 +354,7 @@ pub(crate) fn objects_to_py(py: Python<'_>, objects: &[v2::Object]) -> PyResult<
 fn job_to_py(py: Python<'_>, job: v2::Job) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("job_id", job.job_id)?;
+    dict.set_item("namespace", job.namespace)?;
     dict.set_item("state", state_name(job.state))?;
     dict.set_item(
         "durability",

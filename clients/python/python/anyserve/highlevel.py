@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import functools
+import hashlib
 import inspect
 import json
-import time
-import threading
 import logging
 import os
+import signal
 import socket
+import threading
+import time
+import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from ._native import WorkerConnection
 from .execution import resolve_endpoint
@@ -22,6 +26,10 @@ _RETIRED_RPC_CODES = {9, 10}
 
 _CODEC_BYTES = "bytes"
 _CODEC_JSON = "json"
+
+
+class _PreemptShutdown(BaseException):
+    """Internal control-flow signal raised on SIGTERM so serve() drains preemptively."""
 
 
 class WorkerError(Exception):
@@ -47,6 +55,9 @@ class HandlerSpec:
     max_active_leases: int = 1
     pass_context: bool = False
     streaming_input: bool = False
+    pool: str = ""
+    auto_fetch_uri: bool = False
+    uri_resolver: Optional[Callable[[str, dict[str, str]], bytes]] = None
 
 
 class WorkerHandler:
@@ -69,6 +80,9 @@ def worker(
     max_active_leases: int = 1,
     pass_context: bool = False,
     streaming_input: bool = False,
+    pool: str = "",
+    auto_fetch_uri: bool = False,
+    uri_resolver: Optional[Callable[[str, dict[str, str]], bytes]] = None,
 ) -> Callable[[Callable[[Any], Any]], WorkerHandler]:
     spec = _build_handler_spec(
         interface=interface,
@@ -79,13 +93,14 @@ def worker(
         max_active_leases=max_active_leases,
         pass_context=pass_context,
         streaming_input=streaming_input,
+        pool=pool,
+        auto_fetch_uri=auto_fetch_uri,
+        uri_resolver=uri_resolver,
     )
 
     def decorator(fn: Callable[[Any], Any]) -> WorkerHandler:
         if isinstance(fn, WorkerHandler):
             raise TypeError("handler is already decorated with @worker(...)")
-        if inspect.iscoroutinefunction(fn):
-            raise TypeError("async handlers are not supported by serve(...) yet")
         return WorkerHandler(fn, spec)
 
     return decorator
@@ -98,35 +113,99 @@ def get_handler_spec(handler: Callable[[Any], Any]) -> HandlerSpec:
     return spec
 
 
-def serve(
-    handler: Callable[[Any], Any], endpoint: Optional[str] = None, *,
-    worker_id: Optional[str] = None, token: Optional[str] = None,
-    reconnect_interval_secs: float = 1.0, connection: Any = None,
-) -> None:
-    """Run handlers over the outbound worker session with bounded concurrency.
+def _normalize_serve_args(
+    first: Callable[[Any], Any] | Sequence[Callable[[Any], Any]],
+    second: Optional[str | Callable[[Any], Any]],
+    rest: tuple[Callable[[Any], Any], ...],
+    explicit_endpoint: Optional[str],
+) -> tuple[list[tuple[Callable[[Any], Any], HandlerSpec]], Optional[str]]:
+    if isinstance(first, (list, tuple)):
+        handlers = list(first)
+        if not handlers:
+            raise ValueError("serve(...) requires at least one handler")
+        resolved_endpoint = explicit_endpoint if explicit_endpoint is not None else (second if isinstance(second, str) else None)
+    elif second is not None and not isinstance(second, str):
+        handlers = [first, second, *rest]
+        resolved_endpoint = explicit_endpoint
+    else:
+        handlers = [first, *rest]
+        resolved_endpoint = explicit_endpoint if explicit_endpoint is not None else second
+    pairs = [(h, get_handler_spec(h)) for h in handlers]
+    seen_interfaces: set[str] = set()
+    for _, spec in pairs:
+        if spec.interface in seen_interfaces:
+            raise ValueError(f"duplicate handler interface '{spec.interface}' in serve(...)")
+        seen_interfaces.add(spec.interface)
+    return pairs, resolved_endpoint
 
-    A generator handler emits output frames. A normal return value becomes the
-    terminal result. Callbacks can observe cancellation through a context when
-    decorated with ``pass_context=True``; Python callbacks cancel cooperatively.
+
+def serve(
+    handler: Callable[[Any], Any] | Sequence[Callable[[Any], Any]],
+    endpoint_or_handler: Optional[str | Callable[[Any], Any]] = None,
+    *more_handlers: Callable[[Any], Any],
+    endpoint: Optional[str] = None,
+    worker_id: Optional[str] = None,
+    token: Optional[str] = None,
+    namespace: Optional[str] = None,
+    pool: Optional[str] = None,
+    reconnect_interval_secs: float = 1.0,
+    connection: Any = None,
+) -> None:
+    """Run one or more ``@worker`` handlers over the outbound worker session.
+
+    Supports sync functions, sync generators, ``async def`` coroutines, and
+    ``async`` generators. Multiple handlers are multiplexed on one session.
     """
-    spec = get_handler_spec(handler)
+    handler_pairs, resolved_endpoint = _normalize_serve_args(
+        handler, endpoint_or_handler, more_handlers, endpoint
+    )
     if reconnect_interval_secs <= 0:
         raise ValueError("reconnect_interval_secs must be positive")
-    endpoint = resolve_endpoint(endpoint)
+    resolved_endpoint = resolve_endpoint(resolved_endpoint)
     worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
+    by_interface = {spec.interface: (fn, spec) for fn, spec in handler_pairs}
+    specs = [spec for _, spec in handler_pairs]
+    total_concurrency = (
+        specs[0].max_active_leases
+        if len(specs) == 1
+        else sum(s.max_active_leases for s in specs)
+    )
+    merged_attributes: dict[str, str] = {}
+    merged_capacity: dict[str, int] = {}
+    merged_metadata: dict[str, str] = {}
+    for s in specs:
+        merged_attributes.update(s.attributes)
+        merged_metadata.update(s.metadata)
+        for k, v in s.capacity.items():
+            merged_capacity[k] = merged_capacity.get(k, 0) + v if len(specs) > 1 else v
+    merged_capacity["slot"] = total_concurrency
+    session_pool = pool if pool is not None else specs[0].pool
     active: dict[str, tuple[Any, Future]] = {}
     active_lock = threading.Lock()
     credit_lock = threading.Lock()
-    pool = ThreadPoolExecutor(max_workers=spec.max_active_leases)
+    executor = ThreadPoolExecutor(max_workers=total_concurrency)
     session_id = ""
     conn = connection
     credit_sent = False
     session_draining = False
+    preempting_shutdown = False
+    prev_sigterm = None
+    installed_sigterm = False
+
+    def _on_sigterm(_signum: int, _frame: Any) -> None:
+        nonlocal preempting_shutdown
+        preempting_shutdown = True
+        raise _PreemptShutdown()
+
+    if threading.current_thread() is threading.main_thread():
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _on_sigterm)
+        installed_sigterm = True
 
     def report_capacity(current: Any) -> None:
         with credit_lock:
             entries = _active_snapshot(active, active_lock)
-            free = 0 if session_draining or any(item.cancelled for _, (item, _) in entries) else spec.max_active_leases - len(entries)
+            free = 0 if session_draining or any(item.cancelled for _, (item, _) in entries) else total_concurrency - len(entries)
             current.credit(free)
 
     def completed(lease_id: str, future: Future) -> None:
@@ -152,12 +231,24 @@ def serve(
         while True:
             if conn is None:
                 try:
-                    conn = WorkerConnection(endpoint, {
-                        "worker_id": worker_id, "interfaces": [spec.interface],
-                        "attributes": {**spec.attributes, "worker_id": worker_id},
-                        "capacity": spec.capacity, "metadata": spec.metadata, "max_concurrency": spec.max_active_leases,
-                        "resume_session_id": session_id, "held_lease_ids": _active_ids(active, active_lock),
-                    }, token)
+                    hello = {
+                        "worker_id": worker_id,
+                        "interfaces": [s.interface for s in specs],
+                        "attributes": {**merged_attributes, "worker_id": worker_id},
+                        "capacity": merged_capacity,
+                        "metadata": merged_metadata,
+                        "max_concurrency": total_concurrency,
+                        "resume_session_id": session_id,
+                        "held_lease_ids": _active_ids(active, active_lock),
+                    }
+                    if session_pool:
+                        hello["pool"] = session_pool
+                    if namespace is None:
+                        conn = WorkerConnection(resolved_endpoint, hello, token)
+                    else:
+                        conn = WorkerConnection(
+                            resolved_endpoint, hello, token, namespace=namespace
+                        )
                     session_draining = False
                     session_id = conn.session_id
                     for lease_id, (assignment, _) in _active_snapshot(active, active_lock):
@@ -180,18 +271,31 @@ def serve(
                 lease_id = message.get("lease_id")
                 if kind == "assignment":
                     assignment = message["assignment"]
+                    iface = getattr(assignment, "interface", specs[0].interface)
+                    target = by_interface.get(iface)
                     entries = _active_snapshot(active, active_lock)
                     used: dict[str, int] = {}
                     for _, (held, _) in entries:
                         for resource, amount in held.reserved_capacity.items():
                             used[resource] = used.get(resource, 0) + amount
-                    accepted = not session_draining and len(entries) < spec.max_active_leases and all(
-                        used.get(resource, 0) + amount <= spec.capacity.get(resource, 0)
-                        for resource, amount in assignment.reserved_capacity.items()
+                    accepted = (
+                        target is not None
+                        and not session_draining
+                        and len(entries) < total_concurrency
+                        and all(
+                            used.get(resource, 0) + amount <= merged_capacity.get(resource, 0)
+                            for resource, amount in assignment.reserved_capacity.items()
+                        )
                     )
-                    conn.accept(lease_id, accepted, "local capacity limit" if not accepted else "")
+                    reason = (
+                        ""
+                        if accepted
+                        else ("unknown interface" if target is None else "local capacity limit")
+                    )
+                    conn.accept(lease_id, accepted, reason)
                     if accepted:
-                        future = pool.submit(_process_assignment, handler, spec, assignment)
+                        fn, target_spec = target
+                        future = executor.submit(_process_assignment, fn, target_spec, assignment)
                         with active_lock:
                             active[lease_id] = (assignment, future)
                         future.add_done_callback(lambda done, lease_id=lease_id: completed(lease_id, done))
@@ -216,16 +320,28 @@ def serve(
                 conn = None
                 credit_sent = False
                 time.sleep(reconnect_interval_secs)
+    except _PreemptShutdown:
+        preempting_shutdown = True
     finally:
+        if installed_sigterm:
+            signal.signal(signal.SIGTERM, prev_sigterm)
         if conn is not None:
             try:
-                conn.drain()
+                if preempting_shutdown:
+                    try:
+                        conn.drain(preempting=True)
+                    except TypeError:
+                        conn.drain()
+                else:
+                    conn.drain()
             except RuntimeError:
                 pass
         for _, (assignment, _) in _active_snapshot(active, active_lock):
             assignment.cancel()
-        pool.shutdown(wait=True, cancel_futures=True)
+        executor.shutdown(wait=True, cancel_futures=True)
         if conn is not None:
+            if preempting_shutdown:
+                time.sleep(0.05)
             conn.close()
 
 
@@ -239,6 +355,32 @@ def _active_snapshot(active: dict, lock: threading.Lock) -> list:
         return list(active.items())
 
 
+def _fetch_uri_bytes(uri: str, metadata: dict[str, str]) -> bytes:
+    with urllib.request.urlopen(uri, timeout=30) as resp:
+        data = resp.read()
+    expected_sha = metadata.get("anyserve.sha256")
+    if expected_sha:
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != expected_sha:
+            raise ValueError(
+                f"URI payload SHA-256 mismatch for {uri}: expected {expected_sha}, got {actual}"
+            )
+    return data
+
+
+async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> None:
+    try:
+        async for item in agen:
+            if attempt.cancelled:
+                return
+            payload = _encode_payload(spec.codec, item)
+            if spec.codec == _CODEC_JSON:
+                payload += b"\n"
+            attempt.frame(payload)
+    finally:
+        await agen.aclose()
+
+
 def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -> None:
     attempt = assignment.open_stream() if spec.streaming_input else assignment.open()
     if attempt.cancelled or attempt.terminal_replay:
@@ -248,11 +390,32 @@ def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -
             value = _input_fragments(attempt)
         else:
             inputs = attempt.inputs
-            if any("inline" not in item for item in inputs):
-                raise ValueError("serve(...) requires inline inputs")
-            value = _decode_payload(spec.codec, b"".join(item["inline"] for item in inputs))
+            if not spec.auto_fetch_uri and spec.uri_resolver is None:
+                if any("inline" not in item for item in inputs):
+                    raise ValueError("serve(...) requires inline inputs")
+                raw = b"".join(item["inline"] for item in inputs)
+            else:
+                parts: list[bytes] = []
+                for item in inputs:
+                    if "inline" in item:
+                        parts.append(item["inline"])
+                    elif "uri" in item:
+                        meta = item.get("metadata") or {}
+                        if spec.uri_resolver is not None:
+                            parts.append(spec.uri_resolver(item["uri"], meta))
+                        else:
+                            parts.append(_fetch_uri_bytes(item["uri"], meta))
+                    else:
+                        raise ValueError("input object has neither inline nor uri")
+                raw = b"".join(parts)
+            value = _decode_payload(spec.codec, raw)
         result = handler(value, attempt) if spec.pass_context else handler(value)
-        if inspect.isgenerator(result):
+        if inspect.iscoroutine(result):
+            result = asyncio.run(result)
+        if inspect.isasyncgen(result):
+            asyncio.run(_drive_async_generator(result, spec, attempt))
+            outputs: list[dict[str, Any]] = []
+        elif inspect.isgenerator(result):
             try:
                 for item in result:
                     if attempt.cancelled:
@@ -324,6 +487,9 @@ def _build_handler_spec(
     max_active_leases: int,
     pass_context: bool,
     streaming_input: bool,
+    pool: str = "",
+    auto_fetch_uri: bool = False,
+    uri_resolver: Optional[Callable[[str, dict[str, str]], bytes]] = None,
 ) -> HandlerSpec:
     if not interface:
         raise ValueError("worker interface must be non-empty")
@@ -345,4 +511,7 @@ def _build_handler_spec(
         max_active_leases=max_active_leases,
         pass_context=pass_context,
         streaming_input=streaming_input,
+        pool=pool,
+        auto_fetch_uri=auto_fetch_uri,
+        uri_resolver=uri_resolver,
     )

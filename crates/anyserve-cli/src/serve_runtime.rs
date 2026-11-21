@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use anyserve_core::auth::{AuthLayer, AuthPolicy};
 use anyserve_core::client_service::ClientGrpcService;
+use anyserve_core::cluster::PeerMeshGrpcService;
 use anyserve_core::runtime::Runtime;
 use anyserve_core::worker_service::WorkerGrpcService;
 use anyserve_proto::v2::{client_server::ClientServer, worker_server::WorkerServer};
@@ -169,6 +170,9 @@ async fn run_grpc_server(
     let client_service = ClientServer::new(ClientGrpcService::new(runtime.clone()))
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
+    let peer_mesh_service = auth
+        .has_peer_tokens()
+        .then(|| PeerMeshGrpcService::server(runtime.clone()));
     let worker_service = WorkerGrpcService::server(runtime);
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -213,6 +217,7 @@ async fn run_grpc_server(
         .add_service(health_service)
         .add_service(client_service)
         .add_service(worker_service)
+        .add_optional_service(peer_mesh_service)
         .serve_with_shutdown(addr, async move {
             let _ = shutdown.changed().await;
         })

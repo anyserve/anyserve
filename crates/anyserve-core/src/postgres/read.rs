@@ -13,6 +13,16 @@ use crate::runtime::api::{
 };
 use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 
+pub(super) fn pg_job_from_row(row: &sqlx::postgres::PgRow) -> Result<StoredJob> {
+    let mut job = job_from_row(row)?;
+    job.failed_workers = row
+        .try_get::<Vec<String>, _>("failed_workers")
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    Ok(job)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadMode {
     Metadata,
@@ -107,7 +117,7 @@ impl Postgres {
                 .as_ref()
                 .map(|row| {
                     Ok(JobSnapshot {
-                        job: job_from_row(row)?,
+                        job: pg_job_from_row(row)?,
                         events: Vec::new(),
                         previews: Vec::new(),
                     })
@@ -146,7 +156,7 @@ impl Postgres {
         else {
             return Ok(None);
         };
-        let mut job = job_from_row(&row)?;
+        let mut job = pg_job_from_row(&row)?;
         let floor = row.try_get::<i64, _>("events_floor")? as u64;
         if after.is_some_and(|after| after != 0 && after < floor) {
             return Err(RuntimeError::cursor_expired(floor + 1).into());
@@ -214,6 +224,7 @@ impl Postgres {
         }))
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn scan_jobs(
         &self,
@@ -224,6 +235,25 @@ impl Postgres {
         interface: Option<&str>,
         limit: usize,
     ) -> Result<Vec<StoredJob>> {
+        self.scan_jobs_in(from, to, before, states, interface, None, limit)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn scan_jobs_in(
+        &self,
+        from: u64,
+        to: u64,
+        before: Option<(u64, String)>,
+        states: &[JobState],
+        interface: Option<&str>,
+        namespace: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredJob>> {
+        let before = before.map(|(at, id)| match namespace {
+            Some(ns) => (at, crate::runtime::identity::encode_scoped_id(ns, &id)),
+            None => (at, id),
+        });
         let mut query = QueryBuilder::<Pg>::new("SELECT * FROM jobs WHERE created_at_ms>=");
         query
             .push_bind(from.min(i64::MAX as u64) as i64)
@@ -249,6 +279,9 @@ impl Postgres {
                 .push_bind(states.iter().copied().map(state_text).collect::<Vec<_>>())
                 .push(")");
         }
+        if let Some(ns) = namespace {
+            query.push(" AND namespace=").push_bind(ns);
+        }
         if let Some(interface) = interface {
             query.push(" AND interface=").push_bind(interface);
         }
@@ -260,7 +293,7 @@ impl Postgres {
             .fetch_all(&self.pool)
             .await?
             .iter()
-            .map(job_from_row)
+            .map(pg_job_from_row)
             .collect()
     }
 

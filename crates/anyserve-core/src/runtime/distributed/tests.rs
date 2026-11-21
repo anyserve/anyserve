@@ -146,7 +146,10 @@ fn released_outputs_drop_after_unlocking_runtime_state() {
     }
     let state = Arc::new(Mutex::new(crate::runtime::state::State::default()));
     let dropped = Arc::new(AtomicBool::new(false));
-    let mut guard = super::super::StateGuard(Some(state.lock().unwrap()));
+    let mut guard = super::super::StateGuard {
+        state: Some(state.lock().unwrap()),
+        telemetry: None,
+    };
     guard
         .released
         .outputs
@@ -243,40 +246,42 @@ async fn postgres_cluster_idempotency_is_global_and_atomic() {
 #[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
 async fn postgres_cluster_two_replicas_execute_without_duplicate_claims() {
     let c = Cluster::start().await;
-    let mut wa = worker(&c.a, "a", 16);
-    let mut wb = worker(&c.b, "b", 16);
     for i in 0..32 {
         let mut request = request(&format!("job-{i}"));
         request.spec.inputs[0] = Object::inline(format!("input-{i}"));
         request.spec.params = Bytes::from(format!("params-{i}"));
         c.a.submit(request).await.unwrap();
     }
-    let mut seen = HashSet::new();
+    let mut wa = worker(&c.a, "a", 16);
+    let mut wb = worker(&c.b, "b", 16);
+    let mut pairs = Vec::with_capacity(32);
     for _ in 0..16 {
-        for (runtime, session) in [(&c.a, &mut wa), (&c.b, &mut wb)] {
-            let assign = assigned(session).await;
-            assert!(
-                seen.insert(assign.job_id.clone()),
-                "job assigned on two live replicas"
-            );
-            assert_eq!(assign.inline_inputs.len(), 2);
-            let index = assign.job_id.strip_prefix("job-").unwrap();
-            assert_eq!(
-                assign.inline_inputs[0].body,
-                Some(pb::object::Body::Inline(Bytes::from(format!(
-                    "input-{index}"
-                ))))
-            );
-            assert_eq!(assign.params, Bytes::from(format!("params-{index}")));
-            let link = open(runtime, &assign).await;
-            assert_eq!(
-                runtime
-                    .finish_attempt(&link, AttemptOutcome::Succeeded, vec![Object::inline("ok")])
-                    .await
-                    .unwrap(),
-                FinishStatus::Committed
-            );
-        }
+        pairs.push((&c.a, assigned(&mut wa).await));
+        pairs.push((&c.b, assigned(&mut wb).await));
+    }
+    let mut seen = HashSet::new();
+    for (runtime, assign) in pairs {
+        assert!(
+            seen.insert(assign.job_id.clone()),
+            "job assigned on two live replicas"
+        );
+        assert_eq!(assign.inline_inputs.len(), 2);
+        let index = assign.job_id.strip_prefix("job-").unwrap();
+        assert_eq!(
+            assign.inline_inputs[0].body,
+            Some(pb::object::Body::Inline(Bytes::from(format!(
+                "input-{index}"
+            ))))
+        );
+        assert_eq!(assign.params, Bytes::from(format!("params-{index}")));
+        let link = open(runtime, &assign).await;
+        assert_eq!(
+            runtime
+                .finish_attempt(&link, AttemptOutcome::Succeeded, vec![Object::inline("ok")])
+                .await
+                .unwrap(),
+            FinishStatus::Committed
+        );
     }
     assert_eq!(seen.len(), 32);
     assert_eq!(
@@ -1000,6 +1005,7 @@ async fn postgres_cluster_unassigned_timeouts_and_keyset_history() {
                 to_ms: crate::now_ms() + 1000,
                 limit: 2,
                 cursor,
+                namespace: None,
             })
             .await
             .unwrap();
@@ -1014,4 +1020,524 @@ async fn postgres_cluster_unassigned_timeouts_and_keyset_history() {
     }
     assert_eq!(seen.len(), 7);
     c.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_namespace_fair_claim_concurrency_and_failed_worker_avoidance() {
+    let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL").unwrap();
+    let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+    let mut interfaces = std::collections::BTreeMap::new();
+    interfaces.insert(
+        "vla".to_string(),
+        InterfacePolicy {
+            max_in_flight_per_key: Some(1),
+            ..Default::default()
+        },
+    );
+    let mut journal = JournalConfig::postgres(&url);
+    let pg = journal.postgres.as_mut().unwrap();
+    pg.schema = schema.clone();
+    pg.lease_duration = Duration::from_secs(3);
+    pg.poll_interval = Duration::from_millis(20);
+    let config = RuntimeConfig {
+        journal: Some(journal),
+        default_initial_backoff: Duration::from_millis(20),
+        heartbeat_timeout: Duration::from_secs(30),
+        interfaces,
+        ..Default::default()
+    };
+    let (a, b) = tokio::join!(Runtime::start(config.clone()), Runtime::start(config));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let admin = PgPool::connect(&url).await.unwrap();
+
+    // 1. Multi-tenant isolation with colliding job_id across namespaces.
+    let mut s = JobSpec::default();
+    s.demand.interface = "vla".into();
+    s.policy.durability = Some(Durability::Durable);
+    let out_a = a
+        .submit(SubmitRequest {
+            job_id: Some("shared-id".into()),
+            namespace: Some("robot-a".into()),
+            spec: s.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let out_b = b
+        .submit(SubmitRequest {
+            job_id: Some("shared-id".into()),
+            namespace: Some("robot-b".into()),
+            spec: s.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(out_a.created && out_b.created);
+    assert_eq!(out_a.job.namespace, "robot-a");
+    assert_eq!(out_b.job.namespace, "robot-b");
+    assert_eq!(
+        b.get_job_in("robot-a", "shared-id", false)
+            .await
+            .unwrap()
+            .namespace,
+        "robot-a"
+    );
+
+    // 2. Concurrency key serialization across replicas + fair DRR claim.
+    let mut bulk = s.clone();
+    bulk.policy.fairness_key = "bulk".into();
+    bulk.policy.concurrency_key = "arm-1".into();
+    for i in 0..8 {
+        a.submit(SubmitRequest {
+            job_id: Some(format!("bulk-{i}")),
+            spec: bulk.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let mut wa_vla = a
+        .open_session(pb::Hello {
+            worker_id: "wa-vla".into(),
+            interfaces: vec!["vla".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let first_a = assigned(&mut wa_vla).await;
+    assert_eq!(first_a.job_id, "bulk-0");
+
+    let mut vip = s.clone();
+    vip.policy.fairness_key = "vip".into();
+    vip.policy.concurrency_key = "arm-2".into();
+    a.submit(SubmitRequest {
+        job_id: Some("vip-1".into()),
+        spec: vip,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let mut wb_vla = b
+        .open_session(pb::Hello {
+            worker_id: "wb-vla".into(),
+            interfaces: vec!["vla".into()],
+            max_concurrency: 4,
+            ..Default::default()
+        })
+        .unwrap();
+    let first_b = assigned(&mut wb_vla).await;
+    assert_eq!(first_b.job_id, "vip-1");
+    // Even if arm-1 occupied on one replica, arm-2 ("vip-1") or another key isn't blocked.
+    b.finish_attempt(
+        &AttemptLink::Live {
+            lease_id: first_b.lease_id.clone(),
+            resume_from: 0,
+            inputs: None,
+        },
+        AttemptOutcome::Succeeded,
+        vec![],
+    )
+    .await
+    .unwrap();
+    a.finish_attempt(
+        &AttemptLink::Live {
+            lease_id: first_a.lease_id.clone(),
+            resume_from: 0,
+            inputs: None,
+        },
+        AttemptOutcome::Succeeded,
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // Verify failed_workers persistence across PG retry in an isolated namespace.
+    let mut fw_spec = s;
+    fw_spec.policy.max_attempts = Some(2);
+    a.submit(SubmitRequest {
+        job_id: Some("failover-1".into()),
+        namespace: Some("robot-failover".into()),
+        spec: fw_spec,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let mut w_ra_bad = a
+        .open_session_for(
+            pb::Hello {
+                worker_id: "ra-bad".into(),
+                interfaces: vec!["vla".into()],
+                max_concurrency: 1,
+                ..Default::default()
+            },
+            crate::auth::Principal {
+                namespace: "robot-failover".into(),
+                role: crate::auth::Role::Worker,
+                subject: "w".into(),
+                forced_pool: None,
+                is_operator: false,
+            },
+        )
+        .unwrap();
+    let ass1 = assigned(&mut w_ra_bad).await;
+    assert_eq!(ass1.job_id, "failover-1");
+
+    let mut w_ra_good = b
+        .open_session_for(
+            pb::Hello {
+                worker_id: "ra-good".into(),
+                interfaces: vec!["vla".into()],
+                max_concurrency: 1,
+                ..Default::default()
+            },
+            crate::auth::Principal {
+                namespace: "robot-failover".into(),
+                role: crate::auth::Role::Worker,
+                subject: "w".into(),
+                forced_pool: None,
+                is_operator: false,
+            },
+        )
+        .unwrap();
+
+    a.finish_attempt(
+        &AttemptLink::Live {
+            lease_id: ass1.lease_id,
+            resume_from: 0,
+            inputs: None,
+        },
+        AttemptOutcome::Failed(ErrorInfo::new("worker_failed", "oom", true)),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let ass2 = assigned(&mut w_ra_good).await;
+    assert_eq!(ass2.job_id, "failover-1");
+    b.finish_attempt(
+        &AttemptLink::Live {
+            lease_id: ass2.lease_id,
+            resume_from: 0,
+            inputs: None,
+        },
+        AttemptOutcome::Succeeded,
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b.get_job_in("robot-failover", "failover-1", false)
+            .await
+            .unwrap()
+            .state,
+        JobState::Succeeded
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_event_batcher_coalesces_progress_and_commits_before_ack() {
+    let c = Cluster::start().await;
+    let out = c.a.submit(request("batch-1")).await.unwrap();
+    assert!(out.created);
+    let mut w = worker(&c.a, "w1", 1);
+    let ass = assigned(&mut w).await;
+
+    // Concurrent progress + data push batches cleanly and waits for PG commit.
+    let (r1, r2, r3) = tokio::join!(
+        c.a.push_frame(
+            &ass.lease_id,
+            pb::Frame {
+                sequence: 1,
+                data: Bytes::from_static(b"p1"),
+                progress: true,
+                ..Default::default()
+            }
+        ),
+        c.a.push_frame(
+            &ass.lease_id,
+            pb::Frame {
+                sequence: 2,
+                data: Bytes::from_static(b"p2"),
+                progress: true,
+                ..Default::default()
+            }
+        ),
+        c.a.push_frame(
+            &ass.lease_id,
+            pb::Frame {
+                sequence: 3,
+                data: Bytes::from_static(b"chunk"),
+                progress: false,
+                ..Default::default()
+            }
+        ),
+    );
+    assert_eq!(r1.unwrap(), 1);
+    assert_eq!(r2.unwrap(), 2);
+    assert_eq!(r3.unwrap(), 3);
+
+    // Immediately after push_frame returns, another replica reads committed events (non-empty).
+    let (evs, _) = c.b.events("batch-1", 0).await.unwrap();
+    assert!(
+        evs.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Output { data, progress: false, .. } if data.as_ref() == b"chunk"
+        )),
+        "expected committed output frame in replica B snapshot: {evs:?}"
+    );
+    c.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_peermesh_forward_invoke_and_fast_wakeup() {
+    use anyserve_proto::cluster::peer_mesh_client::PeerMeshClient;
+    use anyserve_proto::cluster::{
+        ForwardInvokeRequest, ForwardInvokeStart, WatchRemoteRequest, forward_invoke_request,
+    };
+    use anyserve_proto::v2::client_server::ClientServer;
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::Code;
+    use tonic::transport::{Endpoint, Server};
+
+    let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL").unwrap();
+    let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+
+    let l_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = l_a.local_addr().unwrap();
+    let l_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = l_b.local_addr().unwrap();
+
+    let make_cfg = |addr: std::net::SocketAddr| {
+        let mut journal = JournalConfig::postgres(&url);
+        let pg = journal.postgres.as_mut().unwrap();
+        pg.schema = schema.clone();
+        pg.lease_duration = Duration::from_secs(5);
+        // Very slow poll interval to prove PeerMesh ClaimWakeup delivers <200ms claim!
+        pg.poll_interval = Duration::from_secs(1);
+        pg.internal_grpc_addr = Some(format!("http://{addr}"));
+        pg.peer_token = Some("peer-secret".to_string());
+        RuntimeConfig {
+            journal: Some(journal),
+            ..Default::default()
+        }
+    };
+    let (a, b) = tokio::join!(
+        Runtime::start(make_cfg(addr_a)),
+        Runtime::start(make_cfg(addr_b))
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+
+    let auth = crate::auth::AuthPolicy::new(["op-client".into()], ["op-worker".into()])
+        .with_scoped_tokens([
+            crate::auth::ScopedToken {
+                token: "tok-a-client".into(),
+                role: crate::auth::Role::Client,
+                namespace: "tenant-a".into(),
+                subject: "a".into(),
+                forced_pool: None,
+            },
+            crate::auth::ScopedToken {
+                token: "tok-b-worker".into(),
+                role: crate::auth::Role::Worker,
+                namespace: "tenant-b".into(),
+                subject: "b".into(),
+                forced_pool: None,
+            },
+        ])
+        .with_peer_tokens(["peer-secret".into()]);
+
+    let (stop_a, rx_a) = tokio::sync::oneshot::channel::<()>();
+    let (stop_b, rx_b) = tokio::sync::oneshot::channel::<()>();
+    for (rt, l, rx, pol) in [(&a, l_a, rx_a, auth.clone()), (&b, l_b, rx_b, auth)] {
+        let c_svc = ClientServer::new(crate::client_service::ClientGrpcService::new(rt.clone()));
+        let w_svc = crate::worker_service::WorkerGrpcService::server(rt.clone());
+        let p_svc = crate::cluster::PeerMeshGrpcService::server(rt.clone());
+        tokio::spawn(async move {
+            Server::builder()
+                .layer(crate::auth::AuthLayer::new(pol))
+                .add_service(c_svc)
+                .add_service(w_svc)
+                .add_service(p_svc)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(l), async move {
+                    let _ = rx.await;
+                })
+                .await
+                .unwrap();
+        });
+    }
+
+    // Verify PeerMesh rejects missing, tenant-client, operator-client, and worker tokens.
+    let ch = Endpoint::from_shared(format!("http://{addr_a}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut mesh_probe = PeerMeshClient::new(ch);
+    for (tok, expected_code) in [
+        (None, Code::Unauthenticated),
+        (Some("tok-a-client"), Code::PermissionDenied),
+        (Some("op-client"), Code::PermissionDenied),
+        (Some("tok-b-worker"), Code::PermissionDenied),
+    ] {
+        let mut r1 = tonic::Request::new(WatchRemoteRequest {
+            namespace: "default".into(),
+            job_id: "x".into(),
+            after_sequence: 0,
+        });
+        if let Some(t) = tok {
+            r1.metadata_mut()
+                .insert("authorization", format!("Bearer {t}").parse().unwrap());
+        }
+        assert_eq!(
+            mesh_probe.watch_remote(r1).await.err().unwrap().code(),
+            expected_code
+        );
+
+        let mut r2 = tonic::Request::new(futures::stream::iter(vec![ForwardInvokeRequest {
+            msg: Some(forward_invoke_request::Msg::Start(ForwardInvokeStart {
+                namespace: "default".into(),
+                hop_count: 1,
+                invoke: Some(pb::InvokeStart {
+                    spec: Some(pb::JobSpec {
+                        demand: Some(pb::Demand {
+                            interface: "echo".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    streaming_input: false,
+                }),
+            })),
+        }]));
+        if let Some(t) = tok {
+            r2.metadata_mut()
+                .insert("authorization", format!("Bearer {t}").parse().unwrap());
+        }
+        let err2 = match mesh_probe.forward_invoke(r2).await {
+            Ok(resp) => match resp.into_inner().message().await {
+                Err(s) => s,
+                Ok(_) => panic!("expected PeerMesh ForwardInvoke rejection for {tok:?}"),
+            },
+            Err(s) => s,
+        };
+        assert_eq!(err2.code(), expected_code);
+
+        let mut r3 = tonic::Request::new(futures::stream::empty());
+        if let Some(t) = tok {
+            r3.metadata_mut()
+                .insert("authorization", format!("Bearer {t}").parse().unwrap());
+        }
+        let err3 = match mesh_probe.sync_directory(r3).await {
+            Ok(resp) => match resp.into_inner().message().await {
+                Err(s) => s,
+                Ok(_) => panic!("expected PeerMesh SyncDirectory rejection for {tok:?}"),
+            },
+            Err(s) => s,
+        };
+        assert_eq!(err3.code(), expected_code);
+    }
+
+    // Worker connected ONLY on Replica B!
+    let mut wb = worker(&b, "wb-mesh", 2);
+    let b_ref = b.clone();
+    tokio::spawn(async move {
+        loop {
+            let ass = tokio::select! {
+                ass = assigned(&mut wb) => ass,
+                _ = tokio::time::sleep(Duration::from_secs(5)) => break,
+            };
+            b_ref
+                .finish_attempt(
+                    &AttemptLink::Live {
+                        lease_id: ass.lease_id,
+                        resume_from: 0,
+                        inputs: None,
+                    },
+                    AttemptOutcome::Succeeded,
+                    vec![Object::inline("mesh-reply")],
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    // Wait briefly for authenticated SyncDirectory snapshot propagation from B -> A.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // 1. Ephemeral Invoke hits Replica A (0 local workers) -> forwarded single-hop over authenticated PeerMesh to B!
+    let mut spec = JobSpec::default();
+    spec.demand.interface = "echo".into();
+    spec.policy.durability = Some(Durability::Ephemeral);
+    let mut exec = a
+        .invoke(InvokeRequest {
+            spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut got_mesh_reply = false;
+    while let Some(ev) = exec.next().await {
+        if let EventKind::Finished { state, outputs, .. } = ev.unwrap().kind {
+            assert_eq!(state, JobState::Succeeded);
+            assert_eq!(outputs, vec![Object::inline("mesh-reply")]);
+            got_mesh_reply = true;
+            break;
+        }
+    }
+    assert!(
+        got_mesh_reply,
+        "expected PeerMesh ForwardInvoke result from Replica B"
+    );
+
+    // 2. Durable Submit on A triggers ClaimWakeup -> Replica B finishes in <350ms despite 1000ms poll!
+    let t0 = std::time::Instant::now();
+    a.submit(request("wakeup-fast")).await.unwrap();
+    loop {
+        let view = a.get_job("wakeup-fast", true).await.unwrap();
+        if view.state == JobState::Succeeded {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "ClaimWakeup timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 3. Shutting down Replica B removes its entry from A's peer mesh (M2 task cleanup).
+    let _ = stop_b.send(());
+    b.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if a.inner.peer_mesh.as_ref().unwrap().live_peer_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("peer_sync_loop must prune expired/stopped peers");
+
+    let _ = stop_a.send(());
+    a.shutdown().await;
+    let admin = PgPool::connect(&url).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }

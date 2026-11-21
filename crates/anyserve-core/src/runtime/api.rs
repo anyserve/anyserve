@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::DEFAULT_NAMESPACE;
 use crate::error::RuntimeError;
 
 pub type Metadata = BTreeMap<String, String>;
@@ -21,6 +22,13 @@ pub type Capacity = BTreeMap<String, i64>;
 /// are excluded from the idempotency fingerprint; every other key counts.
 pub const IDENTITY_EXCLUDED_METADATA_KEYS: &[&str] =
     &["traceparent", "tracestate", "baggage", "x-request-id"];
+
+/// Content-addressed metadata keys for URI-referenced payloads (`BYO-Bucket` /
+/// edge object references). When `OBJECT_SHA256_METADATA_KEY` is present on an
+/// `Object::Uri`, `spec_hash` hashes the content digest rather than transient
+/// paths or query strings.
+pub const OBJECT_SHA256_METADATA_KEY: &str = "anyserve.sha256";
+pub const OBJECT_SIZE_METADATA_KEY: &str = "anyserve.size_bytes";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Object {
@@ -57,6 +65,8 @@ pub struct Demand {
     pub required_attributes: Metadata,
     pub preferred_attributes: Metadata,
     pub required_capacity: Capacity,
+    #[serde(default)]
+    pub affinity_key: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -85,6 +95,10 @@ pub struct ExecutionPolicy {
     /// Whether a failed attempt is retried at all is the worker's call
     /// (`ErrorInfo::retryable`).
     pub max_attempts: Option<u32>,
+    #[serde(default)]
+    pub fairness_key: String,
+    #[serde(default)]
+    pub concurrency_key: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -108,6 +122,7 @@ pub enum ConflictPolicy {
 
 #[derive(Clone, Debug, Default)]
 pub struct SubmitRequest {
+    pub namespace: Option<String>,
     pub job_id: Option<String>,
     pub conflict: ConflictPolicy,
     pub spec: JobSpec,
@@ -124,6 +139,7 @@ pub enum InputMode {
 
 #[derive(Clone, Debug, Default)]
 pub struct InvokeRequest {
+    pub namespace: Option<String>,
     pub spec: JobSpec,
     pub input: InputMode,
 }
@@ -176,6 +192,7 @@ pub mod codes {
     pub const WORKER_FAILED: &str = "worker_failed";
     pub const WORKER_LOST: &str = "worker_lost";
     pub const WORKER_REJECTED: &str = "worker_rejected";
+    pub const WORKER_PREEMPTED: &str = "worker_preempted";
     pub const ATTEMPTS_EXHAUSTED: &str = "attempts_exhausted";
     pub const OUTPUT_INTERRUPTED: &str = "output_interrupted";
     pub const OUTPUT_TOO_LARGE: &str = "output_too_large";
@@ -186,6 +203,7 @@ pub mod codes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobView {
     pub job_id: String,
+    pub namespace: String,
     pub state: JobState,
     pub durability: Durability,
     pub interface: String,
@@ -364,6 +382,7 @@ pub struct JobFilter {
     /// Empty matches every state.
     pub states: Vec<JobState>,
     pub interface: Option<String>,
+    pub namespace: Option<String>,
     /// 0 uses a default page size.
     pub limit: usize,
     pub page_token: Option<String>,
@@ -378,7 +397,7 @@ pub struct JobPage {
 /// Bounded metadata scan in descending (creation time, job id) order.
 /// Archived scans include completed durable jobs; retained scans include live
 /// and recently completed jobs. Neither reads request or result bodies.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct JobScan {
     pub archived: bool,
     pub from_ms: u64,
@@ -386,6 +405,7 @@ pub struct JobScan {
     pub to_ms: u64,
     pub limit: usize,
     pub cursor: Option<String>,
+    pub namespace: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -401,6 +421,8 @@ pub struct WorkerLoad {
 pub struct WorkerView {
     pub session_id: String,
     pub worker_id: String,
+    pub namespace: String,
+    pub pool: String,
     pub interfaces: Vec<String>,
     pub attributes: Metadata,
     pub total_capacity: Capacity,
@@ -440,6 +462,14 @@ pub struct InterfaceStats {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    pub sessions: usize,
+    pub free_slots: u64,
+    pub active_leases: usize,
+    pub desired_additional_slots: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JournalStats {
     pub pending_ops: usize,
     pub committed_batches: u64,
@@ -460,6 +490,8 @@ pub struct RuntimeStats {
     pub retained_jobs: usize,
     pub sessions: usize,
     pub interfaces: BTreeMap<String, InterfaceStats>,
+    /// Keyed by `(namespace, interface, pool)`.
+    pub pools: BTreeMap<(String, String, String), PoolStats>,
     pub journal: Option<JournalStats>,
     /// Bytes held against `max_pending_bytes`.
     pub input_bytes: u64,
@@ -507,18 +539,113 @@ impl Default for Limits {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PoolTier {
+    pub pool: String,
+    pub spillover_after: Duration,
+    /// Overrides the runtime reconnect grace window for workers in this pool
+    /// (for example 1s for datacenter/spot vs 15s for mobile/edge links).
+    pub reconnect_grace: Option<Duration>,
+    /// When set, idle workers beyond `min_sessions` in this pool are drained
+    /// once no queued demand remains.
+    pub idle_drain_after: Option<Duration>,
+    pub min_sessions: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InterfacePolicy {
     pub max_queue: Option<usize>,
     pub queue_timeout: Option<Duration>,
+    pub max_in_flight_per_key: Option<usize>,
+    pub pool_tiers: Vec<PoolTier>,
 }
+
+/// Admission quota outcome evaluated before inserting work into the runtime.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuotaDecision {
+    pub max_in_flight_jobs: Option<usize>,
+    pub max_queued_jobs: Option<usize>,
+    pub max_pending_bytes: Option<u64>,
+    pub allowed_pools: Option<Vec<String>>,
+}
+
+/// Pluggable tenant/workspace admission policy extension point.
+pub trait QuotaPolicy: Send + Sync {
+    fn check_admission(
+        &self,
+        namespace: &str,
+        spec: &JobSpec,
+    ) -> Result<QuotaDecision, RuntimeError>;
+}
+
+/// Non-blocking billing and audit telemetry events emitted outside hot locks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BillingEvent {
+    JobAccepted {
+        namespace: String,
+        job_id: String,
+        durability: Durability,
+        input_bytes: u64,
+        at_ms: u64,
+    },
+    AttemptFinished {
+        namespace: String,
+        job_id: String,
+        pool: String,
+        worker_id: String,
+        state: JobState,
+        duration_ms: u64,
+        output_bytes: u64,
+    },
+}
+
+pub trait TelemetrySink: Send + Sync {
+    fn emit(&self, event: BillingEvent);
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimeHooks {
+    pub quota: Option<Arc<dyn QuotaPolicy>>,
+    pub telemetry: Option<Arc<dyn TelemetrySink>>,
+}
+
+impl std::fmt::Debug for RuntimeHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeHooks")
+            .field("quota", &self.quota.is_some())
+            .field("telemetry", &self.telemetry.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for RuntimeHooks {
+    fn eq(&self, other: &Self) -> bool {
+        let q = match (&self.quota, &other.quota) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        let t = match (&self.telemetry, &other.telemetry) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        q && t
+    }
+}
+
+impl Eq for RuntimeHooks {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub heartbeat_interval: Duration,
-    /// A worker session silent this long is closed; its leases survive this
-    /// long again for a reconnect before their attempts are lost.
+    /// A worker session silent this long is closed; its leases survive for
+    /// `reconnect_grace` (or `heartbeat_timeout` when unset) before their
+    /// attempts are lost.
     pub heartbeat_timeout: Duration,
+    /// Optional default reconnect grace for disconnected sessions; falls back
+    /// to `heartbeat_timeout` when `None`, and can be overridden per pool.
+    pub reconnect_grace: Option<Duration>,
     pub default_max_attempts: u32,
     /// Upper bound for a job's own `ExecutionPolicy::max_attempts`. It also
     /// bounds the lifecycle events that may exceed `max_event_bytes`:
@@ -529,6 +656,7 @@ pub struct RuntimeConfig {
     pub default_max_backoff: Duration,
     pub priority_levels: u32,
     pub default_max_queue: usize,
+    pub default_max_in_flight_per_key: Option<usize>,
     /// Unfinished jobs across all interfaces, including those being accepted.
     pub max_pending_jobs: usize,
     /// Input bytes (static inputs, params and streaming input) of unfinished
@@ -558,6 +686,7 @@ pub struct RuntimeConfig {
     pub max_sessions: usize,
     pub limits: Limits,
     pub journal: Option<JournalConfig>,
+    pub hooks: RuntimeHooks,
 }
 
 impl Default for RuntimeConfig {
@@ -565,12 +694,14 @@ impl Default for RuntimeConfig {
         Self {
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_timeout: Duration::from_secs(15),
+            reconnect_grace: None,
             default_max_attempts: 3,
             max_attempts_limit: 20,
             default_initial_backoff: Duration::from_millis(200),
             default_max_backoff: Duration::from_secs(10),
             priority_levels: 4,
             default_max_queue: 10_000,
+            default_max_in_flight_per_key: None,
             max_pending_jobs: 100_000,
             max_pending_bytes: 2 * 1024 * 1024 * 1024,
             interfaces: BTreeMap::new(),
@@ -585,6 +716,7 @@ impl Default for RuntimeConfig {
             max_sessions: 4_096,
             limits: Limits::default(),
             journal: None,
+            hooks: RuntimeHooks::default(),
         }
     }
 }
@@ -636,6 +768,11 @@ pub struct PostgresConfig {
     pub lease_duration: Duration,
     pub poll_interval: Duration,
     pub max_connections: u32,
+    /// Optional internal gRPC endpoint advertised in `nodes` for PeerMesh
+    /// cross-replica `Invoke` forwarding and `<1ms` claim wakeups.
+    pub internal_grpc_addr: Option<String>,
+    /// Shared secret bearer token required to authenticate inter-replica PeerMesh RPCs.
+    pub peer_token: Option<String>,
 }
 
 impl PostgresConfig {
@@ -646,6 +783,8 @@ impl PostgresConfig {
             lease_duration: Duration::from_secs(15),
             poll_interval: Duration::from_millis(100),
             max_connections: 16,
+            internal_grpc_addr: None,
+            peer_token: None,
         }
     }
 }
@@ -658,6 +797,15 @@ impl std::fmt::Debug for PostgresConfig {
             .field("lease_duration", &self.lease_duration)
             .field("poll_interval", &self.poll_interval)
             .field("max_connections", &self.max_connections)
+            .field("internal_grpc_addr", &self.internal_grpc_addr)
+            .field(
+                "peer_token",
+                &self.peer_token.as_ref().map(|_| "[redacted]"),
+            )
             .finish()
     }
+}
+
+pub fn default_namespace() -> String {
+    DEFAULT_NAMESPACE.to_string()
 }

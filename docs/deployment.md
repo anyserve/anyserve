@@ -17,6 +17,10 @@ schema = "anyserve"
 lease_duration_ms = 15000
 poll_interval_ms = 100
 max_connections = 16
+
+[cluster]
+internal_grpc_addr = "https://10.0.1.12:50052"
+peer_token_env = "ANYSERVE_PEER_TOKEN"
 ```
 
 Provide the PostgreSQL URL through that environment variable, preferably from
@@ -58,15 +62,20 @@ which shares one HTTP/2 connection in PG mode, and a TCP/L4 load balancer such a
 a Kubernetes ClusterIP Service. An L7 proxy that independently balances RPCs
 must provide equivalent affinity. Upgrade existing worker images with the server.
 Ephemeral Invoke/Submit and worker sessions remain local to their serving replica;
-use durable Submit for failover and shared scheduling. In PG mode, ephemeral jobs
-use generated `ephemeral:` IDs; caller-chosen IDs are reserved for durable Submit
-and may not use that prefix. This keeps local and shared job identities disjoint.
-Long-lived worker connections can concentrate on one replica after rolling updates.
-Durable Submit works even on a replica with no local worker; Invoke requires a
-matching local worker. Rebalance worker connections when using Invoke across replicas.
-Metrics and worker lists describe the serving replica; aggregate metrics across
-pods. Memory and admission limits bound each replica's loaded/in-flight work,
-not the entire PG backlog.
+when `[cluster].internal_grpc_addr` and `[cluster].peer_token` / `peer_token_env` are
+configured on PG replicas, `PeerMesh` automatically maintains authenticated bidirectional
+directory links (discovering peer endpoints strictly from the trusted PostgreSQL `nodes`
+table) to wake peers on durable admissions and forward ephemeral `Invoke` single-hop
+to a replica with ready workers when local capacity is absent. Keep `[cluster]` peer
+tokens separate from client/worker tokens and restrict internal replica addresses to a
+private VPC or TLS (`https://`). When no peer token is configured, `PeerMesh` is not
+exposed and no peer-sync tasks run. Durable Submit always works across any replica and backs up
+with PostgreSQL Group-Commit frame batching (`EventBatcher`). In PG mode, ephemeral
+jobs use generated `ephemeral:` IDs; caller-chosen IDs are reserved for durable Submit
+and may not use that prefix.
+Metrics and pool counters (`anyserve_pool_sessions`, `anyserve_pool_free_slots`,
+`anyserve_pool_active_leases`, `anyserve_pool_desired_additional_slots`) expose
+per-`(namespace, interface, pool)` pressure on `/metrics` for autoscalers such as KEDA.
 
 For Helm, create a Secret from a private file containing `ANYSERVE_DATABASE_URL`,
 then install a separate PG release (the chart does not install PostgreSQL):
@@ -241,7 +250,8 @@ do not recover through the shared journal.
 The optional management listener serves `/healthz` (liveness), `/readyz`
 (Runtime admission/journal readiness), `/metrics`, and `/api/overview`,
 `/api/jobs`, `/api/workers`. Probes are public; management reads and metrics
-require a client token when auth is enabled. TLS for this HTTP listener belongs
+require an operator token from `[auth].client_tokens` when auth is enabled (`403 Forbidden`
+for scoped tenant tokens or worker tokens). TLS for this HTTP listener belongs
 at the deployment's ingress or proxy.
 
 | Signal | Next check |

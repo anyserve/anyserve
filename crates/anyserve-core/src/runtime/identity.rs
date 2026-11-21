@@ -1,11 +1,36 @@
-//! Canonical fingerprints: the idempotency hash of a job specification and the
-//! digest of a worker's result. Both are computed by the server only.
+//! Canonical fingerprints: the idempotency hash of a job specification, the
+//! digest of a worker's result, and the bijective `(namespace, job_id)` storage key.
 
 use sha2::{Digest, Sha256};
 
 use super::api::{
-    Durability, ErrorInfo, IDENTITY_EXCLUDED_METADATA_KEYS, JobSpec, Metadata, Object,
+    Durability, ErrorInfo, IDENTITY_EXCLUDED_METADATA_KEYS, JobSpec, Metadata,
+    OBJECT_SHA256_METADATA_KEY, OBJECT_SIZE_METADATA_KEY, Object,
 };
+use crate::auth::DEFAULT_NAMESPACE;
+
+const SCOPED_PREFIX: &str = "@ns:";
+
+/// Bijective mapping between `(namespace, raw_job_id)` and the internal
+/// storage key so `"default"` namespace jobs keep raw IDs while other
+/// namespaces are isolated across memory, SQLite, and PostgreSQL without
+/// colliding or leaking job existence.
+pub(crate) fn encode_scoped_id(namespace: &str, raw_job_id: &str) -> String {
+    if namespace == DEFAULT_NAMESPACE && !raw_job_id.starts_with(SCOPED_PREFIX) {
+        raw_job_id.to_string()
+    } else {
+        format!("{SCOPED_PREFIX}{namespace}:{raw_job_id}")
+    }
+}
+
+pub(crate) fn decode_scoped_id(scoped_job_id: &str) -> (&str, &str) {
+    if let Some(rest) = scoped_job_id.strip_prefix(SCOPED_PREFIX)
+        && let Some((ns, raw)) = rest.split_once(':')
+    {
+        return (ns, raw);
+    }
+    (DEFAULT_NAMESPACE, scoped_job_id)
+}
 
 struct Canonical(Sha256);
 
@@ -45,9 +70,32 @@ impl Canonical {
                 self.map(metadata.iter());
             }
             Object::Uri { uri, metadata } => {
-                self.str("uri");
-                self.str(uri);
-                self.map(metadata.iter());
+                if let Some(digest) = metadata
+                    .get(OBJECT_SHA256_METADATA_KEY)
+                    .filter(|d| !d.is_empty())
+                {
+                    self.str("uri_digest");
+                    self.str(digest);
+                    self.str(
+                        metadata
+                            .get(OBJECT_SIZE_METADATA_KEY)
+                            .map(String::as_str)
+                            .unwrap_or(""),
+                    );
+                    let rest: Metadata = metadata
+                        .iter()
+                        .filter(|(k, _)| {
+                            k.as_str() != OBJECT_SHA256_METADATA_KEY
+                                && k.as_str() != OBJECT_SIZE_METADATA_KEY
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    self.map(rest.iter());
+                } else {
+                    self.str("uri");
+                    self.str(uri);
+                    self.map(metadata.iter());
+                }
             }
         }
     }
@@ -61,7 +109,8 @@ fn optional_ms(value: Option<std::time::Duration>) -> u64 {
     value.map(|value| value.as_millis() as u64).unwrap_or(0)
 }
 
-/// Fingerprint of everything that defines a job, except transport context.
+/// Fingerprint of everything that defines a job, except transport context and
+/// scheduling hints (`affinity_key`, `fairness_key`, `concurrency_key`).
 pub(crate) fn spec_hash(spec: &JobSpec, durability: Durability) -> String {
     let mut hash = Canonical::new("anyserve.job.v1");
     let demand = &spec.demand;
@@ -144,13 +193,60 @@ mod tests {
     }
 
     #[test]
-    fn transport_metadata_does_not_change_identity() {
+    fn transport_metadata_and_scheduling_hints_do_not_change_identity() {
         let base = spec_hash(&spec(), Durability::Durable);
         let mut traced = spec();
         traced
             .metadata
             .insert("traceparent".to_string(), "00-abc".to_string());
+        traced.demand.affinity_key = "robot-cam-1".to_string();
+        traced.policy.fairness_key = "fleet-a".to_string();
+        traced.policy.concurrency_key = "gpu-group".to_string();
         assert_eq!(base, spec_hash(&traced, Durability::Durable));
+    }
+
+    #[test]
+    fn uri_with_content_sha256_hashes_digest_not_transient_uri() {
+        let mut a = spec();
+        a.inputs = vec![Object::Uri {
+            uri: "s3://bucket-1/tmp/upload-123".into(),
+            metadata: Metadata::from([
+                (OBJECT_SHA256_METADATA_KEY.into(), "deadbeef".into()),
+                (OBJECT_SIZE_METADATA_KEY.into(), "1024".into()),
+                ("mime".into(), "video/mp4".into()),
+            ]),
+        }];
+        let mut b = a.clone();
+        b.inputs = vec![Object::Uri {
+            uri: "s3://bucket-1/tmp/upload-999?X-Amz-Signature=xyz".into(),
+            metadata: Metadata::from([
+                (OBJECT_SHA256_METADATA_KEY.into(), "deadbeef".into()),
+                (OBJECT_SIZE_METADATA_KEY.into(), "1024".into()),
+                ("mime".into(), "video/mp4".into()),
+            ]),
+        }];
+        assert_eq!(
+            spec_hash(&a, Durability::Durable),
+            spec_hash(&b, Durability::Durable)
+        );
+    }
+
+    #[test]
+    fn scoped_id_roundtrip_is_bijective() {
+        for (ns, raw) in [
+            ("default", "job-1"),
+            ("default", "@ns:weird:id"),
+            ("robot-a", "job-1"),
+            ("robot-b", "job-1"),
+            ("tenant.prod", "a:b:c"),
+        ] {
+            let encoded = encode_scoped_id(ns, raw);
+            assert_eq!(decode_scoped_id(&encoded), (ns, raw));
+        }
+        assert_ne!(
+            encode_scoped_id("robot-a", "job-1"),
+            encode_scoped_id("robot-b", "job-1")
+        );
     }
 
     #[test]

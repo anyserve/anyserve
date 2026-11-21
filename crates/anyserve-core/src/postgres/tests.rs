@@ -1,6 +1,8 @@
 use super::*;
 use crate::journal::{AcceptRecord, AttemptStartRecord, TerminalRecord};
-use crate::runtime::api::{ConflictPolicy, ErrorInfo, EventKind, JobSpec, JobState, Object};
+use crate::runtime::api::{
+    ConflictPolicy, ErrorInfo, EventKind, JobSpec, JobState, Object, RuntimeConfig,
+};
 
 async fn node() -> (Arc<Postgres>, PgPool) {
     let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL")
@@ -628,4 +630,448 @@ async fn postgres_cluster_heartbeat_lock_wait_cannot_revive_expired_membership()
             .unwrap();
     assert!(expired);
     close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_whale_100k_backlog_does_not_starve_small_tenant() {
+    let (pg, admin) = node().await;
+    let empty_json = serde_json::json!({});
+    let empty_str = empty_json.to_string();
+    sqlx::query(
+        "INSERT INTO jobs(
+            job_id, state, spec_hash, spec_json, namespace, interface, fairness_key,
+            concurrency_key, failed_workers, required_attributes, preferred_attributes,
+            required_capacity, priority, input_bytes, attempt_count, max_attempts,
+            created_at_ms, updated_at_ms, queued_at_ms, not_before_ms
+        )
+        SELECT
+            'whale-' || lpad(i::text, 6, '0'),
+            'queued',
+            'h',
+            '{\"demand\":{\"interface\":\"echo\",\"required_attributes\":{},\"preferred_attributes\":{},\"required_capacity\":{},\"affinity_key\":\"\"},\"policy\":{\"durability\":\"Durable\",\"priority\":0,\"queue_timeout\":null,\"execution_timeout\":null,\"total_deadline\":null,\"total_timeout\":null,\"spillover_after\":null,\"max_attempts\":3,\"fairness_key\":\"whale\",\"concurrency_key\":\"\"},\"metadata\":{}}',
+            'default',
+            'echo',
+            'whale',
+            NULL,
+            '{}'::text[],
+            $1::jsonb,
+            $1::jsonb,
+            $1::jsonb,
+            0,
+            4,
+            0,
+            3,
+            i,
+            i,
+            i,
+            0
+        FROM generate_series(1, 100000) AS i",
+    )
+    .bind(&empty_str)
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    let mut small_rec = acceptance("small-1", None);
+    let mut small_spec = JobSpec::default();
+    small_spec.demand.interface = "echo".into();
+    small_spec.policy.fairness_key = "small".into();
+    small_rec.spec = Arc::new(small_spec);
+    let (_, created) = pg
+        .accept(small_rec, ConflictPolicy::Fail, Some(60_000))
+        .await
+        .unwrap();
+    assert!(created);
+
+    let budget = Arc::new(crate::runtime::events::ByteBudget::new(1024 * 1024));
+    let workers = serde_json::json!([{
+        "worker_id": "w1",
+        "namespace": "default",
+        "pool": "",
+        "interfaces": ["echo"],
+        "attributes": {},
+        "capacity": {"slot": 4}
+    }]);
+    let t0 = std::time::Instant::now();
+    let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {}", write::SKIP_SCAN_SQL);
+    for (cur_p, cur_o, cur_f) in [
+        (Vec::<i64>::new(), Vec::<i64>::new(), Vec::<String>::new()),
+        (vec![0i64], vec![1i64], vec!["whale".to_string()]),
+    ] {
+        let explain_rows: Vec<(String,)> = sqlx::query_as(&explain_sql)
+            .bind(vec!["default"])
+            .bind(vec!["echo"])
+            .bind(i64::MAX)
+            .bind(cur_p)
+            .bind(cur_o)
+            .bind(cur_f)
+            .fetch_all(&pg.pool)
+            .await
+            .unwrap();
+        let explain_text: String = explain_rows
+            .iter()
+            .map(|(line,)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            explain_text.contains("jobs_claim_fair_groups"),
+            "expected skip-scan to use jobs_claim_fair_groups:\n{explain_text}"
+        );
+        assert!(
+            !explain_text.contains("Seq Scan on jobs"),
+            "skip-scan must never Seq Scan jobs:\n{explain_text}"
+        );
+        let root_buf_line = explain_rows
+            .iter()
+            .find(|(line,)| line.trim_start().starts_with("Buffers: shared"))
+            .map(|(line,)| line.as_str())
+            .unwrap_or_else(|| panic!("missing root Buffers line in EXPLAIN:\n{explain_text}"));
+        let parse_buf = |prefix: &str| -> usize {
+            root_buf_line
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix(prefix)?.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        let total_buffers = parse_buf("hit=") + parse_buf("read=");
+        assert!(
+            total_buffers > 0 && total_buffers < 50,
+            "expected O(buckets) constant buffer access (<50) over 100k whale bucket, got {total_buffers} ({root_buf_line}):\n{explain_text}"
+        );
+    }
+
+    let claimed = pg.claim(workers, 4, budget).await.unwrap();
+    let elapsed = t0.elapsed();
+    assert_eq!(claimed.len(), 4);
+    assert!(
+        claimed.iter().any(|c| c.job.job_id == "small-1"),
+        "expected small-1 in first claim despite 100k whale backlog (got {:?})",
+        claimed.iter().map(|c| &c.job.job_id).collect::<Vec<_>>()
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "fair claim over 100k backlog took too long: {elapsed:?}"
+    );
+    close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_200_unserved_buckets_do_not_starve_serviceable_interface() {
+    let (pg, admin) = node().await;
+    let empty_str = "{}";
+    sqlx::query(
+        "INSERT INTO jobs(
+            job_id, state, spec_hash, spec_json, namespace, interface, fairness_key, concurrency_key,
+            failed_workers, required_attributes, preferred_attributes, required_capacity,
+            priority, input_bytes, attempt_count, max_attempts, created_at_ms, updated_at_ms, queued_at_ms, not_before_ms
+        )
+        SELECT
+            'unserved-' || i,
+            'queued',
+            'h-' || i,
+            '{\"demand\":{\"interface\":\"a.noworker.v1\",\"required_attributes\":{},\"preferred_attributes\":{},\"required_capacity\":{},\"affinity_key\":\"\"},\"policy\":{\"durability\":\"Durable\",\"priority\":3,\"queue_timeout\":null,\"execution_timeout\":null,\"total_deadline\":null,\"total_timeout\":null,\"spillover_after\":null,\"max_attempts\":3,\"fairness_key\":\"u-' || i || '\",\"concurrency_key\":\"\"},\"metadata\":{}}',
+            'default',
+            'a.noworker.v1',
+            'u-' || lpad(i::text, 3, '0'),
+            NULL,
+            '{}'::text[],
+            $1::jsonb,
+            $1::jsonb,
+            $1::jsonb,
+            3,
+            4,
+            0,
+            3,
+            i,
+            i,
+            i,
+            0
+        FROM generate_series(1, 200) AS i",
+    )
+    .bind(empty_str)
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    for i in 0..5 {
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "z.serve.v1".into();
+        let rec = AcceptRecord {
+            job_id: format!("servable-{i}"),
+            spec_hash: format!("sh-{i}"),
+            spec: Arc::new(spec),
+            max_attempts: 2,
+            created_at_ms: 10_000 + i as u64,
+        };
+        assert!(
+            pg.accept(rec, ConflictPolicy::Fail, Some(60_000))
+                .await
+                .unwrap()
+                .1
+        );
+    }
+
+    let budget = Arc::new(crate::runtime::events::ByteBudget::new(1024 * 1024));
+    let workers = serde_json::json!([{
+        "worker_id": "w-z",
+        "namespace": "default",
+        "pool": "",
+        "interfaces": ["z.serve.v1"],
+        "attributes": {},
+        "capacity": {"slot": 8}
+    }]);
+    let t0 = std::time::Instant::now();
+    let claimed = pg.claim(workers, 8, budget).await.unwrap();
+    let elapsed = t0.elapsed();
+    let ids: Vec<&str> = claimed.iter().map(|c| c.job.job_id.as_str()).collect();
+    assert_eq!(ids.len(), 5, "expected all 5 servable jobs, got {ids:?}");
+    for i in 0..5 {
+        assert!(ids.contains(&format!("servable-{i}").as_str()));
+    }
+    assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
+    close(pg, admin).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_200_fairness_keys_round_robin_beyond_64_window() {
+    use crate::runtime::Runtime;
+    use crate::runtime::worker::{AttemptLink, AttemptOutcome};
+    use anyserve_proto::v2 as pb;
+
+    let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL").unwrap();
+    let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+    let mut journal = JournalConfig::postgres(&url);
+    let pg_cfg = journal.postgres.as_mut().unwrap();
+    pg_cfg.schema = schema.clone();
+    pg_cfg.lease_duration = Duration::from_secs(10);
+    pg_cfg.poll_interval = Duration::from_millis(10);
+    let rt = Runtime::start(RuntimeConfig {
+        journal: Some(journal),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let pg = rt.inner.postgres.as_ref().unwrap().clone();
+
+    sqlx::query(
+        "INSERT INTO jobs(
+            job_id, state, spec_hash, spec_json, namespace, interface, fairness_key, concurrency_key,
+            failed_workers, required_attributes, preferred_attributes, required_capacity,
+            priority, input_bytes, attempt_count, max_attempts, created_at_ms, updated_at_ms, queued_at_ms, not_before_ms
+        )
+        SELECT
+            'k-' || lpad(k::text, 3, '0') || '-j-' || j_idx,
+            'queued',
+            'h-' || k || '-' || j_idx,
+            '{\"demand\":{\"interface\":\"z.serve.v1\",\"required_attributes\":{},\"preferred_attributes\":{},\"required_capacity\":{},\"affinity_key\":\"\"},\"policy\":{\"durability\":\"Durable\",\"priority\":0,\"queue_timeout\":null,\"execution_timeout\":null,\"total_deadline\":null,\"total_timeout\":null,\"spillover_after\":null,\"max_attempts\":3,\"fairness_key\":\"k-' || lpad(k::text, 3, '0') || '\",\"concurrency_key\":\"\"},\"metadata\":{}}',
+            'default',
+            'z.serve.v1',
+            'k-' || lpad(k::text, 3, '0'),
+            NULL,
+            '{}'::text[],
+            '{}'::jsonb,
+            '{}'::jsonb,
+            '{}'::jsonb,
+            0,
+            4,
+            0,
+            3,
+            (k * 10 + j_idx),
+            (k * 10 + j_idx),
+            (k * 10 + j_idx),
+            0
+        FROM generate_series(0, 199) AS k
+        CROSS JOIN generate_series(0, 2) AS j_idx",
+    )
+    .execute(&pg.pool)
+    .await
+    .unwrap();
+
+    let mut session = rt
+        .open_session(pb::Hello {
+            worker_id: "w-rr".into(),
+            interfaces: vec!["z.serve.v1".into()],
+            max_concurrency: 8,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut completion_order: Vec<(usize, usize)> = Vec::with_capacity(600);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while completion_order.len() < 600 {
+            let msg = session.messages.recv().await.expect("session open").msg;
+            if let Some(pb::server_message::Msg::Assign(assign)) = msg {
+                let parts: Vec<&str> = assign.job_id.split('-').collect();
+                let k_idx: usize = parts[1].parse().unwrap();
+                let j_idx: usize = parts[3].parse().unwrap();
+                let rt_ref = rt.clone();
+                let lease_id = assign.lease_id.clone();
+                let link = rt_ref
+                    .open_attempt(&pb::AttemptOpen {
+                        lease_id: lease_id.clone(),
+                        generation: rt_ref.generation(),
+                        resume_after_sequence: 0,
+                    })
+                    .await
+                    .unwrap()
+                    .0;
+                assert!(matches!(link, AttemptLink::Live { .. }));
+                rt_ref
+                    .finish_attempt(&link, AttemptOutcome::Succeeded, vec![])
+                    .await
+                    .unwrap();
+                completion_order.push((k_idx, j_idx));
+                let _ = rt_ref.session_message(
+                    &session.session_id,
+                    session.connection,
+                    pb::worker_message::Msg::Credit(pb::Credit { free_slots: 8 }),
+                );
+            }
+        }
+    })
+    .await
+    .expect("drain 600 multi-key jobs within 20s");
+
+    let max_first_wave = completion_order
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, j_idx))| *j_idx == 0)
+        .map(|(pos, _)| pos)
+        .max()
+        .unwrap();
+    let min_third_wave = completion_order
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, j_idx))| *j_idx == 2)
+        .map(|(pos, _)| pos)
+        .min()
+        .unwrap();
+    assert!(
+        max_first_wave < min_third_wave,
+        "expected every fairness_key's 1st job to finish before any key's 3rd job (max j=0 at {max_first_wave}, min j=2 at {min_third_wave})"
+    );
+
+    drop(session);
+    rt.shutdown().await;
+    let admin = PgPool::connect(&url).await.unwrap();
+    sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_cluster_v1_migrates_to_v2_and_v2_skips_alter_lock() {
+    let url = std::env::var("ANYSERVE_TEST_POSTGRES_URL").unwrap();
+    let schema = format!("test_{}", uuid::Uuid::new_v4().simple());
+    let admin = PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA \"{schema}\";
+         SET search_path TO \"{schema}\",pg_catalog;
+         CREATE TABLE cluster_schema (version BIGINT PRIMARY KEY);
+         INSERT INTO cluster_schema VALUES (1);
+         CREATE SEQUENCE node_generation;
+         CREATE TABLE nodes (
+             node_id TEXT PRIMARY KEY,
+             generation BIGINT NOT NULL,
+             expires_at TIMESTAMPTZ NOT NULL
+         );
+         CREATE TABLE jobs (
+             job_id TEXT COLLATE \"C\" PRIMARY KEY,
+             state TEXT NOT NULL,
+             spec_hash TEXT NOT NULL,
+             spec_json TEXT NOT NULL,
+             interface TEXT NOT NULL,
+             required_attributes JSONB NOT NULL,
+             preferred_attributes JSONB NOT NULL,
+             required_capacity JSONB NOT NULL,
+             priority BIGINT NOT NULL,
+             input_bytes BIGINT NOT NULL,
+             attempt_count BIGINT NOT NULL DEFAULT 0,
+             max_attempts BIGINT NOT NULL,
+             created_at_ms BIGINT NOT NULL,
+             updated_at_ms BIGINT NOT NULL,
+             queued_at_ms BIGINT NOT NULL,
+             not_before_ms BIGINT NOT NULL DEFAULT 0,
+             queue_timeout_ms BIGINT,
+             total_deadline_ms BIGINT,
+             spillover_ms BIGINT,
+             owner_id TEXT,
+             ownership_epoch BIGINT NOT NULL DEFAULT 0,
+             event_sequence BIGINT NOT NULL DEFAULT 0,
+             events_floor BIGINT NOT NULL DEFAULT 0,
+             last_frame_seq BIGINT NOT NULL DEFAULT 0,
+             error_json TEXT,
+             last_attempt_id TEXT,
+             last_worker_id TEXT
+         );
+         CREATE INDEX jobs_claim ON jobs(interface, priority DESC, created_at_ms, job_id) WHERE state IN ('queued','running');
+         CREATE INDEX jobs_claim_order ON jobs(priority DESC, created_at_ms, job_id) WHERE state IN ('queued','running');
+         CREATE INDEX jobs_owner ON jobs(owner_id) WHERE state IN ('queued','running');
+         CREATE TABLE objects (job_id TEXT NOT NULL, role TEXT NOT NULL, idx BIGINT NOT NULL, uri TEXT, content BYTEA, metadata_json TEXT NOT NULL, PRIMARY KEY(job_id,role,idx));
+         CREATE TABLE events (job_id TEXT NOT NULL, sequence BIGINT NOT NULL, attempt_id TEXT, at_ms BIGINT NOT NULL, kind_json TEXT NOT NULL, frame_data BYTEA, PRIMARY KEY(job_id,sequence));
+         CREATE TABLE receipts (lease_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, digest TEXT NOT NULL);
+         CREATE TABLE concurrency_slots (namespace TEXT NOT NULL, concurrency_key TEXT NOT NULL, in_flight INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(namespace, concurrency_key));"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    let mut cfg = JournalConfig::postgres(&url);
+    let pg_cfg = cfg.postgres.as_mut().unwrap();
+    pg_cfg.schema = schema.clone();
+    pg_cfg.lease_duration = Duration::from_secs(3);
+
+    // First open upgrades v1 -> v2 cleanly and drops obsolete v1 indexes.
+    let pg1 = Postgres::open(&cfg).await.unwrap();
+    let max_v: i64 = sqlx::query_scalar(&format!(
+        "SELECT MAX(version) FROM \"{schema}\".cluster_schema"
+    ))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(max_v, 2);
+    let idx_names: Vec<String> = sqlx::query_scalar(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'jobs'",
+    )
+    .bind(&schema)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    for obsolete in ["jobs_claim", "jobs_claim_order", "jobs_owner"] {
+        assert!(
+            !idx_names.iter().any(|n| n == obsolete),
+            "obsolete index {obsolete} still present: {idx_names:?}"
+        );
+    }
+    for required in ["jobs_claim_fair_groups", "jobs_queued_expiry"] {
+        assert!(
+            idx_names.iter().any(|n| n == required),
+            "missing v2 index {required}: {idx_names:?}"
+        );
+    }
+
+    // Hold a ROW SHARE lock on jobs, which blocks any ALTER TABLE, then open a second replica.
+    let mut blocker = admin.begin().await.unwrap();
+    sqlx::query(&format!("SELECT COUNT(*) FROM \"{schema}\".jobs"))
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let pg2 = tokio::time::timeout(Duration::from_secs(2), Postgres::open(&cfg))
+        .await
+        .expect("v2 open must skip ALTER TABLE DDL locks")
+        .unwrap();
+
+    blocker.rollback().await.unwrap();
+    pg1.close().await;
+    pg2.close().await;
+    sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }

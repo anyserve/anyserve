@@ -79,6 +79,35 @@ pub(super) fn render(runtime: &Runtime) -> String {
             current.free_slots
         );
     }
+    if !stats.pools.is_empty() {
+        out.push_str("# HELP anyserve_pool_sessions Retained worker sessions per namespace, interface, and pool.\n# TYPE anyserve_pool_sessions gauge\n# HELP anyserve_pool_free_slots Available execution slots per namespace, interface, and pool.\n# TYPE anyserve_pool_free_slots gauge\n# HELP anyserve_pool_active_leases Active execution leases per namespace, interface, and pool.\n# TYPE anyserve_pool_active_leases gauge\n# HELP anyserve_pool_desired_additional_slots Additional worker slots needed for queued demand per pool.\n# TYPE anyserve_pool_desired_additional_slots gauge\n");
+        for ((namespace, interface, pool), current) in &stats.pools {
+            let ns = escape(namespace);
+            let iface = escape(interface);
+            let pool = escape(pool);
+            let labels = format!("namespace=\"{ns}\",interface=\"{iface}\",pool=\"{pool}\"");
+            let _ = writeln!(
+                out,
+                "anyserve_pool_sessions{{{labels}}} {}",
+                current.sessions
+            );
+            let _ = writeln!(
+                out,
+                "anyserve_pool_free_slots{{{labels}}} {}",
+                current.free_slots
+            );
+            let _ = writeln!(
+                out,
+                "anyserve_pool_active_leases{{{labels}}} {}",
+                current.active_leases
+            );
+            let _ = writeln!(
+                out,
+                "anyserve_pool_desired_additional_slots{{{labels}}} {}",
+                current.desired_additional_slots
+            );
+        }
+    }
     if let Some(journal) = stats.journal {
         out.push_str("# HELP anyserve_journal_pending_ops Outstanding journal operations.\n# TYPE anyserve_journal_pending_ops gauge\n# HELP anyserve_journal_committed_ops_total Journal operations committed since this Runtime started.\n# TYPE anyserve_journal_committed_ops_total counter\n# HELP anyserve_journal_committed_batches_total Journal transaction batches committed since this Runtime started.\n# TYPE anyserve_journal_committed_batches_total counter\n# HELP anyserve_journal_last_batch_size Number of operations in the last committed journal batch.\n# TYPE anyserve_journal_last_batch_size gauge\n# HELP anyserve_journal_last_commit_duration_seconds Duration in seconds of the last committed journal batch.\n# TYPE anyserve_journal_last_commit_duration_seconds gauge\n");
         let _ = writeln!(out, "anyserve_journal_pending_ops {}", journal.pending_ops);

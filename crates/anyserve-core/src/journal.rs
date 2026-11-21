@@ -104,6 +104,7 @@ pub(crate) struct StoredJob {
     pub outputs: Vec<Object>,
     pub last_attempt_id: Option<String>,
     pub last_worker_id: Option<String>,
+    pub failed_workers: std::collections::BTreeSet<String>,
 }
 
 pub(crate) struct Recovery {
@@ -195,29 +196,56 @@ impl Journal {
         from_ms: u64,
         to_ms: u64,
         before: Option<(u64, String)>,
+        namespace: Option<&str>,
         limit: usize,
     ) -> Result<Vec<StoredJob>> {
-        let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
-        query
-            .push(" INDEXED BY journal_jobs_history WHERE state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
-            .push_bind(from_ms as i64)
-            .push(" AND created_at_ms < ")
-            .push_bind(to_ms as i64);
-        if let Some((at, id)) = before {
+        let mut cursor = before.map(|(at, id)| match namespace {
+            Some(ns) => (at, crate::runtime::identity::encode_scoped_id(ns, &id)),
+            None => (at, id),
+        });
+        let mut out = Vec::with_capacity(limit);
+        let batch_size = limit.clamp(1, 250);
+        loop {
+            let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
             query
-                .push(" AND (created_at_ms, job_id) < (")
-                .push_bind(at as i64)
-                .push(", ")
-                .push_bind(id)
-                .push(")");
+                .push(" INDEXED BY journal_jobs_history WHERE state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
+                .push_bind(from_ms as i64)
+                .push(" AND created_at_ms < ")
+                .push_bind(to_ms as i64);
+            if let Some((at, id)) = &cursor {
+                query
+                    .push(" AND (created_at_ms, job_id) < (")
+                    .push_bind(*at as i64)
+                    .push(", ")
+                    .push_bind(id)
+                    .push(")");
+            }
+            let rows = query
+                .push(" ORDER BY created_at_ms DESC, job_id DESC LIMIT ")
+                .push_bind(batch_size as i64)
+                .build()
+                .fetch_all(&self.read_pool)
+                .await?;
+            let done = rows.len() < batch_size;
+            for row in &rows {
+                let job = job_from_row(row)?;
+                cursor = Some((job.created_at_ms, job.job_id.clone()));
+                if let Some(expected_ns) = namespace {
+                    let (row_ns, _) = crate::runtime::identity::decode_scoped_id(&job.job_id);
+                    if row_ns != expected_ns {
+                        continue;
+                    }
+                }
+                out.push(job);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+            if done {
+                break;
+            }
         }
-        let rows = query
-            .push(" ORDER BY created_at_ms DESC, job_id DESC LIMIT ")
-            .push_bind(limit as i64)
-            .build()
-            .fetch_all(&self.read_pool)
-            .await?;
-        rows.iter().map(job_from_row).collect()
+        Ok(out)
     }
 
     /// Opens (creating if needed) the journal, starts a new generation and
@@ -643,6 +671,7 @@ where
         outputs: Vec::new(),
         last_attempt_id: row.try_get("last_attempt_id")?,
         last_worker_id: row.try_get("last_worker_id")?,
+        failed_workers: Default::default(),
     })
 }
 
@@ -729,10 +758,16 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
         }
         JournalOp::AttemptStart(record) => {
             let updated = sqlx::query(
-                "UPDATE journal_jobs SET attempt_count = attempt_count + 1, updated_at_ms = ?
+                "UPDATE journal_jobs
+                 SET attempt_count = attempt_count + 1,
+                     updated_at_ms = ?,
+                     last_attempt_id = COALESCE(?, last_attempt_id),
+                     last_worker_id = COALESCE(?, last_worker_id)
                  WHERE job_id = ? AND state = 'queued'",
             )
             .bind(record.at_ms as i64)
+            .bind(&record.attempt_id)
+            .bind(&record.worker_id)
             .bind(&record.job_id)
             .execute(&mut **tx)
             .await?;
@@ -1241,7 +1276,7 @@ mod tests {
                 SELECT ?, ?, spec_hash, spec_json, max_attempts, ?, 99 FROM journal_jobs WHERE job_id = 'result'")
                 .bind(id).bind(state).bind(at).execute(&mut conn).await.unwrap();
         }
-        let page = journal.scan_jobs(1, 3, None, 2).await.unwrap();
+        let page = journal.scan_jobs(1, 3, None, None, 2).await.unwrap();
         assert_eq!(
             page.iter()
                 .map(|job| job.job_id.as_str())
@@ -1253,7 +1288,7 @@ mod tests {
             .await
             .unwrap();
         let page = journal
-            .scan_jobs(1, 3, Some((2, "y".into())), 2)
+            .scan_jobs(1, 3, Some((2, "y".into())), None, 2)
             .await
             .unwrap();
         assert_eq!(

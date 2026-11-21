@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod client_service;
+pub mod cluster;
 pub mod error;
 pub mod journal;
 mod postgres;

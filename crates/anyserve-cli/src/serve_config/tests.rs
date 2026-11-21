@@ -157,6 +157,20 @@ fn unknown_keys_and_sections_are_rejected() {
 }
 
 #[test]
+fn cluster_section_configures_peer_token_and_internal_addr() {
+    let resolved = config(
+        r#"
+[cluster]
+internal_grpc_addr = "https://10.0.0.5:50052"
+peer_token = "cluster-secret"
+"#,
+        ServeOverrides::default(),
+    )
+    .unwrap();
+    assert!(resolved.auth.has_peer_tokens());
+}
+
+#[test]
 fn all_repository_example_and_benchmark_toml_files_parse() -> anyhow::Result<()> {
     use anyhow::Context;
     use std::path::{Path, PathBuf};

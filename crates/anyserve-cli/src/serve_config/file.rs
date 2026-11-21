@@ -19,6 +19,59 @@ pub(super) struct AnyserveConfigFile {
     pub(super) journal: Option<JournalConfigFile>,
     pub(super) console: Option<ServeConsoleConfigFile>,
     pub(super) auth: Option<AuthConfigFile>,
+    pub(super) cluster: Option<ClusterConfigFile>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ClusterConfigFile {
+    internal_grpc_addr: Option<String>,
+    peer_token: Option<String>,
+    peer_token_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ResolvedClusterConfig {
+    pub(super) internal_grpc_addr: Option<String>,
+    pub(super) peer_token: Option<String>,
+}
+
+impl ClusterConfigFile {
+    pub(super) fn resolve(self) -> Result<ResolvedClusterConfig> {
+        let token = match (self.peer_token, self.peer_token_env) {
+            (Some(t), _) => Some(t),
+            (None, Some(env)) => {
+                let raw = std::env::var(&env)
+                    .with_context(|| format!("read cluster peer_token from env var {env}"))?;
+                if raw.trim().is_empty() {
+                    anyhow::bail!("cluster.peer_token_env env var {env} is empty");
+                }
+                Some(raw)
+            }
+            (None, None) => None,
+        }
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+        Ok(ResolvedClusterConfig {
+            internal_grpc_addr: self
+                .internal_grpc_addr
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty()),
+            peer_token: token,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedTokenFile {
+    token: Option<String>,
+    token_env: Option<String>,
+    role: String,
+    namespace: String,
+    #[serde(default)]
+    subject: String,
+    forced_pool: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -32,6 +85,8 @@ pub(super) struct AuthConfigFile {
     worker_tokens: Vec<String>,
     /// Env var holding comma-separated worker tokens.
     worker_tokens_env: Option<String>,
+    #[serde(default)]
+    scoped_tokens: Vec<ScopedTokenFile>,
 }
 
 impl AuthConfigFile {
@@ -48,7 +103,38 @@ impl AuthConfigFile {
         client_tokens.extend(from_env(self.client_tokens_env.as_deref())?);
         let mut worker_tokens = self.worker_tokens;
         worker_tokens.extend(from_env(self.worker_tokens_env.as_deref())?);
-        Ok(AuthPolicy::new(client_tokens, worker_tokens))
+        let mut scoped = Vec::with_capacity(self.scoped_tokens.len());
+        for entry in self.scoped_tokens {
+            let token = match (entry.token, entry.token_env) {
+                (Some(t), _) => t,
+                (None, Some(env)) => std::env::var(&env)
+                    .with_context(|| format!("read scoped token from env var {env}"))?,
+                (None, None) => {
+                    anyhow::bail!("auth.scoped_tokens entry requires token or token_env")
+                }
+            };
+            let role = match entry.role.trim().to_ascii_lowercase().as_str() {
+                "client" => anyserve_core::auth::Role::Client,
+                "worker" => anyserve_core::auth::Role::Worker,
+                other => {
+                    anyhow::bail!("unknown scoped_token role '{other}' (expected client|worker)")
+                }
+            };
+            anyserve_core::auth::validate_namespace(entry.namespace.trim())
+                .map_err(|s| anyhow::anyhow!("invalid scoped_token namespace: {}", s.message()))?;
+            scoped.push(anyserve_core::auth::ScopedToken {
+                token,
+                role,
+                namespace: entry.namespace.trim().to_string(),
+                subject: if entry.subject.trim().is_empty() {
+                    format!("{}-token", entry.role)
+                } else {
+                    entry.subject
+                },
+                forced_pool: entry.forced_pool.filter(|p| !p.trim().is_empty()),
+            });
+        }
+        Ok(AuthPolicy::new(client_tokens, worker_tokens).with_scoped_tokens(scoped))
     }
 }
 
@@ -110,6 +196,7 @@ pub(super) struct JournalConfigFile {
     lease_duration_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
     max_connections: Option<u32>,
+    internal_grpc_addr: Option<String>,
     path: Option<PathBuf>,
     full_sync: Option<bool>,
     queue_capacity: Option<usize>,
@@ -201,6 +288,9 @@ impl JournalConfigFile {
                 .with_context(|| format!("PostgreSQL requires connection URL in env var {name}"))?;
             let mut config = JournalConfig::postgres(url);
             let pg = config.postgres.as_mut().expect("PostgreSQL config");
+            if let Some(addr) = self.internal_grpc_addr {
+                pg.internal_grpc_addr = Some(addr);
+            }
             if let Some(schema) = self.schema {
                 pg.schema = schema;
             }
@@ -248,8 +338,10 @@ impl JournalConfigFile {
 pub(super) struct RuntimeConfigFile {
     heartbeat_interval_ms: Option<u64>,
     heartbeat_timeout_ms: Option<u64>,
+    reconnect_grace_ms: Option<u64>,
     max_attempts: Option<u32>,
     max_queue: Option<usize>,
+    default_max_in_flight_per_key: Option<usize>,
     max_pending_bytes: Option<u64>,
     max_pending_jobs: Option<usize>,
     max_event_bytes: Option<u64>,
@@ -264,11 +356,26 @@ pub(super) struct RuntimeConfigFile {
     #[serde(default)]
     interfaces: BTreeMap<String, InterfaceConfigFile>,
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolTierFile {
+    pool: String,
+    #[serde(default)]
+    spillover_after_ms: u64,
+    reconnect_grace_ms: Option<u64>,
+    idle_drain_after_ms: Option<u64>,
+    #[serde(default)]
+    min_sessions: usize,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InterfaceConfigFile {
     max_queue: Option<usize>,
     queue_timeout_ms: Option<u64>,
+    max_in_flight_per_key: Option<usize>,
+    #[serde(default)]
+    pool_tiers: Vec<PoolTierFile>,
 }
 impl RuntimeConfigFile {
     pub(super) fn resolve(self) -> RuntimeConfig {
@@ -279,11 +386,17 @@ impl RuntimeConfigFile {
         if let Some(value) = self.heartbeat_timeout_ms {
             config.heartbeat_timeout = Duration::from_millis(value);
         }
+        if let Some(value) = self.reconnect_grace_ms {
+            config.reconnect_grace = Some(Duration::from_millis(value));
+        }
         if let Some(value) = self.max_attempts {
             config.default_max_attempts = value;
         }
         if let Some(value) = self.max_queue {
             config.default_max_queue = value;
+        }
+        if let Some(value) = self.default_max_in_flight_per_key {
+            config.default_max_in_flight_per_key = Some(value);
         }
         if let Some(value) = self.max_pending_bytes {
             config.max_pending_bytes = value;
@@ -327,6 +440,20 @@ impl RuntimeConfigFile {
                     InterfacePolicy {
                         max_queue: policy.max_queue,
                         queue_timeout: policy.queue_timeout_ms.map(Duration::from_millis),
+                        max_in_flight_per_key: policy.max_in_flight_per_key,
+                        pool_tiers: policy
+                            .pool_tiers
+                            .into_iter()
+                            .map(|tier| anyserve_core::runtime::api::PoolTier {
+                                pool: tier.pool,
+                                spillover_after: Duration::from_millis(tier.spillover_after_ms),
+                                reconnect_grace: tier.reconnect_grace_ms.map(Duration::from_millis),
+                                idle_drain_after: tier
+                                    .idle_drain_after_ms
+                                    .map(Duration::from_millis),
+                                min_sessions: tier.min_sessions,
+                            })
+                            .collect(),
                     },
                 )
             })

@@ -59,6 +59,7 @@ async fn analytics_jobs(
             to_ms: query.to_ms,
             limit: query.limit.unwrap_or(250),
             cursor: query.cursor,
+            namespace: None,
         })
         .await
         .map_err(api_error)?;

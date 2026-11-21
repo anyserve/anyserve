@@ -1,18 +1,24 @@
--- Version 1. Schema creation is serialized only during startup, never scheduling.
+-- Version 2. Schema creation is serialized only during initial bootstrap/upgrade.
 CREATE TABLE IF NOT EXISTS cluster_schema (version BIGINT PRIMARY KEY);
 INSERT INTO cluster_schema VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO cluster_schema VALUES (2) ON CONFLICT DO NOTHING;
 CREATE SEQUENCE IF NOT EXISTS node_generation;
 CREATE TABLE IF NOT EXISTS nodes (
     node_id TEXT PRIMARY KEY,
     generation BIGINT NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL
+    expires_at TIMESTAMPTZ NOT NULL,
+    internal_grpc_addr TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT COLLATE "C" PRIMARY KEY,
     state TEXT NOT NULL CHECK (state IN ('queued','running','succeeded','failed','cancelled')),
     spec_hash TEXT NOT NULL,
     spec_json TEXT NOT NULL,
+    namespace TEXT NOT NULL DEFAULT 'default',
     interface TEXT NOT NULL,
+    fairness_key TEXT NOT NULL DEFAULT '_default',
+    concurrency_key TEXT,
+    failed_workers TEXT[] NOT NULL DEFAULT '{}',
     required_attributes JSONB NOT NULL,
     preferred_attributes JSONB NOT NULL,
     required_capacity JSONB NOT NULL,
@@ -36,13 +42,24 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_attempt_id TEXT,
     last_worker_id TEXT
 );
-CREATE INDEX IF NOT EXISTS jobs_claim ON jobs(interface, priority DESC, created_at_ms, job_id)
-    WHERE state IN ('queued','running');
--- Claims order eligible jobs across interfaces by priority and acceptance time.
-CREATE INDEX IF NOT EXISTS jobs_claim_order ON jobs(priority DESC, created_at_ms, job_id)
-    WHERE state IN ('queued','running');
-CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner_id) WHERE state IN ('queued','running');
+CREATE INDEX IF NOT EXISTS jobs_claim_fair_groups
+    ON jobs(namespace, interface, priority DESC, fairness_key ASC, queued_at_ms ASC, job_id ASC)
+    WHERE state = 'queued' AND owner_id IS NULL;
+CREATE INDEX IF NOT EXISTS jobs_queued_expiry ON jobs (
+    LEAST(
+        COALESCE(total_deadline_ms, 9223372036854775807),
+        CASE WHEN queue_timeout_ms IS NULL THEN 9223372036854775807
+             WHEN queued_at_ms > 9223372036854775807 - queue_timeout_ms THEN 9223372036854775807
+             ELSE queued_at_ms + queue_timeout_ms END
+    )
+) WHERE state = 'queued' AND owner_id IS NULL
+  AND (total_deadline_ms IS NOT NULL OR queue_timeout_ms IS NOT NULL);
+CREATE INDEX IF NOT EXISTS jobs_orphan_recovery ON jobs(owner_id, updated_at_ms)
+    WHERE state IN ('queued','running') AND owner_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_concurrency_active ON jobs(namespace, concurrency_key)
+    WHERE concurrency_key IS NOT NULL AND concurrency_key <> '' AND owner_id IS NOT NULL AND state IN ('queued','running');
 CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_at_ms DESC, job_id DESC);
+CREATE INDEX IF NOT EXISTS jobs_ns_created ON jobs(namespace, created_at_ms DESC, job_id DESC);
 CREATE INDEX IF NOT EXISTS jobs_history ON jobs(created_at_ms DESC, job_id DESC)
     WHERE state IN ('succeeded','failed','cancelled');
 CREATE INDEX IF NOT EXISTS jobs_retention ON jobs(updated_at_ms)
