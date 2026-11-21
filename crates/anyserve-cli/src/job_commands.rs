@@ -112,14 +112,18 @@ fn state_name(state: i32) -> &'static str {
     }
 }
 fn read_job_ids(reader: impl BufRead) -> Result<Vec<String>> {
-    let ids = reader
-        .lines()
-        .map(|line| line.context("read stdin line"))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(|line| line.trim().to_owned())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let mut ids = Vec::new();
+    for line in reader.lines() {
+        let line = line.context("read stdin line")?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if trimmed.len() == line.len() {
+                ids.push(line);
+            } else {
+                ids.push(trimmed.to_owned());
+            }
+        }
+    }
     if ids.is_empty() {
         bail!("no job ids provided");
     }
@@ -131,5 +135,10 @@ mod tests {
     fn stdin_job_ids_skip_blank_lines() {
         let ids = super::read_job_ids(std::io::Cursor::new("job-1\n\n  job-2 \n")).unwrap();
         assert_eq!(ids, vec!["job-1", "job-2"]);
+    }
+
+    #[test]
+    fn stdin_job_ids_reject_empty_input() {
+        assert!(super::read_job_ids(std::io::Cursor::new("\n   \n")).is_err());
     }
 }

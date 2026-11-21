@@ -17,6 +17,15 @@ pub(crate) struct AppState {
     pub(crate) runtime: Runtime,
     pub(crate) allowed_origins: Arc<BTreeSet<String>>,
     pub(crate) mode: RuntimeModeSummary,
+    pub(crate) control_plane: Arc<ControlPlaneStatic>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ControlPlaneStatic {
+    pub(crate) grpc_listen: String,
+    pub(crate) grpc_tls_enabled: bool,
+    pub(crate) console_listen: String,
+    pub(crate) auth_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -48,6 +57,133 @@ pub(crate) struct RuntimeModeSummary {
     pub(crate) label: &'static str,
     pub(crate) journal: &'static str,
 }
+
+#[derive(Serialize)]
+pub(crate) struct OverviewResponse {
+    pub(crate) runtime: RuntimeModeSummary,
+    pub(crate) health: HealthSummary,
+    pub(crate) control_plane: ControlPlaneSummary,
+    pub(crate) budgets: BudgetsSummary,
+    pub(crate) journal_stats: Option<JournalStatsSummary>,
+    pub(crate) queue: QueueSummary,
+    pub(crate) history: HistorySummary,
+    pub(crate) workers: WorkerRollup,
+    pub(crate) interfaces: Vec<InterfaceSummary>,
+    pub(crate) pools: Vec<PoolSummary>,
+    pub(crate) refreshed_at_ms: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct HealthSummary {
+    pub(crate) live: bool,
+    pub(crate) ready: bool,
+    pub(crate) journal: JournalHealthSummary,
+}
+
+#[derive(Serialize)]
+pub(crate) struct JournalHealthSummary {
+    pub(crate) status: &'static str,
+    pub(crate) message: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ControlPlaneSummary {
+    pub(crate) grpc_listen: String,
+    pub(crate) grpc_tls_enabled: bool,
+    pub(crate) console_listen: String,
+    pub(crate) auth_enabled: bool,
+    pub(crate) generation: u64,
+    pub(crate) retained_jobs: usize,
+    pub(crate) sessions: usize,
+    pub(crate) max_sessions: usize,
+    pub(crate) priority_levels: u32,
+    pub(crate) default_max_attempts: u32,
+    pub(crate) heartbeat_interval_ms: u64,
+    pub(crate) heartbeat_timeout_ms: u64,
+    pub(crate) reconnect_grace_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct BudgetsSummary {
+    pub(crate) input_bytes: u64,
+    pub(crate) max_pending_bytes: u64,
+    pub(crate) result_bytes: u64,
+    pub(crate) max_result_bytes: u64,
+    pub(crate) event_bytes: u64,
+    pub(crate) max_event_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct JournalStatsSummary {
+    pub(crate) pending_ops: usize,
+    pub(crate) committed_batches: u64,
+    pub(crate) committed_ops: u64,
+    pub(crate) last_batch_size: usize,
+    pub(crate) last_commit_micros: u64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct QueueSummary {
+    pub(crate) queued: usize,
+    pub(crate) running: usize,
+    pub(crate) active: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct HistorySummary {
+    pub(crate) succeeded: usize,
+    pub(crate) failed: usize,
+    pub(crate) cancelled: usize,
+    pub(crate) total: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct WorkerRollup {
+    pub(crate) total: usize,
+    pub(crate) healthy: usize,
+    pub(crate) unavailable: usize,
+    pub(crate) active_leases: u64,
+    pub(crate) total_capacity: BTreeMap<String, i64>,
+    pub(crate) last_seen_at_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PoolTierSummary {
+    pub(crate) pool: String,
+    pub(crate) spillover_after_ms: u64,
+    pub(crate) reconnect_grace_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct InterfacePolicySummary {
+    pub(crate) max_queue: Option<usize>,
+    pub(crate) queue_timeout_ms: Option<u64>,
+    pub(crate) max_in_flight_per_key: Option<usize>,
+    pub(crate) pool_tiers: Vec<PoolTierSummary>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct InterfaceSummary {
+    pub(crate) name: String,
+    pub(crate) queued: usize,
+    pub(crate) running: usize,
+    pub(crate) oldest_queued_age_ms: u64,
+    pub(crate) sessions: usize,
+    pub(crate) free_slots: u64,
+    pub(crate) policy: Option<InterfacePolicySummary>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PoolSummary {
+    pub(crate) namespace: String,
+    pub(crate) interface: String,
+    pub(crate) pool: String,
+    pub(crate) sessions: usize,
+    pub(crate) free_slots: u64,
+    pub(crate) active_leases: usize,
+    pub(crate) desired_additional_slots: usize,
+}
+
 #[derive(Serialize)]
 pub(crate) struct JobsResponse {
     pub(crate) jobs: Vec<JobSummary>,
@@ -56,7 +192,9 @@ pub(crate) struct JobsResponse {
 #[derive(Serialize)]
 pub(crate) struct JobSummary {
     pub(crate) job_id: String,
+    pub(crate) namespace: String,
     pub(crate) state: &'static str,
+    pub(crate) durability: &'static str,
     pub(crate) interface_name: String,
     pub(crate) source: Option<String>,
     pub(crate) created_at_ms: u64,
@@ -66,6 +204,8 @@ pub(crate) struct JobSummary {
     pub(crate) latest_worker_id: Option<String>,
     pub(crate) attempt_count: u32,
     pub(crate) last_error: Option<String>,
+    pub(crate) error_code: Option<String>,
+    pub(crate) error_retryable: Option<bool>,
     pub(crate) metadata: BTreeMap<String, String>,
 }
 #[derive(Serialize)]
@@ -124,8 +264,18 @@ pub(crate) struct JobEventSummary {
     pub(crate) payload_size_bytes: usize,
 }
 #[derive(Serialize)]
+pub(crate) struct WorkerLoadSummary {
+    pub(crate) queued: u32,
+    pub(crate) running: u32,
+    pub(crate) utilization: f64,
+    pub(crate) custom: BTreeMap<String, f64>,
+}
+#[derive(Serialize)]
 pub(crate) struct WorkerSummary {
+    pub(crate) session_id: String,
     pub(crate) worker_id: String,
+    pub(crate) namespace: String,
+    pub(crate) pool: String,
     pub(crate) healthy: bool,
     pub(crate) interfaces: Vec<String>,
     pub(crate) attributes: BTreeMap<String, String>,
@@ -134,8 +284,10 @@ pub(crate) struct WorkerSummary {
     pub(crate) active_leases: u32,
     pub(crate) free_slots: u32,
     pub(crate) utilization: f64,
+    pub(crate) load: WorkerLoadSummary,
     pub(crate) connected: bool,
     pub(crate) draining: bool,
+    pub(crate) connected_at_ms: u64,
     pub(crate) last_seen_at_ms: u64,
 }
 #[derive(Serialize)]
@@ -143,6 +295,8 @@ pub(crate) struct WorkersResponse {
     pub(crate) workers: Vec<WorkerSummary>,
     pub(crate) total: usize,
     pub(crate) healthy: usize,
+    pub(crate) draining: usize,
+    pub(crate) disconnected: usize,
 }
 #[derive(Serialize)]
 pub(crate) struct CancelJobResponse {
@@ -151,9 +305,16 @@ pub(crate) struct CancelJobResponse {
 #[derive(Deserialize)]
 pub(crate) struct JobsQuery {
     pub(crate) states: Option<String>,
+    pub(crate) interface: Option<String>,
+    pub(crate) namespace: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
     pub(crate) page_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NamespaceQuery {
+    pub(crate) namespace: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -170,18 +331,12 @@ pub(crate) struct AnalyticsQuery {
     pub(crate) to_ms: u64,
     pub(crate) limit: Option<usize>,
     pub(crate) cursor: Option<String>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct AnalyticsJob {
-    #[serde(flatten)]
-    pub(crate) summary: JobSummary,
-    pub(crate) durability: &'static str,
+    pub(crate) namespace: Option<String>,
 }
 
 #[derive(Serialize)]
 pub(crate) struct AnalyticsResponse {
-    pub(crate) jobs: Vec<AnalyticsJob>,
+    pub(crate) jobs: Vec<JobSummary>,
     pub(crate) next_cursor: Option<String>,
 }
 pub(crate) fn runtime_mode_summary(mode: RuntimeMode) -> RuntimeModeSummary {

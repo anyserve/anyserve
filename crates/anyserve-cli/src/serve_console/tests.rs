@@ -14,8 +14,9 @@ use serde_json::Value;
 
 use crate::serve_config::RuntimeMode;
 
-use super::api::{AppState, runtime_mode_summary};
+use super::api::{AppState, ControlPlaneStatic, runtime_mode_summary};
 use super::handlers::{parse_states, router};
+use super::{ControlPlaneMetadata, format_host_port, run_server};
 
 #[test]
 fn parse_states_rejects_invalid_values() {
@@ -651,14 +652,41 @@ async fn spawn_test_server_with_auth(
     runtime: Runtime,
     auth: AuthPolicy,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    spawn_test_server_with_metadata(
+        runtime,
+        auth,
+        ControlPlaneMetadata {
+            grpc_listen: "127.0.0.1:50052".into(),
+            grpc_tls_enabled: false,
+        },
+    )
+    .await
+}
+
+async fn spawn_test_server_with_metadata(
+    runtime: Runtime,
+    auth: AuthPolicy,
+    control_plane: ControlPlaneMetadata,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mode = match runtime.config().journal.as_ref() {
+        Some(journal) if journal.postgres.is_some() => RuntimeMode::MemoryPlusPostgres,
+        Some(_) => RuntimeMode::MemoryPlusSqlite,
+        None => RuntimeMode::Memory,
+    };
     let state = AppState {
         runtime,
         allowed_origins: Arc::new(BTreeSet::from(["http://console.test".to_string()])),
-        mode: runtime_mode_summary(RuntimeMode::Memory),
+        mode: runtime_mode_summary(mode),
+        control_plane: Arc::new(ControlPlaneStatic {
+            grpc_listen: control_plane.grpc_listen,
+            grpc_tls_enabled: control_plane.grpc_tls_enabled,
+            console_listen: addr.to_string(),
+            auth_enabled: auth.is_enabled(),
+        }),
     };
     let app = router(state, Arc::new(auth));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -832,5 +860,819 @@ async fn management_liveness_and_readiness_are_separate() {
         .await
         .unwrap();
     assert!(metrics.contains("anyserve_runtime_ready 0\n"));
+    handle.abort();
+}
+
+#[test]
+fn format_host_port_handles_ipv4_hostnames_and_ipv6() {
+    assert_eq!(format_host_port("127.0.0.1", 50052), "127.0.0.1:50052");
+    assert_eq!(format_host_port("localhost", 50052), "localhost:50052");
+    assert_eq!(format_host_port("::1", 50052), "[::1]:50052");
+    assert_eq!(format_host_port("[::1]", 50052), "[::1]:50052");
+}
+
+#[tokio::test]
+async fn overview_exposes_health_control_plane_budgets_journal_policies_and_pools() {
+    use crate::test_support::temporary_path;
+    use anyserve_client::execution::{WorkerSession, v2};
+    use anyserve_core::runtime::api::{InterfacePolicy, JournalConfig, PoolTier};
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    let path = temporary_path("overview-enriched.sqlite");
+    let config = RuntimeConfig {
+        journal: Some(JournalConfig::new(&path)),
+        max_sessions: 128,
+        priority_levels: 8,
+        default_max_attempts: 5,
+        heartbeat_interval: Duration::from_secs(2),
+        heartbeat_timeout: Duration::from_secs(9),
+        reconnect_grace: Some(Duration::from_secs(4)),
+        max_pending_bytes: 1_000_000,
+        max_result_bytes: 2_000_000,
+        max_event_bytes: 3_000_000,
+        interfaces: BTreeMap::from([
+            (
+                "alpha.idle.v1".into(),
+                InterfacePolicy {
+                    max_queue: Some(50),
+                    queue_timeout: Some(Duration::from_millis(1200)),
+                    max_in_flight_per_key: Some(4),
+                    pool_tiers: vec![PoolTier {
+                        pool: "gpu-primary".into(),
+                        spillover_after: Duration::from_millis(500),
+                        reconnect_grace: Some(Duration::from_secs(2)),
+                    }],
+                },
+            ),
+            (
+                "zebra.active.v1".into(),
+                InterfacePolicy {
+                    max_queue: Some(10),
+                    pool_tiers: vec![PoolTier {
+                        pool: "gpu-primary".into(),
+                        spillover_after: Duration::from_millis(0),
+                        reconnect_grace: None,
+                    }],
+                    ..Default::default()
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    let server = Server::start(config, AuthPolicy::default()).await;
+    let mut session = WorkerSession::connect(
+        &server.endpoint,
+        None,
+        v2::Hello {
+            worker_id: "pool-worker".into(),
+            pool: "gpu-primary".into(),
+            interfaces: vec!["zebra.active.v1".into(), "dynamic.unconfigured.v1".into()],
+            max_concurrency: 3,
+            total_capacity: [("gpu".into(), 1)].into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _welcome = session.messages.message().await.unwrap().unwrap();
+    session
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Credit(v2::Credit {
+                free_slots: 3,
+            })),
+        })
+        .await
+        .unwrap();
+
+    // Wait for worker session to register before submitting jobs so first job leases cleanly.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.runtime.list_workers().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let mut first_spec = test_job_spec("zebra.active.v1");
+    first_spec.policy.durability = Some(Durability::Durable);
+    first_spec.inputs = vec![Object::inline(b"hello world".as_slice())];
+    server
+        .runtime
+        .submit(SubmitRequest {
+            spec: first_spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // Accept the first assignment so 1 lease is active and 2 slots remain free.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(v2::server_message::Msg::Assign(assign)) =
+                session.messages.message().await.unwrap().unwrap().msg
+            {
+                session
+                    .control
+                    .send(v2::WorkerMessage {
+                        msg: Some(v2::worker_message::Msg::AssignReply(v2::AssignReply {
+                            lease_id: assign.lease_id,
+                            accepted: true,
+                            reject_reason: String::new(),
+                        })),
+                    })
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    // Exhaust free slots and create queued demand for desired_additional_slots > 0.
+    for _ in 0..4 {
+        let mut spec = test_job_spec("zebra.active.v1");
+        spec.policy.durability = Some(Durability::Durable);
+        spec.inputs = vec![Object::inline(b"hello world".as_slice())];
+        spec.demand
+            .required_attributes
+            .insert("region".into(), "unreachable".into());
+        server
+            .runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    let auth = AuthPolicy::new(["op-secret".into()], []);
+    let (base_url, handle) = spawn_test_server_with_metadata(
+        server.runtime.clone(),
+        auth,
+        ControlPlaneMetadata {
+            grpc_listen: "0.0.0.0:50062".into(),
+            grpc_tls_enabled: true,
+        },
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base_url}/api/overview"))
+        .bearer_auth("op-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+
+    assert_eq!(body["runtime"]["code"], "memory_plus_sqlite");
+    assert_eq!(body["runtime"]["journal"], "sqlite");
+    assert_eq!(body["health"]["live"], true);
+    assert_eq!(body["health"]["ready"], true);
+    assert_eq!(body["health"]["journal"]["status"], "healthy");
+    assert!(body["health"]["journal"]["message"].is_null());
+
+    let cp = &body["control_plane"];
+    assert_eq!(cp["grpc_listen"], "0.0.0.0:50062");
+    assert_eq!(cp["grpc_tls_enabled"], true);
+    assert!(
+        cp["console_listen"]
+            .as_str()
+            .unwrap()
+            .starts_with("127.0.0.1:")
+    );
+    assert_eq!(cp["auth_enabled"], true);
+    assert!(cp["generation"].as_u64().unwrap() >= 1);
+    assert_eq!(cp["retained_jobs"], 0);
+    assert_eq!(cp["sessions"], 1);
+    assert_eq!(cp["max_sessions"], 128);
+    assert_eq!(cp["priority_levels"], 8);
+    assert_eq!(cp["default_max_attempts"], 5);
+    assert_eq!(cp["heartbeat_interval_ms"], 2000);
+    assert_eq!(cp["heartbeat_timeout_ms"], 9000);
+    assert_eq!(cp["reconnect_grace_ms"], 4000);
+
+    let budgets = &body["budgets"];
+    assert_eq!(budgets["input_bytes"], 80);
+    assert_eq!(budgets["max_pending_bytes"], 1_000_000);
+    assert_eq!(budgets["result_bytes"], 0);
+    assert_eq!(budgets["max_result_bytes"], 2_000_000);
+    assert!(budgets["event_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(budgets["max_event_bytes"], 3_000_000);
+
+    let journal_stats = &body["journal_stats"];
+    assert!(journal_stats.is_object());
+    assert!(journal_stats["committed_batches"].as_u64().unwrap() >= 1);
+    assert!(journal_stats["committed_ops"].as_u64().unwrap() >= 5);
+
+    let interfaces = body["interfaces"].as_array().unwrap();
+    let names: Vec<&str> = interfaces
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "alpha.idle.v1",
+            "dynamic.unconfigured.v1",
+            "zebra.active.v1"
+        ]
+    );
+    assert_eq!(interfaces[0]["queued"], 0);
+    assert_eq!(interfaces[0]["sessions"], 0);
+    assert_eq!(interfaces[0]["policy"]["max_queue"], 50);
+    assert_eq!(interfaces[0]["policy"]["queue_timeout_ms"], 1200);
+    assert_eq!(interfaces[0]["policy"]["max_in_flight_per_key"], 4);
+    assert_eq!(
+        interfaces[0]["policy"]["pool_tiers"][0]["pool"],
+        "gpu-primary"
+    );
+    assert_eq!(
+        interfaces[0]["policy"]["pool_tiers"][0]["spillover_after_ms"],
+        500
+    );
+    assert_eq!(
+        interfaces[0]["policy"]["pool_tiers"][0]["reconnect_grace_ms"],
+        2000
+    );
+    assert!(interfaces[1]["policy"].is_null());
+    assert_eq!(interfaces[1]["sessions"], 1);
+    assert_eq!(interfaces[1]["free_slots"], 2);
+    assert_eq!(interfaces[2]["queued"], 4);
+    assert_eq!(interfaces[2]["running"], 1);
+    assert_eq!(interfaces[2]["policy"]["max_queue"], 10);
+
+    let pools = body["pools"].as_array().unwrap();
+    let zebra_pool = pools
+        .iter()
+        .find(|p| p["interface"] == "zebra.active.v1" && p["pool"] == "gpu-primary")
+        .unwrap();
+    assert_eq!(zebra_pool["namespace"], "default");
+    assert_eq!(zebra_pool["sessions"], 1);
+    assert_eq!(zebra_pool["free_slots"], 2);
+    assert_eq!(zebra_pool["active_leases"], 1);
+    assert_eq!(zebra_pool["desired_additional_slots"], 2);
+
+    handle.abort();
+    drop(session);
+    server.stop().await;
+    for suffix in ["", "-wal", "-shm", ".lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn overview_memory_mode_reports_disabled_journal_and_null_journal_stats() {
+    let runtime = test_runtime().await;
+    let (base_url, handle) = spawn_test_server(runtime).await;
+    let body: Value = reqwest::get(format!("{base_url}/api/overview"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["health"]["live"], true);
+    assert_eq!(body["health"]["ready"], true);
+    assert_eq!(body["health"]["journal"]["status"], "disabled");
+    assert!(body["health"]["journal"]["message"].is_null());
+    assert!(body["journal_stats"].is_null());
+    assert_eq!(body["control_plane"]["auth_enabled"], false);
+    assert!(body["control_plane"]["reconnect_grace_ms"].is_null());
+    assert!(body["pools"].as_array().unwrap().is_empty());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn run_server_serves_control_plane_metadata_and_shuts_down_cleanly() {
+    let runtime = test_runtime().await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let task = tokio::spawn(run_server(
+        addr,
+        runtime,
+        crate::serve_config::ServeConsoleConfig {
+            listen: "127.0.0.1:0".into(),
+            allowed_origins: vec![" http://console.test ".into(), "".into()],
+        },
+        ControlPlaneMetadata {
+            grpc_listen: "127.0.0.1:50099".into(),
+            grpc_tls_enabled: true,
+        },
+        RuntimeMode::Memory,
+        Arc::new(AuthPolicy::default()),
+        shutdown_rx,
+    ));
+    let _ = shutdown_tx.send(true);
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn workers_endpoint_reports_session_pool_namespace_load_draining_and_disconnected() {
+    use anyserve_client::execution::{WorkerSession, v2};
+    use std::time::Duration;
+
+    let server = Server::start(
+        RuntimeConfig {
+            reconnect_grace: Some(Duration::from_secs(30)),
+            ..Default::default()
+        },
+        AuthPolicy::default(),
+    )
+    .await;
+
+    let mut healthy = WorkerSession::connect_with_namespace(
+        &server.endpoint,
+        None,
+        Some("team-alpha"),
+        v2::Hello {
+            worker_id: "w-healthy".into(),
+            pool: "spot".into(),
+            interfaces: vec!["demo.v1".into()],
+            max_concurrency: 4,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = healthy.messages.message().await.unwrap();
+    healthy
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Credit(v2::Credit {
+                free_slots: 4,
+            })),
+        })
+        .await
+        .unwrap();
+    healthy
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Heartbeat(v2::Heartbeat {
+                load: Some(v2::Load {
+                    queued: 2,
+                    running: 1,
+                    utilization: 0.75,
+                    custom: [("vram_used_mb".into(), 4096.0)].into(),
+                }),
+            })),
+        })
+        .await
+        .unwrap();
+
+    let mut draining = WorkerSession::connect(
+        &server.endpoint,
+        None,
+        v2::Hello {
+            worker_id: "w-draining".into(),
+            pool: "ondemand".into(),
+            interfaces: vec!["demo.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = draining.messages.message().await.unwrap();
+    draining
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
+                preempting: false,
+            })),
+        })
+        .await
+        .unwrap();
+
+    let mut disconnected = WorkerSession::connect(
+        &server.endpoint,
+        None,
+        v2::Hello {
+            worker_id: "w-disconnected".into(),
+            pool: "edge".into(),
+            interfaces: vec!["demo.disconnect.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let _ = disconnected.messages.message().await.unwrap();
+    disconnected
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Credit(v2::Credit {
+                free_slots: 1,
+            })),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !server
+            .runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.worker_id == "w-disconnected")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    server
+        .runtime
+        .submit(SubmitRequest {
+            spec: test_job_spec("demo.disconnect.v1"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(v2::server_message::Msg::Assign(assign)) =
+                disconnected.messages.message().await.unwrap().unwrap().msg
+            {
+                disconnected
+                    .control
+                    .send(v2::WorkerMessage {
+                        msg: Some(v2::worker_message::Msg::AssignReply(v2::AssignReply {
+                            lease_id: assign.lease_id,
+                            accepted: true,
+                            reject_reason: String::new(),
+                        })),
+                    })
+                    .await
+                    .unwrap();
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !server
+            .runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.worker_id == "w-disconnected" && w.active_leases == 1)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(disconnected);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let workers = server.runtime.list_workers();
+            let ready = workers.len() == 3
+                && workers
+                    .iter()
+                    .any(|w| w.worker_id == "w-healthy" && w.load.queued == 2)
+                && workers
+                    .iter()
+                    .any(|w| w.worker_id == "w-draining" && w.draining)
+                && workers
+                    .iter()
+                    .any(|w| w.worker_id == "w-disconnected" && !w.connected);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let (base_url, handle) = spawn_test_server(server.runtime.clone()).await;
+    let body: Value = reqwest::get(format!("{base_url}/api/workers"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["healthy"], 1);
+    assert_eq!(body["draining"], 1);
+    assert_eq!(body["disconnected"], 1);
+
+    let workers = body["workers"].as_array().unwrap();
+    let w_healthy = workers
+        .iter()
+        .find(|w| w["worker_id"] == "w-healthy")
+        .unwrap();
+    assert!(!w_healthy["session_id"].as_str().unwrap().is_empty());
+    assert_eq!(w_healthy["namespace"], "team-alpha");
+    assert_eq!(w_healthy["pool"], "spot");
+    assert!(w_healthy["connected_at_ms"].as_u64().unwrap() > 0);
+    assert_eq!(w_healthy["utilization"], 0.75);
+    assert_eq!(w_healthy["load"]["queued"], 2);
+    assert_eq!(w_healthy["load"]["running"], 1);
+    assert_eq!(w_healthy["load"]["utilization"], 0.75);
+    assert_eq!(w_healthy["load"]["custom"]["vram_used_mb"], 4096.0);
+
+    handle.abort();
+    drop(healthy);
+    drop(draining);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn jobs_endpoints_filter_and_expose_enriched_summary_and_detail_fields() {
+    use anyserve_client::execution::{Attempt, WorkerSession, v2};
+    use std::time::Duration;
+
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+
+    let mut worker_beta = WorkerSession::connect_with_namespace(
+        &server.endpoint,
+        None,
+        Some("team-beta"),
+        v2::Hello {
+            worker_id: "shared-worker-id".into(),
+            pool: "beta-pool".into(),
+            interfaces: vec!["iface.a".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let Some(v2::server_message::Msg::Welcome(welcome)) =
+        worker_beta.messages.message().await.unwrap().unwrap().msg
+    else {
+        panic!("missing Welcome");
+    };
+    let limits = welcome.limits.unwrap();
+    let hb_timeout = Duration::from_millis(u64::from(welcome.heartbeat_timeout_ms));
+    worker_beta
+        .control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Credit(v2::Credit {
+                free_slots: 2,
+            })),
+        })
+        .await
+        .unwrap();
+
+    // Also connect a default-namespace worker with the SAME worker_id to ensure detail matches namespace!
+    let _worker_default =
+        Worker::connect(&server, "shared-worker-id", vec!["iface.b".into()], 1).await;
+
+    let before = anyserve_core::now_ms().saturating_sub(1000);
+    let mut beta_spec = test_job_spec("iface.a");
+    beta_spec.demand.affinity_key = "aff-1".into();
+    beta_spec.policy.fairness_key = "fair-1".into();
+    beta_spec.policy.concurrency_key = "conc-1".into();
+    let beta_failed_job = server
+        .runtime
+        .submit(SubmitRequest {
+            namespace: Some("team-beta".into()),
+            spec: beta_spec,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+
+    let assign = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(v2::server_message::Msg::Assign(assign)) =
+                worker_beta.messages.message().await.unwrap().unwrap().msg
+            {
+                worker_beta
+                    .control
+                    .send(v2::WorkerMessage {
+                        msg: Some(v2::worker_message::Msg::AssignReply(v2::AssignReply {
+                            lease_id: assign.lease_id.clone(),
+                            accepted: true,
+                            reject_reason: String::new(),
+                        })),
+                    })
+                    .await
+                    .unwrap();
+                return assign;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let mut attempt = Attempt::open(&mut worker_beta.data, &assign, &limits, hb_timeout)
+        .await
+        .unwrap();
+    attempt
+        .finish(
+            &[],
+            v2::finish::Outcome::Failed(v2::ErrorInfo {
+                code: "bad_input".into(),
+                message: "bad payload".into(),
+                retryable: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Submit a second queued job in team-beta to test cancel?namespace=team-beta.
+    let beta_cancel_job = server
+        .runtime
+        .submit(SubmitRequest {
+            namespace: Some("team-beta".into()),
+            spec: {
+                let mut s = test_job_spec("iface.a");
+                s.demand
+                    .required_attributes
+                    .insert("unreachable".into(), "true".into());
+                s
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+
+    // Submit a default-namespace job on iface.b.
+    let default_job = server
+        .runtime
+        .submit(SubmitRequest {
+            spec: {
+                let mut s = test_job_spec("iface.b");
+                s.demand
+                    .required_attributes
+                    .insert("unreachable".into(), "true".into());
+                s
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .job;
+
+    let end = anyserve_core::now_ms() + 1;
+    let (base_url, handle) = spawn_test_server(server.runtime.clone()).await;
+    let client = reqwest::Client::new();
+
+    // 1. Filter by interface=iface.a -> returns both beta jobs, not default_job.
+    let by_iface: Value = client
+        .get(format!("{base_url}/api/jobs?interface=iface.a"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(by_iface["jobs"].as_array().unwrap().len(), 2);
+
+    // 2. Filter by namespace=team-beta&states=failed -> returns beta_failed_job with error_code/retryable.
+    let by_ns: Value = client
+        .get(format!(
+            "{base_url}/api/jobs?namespace=team-beta&states=failed"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let failed_rows = by_ns["jobs"].as_array().unwrap();
+    assert_eq!(failed_rows.len(), 1);
+    assert_eq!(failed_rows[0]["job_id"], beta_failed_job.job_id);
+    assert_eq!(failed_rows[0]["namespace"], "team-beta");
+    assert_eq!(failed_rows[0]["durability"], "ephemeral");
+    assert_eq!(failed_rows[0]["last_error"], "bad payload");
+    assert_eq!(failed_rows[0]["error_code"], "bad_input");
+    assert_eq!(failed_rows[0]["error_retryable"], false);
+
+    // 3. Empty/whitespace interface & namespace filters are treated as None (all 3 jobs returned).
+    let all_jobs: Value = client
+        .get(format!("{base_url}/api/jobs?interface=%20%20&namespace="))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(all_jobs["jobs"].as_array().unwrap().len(), 3);
+
+    // 4. Detail for non-default namespace job exposes affinity_key, fairness_key, concurrency_key,
+    //    and resolves latest_worker in the job's namespace ("beta-pool", not default).
+    let detail: Value = client
+        .get(format!(
+            "{base_url}/api/jobs/{}?namespace=team-beta",
+            beta_failed_job.job_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["job"]["namespace"], "team-beta");
+    assert_eq!(detail["job"]["durability"], "ephemeral");
+    assert_eq!(detail["job"]["error_code"], "bad_input");
+    assert_eq!(detail["job"]["error_retryable"], false);
+    assert_eq!(detail["job"]["demand"]["affinity_key"], "aff-1");
+    assert_eq!(detail["job"]["policy"]["fairness_key"], "fair-1");
+    assert_eq!(detail["job"]["policy"]["concurrency_key"], "conc-1");
+    assert_eq!(detail["latest_worker"]["namespace"], "team-beta");
+    assert_eq!(detail["latest_worker"]["pool"], "beta-pool");
+
+    // 5. Default-namespace lookup for beta job returns 404; default job returns 200 without ?namespace.
+    assert_eq!(
+        client
+            .get(format!("{base_url}/api/jobs/{}", beta_failed_job.job_id))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+    assert_eq!(
+        client
+            .get(format!("{base_url}/api/jobs/{}", default_job.job_id))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+
+    // 6. Cancel in non-default namespace via ?namespace=team-beta.
+    let cancelled: Value = client
+        .post(format!(
+            "{base_url}/api/jobs/{}/cancel?namespace=team-beta",
+            beta_cancel_job.job_id
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cancelled["job"]["state"], "cancelled");
+    assert_eq!(cancelled["job"]["namespace"], "team-beta");
+    assert_eq!(cancelled["job"]["error_code"], "cancelled");
+
+    // 7. Analytics with ?namespace=team-beta returns single durability & enriched fields.
+    let analytics: Value = client
+        .get(format!(
+            "{base_url}/api/analytics/jobs?source=retained&from_ms={before}&to_ms={end}&namespace=team-beta"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(analytics["jobs"].as_array().unwrap().len(), 2);
+    assert!(
+        analytics["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|j| j["namespace"] == "team-beta" && j["durability"] == "ephemeral")
+    );
+
+    handle.abort();
+    drop(worker_beta);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn cors_middleware_allows_only_configured_origins() {
+    let runtime = test_runtime().await;
+    let (base_url, handle) = spawn_test_server(runtime).await;
+    let client = reqwest::Client::new();
+
+    let allowed = client
+        .get(format!("{base_url}/api/overview"))
+        .header("origin", "http://console.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed.headers()["access-control-allow-origin"],
+        "http://console.test"
+    );
+
+    let disallowed = client
+        .get(format!("{base_url}/api/overview"))
+        .header("origin", "http://evil.test")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        disallowed
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+
     handle.abort();
 }
