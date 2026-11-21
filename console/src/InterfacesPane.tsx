@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { formatDuration, formatNumber } from "./format";
+import { formatDuration, formatNumber, formatPool } from "./format";
 import { InspectorGroup, InspectorSection, InspectorShell, MetaGrid } from "./pane-inspector";
 import { EmptyState, InterfacesTable, PanelHeader, SearchInput, TierChain, WorkerMiniList } from "./pane-tables";
 import type { InterfaceSummary, PoolSummary, WorkerSummary } from "./types";
@@ -106,7 +106,7 @@ export function InterfacesPane(props: InterfacesPaneProps) {
                     const key = `${pool.namespace}::${pool.interface}::${pool.pool}`;
                     return (
                       <button key={key} type="button" className="chip-btn" onClick={() => onOpenPool(key)}>
-                        <span className="mono">{pool.pool}</span>
+                        <span className="mono">{formatPool(pool.pool)}</span>
                         <span className="chip-btn__meta">{pool.namespace} · {pool.sessions}s / {pool.free_slots} free</span>
                       </button>
                     );

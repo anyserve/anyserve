@@ -171,7 +171,10 @@ export function JobInspector({ detail, isCancelling = false, onCancel }: {
       ].filter((v): v is string => Boolean(v))
     : [];
   const hasParams = Boolean(job.params_preview) || (job.params_size_bytes != null && job.params_size_bytes > 0);
-  const hasPayload = hasParams || job.inputs.length > 0 || job.outputs.length > 0 || Boolean(job.output_preview);
+  const showOutputs =
+    job.outputs.length > 0 &&
+    !(job.output_preview != null && job.outputs.length === 1 && job.outputs[0].kind === "inline");
+  const hasPayload = hasParams || job.inputs.length > 0 || showOutputs || Boolean(job.output_preview);
 
   return (
     <InspectorShell
@@ -237,7 +240,7 @@ export function JobInspector({ detail, isCancelling = false, onCancel }: {
               </InspectorSection>
             ) : null}
             {job.inputs.length > 0 ? <InspectorSection title="Inputs"><ObjectRefList objects={job.inputs} /></InspectorSection> : null}
-            {job.outputs.length > 0 ? <InspectorSection title="Outputs"><ObjectRefList objects={job.outputs} /></InspectorSection> : null}
+            {showOutputs ? <InspectorSection title="Outputs"><ObjectRefList objects={job.outputs} /></InspectorSection> : null}
             {job.output_preview ? (
               <InspectorSection title="Response">
                 <div className="preview-meta">

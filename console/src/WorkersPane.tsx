@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { formatCapacityMap, formatNumber, formatPercent, formatShortTime, formatTimestamp } from "./format";
+import { formatCapacityMap, formatNumber, formatPercent, formatPool, formatShortTime, formatTimestamp } from "./format";
 import { InspectorGroup, InspectorSection, InspectorShell, KeyValueGrid, MetaGrid } from "./pane-inspector";
 import { EmptyState, PanelHeader, ProgressMeter, SearchInput, SelectField, StatsRow, WorkerStateBadge } from "./pane-tables";
 import type { OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
@@ -26,7 +26,7 @@ export function WorkersPane(props: WorkersPaneProps) {
   const [interfaceFilter, setInterfaceFilter] = useState("all");
   const [search, setSearch] = useState("");
 
-  const poolOptions = useMemo(() => ["all", ...Array.from(new Set(workers.map((w) => w.pool).filter(Boolean) as string[])).sort()], [workers]);
+  const poolOptions = useMemo(() => ["all", ...Array.from(new Set(workers.map((w) => formatPool(w.pool)))).sort()], [workers]);
   const interfaceOptions = useMemo(() => ["all", ...Array.from(new Set(workers.flatMap((w) => w.interfaces))).sort()], [workers]);
 
   const filtered = useMemo(() => {
@@ -35,9 +35,9 @@ export function WorkersPane(props: WorkersPaneProps) {
       if (healthFilter === "healthy" && !w.healthy) return false;
       if (healthFilter === "draining" && !(w.connected && w.draining)) return false;
       if (healthFilter === "disconnected" && w.connected) return false;
-      if (poolFilter !== "all" && (w.pool ?? "default") !== poolFilter) return false;
+      if (poolFilter !== "all" && formatPool(w.pool) !== poolFilter) return false;
       if (interfaceFilter !== "all" && !w.interfaces.includes(interfaceFilter)) return false;
-      return !q || [w.worker_id, w.session_id, w.pool, w.namespace].some((s) => (s ?? "").toLowerCase().includes(q));
+      return !q || [w.worker_id, w.session_id, formatPool(w.pool), w.namespace].some((s) => (s ?? "").toLowerCase().includes(q));
     });
   }, [workers, healthFilter, poolFilter, interfaceFilter, search]);
 
@@ -82,18 +82,19 @@ export function WorkersPane(props: WorkersPaneProps) {
             <table className="table table--fixed table--interactive">
               <thead>
                 <tr>
-                  <th style={{ width: "18%" }}>Status</th>
-                  <th style={{ width: "22%" }}>Worker</th>
-                  <th style={{ width: "14%" }}>Pool</th>
-                  <th style={{ width: "16%" }}>Interfaces</th>
-                  <th style={{ width: "17%" }}>Occupancy</th>
-                  <th style={{ width: "13%" }}>Last seen</th>
+                  <th style={{ width: "14%" }}>Status</th>
+                  <th style={{ width: "23%" }}>Worker</th>
+                  <th style={{ width: "15%" }}>Pool</th>
+                  <th style={{ width: "21%" }}>Interfaces</th>
+                  <th style={{ width: "16%" }}>Occupancy</th>
+                  <th style={{ width: "11%" }}>Last seen</th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((worker) => {
                   const slotRatio = worker.max_concurrency > 0 ? worker.active_leases / worker.max_concurrency : 0;
                   const ifaces = worker.interfaces.join(", ") || "None";
+                  const poolName = formatPool(worker.pool);
                   return (
                     <tr key={worker.session_id ?? worker.worker_id} className={activeWorker?.worker_id === worker.worker_id ? "is-selected" : ""} onClick={() => onSelectWorker(worker.worker_id)}>
                       <td><WorkerStateBadge worker={worker} /></td>
@@ -102,7 +103,7 @@ export function WorkersPane(props: WorkersPaneProps) {
                         {worker.session_id ? <div className="table__secondary mono ellipsis" title={worker.session_id}>{worker.session_id}</div> : null}
                       </td>
                       <td>
-                        <div className="table__primary mono ellipsis" title={worker.pool ?? "default"}>{worker.pool ?? "default"}</div>
+                        <div className="table__primary mono ellipsis" title={poolName}>{poolName}</div>
                         {worker.namespace && worker.namespace !== "default" ? <div className="table__secondary ellipsis">{worker.namespace}</div> : null}
                       </td>
                       <td className="mono ellipsis" title={ifaces}>{ifaces}</td>
@@ -131,7 +132,7 @@ export function WorkersPane(props: WorkersPaneProps) {
         emptyHint="Select a worker"
         emptyMessage="Select a worker to inspect its outbound gRPC session, load, attributes, and capacity."
         title={activeWorker?.worker_id ?? ""}
-        subtitle={activeWorker ? `${activeWorker.namespace ?? "default"} · ${activeWorker.pool ?? "default"}` : null}
+        subtitle={activeWorker ? `${activeWorker.namespace ?? "default"} · ${formatPool(activeWorker.pool)}` : null}
         actions={
           activeWorker ? (
             <>

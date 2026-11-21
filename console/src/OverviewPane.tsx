@@ -1,7 +1,6 @@
 import type { ConsoleTab } from "./app-constants";
-import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber } from "./format";
+import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber, formatPool } from "./format";
 import { IconArrowRight } from "./icons";
-import { MetaGrid } from "./pane-inspector";
 import { EmptyState, InterfacesTable, PanelHeader, ProgressMeter } from "./pane-tables";
 import type { OverviewResponse } from "./types";
 
@@ -139,7 +138,19 @@ export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool
         <section className="panel">
           <PanelHeader title="Control Plane & Journal" />
           <div className="panel__body">
-            {cp ? <MetaGrid items={cpItems} /> : <EmptyState message="Control plane metadata unavailable on this server payload." inline />}
+            {cp ? (
+              <div className="cp-grid">
+                {cpItems.map((item) => (
+                  <div key={item.label} className="meta-item">
+                    <span>{item.label}</span>
+                    <strong className={item.mono ? "meta-item__value mono" : "meta-item__value"}>
+                      {item.value}
+                      {item.tag ? <> <em className="tag">{item.tag}</em></> : null}
+                    </strong>
+                  </div>
+                ))}
+              </div>
+            ) : <EmptyState message="Control plane metadata unavailable on this server payload." inline />}
           </div>
         </section>
       </div>
@@ -179,9 +190,10 @@ export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool
                 <tbody>
                   {pools.slice(0, 8).map((pool) => {
                     const key = `${pool.namespace}::${pool.interface}::${pool.pool}`;
+                    const poolName = formatPool(pool.pool);
                     return (
                       <tr key={key} onClick={() => onOpenPool(key)}>
-                        <td className="table__primary mono ellipsis" title={pool.pool}>{pool.pool}</td>
+                        <td className="table__primary mono ellipsis" title={poolName}>{poolName}</td>
                         <td>
                           <div className="cell-inline" title={`${pool.namespace} / ${pool.interface}`}>
                             {pool.namespace !== "default" ? <span className="tag">{pool.namespace}</span> : null}

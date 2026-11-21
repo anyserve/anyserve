@@ -163,6 +163,15 @@ const richOverview = (): OverviewResponse => ({
       active_leases: 2,
       desired_additional_slots: 3,
     },
+    {
+      namespace: "default",
+      interface: "echo",
+      pool: "",
+      sessions: 1,
+      free_slots: 2,
+      active_leases: 0,
+      desired_additional_slots: 0,
+    },
   ],
 });
 
@@ -214,7 +223,7 @@ const richWorkers = (): WorkersResponse => ({
       worker_id: "worker-lost-03",
       session_id: "sess-333",
       namespace: "default",
-      pool: "default",
+      pool: "",
       healthy: false,
       interfaces: ["echo"],
       attributes: {},
@@ -387,6 +396,7 @@ it("renders Pools and Workers with slot occupancy meters, reported load, and nav
   expect(screen.getAllByText("Desired additional").length).toBeGreaterThan(0);
   expect(screen.getByText("+3")).toBeTruthy();
   expect(screen.getByText("Spillover Tier Position")).toBeTruthy();
+  expect(screen.getAllByText("default").length).toBeGreaterThan(0);
 
   fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
   expect(await screen.findByRole("heading", { name: "worker-gpu-01" })).toBeTruthy();
@@ -398,6 +408,7 @@ it("renders Pools and Workers with slot occupancy meters, reported load, and nav
   fireEvent.click(screen.getByRole("button", { name: "Disconnected" }));
   expect(screen.queryByRole("heading", { name: "worker-gpu-01" })).toBeNull();
   expect(screen.getByRole("heading", { name: "worker-lost-03" })).toBeTruthy();
+  expect(screen.getByText("default · default")).toBeTruthy();
   expect(screen.getByText("Session disconnected; active leases survive until reconnect grace expires.")).toBeTruthy();
 
   fireEvent.click(screen.getByRole("button", { name: "View Worker Jobs" }));
@@ -496,7 +507,27 @@ it("formats OpenAI SSE / JSON payloads, shows retryable attempts, and collapses 
             },
           ],
         }
-      : detail(id, { namespace: "tenant-a", interface_name: "triton/minilm" }),
+      : detail(id, {
+          namespace: "tenant-a",
+          interface_name: "triton/minilm",
+          output_preview: {
+            size_bytes: 28,
+            content_type: "application/json",
+            preview: '{"model_name":"minilm"}',
+            truncated: false,
+          },
+          outputs: [
+            {
+              kind: "inline",
+              size_bytes: 28,
+              uri: null,
+              content_type: "application/json",
+              preview: '{"model_name":"minilm"}',
+              truncated: false,
+              metadata: {},
+            },
+          ],
+        }),
   );
 
   render(<App />);
@@ -518,7 +549,9 @@ it("formats OpenAI SSE / JSON payloads, shows retryable attempts, and collapses 
   expect(screen.getByText("job-2")).toBeTruthy();
 
   fireEvent.click(screen.getByText("job-2"));
-  expect(await screen.findByText("No retained request or response payloads.")).toBeTruthy();
+  expect(await screen.findByText(/model_name/)).toBeTruthy();
+  expect(screen.queryByText("Outputs")).toBeNull();
+  expect(screen.getAllByText(/minilm/).length).toBeGreaterThan(0);
 });
 
 it("toggles Light/Dark theme and disconnects token cleanly", async () => {

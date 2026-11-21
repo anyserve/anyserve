@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { formatDuration, formatNumber } from "./format";
+import { formatDuration, formatNumber, formatPool } from "./format";
 import { InspectorSection, InspectorShell, MetaGrid } from "./pane-inspector";
 import { EmptyState, PanelHeader, SearchInput, SelectField, StatsRow, TierChain, WorkerMiniList } from "./pane-tables";
 import type { InterfaceSummary, PoolSummary, WorkerSummary } from "./types";
@@ -33,7 +33,7 @@ export function PoolsPane(props: PoolsPaneProps) {
     return pools.filter((item) => {
       if (namespaceFilter !== "all" && item.namespace !== namespaceFilter) return false;
       if (interfaceFilter !== "all" && item.interface !== interfaceFilter) return false;
-      return !q || [item.pool, item.interface, item.namespace].some((s) => s.toLowerCase().includes(q));
+      return !q || [formatPool(item.pool), item.interface, item.namespace].some((s) => s.toLowerCase().includes(q));
     });
   }, [pools, namespaceFilter, interfaceFilter, search]);
 
@@ -42,7 +42,7 @@ export function PoolsPane(props: PoolsPaneProps) {
   const matchingWorkers = useMemo(() => {
     if (!activePool) return [];
     return workers.filter(
-      (w) => (w.pool ?? "default") === activePool.pool && (w.namespace ?? "default") === activePool.namespace && w.interfaces.includes(activePool.interface),
+      (w) => formatPool(w.pool) === formatPool(activePool.pool) && (w.namespace ?? "default") === activePool.namespace && w.interfaces.includes(activePool.interface),
     );
   }, [activePool, workers]);
   const configuredSpillovers = useMemo(() => interfaces.filter((item) => (item.policy?.pool_tiers.length ?? 0) > 0), [interfaces]);
@@ -113,9 +113,10 @@ export function PoolsPane(props: PoolsPaneProps) {
                 <tbody>
                   {filtered.map((item) => {
                     const key = poolKey(item);
+                    const poolName = formatPool(item.pool);
                     return (
                       <tr key={key} className={activePool && poolKey(activePool) === key ? "is-selected" : ""} onClick={() => onSelectPool(key)}>
-                        <td className="table__primary mono ellipsis" title={item.pool}>{item.pool}</td>
+                        <td className="table__primary mono ellipsis" title={poolName}>{poolName}</td>
                         <td><span className="tag ellipsis" title={item.namespace}>{item.namespace}</span></td>
                         <td className="mono ellipsis" title={item.interface}>{item.interface}</td>
                         <td className="num">{formatNumber(item.sessions)}</td>
@@ -161,7 +162,7 @@ export function PoolsPane(props: PoolsPaneProps) {
         emptyTitle="Pool Inspector"
         emptyHint="Select a pool"
         emptyMessage="Select a pool entry to inspect autoscaling demand, spillover tier order, and workers."
-        title={activePool?.pool ?? ""}
+        title={activePool ? formatPool(activePool.pool) : ""}
         subtitle={activePool ? `${activePool.namespace} · ${activePool.interface}` : null}
         actions={
           activePool ? (

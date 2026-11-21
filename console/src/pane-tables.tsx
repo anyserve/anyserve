@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import type { PaneStat } from "./app-constants";
-import { formatDuration, formatNumber, formatShortTime, formatTimestamp } from "./format";
+import { formatDuration, formatNumber, formatPool, formatShortTime, formatTimestamp } from "./format";
 import { IconSearch } from "./icons";
 import type { InterfaceSummary, JobState, JobSummary, PoolTierPolicy, WorkerSummary } from "./types";
 
@@ -130,7 +130,7 @@ export function WorkerMiniList(props: {
           <span className="mono ellipsis" title={worker.worker_id}>{worker.worker_id}</span>
           <span className="mini-row__meta">
             {props.showLeases ? <span className="num">{worker.active_leases}/{worker.max_concurrency}</span> : null}
-            {!props.showLeases && worker.pool ? <span className="tag">{worker.pool}</span> : null}
+            {!props.showLeases ? <span className="tag">{formatPool(worker.pool)}</span> : null}
             <WorkerStateBadge worker={worker} />
           </span>
         </button>
@@ -212,16 +212,16 @@ export function InterfacesTable(props: {
   if (interfaces.length === 0) return <EmptyState message="No interfaces match the filter" inline={compact} />;
   return (
     <div className="table-wrap">
-      <table className={`table table--fixed${onSelect ? " table--interactive" : ""}`}>
+      <table className={`table table--fixed${compact ? " table--compact" : ""}${onSelect ? " table--interactive" : ""}`}>
         <thead>
           <tr>
-            <th style={{ width: compact ? "26%" : "21%" }}>Interface</th>
-            <th style={{ width: compact ? "12.5%" : "9%" }}>Queued</th>
-            <th style={{ width: compact ? "14%" : "10%" }}>Running</th>
-            {!compact ? <th style={{ width: "14.5%" }}>Oldest wait</th> : null}
-            <th style={{ width: compact ? "14.5%" : "11%" }}>Sessions</th>
-            <th style={{ width: compact ? "9.5%" : "13%" }}>{compact ? "Free" : "Free slots"}</th>
-            <th style={{ width: compact ? "23.5%" : "21.5%" }}>Policy</th>
+            <th style={{ width: compact ? "26.5%" : "24%" }}>Interface</th>
+            <th style={{ width: compact ? "11%" : "8.5%" }}>Queued</th>
+            <th style={{ width: compact ? "12.5%" : "9.5%" }}>Running</th>
+            {!compact ? <th style={{ width: "9%" }}>Oldest</th> : null}
+            <th style={{ width: compact ? "13%" : "10%" }}>Sessions</th>
+            <th style={{ width: compact ? "8.5%" : "8%" }}>Free</th>
+            <th style={{ width: compact ? "28.5%" : "31%" }}>Policy</th>
           </tr>
         </thead>
         <tbody>

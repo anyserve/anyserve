@@ -88,6 +88,10 @@ export function formatCapacityMap(value: Record<string, string | number>): strin
   return entries.length === 0 ? "N/A" : entries.map(([k, v]) => `${k}:${v}`).join(" ");
 }
 
+export function formatPool(pool: string | null | undefined): string {
+  return pool?.trim() || "default";
+}
+
 export function formatObjectMeta(value: { size_bytes: number | null; metadata: Record<string, string> }): string {
   const parts: string[] = [];
   if (value.size_bytes != null) parts.push(`${formatNumber(value.size_bytes)} B`);
