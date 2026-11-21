@@ -191,7 +191,6 @@ pub(crate) struct Inner {
 /// after the lock is let go.
 pub(crate) struct StateGuard<'a> {
     state: Option<MutexGuard<'a, State>>,
-    telemetry: Option<&'a Arc<dyn api::TelemetrySink>>,
 }
 
 impl Deref for StateGuard<'_> {
@@ -211,13 +210,8 @@ impl DerefMut for StateGuard<'_> {
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
         if let Some(mut st) = self.state.take() {
-            let mut released = std::mem::take(&mut st.released);
+            let released = std::mem::take(&mut st.released);
             drop(st);
-            if let Some(sink) = self.telemetry {
-                for event in released.billing.drain(..) {
-                    sink.emit(event);
-                }
-            }
             drop(released);
         }
     }
@@ -227,7 +221,6 @@ impl Inner {
     pub(crate) fn lock(&self) -> StateGuard<'_> {
         StateGuard {
             state: Some(self.state.lock().expect("runtime state poisoned")),
-            telemetry: self.config.hooks.telemetry.as_ref(),
         }
     }
 
@@ -381,83 +374,12 @@ impl Inner {
         {
             let mut st = self.lock();
             self.evict_terminal_locked(&mut st, now);
-            self.idle_drain_locked(&mut st, now);
         }
         if matches!(
             *self.journal_status.lock().expect("journal status poisoned"),
             JournalStatus::Degraded(_)
         ) {
             let _ = self.commit(crate::journal::JournalOp::Probe, |_, _| {});
-        }
-    }
-
-    fn idle_drain_locked(&self, st: &mut State, now: u64) {
-        for (interface, policy) in &self.config.interfaces {
-            for tier in &policy.pool_tiers {
-                let Some(idle_after) = tier.idle_drain_after else {
-                    continue;
-                };
-                let idle_ms = ms(idle_after);
-                let mut by_ns: HashMap<String, Vec<(String, Option<u64>)>> = HashMap::new();
-                for session in st.sessions.values() {
-                    if session.tx.is_some()
-                        && !session.draining
-                        && session.pool == tier.pool
-                        && session.interfaces.contains(interface)
-                    {
-                        by_ns
-                            .entry(session.namespace.clone())
-                            .or_default()
-                            .push((session.id.clone(), session.idle_since_ms));
-                    }
-                }
-                for (namespace, mut members) in by_ns {
-                    if members.len() <= tier.min_sessions {
-                        continue;
-                    }
-                    let has_demand = st
-                        .queue(&namespace, interface)
-                        .is_some_and(|q| !q.is_empty())
-                        || st.accepting_count(&namespace, interface) > 0;
-                    if has_demand {
-                        continue;
-                    }
-                    members.sort_by_key(|(_, since)| *since);
-                    let mut remaining = members.len();
-                    for (session_id, idle_since) in members {
-                        if remaining <= tier.min_sessions {
-                            break;
-                        }
-                        if idle_since.is_some_and(|since| now.saturating_sub(since) >= idle_ms) {
-                            let all_interfaces_idle =
-                                st.sessions.get(&session_id).is_some_and(|session| {
-                                    session.active.is_empty()
-                                        && session.interfaces.iter().all(|iface| {
-                                            st.queue(&session.namespace, iface)
-                                                .is_none_or(|q| q.is_empty())
-                                                && st.accepting_count(&session.namespace, iface)
-                                                    == 0
-                                        })
-                                });
-                            if !all_interfaces_idle {
-                                continue;
-                            }
-                            if let Some(session) = st.sessions.get_mut(&session_id) {
-                                session.draining = true;
-                                remaining -= 1;
-                                self.send_locked(
-                                    st,
-                                    &session_id,
-                                    anyserve_proto::v2::server_message::Msg::Drain(
-                                        anyserve_proto::v2::Drain {},
-                                    ),
-                                    now,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 

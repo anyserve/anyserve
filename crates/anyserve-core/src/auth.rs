@@ -1,4 +1,4 @@
-//! Bearer-token authentication and pluggable verifier traits for the control plane.
+//! Bearer-token authentication for the control plane.
 //!
 //! Edge workers dial the control plane across the WAN, so the API needs a
 //! credential check before any request reaches the runtime. Tokens are split by
@@ -69,13 +69,6 @@ pub fn validate_namespace(namespace: &str) -> Result<&str, Status> {
         ));
     }
     Ok(namespace)
-}
-
-#[allow(clippy::result_large_err)] // tonic::Status is the natural error for gRPC auth.
-pub trait AuthVerifier: Send + Sync + 'static {
-    fn is_enabled(&self) -> bool;
-    fn verify(&self, path: &str, headers: &HeaderMap) -> Result<Option<Principal>, Status>;
-    fn verify_client_headers(&self, headers: &HeaderMap) -> Result<Principal, Status>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,15 +223,8 @@ impl AuthPolicy {
             is_operator: role == Role::Client,
         })
     }
-}
 
-#[allow(clippy::result_large_err)]
-impl AuthVerifier for AuthPolicy {
-    fn is_enabled(&self) -> bool {
-        AuthPolicy::is_enabled(self)
-    }
-
-    fn verify(&self, path: &str, headers: &HeaderMap) -> Result<Option<Principal>, Status> {
+    pub fn verify(&self, path: &str, headers: &HeaderMap) -> Result<Option<Principal>, Status> {
         if path.starts_with(HEALTH_PREFIX) || path.starts_with(REFLECTION_PREFIX) {
             return Ok(None);
         }
@@ -281,7 +267,7 @@ impl AuthVerifier for AuthPolicy {
         Ok(Some(principal))
     }
 
-    fn verify_client_headers(&self, headers: &HeaderMap) -> Result<Principal, Status> {
+    pub fn verify_client_headers(&self, headers: &HeaderMap) -> Result<Principal, Status> {
         if !self.is_enabled() {
             return Self::unauthenticated_principal(Role::Client, headers);
         }
@@ -327,16 +313,14 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 
 #[derive(Clone)]
 pub struct AuthLayer {
-    verifier: Arc<dyn AuthVerifier>,
+    policy: Arc<AuthPolicy>,
 }
 
 impl AuthLayer {
     pub fn new(policy: AuthPolicy) -> Self {
-        Self::from_verifier(Arc::new(policy))
-    }
-
-    pub fn from_verifier(verifier: Arc<dyn AuthVerifier>) -> Self {
-        Self { verifier }
+        Self {
+            policy: Arc::new(policy),
+        }
     }
 }
 
@@ -346,7 +330,7 @@ impl<S> Layer<S> for AuthLayer {
     fn layer(&self, inner: S) -> Self::Service {
         AuthService {
             inner,
-            verifier: Arc::clone(&self.verifier),
+            policy: Arc::clone(&self.policy),
         }
     }
 }
@@ -354,7 +338,7 @@ impl<S> Layer<S> for AuthLayer {
 #[derive(Clone)]
 pub struct AuthService<S> {
     inner: S,
-    verifier: Arc<dyn AuthVerifier>,
+    policy: Arc<AuthPolicy>,
 }
 
 impl<S, B> Service<http::Request<B>> for AuthService<S>
@@ -371,10 +355,7 @@ where
     }
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
-        match self
-            .verifier
-            .verify(request.uri().path(), request.headers())
-        {
+        match self.policy.verify(request.uri().path(), request.headers()) {
             Ok(principal) => {
                 if let Some(principal) = principal {
                     request.extensions_mut().insert(principal.role);

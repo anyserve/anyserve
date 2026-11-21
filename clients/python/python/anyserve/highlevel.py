@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import hashlib
 import inspect
 import json
 import logging
@@ -11,7 +10,6 @@ import signal
 import socket
 import threading
 import time
-import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
@@ -56,7 +54,6 @@ class HandlerSpec:
     pass_context: bool = False
     streaming_input: bool = False
     pool: str = ""
-    auto_fetch_uri: bool = False
     uri_resolver: Optional[Callable[[str, dict[str, str]], bytes]] = None
 
 
@@ -81,7 +78,6 @@ def worker(
     pass_context: bool = False,
     streaming_input: bool = False,
     pool: str = "",
-    auto_fetch_uri: bool = False,
     uri_resolver: Optional[Callable[[str, dict[str, str]], bytes]] = None,
 ) -> Callable[[Callable[[Any], Any]], WorkerHandler]:
     spec = _build_handler_spec(
@@ -94,7 +90,6 @@ def worker(
         pass_context=pass_context,
         streaming_input=streaming_input,
         pool=pool,
-        auto_fetch_uri=auto_fetch_uri,
         uri_resolver=uri_resolver,
     )
 
@@ -355,19 +350,6 @@ def _active_snapshot(active: dict, lock: threading.Lock) -> list:
         return list(active.items())
 
 
-def _fetch_uri_bytes(uri: str, metadata: dict[str, str]) -> bytes:
-    with urllib.request.urlopen(uri, timeout=30) as resp:
-        data = resp.read()
-    expected_sha = metadata.get("anyserve.sha256")
-    if expected_sha:
-        actual = hashlib.sha256(data).hexdigest()
-        if actual != expected_sha:
-            raise ValueError(
-                f"URI payload SHA-256 mismatch for {uri}: expected {expected_sha}, got {actual}"
-            )
-    return data
-
-
 async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> None:
     try:
         async for item in agen:
@@ -390,7 +372,7 @@ def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -
             value = _input_fragments(attempt)
         else:
             inputs = attempt.inputs
-            if not spec.auto_fetch_uri and spec.uri_resolver is None:
+            if spec.uri_resolver is None:
                 if any("inline" not in item for item in inputs):
                     raise ValueError("serve(...) requires inline inputs")
                 raw = b"".join(item["inline"] for item in inputs)
@@ -401,10 +383,7 @@ def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -
                         parts.append(item["inline"])
                     elif "uri" in item:
                         meta = item.get("metadata") or {}
-                        if spec.uri_resolver is not None:
-                            parts.append(spec.uri_resolver(item["uri"], meta))
-                        else:
-                            parts.append(_fetch_uri_bytes(item["uri"], meta))
+                        parts.append(spec.uri_resolver(item["uri"], meta))
                     else:
                         raise ValueError("input object has neither inline nor uri")
                 raw = b"".join(parts)
@@ -488,7 +467,6 @@ def _build_handler_spec(
     pass_context: bool,
     streaming_input: bool,
     pool: str = "",
-    auto_fetch_uri: bool = False,
     uri_resolver: Optional[Callable[[str, dict[str, str]], bytes]] = None,
 ) -> HandlerSpec:
     if not interface:
@@ -512,6 +490,5 @@ def _build_handler_spec(
         pass_context=pass_context,
         streaming_input=streaming_input,
         pool=pool,
-        auto_fetch_uri=auto_fetch_uri,
         uri_resolver=uri_resolver,
     )

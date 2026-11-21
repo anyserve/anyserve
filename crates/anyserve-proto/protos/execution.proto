@@ -92,7 +92,6 @@ message WorkerMessage {
   oneof msg {
     Hello hello = 1; Credit credit = 2; Heartbeat heartbeat = 3;
     AssignReply assign_reply = 4; CancelAck cancel_ack = 5; Draining draining = 6;
-    UpdateAttributes update_attributes = 7;
   }
 }
 message Hello {
@@ -113,11 +112,6 @@ message Load {
 message AssignReply { string lease_id = 1; bool accepted = 2; string reject_reason = 3; }
 message CancelAck { string lease_id = 1; }
 message Draining { bool preempting = 1; }
-message UpdateAttributes {
-  map<string, string> attributes = 1;
-  map<string, int64> total_capacity = 2;
-  string pool = 3;
-}
 
 message ServerMessage {
   oneof msg { Welcome welcome = 1; Assign assign = 2; Cancel cancel = 3; Fence fence = 4; Drain drain = 5; }

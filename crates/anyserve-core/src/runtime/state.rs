@@ -9,8 +9,8 @@ use anyserve_proto::v2 as pb;
 use tokio::sync::{mpsc, oneshot};
 
 use super::api::{
-    BillingEvent, Capacity, Durability, ErrorInfo, ExecutionEvent, JobSpec, JobState, JobView,
-    Metadata, Object, WorkerLoad,
+    Capacity, Durability, ErrorInfo, ExecutionEvent, JobSpec, JobState, JobView, Metadata, Object,
+    WorkerLoad,
 };
 use super::events::{JobLog, Permit};
 use super::index::JobIndex;
@@ -257,7 +257,7 @@ pub(crate) struct State {
     pub generation: u64,
     pub jobs: HashMap<String, Job>,
     pub job_index: JobIndex,
-    /// Queued jobs per `namespace -> interface`, priority + DRR fairness order.
+    /// Queued jobs per `namespace -> interface`, priority + round-robin fairness order.
     pub queues: NsIfaceMap<InterfaceQueue>,
     /// Where the scan past the dispatch head left off per `namespace -> interface`.
     pub scan_cursor: NsIfaceMap<QueueKey>,
@@ -455,7 +455,6 @@ pub(crate) struct Released {
     /// Full specifications of jobs that just ended; their inputs go with them.
     pub specs: Vec<Arc<JobSpec>>,
     pub outputs: Vec<Vec<Object>>,
-    pub billing: Vec<BillingEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -509,7 +508,6 @@ pub(crate) struct Attempt {
     pub number: u32,
     pub session_id: String,
     pub worker_id: String,
-    pub pool: String,
     pub started_at_ms: u64,
     pub inputs_via_attempt: bool,
     pub last_frame_seq: u64,
@@ -651,7 +649,6 @@ pub(crate) struct Session {
     pub connected_at_ms: u64,
     pub last_seen_ms: u64,
     pub disconnected_at_ms: Option<u64>,
-    pub idle_since_ms: Option<u64>,
     pub consecutive_failures: u32,
     pub cooldown_until_ms: u64,
 }
@@ -672,7 +669,6 @@ impl Session {
 
     pub(crate) fn attach(&mut self, lease_id: String, capacity: &Capacity) {
         if self.active.insert(lease_id) {
-            self.idle_since_ms = None;
             for (name, value) in capacity {
                 let held = self.reserved.entry(name.clone()).or_insert(0);
                 *held = held.saturating_add(*value);
@@ -680,7 +676,7 @@ impl Session {
         }
     }
 
-    pub(crate) fn detach(&mut self, lease_id: &str, capacity: &Capacity, now: u64) {
+    pub(crate) fn detach(&mut self, lease_id: &str, capacity: &Capacity) {
         if self.active.remove(lease_id) {
             for (name, value) in capacity {
                 if let Some(held) = self.reserved.get_mut(name) {
@@ -689,9 +685,6 @@ impl Session {
                         self.reserved.remove(name);
                     }
                 }
-            }
-            if self.active.is_empty() {
-                self.idle_since_ms = Some(now);
             }
         }
     }

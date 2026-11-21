@@ -214,23 +214,6 @@ impl WorkerConnection {
             v2::worker_message::Msg::Draining(v2::Draining { preempting }),
         )
     }
-    #[pyo3(signature = (attributes=None, capacity=None, pool=String::new()))]
-    fn update_attributes(
-        &self,
-        py: Python<'_>,
-        attributes: Option<HashMap<String, String>>,
-        capacity: Option<HashMap<String, i64>>,
-        pool: String,
-    ) -> PyResult<()> {
-        self.send(
-            py,
-            v2::worker_message::Msg::UpdateAttributes(v2::UpdateAttributes {
-                attributes: attributes.unwrap_or_default(),
-                total_capacity: capacity.unwrap_or_default(),
-                pool,
-            }),
-        )
-    }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.heartbeat.abort();
         let messages = Arc::clone(&self.messages);

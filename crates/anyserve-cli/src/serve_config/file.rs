@@ -363,9 +363,6 @@ struct PoolTierFile {
     #[serde(default)]
     spillover_after_ms: u64,
     reconnect_grace_ms: Option<u64>,
-    idle_drain_after_ms: Option<u64>,
-    #[serde(default)]
-    min_sessions: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -448,10 +445,6 @@ impl RuntimeConfigFile {
                                 pool: tier.pool,
                                 spillover_after: Duration::from_millis(tier.spillover_after_ms),
                                 reconnect_grace: tier.reconnect_grace_ms.map(Duration::from_millis),
-                                idle_drain_after: tier
-                                    .idle_drain_after_ms
-                                    .map(Duration::from_millis),
-                                min_sessions: tier.min_sessions,
                             })
                             .collect(),
                     },

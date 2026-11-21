@@ -17,7 +17,7 @@ backend-specific semantics to the control plane.
   optional SQLite or PostgreSQL backend commits input before acceptance and terminal results
   before completion acknowledgement. External side effects need application
   idempotency because unfinished work can execute again after a restart.
-- **Placement** matches interfaces, `namespace` isolation, worker `pool` tiers with spillover, `affinity_key` sticky routing, two-level Priority + DRR `fairness_key`, `concurrency_key` serialization, required/preferred attributes, resource quantities, and worker credits. Workers establish outbound Session/Attempt connections and need no inbound endpoint.
+- **Placement** matches interfaces, `namespace` isolation, worker `pool` tiers with spillover, `affinity_key` sticky routing, two-level Priority + round-robin `fairness_key`, `concurrency_key` serialization, required/preferred attributes, resource quantities, and worker credits. Workers establish outbound Session/Attempt connections and need no inbound endpoint.
 - **Edge & AI Bridges**: `anyserve connect` turns any local HTTP/SSE inference server (vLLM, Ollama, TRT-LLM, ROS/Jetson services) into an outbound Anyserve worker without inbound ports, while Python workers support `async def`, `async` generators, multi-interface `serve(...)`, and `AsyncAnyserveClient`.
 - **Bounded delivery** provides output events, per-attempt byte windows, replay cursors and three memory budgets. Exposed streamed output cannot silently switch attempts. `max_attempts` includes the first attempt.
 - **Operations** provides client/worker/scoped-tenant token roles, TLS for gRPC, a management API, console, health probes, pool autoscaling Prometheus metrics, and logs.

@@ -195,10 +195,6 @@ impl JobIndex {
         limit: usize,
     ) -> (Vec<&str>, usize) {
         let mut selected: Vec<&BTreeSet<OrderKey>> = Vec::new();
-        let collect_by_state = |by_state: &'static ByState| {
-            let _ = by_state;
-        };
-        let _ = collect_by_state;
         match (&filter.namespace, &filter.interface) {
             (Some(ns), Some(name)) => {
                 if let Some(interface) =
@@ -260,13 +256,6 @@ impl JobIndex {
 
     pub(crate) fn counts(&self) -> [usize; 5] {
         self.counts
-    }
-
-    pub(crate) fn namespace_active_counts(&self, namespace: &str) -> (usize, usize) {
-        self.namespaces
-            .get(namespace)
-            .map(|ns| (ns.jobs[0].len(), ns.jobs[1].len()))
-            .unwrap_or((0, 0))
     }
 
     pub(crate) fn interfaces(&self, now: u64) -> BTreeMap<String, InterfaceStats> {

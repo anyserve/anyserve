@@ -546,10 +546,6 @@ pub struct PoolTier {
     /// Overrides the runtime reconnect grace window for workers in this pool
     /// (for example 1s for datacenter/spot vs 15s for mobile/edge links).
     pub reconnect_grace: Option<Duration>,
-    /// When set, idle workers beyond `min_sessions` in this pool are drained
-    /// once no queued demand remains.
-    pub idle_drain_after: Option<Duration>,
-    pub min_sessions: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -559,82 +555,6 @@ pub struct InterfacePolicy {
     pub max_in_flight_per_key: Option<usize>,
     pub pool_tiers: Vec<PoolTier>,
 }
-
-/// Admission quota outcome evaluated before inserting work into the runtime.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct QuotaDecision {
-    pub max_in_flight_jobs: Option<usize>,
-    pub max_queued_jobs: Option<usize>,
-    pub max_pending_bytes: Option<u64>,
-    pub allowed_pools: Option<Vec<String>>,
-}
-
-/// Pluggable tenant/workspace admission policy extension point.
-pub trait QuotaPolicy: Send + Sync {
-    fn check_admission(
-        &self,
-        namespace: &str,
-        spec: &JobSpec,
-    ) -> Result<QuotaDecision, RuntimeError>;
-}
-
-/// Non-blocking billing and audit telemetry events emitted outside hot locks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BillingEvent {
-    JobAccepted {
-        namespace: String,
-        job_id: String,
-        durability: Durability,
-        input_bytes: u64,
-        at_ms: u64,
-    },
-    AttemptFinished {
-        namespace: String,
-        job_id: String,
-        pool: String,
-        worker_id: String,
-        state: JobState,
-        duration_ms: u64,
-        output_bytes: u64,
-    },
-}
-
-pub trait TelemetrySink: Send + Sync {
-    fn emit(&self, event: BillingEvent);
-}
-
-#[derive(Clone, Default)]
-pub struct RuntimeHooks {
-    pub quota: Option<Arc<dyn QuotaPolicy>>,
-    pub telemetry: Option<Arc<dyn TelemetrySink>>,
-}
-
-impl std::fmt::Debug for RuntimeHooks {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeHooks")
-            .field("quota", &self.quota.is_some())
-            .field("telemetry", &self.telemetry.is_some())
-            .finish()
-    }
-}
-
-impl PartialEq for RuntimeHooks {
-    fn eq(&self, other: &Self) -> bool {
-        let q = match (&self.quota, &other.quota) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        let t = match (&self.telemetry, &other.telemetry) {
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
-        q && t
-    }
-}
-
-impl Eq for RuntimeHooks {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -686,7 +606,6 @@ pub struct RuntimeConfig {
     pub max_sessions: usize,
     pub limits: Limits,
     pub journal: Option<JournalConfig>,
-    pub hooks: RuntimeHooks,
 }
 
 impl Default for RuntimeConfig {
@@ -716,7 +635,6 @@ impl Default for RuntimeConfig {
             max_sessions: 4_096,
             limits: Limits::default(),
             journal: None,
-            hooks: RuntimeHooks::default(),
         }
     }
 }

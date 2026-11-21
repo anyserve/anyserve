@@ -148,7 +148,6 @@ fn released_outputs_drop_after_unlocking_runtime_state() {
     let dropped = Arc::new(AtomicBool::new(false));
     let mut guard = super::super::StateGuard {
         state: Some(state.lock().unwrap()),
-        telemetry: None,
     };
     guard
         .released

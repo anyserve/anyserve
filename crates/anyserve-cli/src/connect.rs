@@ -357,51 +357,13 @@ pub async fn run_connect_with_shutdown(
 
         let session_result: Result<bool> = loop {
             if *shutdown.borrow() {
-                info!("received shutdown signal; sending preemptive draining");
-                draining.store(true, Ordering::Release);
-                let _ = session
-                    .control
-                    .send(v2::WorkerMessage {
-                        msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
-                            preempting: true,
-                        })),
-                    })
-                    .await;
-                let aborts: Vec<_> = active_aborts
-                    .lock()
-                    .expect("abort map poisoned")
-                    .drain()
-                    .map(|(_, tx)| tx)
-                    .collect();
-                for tx in aborts {
-                    let _ = tx.send(());
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                preemptive_drain(&session.control, &draining, &active_aborts).await;
                 break Ok(true);
             }
             tokio::select! {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        info!("received shutdown signal; sending preemptive draining");
-                        draining.store(true, Ordering::Release);
-                        let _ = session
-                    .control
-                    .send(v2::WorkerMessage {
-                        msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
-                            preempting: true,
-                        })),
-                    })
-                    .await;
-                        let aborts: Vec<_> = active_aborts
-                            .lock()
-                            .expect("abort map poisoned")
-                            .drain()
-                            .map(|(_, tx)| tx)
-                            .collect();
-                        for tx in aborts {
-                            let _ = tx.send(());
-                        }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        preemptive_drain(&session.control, &draining, &active_aborts).await;
                         break Ok(true);
                     }
                 }
@@ -560,6 +522,32 @@ pub async fn run_connect_with_shutdown(
     }
 }
 
+async fn preemptive_drain(
+    control: &tokio::sync::mpsc::Sender<v2::WorkerMessage>,
+    draining: &AtomicBool,
+    active_aborts: &Mutex<HashMap<String, oneshot::Sender<()>>>,
+) {
+    info!("received shutdown signal; sending preemptive draining");
+    draining.store(true, Ordering::Release);
+    let _ = control
+        .send(v2::WorkerMessage {
+            msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
+                preempting: true,
+            })),
+        })
+        .await;
+    let aborts: Vec<_> = active_aborts
+        .lock()
+        .expect("abort map poisoned")
+        .drain()
+        .map(|(_, tx)| tx)
+        .collect();
+    for tx in aborts {
+        let _ = tx.send(());
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_upstream_attempt(
     data_client: &mut AttemptClient,
@@ -590,14 +578,19 @@ async fn execute_upstream_attempt(
         }
         match &obj.body {
             Some(v2::object::Body::Inline(bytes)) => payload.extend_from_slice(bytes),
-            Some(v2::object::Body::Uri(uri)) => {
-                if payload.is_empty() && attempt.inputs.len() == 1 {
-                    let body = serde_json::json!({ "uri": uri, "metadata": obj.metadata });
-                    payload = serde_json::to_vec(&body).unwrap_or_default();
-                    content_type = Some("application/json".to_string());
-                } else {
-                    payload.extend_from_slice(uri.as_bytes());
-                }
+            Some(v2::object::Body::Uri(_)) => {
+                let _ = attempt
+                    .finish(
+                        &[],
+                        v2::finish::Outcome::Failed(v2::ErrorInfo {
+                            code: "unsupported_uri_input".to_string(),
+                            message: "anyserve connect forwards inline byte payloads only"
+                                .to_string(),
+                            retryable: false,
+                        }),
+                    )
+                    .await;
+                return false;
             }
             None => {}
         }

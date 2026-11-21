@@ -349,12 +349,6 @@ impl Runtime {
             .map(|d| ms(d).min(i64::MAX as u64) as i64);
         let pg = self.inner.postgres.as_ref().expect("PG");
         let interface = spec.demand.interface.clone();
-        let input_bytes = spec
-            .inputs
-            .iter()
-            .map(super::api::Object::inline_len)
-            .sum::<usize>() as u64
-            + spec.params.len() as u64;
         let accepted = pg.accept(
             AcceptRecord {
                 job_id: id.clone(),
@@ -376,20 +370,9 @@ impl Runtime {
             .map_err(read_error)?;
         drop(permit);
         self.inner.cluster_wakeup.notify_one();
-        if created {
-            if let Some(sink) = &self.inner.config.hooks.telemetry {
-                sink.emit(super::api::BillingEvent::JobAccepted {
-                    namespace: ns.to_string(),
-                    job_id: raw_id.to_string(),
-                    durability: Durability::Durable,
-                    input_bytes,
-                    at_ms: job.created_at_ms,
-                });
-            }
-            if let Some(mesh) = &self.inner.peer_mesh {
-                let self_addr = pg.config.internal_grpc_addr.as_deref().unwrap_or("");
-                mesh.broadcast_wakeup(&pg.node_id, self_addr, ns, &interface);
-            }
+        if created && let Some(mesh) = &self.inner.peer_mesh {
+            let self_addr = pg.config.internal_grpc_addr.as_deref().unwrap_or("");
+            mesh.broadcast_wakeup(&pg.node_id, self_addr, ns, &interface);
         }
         Ok(SubmitOutcome {
             job: view_from_stored(job, false),

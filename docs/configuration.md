@@ -86,8 +86,6 @@ event_log_max_bytes = 8388608
 # [[runtime.interfaces."demo.echo.v1".pool_tiers]]
 # pool = "cloud-burst"
 # spillover_after_ms = 200
-# idle_drain_after_ms = 300000
-# min_sessions = 1
 ```
 
 Token lists and their environment sources are combined. An environment key names

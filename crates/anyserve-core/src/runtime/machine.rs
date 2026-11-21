@@ -14,8 +14,8 @@ use bytes::Bytes;
 use uuid::Uuid;
 
 use super::api::{
-    BillingEvent, Durability, ErrorInfo, EventKind, InterfacePolicy, JobSpec, JobState,
-    JournalHealth, Object, PoolTier, codes,
+    Durability, ErrorInfo, EventKind, InterfacePolicy, JobSpec, JobState, JournalHealth, Object,
+    PoolTier, codes,
 };
 use super::events::{JobLog, Permit};
 use super::identity::decode_scoped_id;
@@ -251,37 +251,6 @@ impl Inner {
         if st.unfinished_jobs >= self.config.max_pending_jobs {
             return Err(RuntimeError::exhausted("unfinished job limit reached"));
         }
-        if let Some(quota) = &self.config.hooks.quota {
-            let decision = quota.check_admission(namespace, spec)?;
-            let (ns_queued, ns_running) = st.job_index.namespace_active_counts(namespace);
-            if let Some(max_q) = decision.max_queued_jobs
-                && ns_queued >= max_q
-            {
-                return Err(RuntimeError::exhausted(format!(
-                    "namespace '{namespace}' queued job quota reached"
-                )));
-            }
-            if let Some(max_in_flight) = decision.max_in_flight_jobs
-                && (ns_queued + ns_running) >= max_in_flight
-            {
-                return Err(RuntimeError::exhausted(format!(
-                    "namespace '{namespace}' in-flight job quota reached"
-                )));
-            }
-            if let Some(max_bytes) = decision.max_pending_bytes {
-                let ns_bytes: u64 = st
-                    .jobs
-                    .values()
-                    .filter(|j| j.namespace == namespace && !j.is_terminal())
-                    .map(|j| spec_payload_bytes(&j.spec))
-                    .sum();
-                if ns_bytes.saturating_add(spec_payload_bytes(spec)) > max_bytes {
-                    return Err(RuntimeError::exhausted(format!(
-                        "namespace '{namespace}' pending byte quota reached"
-                    )));
-                }
-            }
-        }
         let interface = &spec.demand.interface;
         let queued = st.queue(namespace, interface).map(|q| q.len()).unwrap_or(0)
             + st.accepting_count(namespace, interface);
@@ -364,7 +333,7 @@ impl Inner {
 
     /// Makes an accepted job schedulable.
     pub(crate) fn accepted_locked(&self, st: &mut State, job_id: &str, now: u64) {
-        let billing_event = {
+        {
             let Some(job) = st.jobs.get_mut(job_id) else {
                 return;
             };
@@ -385,18 +354,6 @@ impl Inner {
                 );
                 job.timers.push(timer);
             }
-            (self.config.hooks.telemetry.is_some() && job.ownership_epoch.is_none()).then(|| {
-                BillingEvent::JobAccepted {
-                    namespace: job.namespace.clone(),
-                    job_id: job.raw_id.clone(),
-                    durability: job.durability,
-                    input_bytes: spec_payload_bytes(&job.spec),
-                    at_ms: now,
-                }
-            })
-        };
-        if let Some(event) = billing_event {
-            st.released.billing.push(event);
         }
         self.enqueue_locked(st, job_id, now);
         if st.jobs[job_id].cancel_requested.is_some() {
@@ -461,7 +418,6 @@ impl Inner {
             leases.extend(plan.release_lease.clone());
             leases.extend(plan.cancel_lease.as_ref().map(|(lease, _)| lease.clone()));
         }
-        let now = crate::now_ms();
         for lease_id in leases {
             let Some(lease) = st.leases.get_mut(&lease_id) else {
                 continue;
@@ -469,7 +425,7 @@ impl Inner {
             lease.cancelling = true;
             let session_id = lease.session_id.clone();
             if let Some(session) = st.sessions.get_mut(&session_id) {
-                session.detach(&lease_id, &lease.reserved, now);
+                session.detach(&lease_id, &lease.reserved);
             }
             self.send_locked(
                 st,
@@ -478,7 +434,7 @@ impl Inner {
                     lease_id,
                     reason: "commit_outcome_unknown".to_string(),
                 }),
-                now,
+                crate::now_ms(),
             );
         }
         let job = st.jobs.get_mut(job_id).expect("job");
@@ -606,8 +562,8 @@ impl Inner {
     // ---------------------------------------------------------------- dispatch
 
     /// Assigns queued jobs to sessions with free slots using two-level Priority
-    /// and Deficit Round-Robin across `fairness_key`s, tiered pools, concurrency
-    /// limits, and bounded-load affinity routing.
+    /// and round-robin across `fairness_key`s, tiered pools, concurrency limits,
+    /// and bounded-load affinity routing.
     pub(crate) fn dispatch_locked(&self, st: &mut State, now: u64) {
         if st.shutting_down || st.job_index.counts()[0] == 0 {
             return;
@@ -747,7 +703,6 @@ impl Inner {
         let attempt_id = new_id();
         let session = st.sessions.get_mut(&session_id).expect("picked session");
         let worker_id = session.worker_id.clone();
-        let pool = session.pool.clone();
         session.attach(lease_id.clone(), &spec.demand.required_capacity);
         session.assigned_since_report += 1;
         if let Some(mesh) = &self.peer_mesh {
@@ -759,15 +714,6 @@ impl Inner {
         } else {
             false
         };
-        if self.config.hooks.telemetry.is_some() {
-            st.released.billing.push(BillingEvent::JobAccepted {
-                namespace: namespace.to_string(),
-                job_id: raw_id.clone(),
-                durability: Durability::Ephemeral,
-                input_bytes: spec_payload_bytes(&spec),
-                at_ms: now,
-            });
-        }
         let log = self.new_log(st, &raw_id);
         log.set_primary(true);
         let changes = log.subscribe();
@@ -825,7 +771,6 @@ impl Inner {
                 number: 1,
                 session_id: session_id.clone(),
                 worker_id: worker_id.clone(),
-                pool,
                 started_at_ms: now,
                 inputs_via_attempt: input.is_some() || inline_bytes > limit,
                 last_frame_seq: 0,
@@ -880,7 +825,6 @@ impl Inner {
         let reserved = st.jobs[job_id].spec.demand.required_capacity.clone();
         let session = st.sessions.get_mut(session_id).expect("picked session");
         let worker_id = session.worker_id.clone();
-        let pool = session.pool.clone();
         let lease_id = new_id();
         let attempt_id = new_id();
         session.attach(lease_id.clone(), &reserved);
@@ -918,7 +862,6 @@ impl Inner {
             number: job.attempt_count,
             session_id: session_id.to_string(),
             worker_id: worker_id.clone(),
-            pool,
             started_at_ms: now,
             inputs_via_attempt: job.input.is_some() || inline_bytes > limit,
             last_frame_seq: 0,
@@ -1333,11 +1276,10 @@ impl Inner {
         if let Some(mesh) = &self.peer_mesh {
             mesh.notify_directory_changed();
         }
-        let now = crate::now_ms();
         if let Some(lease) = st.leases.remove(lease_id)
             && let Some(session) = st.sessions.get_mut(&lease.session_id)
         {
-            session.detach(lease_id, &lease.reserved, now);
+            session.detach(lease_id, &lease.reserved);
         }
     }
 
@@ -1535,24 +1477,9 @@ impl Inner {
         };
         let output_bytes = outputs.iter().map(|o| o.inline_len() as u64).sum::<u64>();
         job.outputs = (plan.state == JobState::Succeeded).then(|| Arc::new(outputs.clone()));
-        let mut attempt_pool = String::new();
-        let mut started_at_ms = job.created_at_ms;
         if let Some(attempt) = job.attempt.take() {
-            attempt_pool = attempt.pool;
-            started_at_ms = attempt.started_at_ms;
             job.last_attempt_id = Some(attempt.attempt_id);
             job.last_worker_id = Some(attempt.worker_id);
-        }
-        if self.config.hooks.telemetry.is_some() {
-            st.released.billing.push(BillingEvent::AttemptFinished {
-                namespace: job.namespace.clone(),
-                job_id: job.raw_id.clone(),
-                pool: attempt_pool,
-                worker_id: job.last_worker_id.clone().unwrap_or_default(),
-                state: plan.state,
-                duration_ms: now.saturating_sub(started_at_ms),
-                output_bytes,
-            });
         }
         // Inputs and params leave with the full spec, freed after the lock.
         let slim = Arc::new(without_payload(&job.spec));

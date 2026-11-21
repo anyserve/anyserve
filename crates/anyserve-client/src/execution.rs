@@ -16,8 +16,6 @@ pub use anyserve_proto::v2;
 use v2::client_client::ClientClient;
 use v2::worker_client::WorkerClient;
 
-use std::collections::HashMap;
-
 use crate::{BearerAuth, NAMESPACE_ENV, TOKEN_ENV, connect_channel};
 
 mod attempt;
@@ -253,26 +251,6 @@ impl WorkerSession {
                 msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
                     preempting,
                 })),
-            })
-            .await
-            .map_err(|_| Status::unavailable("worker control stream closed"))
-    }
-
-    pub async fn update_attributes(
-        &self,
-        attributes: HashMap<String, String>,
-        total_capacity: HashMap<String, i64>,
-        pool: impl Into<String>,
-    ) -> Result<(), Status> {
-        self.control
-            .send(v2::WorkerMessage {
-                msg: Some(v2::worker_message::Msg::UpdateAttributes(
-                    v2::UpdateAttributes {
-                        attributes,
-                        total_capacity,
-                        pool: pool.into(),
-                    },
-                )),
             })
             .await
             .map_err(|_| Status::unavailable("worker control stream closed"))

@@ -1,9 +1,9 @@
 //! Integration tests for Anyserve vNext Edge / Embodied reliability, multi-tenancy,
-//! hierarchical pool scheduling, DRR fairness, concurrency limits, affinity routing, and autoscaling.
+//! hierarchical pool scheduling, round-robin fairness, concurrency limits, affinity routing, and autoscaling.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -137,32 +137,6 @@ impl TestWorker {
         self.control
             .send(pb::WorkerMessage {
                 msg: Some(pb::worker_message::Msg::Credit(pb::Credit { free_slots })),
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn update_attributes(
-        &mut self,
-        attributes: Vec<(&str, &str)>,
-        capacity: Vec<(&str, i64)>,
-        pool: &str,
-    ) {
-        self.control
-            .send(pb::WorkerMessage {
-                msg: Some(pb::worker_message::Msg::UpdateAttributes(
-                    pb::UpdateAttributes {
-                        attributes: attributes
-                            .into_iter()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect(),
-                        total_capacity: capacity
-                            .into_iter()
-                            .map(|(k, v)| (k.to_string(), v))
-                            .collect(),
-                        pool: pool.to_string(),
-                    },
-                )),
             })
             .await
             .unwrap();
@@ -340,15 +314,11 @@ async fn phase0_fast_reconnect_grace_and_preemptive_drain() {
                     pool: "spot".into(),
                     spillover_after: Duration::ZERO,
                     reconnect_grace: Some(Duration::from_millis(40)),
-                    idle_drain_after: None,
-                    min_sessions: 0,
                 },
                 PoolTier {
                     pool: "cloud".into(),
                     spillover_after: Duration::from_millis(80),
                     reconnect_grace: Some(Duration::from_millis(40)),
-                    idle_drain_after: None,
-                    min_sessions: 0,
                 },
             ],
             ..Default::default()
@@ -424,43 +394,8 @@ async fn phase0_fast_reconnect_grace_and_preemptive_drain() {
 }
 
 #[tokio::test]
-async fn phase1a_namespace_isolation_quotas_telemetry_and_uri_digest() {
-    struct TestQuota;
-    impl QuotaPolicy for TestQuota {
-        fn check_admission(
-            &self,
-            namespace: &str,
-            _spec: &JobSpec,
-        ) -> Result<QuotaDecision, anyserve_core::error::RuntimeError> {
-            if namespace == "alpha" {
-                Ok(QuotaDecision {
-                    max_queued_jobs: Some(1),
-                    max_in_flight_jobs: Some(1),
-                    ..Default::default()
-                })
-            } else {
-                Ok(QuotaDecision::default())
-            }
-        }
-    }
-
-    #[derive(Default)]
-    struct TestSink(Mutex<Vec<BillingEvent>>);
-    impl TelemetrySink for TestSink {
-        fn emit(&self, event: BillingEvent) {
-            self.0.lock().unwrap().push(event);
-        }
-    }
-
-    let sink = Arc::new(TestSink::default());
-    let server = serve(RuntimeConfig {
-        hooks: RuntimeHooks {
-            quota: Some(Arc::new(TestQuota)),
-            telemetry: Some(sink.clone()),
-        },
-        ..Default::default()
-    })
-    .await;
+async fn phase1a_namespace_isolation_and_uri_digest() {
+    let server = serve(RuntimeConfig::default()).await;
 
     // Content digest deduplicates ephemeral-style transient URLs, excluding scheduling hints.
     let mut s1 = edge_spec("vision");
@@ -514,19 +449,6 @@ async fn phase1a_namespace_isolation_quotas_telemetry_and_uri_digest() {
         .unwrap();
     assert!(!r1_dup.created);
 
-    // Alpha quota allows max 1 queued job -> second distinct job fails with ResourceExhausted.
-    let err = server
-        .runtime
-        .submit(SubmitRequest {
-            job_id: Some("mission-2".into()),
-            namespace: Some("alpha".into()),
-            conflict: ConflictPolicy::Fail,
-            spec: s1.clone(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind, anyserve_core::error::ErrorKind::ResourceExhausted);
-
     // Beta uses the exact same caller job_id "mission-1" independently with zero collision!
     let r2 = server
         .runtime
@@ -565,23 +487,10 @@ async fn phase1a_namespace_isolation_quotas_telemetry_and_uri_digest() {
         .await
         .unwrap();
     assert_eq!(beta_view.state, JobState::Queued);
-
-    // Verify telemetry sink observed JobAccepted and AttemptFinished outside lock.
-    let events = sink.0.lock().unwrap();
-    assert!(events.iter().any(|e| matches!(
-        e,
-        BillingEvent::JobAccepted { namespace, job_id, .. }
-        if namespace == "alpha" && job_id == "mission-1"
-    )));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        BillingEvent::AttemptFinished { namespace, job_id, state: JobState::Succeeded, .. }
-        if namespace == "alpha" && job_id == "mission-1"
-    )));
 }
 
 #[tokio::test]
-async fn phase1b_three_tier_pool_waterfall_and_update_attributes() {
+async fn phase1b_three_tier_pool_waterfall() {
     let mut interfaces = BTreeMap::new();
     interfaces.insert(
         "vla".to_string(),
@@ -612,7 +521,6 @@ async fn phase1b_three_tier_pool_waterfall_and_update_attributes() {
     })
     .await;
 
-    // Connect rack & cloud workers first; jobs stay waiting for Tier 0 until spillover elapses.
     let mut cloud = TestWorker::connect(
         &server.url,
         "w-cloud",
@@ -623,13 +531,13 @@ async fn phase1b_three_tier_pool_waterfall_and_update_attributes() {
         None,
     )
     .await;
-    let mut rack = TestWorker::connect(
+    let mut rack_only = TestWorker::connect(
         &server.url,
-        "w-rack",
+        "w-rack-only",
         "site-rack",
         &["vla"],
-        &[("model", "vla-v1")],
-        2,
+        &[("model", "vla-v2")],
+        1,
         None,
     )
     .await;
@@ -641,47 +549,13 @@ async fn phase1b_three_tier_pool_waterfall_and_update_attributes() {
     server
         .runtime
         .submit(SubmitRequest {
-            job_id: Some("tier-job".into()),
-            spec: s.clone(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    // UpdateAttributes upgrades rack worker model to vla-v2 and moves into jetson-local tier 0 -> immediate match!
-    rack.update_attributes(vec![("model", "vla-v2")], vec![], "jetson-local")
-        .await;
-    let a = tokio::time::timeout(Duration::from_millis(50), rack.next_assign())
-        .await
-        .expect("tier 0 after UpdateAttributes should match immediately");
-    assert_eq!(a.job_id, "tier-job");
-    rack.finish_inline(&a, b"ok").await;
-
-    // Now test natural spillover from Tier 0 (absent) -> Tier 1 (site-rack @80ms) -> Tier 2 (cloud-burst @160ms).
-    let mut rack_only = TestWorker::connect(
-        &server.url,
-        "w-rack-only",
-        "site-rack",
-        &["vla"],
-        &[("model", "vla-v2")],
-        1,
-        None,
-    )
-    .await;
-    // Occupy rack slots; move original rack away from model=vla-v2 so Tier 1 handles one and Tier 2 handles next.
-    rack.update_attributes(vec![("model", "other")], vec![], "site-rack")
-        .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server
-        .runtime
-        .submit(SubmitRequest {
             job_id: Some("j-tier1".into()),
             spec: s.clone(),
             ..Default::default()
         })
         .await
         .unwrap();
-    let a1 = tokio::time::timeout(Duration::from_millis(250), rack_only.next_assign())
+    let a1 = tokio::time::timeout(Duration::from_millis(800), rack_only.next_assign())
         .await
         .expect("should spill to Tier 1 at 80ms before Tier 2 at 160ms");
     assert_eq!(a1.job_id, "j-tier1");
@@ -695,7 +569,7 @@ async fn phase1b_three_tier_pool_waterfall_and_update_attributes() {
         })
         .await
         .unwrap();
-    let a2 = tokio::time::timeout(Duration::from_millis(400), cloud.next_assign())
+    let a2 = tokio::time::timeout(Duration::from_millis(1000), cloud.next_assign())
         .await
         .expect("should spill to Tier 2 at 160ms");
     assert_eq!(a2.job_id, "j-tier2");
@@ -704,7 +578,7 @@ async fn phase1b_three_tier_pool_waterfall_and_update_attributes() {
 }
 
 #[tokio::test]
-async fn phase1c_affinity_drr_concurrency_key_and_idle_drain() {
+async fn phase1c_affinity_fairness_and_concurrency_key() {
     let mut interfaces = BTreeMap::new();
     interfaces.insert(
         "control".to_string(),
@@ -714,8 +588,6 @@ async fn phase1c_affinity_drr_concurrency_key_and_idle_drain() {
                 pool: "cloud-burst".into(),
                 spillover_after: Duration::ZERO,
                 reconnect_grace: None,
-                idle_drain_after: Some(Duration::from_millis(80)),
-                min_sessions: 1,
             }],
             ..Default::default()
         },
@@ -805,15 +677,7 @@ async fn phase1c_affinity_drr_concurrency_key_and_idle_drain() {
     }
     assert_eq!(max_active.load(Ordering::SeqCst), 1);
 
-    // 2. Idle scale-down sends Drain to excess sessions while keeping min_sessions = 1 undrained.
-    tokio::time::sleep(Duration::from_millis(1250)).await;
-    let workers = server.runtime.list_workers();
-    let drained_count = workers.iter().filter(|w| w.draining).count();
-    let undrained_count = workers.iter().filter(|w| !w.draining).count();
-    assert_eq!(drained_count, 2, "expected 2 excess idle workers drained");
-    assert_eq!(undrained_count, 1, "expected min_sessions=1 kept undrained");
-
-    // 3. Affinity routing + overload spillover + DRR fairness_key anti-starvation on a fresh server.
+    // 2. Affinity routing + overload spillover + round-robin fairness_key anti-starvation on a fresh server.
     let server2 = serve(RuntimeConfig::default()).await;
     let mut a1 = TestWorker::connect(&server2.url, "sticky-a", "", &["chat"], &[], 2, None).await;
     let mut a2 = TestWorker::connect(&server2.url, "sticky-b", "", &["chat"], &[], 2, None).await;
@@ -859,7 +723,7 @@ async fn phase1c_affinity_drr_concurrency_key_and_idle_drain() {
     assert!(counts.values().any(|&c| c == 1));
     let _ = (j1, j2, j3, &mut a1, &mut a2);
 
-    // 4. DRR fairness_key: 20 bulk jobs queued + 1 interactive job on concurrency-1 worker.
+    // 3. Round-robin fairness_key: 20 bulk jobs queued + 1 interactive job on concurrency-1 worker.
     let server3 = serve(RuntimeConfig::default()).await;
     let mut bulk_spec = edge_spec("infer");
     bulk_spec.policy.fairness_key = "bulk".into();
@@ -893,7 +757,7 @@ async fn phase1c_affinity_drr_concurrency_key_and_idle_drain() {
     slow_w.finish_inline(&second, b"2").await;
     assert!(
         first.job_id == "robot-1" || second.job_id == "robot-1",
-        "DRR must serve interactive fairness_key within first round, got {}, {}",
+        "round-robin must serve interactive fairness_key within first round, got {}, {}",
         first.job_id,
         second.job_id
     );

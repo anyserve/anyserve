@@ -173,7 +173,6 @@ impl Runtime {
             session.connection = connection;
             session.disconnected_at_ms = None;
             session.last_seen_ms = now;
-            session.idle_since_ms = session.active.is_empty().then_some(now);
         } else {
             st.sessions.insert(
                 session_id.clone(),
@@ -199,7 +198,6 @@ impl Runtime {
                     connected_at_ms: now,
                     last_seen_ms: now,
                     disconnected_at_ms: None,
-                    idle_since_ms: Some(now),
                     consecutive_failures: 0,
                     cooldown_until_ms: 0,
                 },
@@ -229,7 +227,7 @@ impl Runtime {
             let job_id = lease.job_id.clone();
             let reserved = lease.reserved.clone();
             if let Some(old) = st.sessions.get_mut(&previous) {
-                old.detach(lease_id, &reserved, now);
+                old.detach(lease_id, &reserved);
             }
             st.sessions
                 .get_mut(&session_id)
@@ -400,33 +398,6 @@ impl Runtime {
                         }
                     }
                 }
-            }
-            pb::worker_message::Msg::UpdateAttributes(update) => {
-                let limits = &inner.config.limits;
-                if update.pool.len() > limits.max_identifier_bytes as usize {
-                    return Err(RuntimeError::invalid(
-                        "UpdateAttributes.pool exceeds max_identifier_bytes",
-                    ));
-                }
-                if update.total_capacity.values().any(|value| *value < 0) {
-                    return Err(RuntimeError::invalid(
-                        "UpdateAttributes.total_capacity cannot be negative",
-                    ));
-                }
-                let attributes = to_metadata(update.attributes);
-                if metadata_size(&attributes) > limits.max_metadata_bytes as usize {
-                    return Err(RuntimeError::invalid(
-                        "UpdateAttributes.attributes exceed max_metadata_bytes",
-                    ));
-                }
-                session.attributes = attributes;
-                if !update.total_capacity.is_empty() {
-                    session.total_capacity = update.total_capacity.into_iter().collect();
-                }
-                if !update.pool.is_empty() && session.forced_pool.is_none() {
-                    session.pool = update.pool;
-                }
-                may_free_slot = true;
             }
             pb::worker_message::Msg::CancelAck(ack) => {
                 if st

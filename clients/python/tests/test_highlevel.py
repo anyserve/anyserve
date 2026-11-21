@@ -472,7 +472,7 @@ class HighLevelTests(unittest.TestCase):
         self.assertEqual(frames, [{"v": 11}, {"v": 12}])
         self.assertEqual(assignment2.attempt.outputs, [])
 
-    def test_uri_resolver_auto_fetch_and_sha256_verification(self):
+    def test_uri_resolver_and_sha256_metadata(self):
         payload = b"tensor-blob"
         digest = hashlib.sha256(payload).hexdigest()
 
@@ -484,25 +484,6 @@ class HighLevelTests(unittest.TestCase):
         a.attempt.inputs = [uri_object("s3://b/k", sha256=digest)]
         _process_assignment(resolve_custom, resolve_custom.spec, a)
         self.assertEqual(a.attempt.outputs, [{"inline": b"TENSOR-BLOB", "metadata": {}}])
-
-        with tempfile.NamedTemporaryFile() as tmp:
-            tmp.write(payload)
-            tmp.flush()
-
-            @worker(interface="uri.auto", auto_fetch_uri=True)
-            def resolve_file(data):
-                return data
-
-            ok_a = Assignment()
-            ok_a.attempt.inputs = [uri_object(f"file://{tmp.name}", sha256=digest)]
-            _process_assignment(resolve_file, resolve_file.spec, ok_a)
-            self.assertEqual(ok_a.attempt.outputs, [{"inline": payload, "metadata": {}}])
-
-            bad_a = Assignment()
-            bad_a.attempt.inputs = [uri_object(f"file://{tmp.name}", sha256="0" * 64)]
-            _process_assignment(resolve_file, resolve_file.spec, bad_a)
-            self.assertIn("SHA-256 mismatch", bad_a.attempt.failure[0])
-            self.assertFalse(bad_a.attempt.failure[1])
 
     def test_multi_interface_serve_routes_by_interface_and_merges_capacity(self):
         @worker(interface="iface.a", capacity={"slot": 1}, max_active_leases=1)

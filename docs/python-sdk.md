@@ -26,8 +26,7 @@ metadata=None)` builds `{"inline": bytes, "metadata": dict}`;
 `uri_object(uri, metadata=None, *, sha256=None, size_bytes=None, content_type=None)`
 attaches content digests (`anyserve.sha256` / `anyserve.size_bytes`) so
 transient presigned URLs still deduplicate under `job_id` idempotency. Set
-`@worker(..., auto_fetch_uri=True)` or `uri_resolver=` for automatic URI
-fetching and SHA-256 verification.
+`@worker(..., uri_resolver=...)` to resolve URI inputs into bytes.
 
 | Method | Result |
 |---|---|
@@ -97,7 +96,7 @@ All maps default to `{}`, `params` to `b""` and numbers to zero.
 | `spillover_after_ms: int` | Hold for all preferences before allowing partial matches; zero ranks immediately |
 | `max_attempts: int` | Includes the first attempt; zero uses the server default (3), one disables retries; default ceiling is 20 |
 | `affinity_key: str` | Sticky bounded-load Rendezvous routing preference (`< 0.85` utilization), excluding failed workers |
-| `fairness_key: str` | Two-level Priority + DRR queue key preventing bulk bursts from starving peer tenants |
+| `fairness_key: str` | Two-level Priority + per-key round-robin queue key preventing bulk bursts from starving peer tenants |
 | `concurrency_key: str` | Per-key in-flight serialization / cap across workers and replicas |
 
 Once a non-progress output event is exposed, an interrupted attempt ends with
@@ -149,7 +148,7 @@ serve(echo)
 `@worker` requires `interface=`. Optional keywords are `attributes`, `capacity`
 and `metadata` (empty maps), `codec="bytes"` (`"json"` decodes/encodes JSON),
 `max_active_leases=1`, `pass_context=False`, `streaming_input=False`, `pool=""`,
-`auto_fetch_uri=False`, and `uri_resolver=None`. Handlers may be synchronous
+and `uri_resolver=None`. Handlers may be synchronous
 functions, synchronous generators, `async def` coroutines, or `async` generators.
 
 `serve(handler_or_handlers, endpoint=None, *, worker_id=None, token=None,
