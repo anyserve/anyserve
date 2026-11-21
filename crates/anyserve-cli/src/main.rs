@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-mod connect;
 mod job_commands;
 mod serve_auth;
 mod serve_config;
@@ -11,7 +10,6 @@ mod serve_runtime;
 #[cfg(test)]
 mod test_support;
 
-use connect::{ConnectArgs, run_connect};
 use job_commands::{JobCommands, run_job_command};
 use serve_runtime::{ServeArgs, run as run_serve};
 
@@ -37,7 +35,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Serve(ServeArgs),
-    Connect(ConnectArgs),
     Job {
         #[command(subcommand)]
         command: JobCommands,
@@ -56,7 +53,6 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Serve(args) => run_serve(args).await,
-        Commands::Connect(args) => run_connect(&endpoint, args).await,
         Commands::Job { command } => run_job_command(&endpoint, command).await,
     }
 }

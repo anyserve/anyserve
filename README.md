@@ -18,14 +18,14 @@ backend-specific semantics to the control plane.
   before completion acknowledgement. External side effects need application
   idempotency because unfinished work can execute again after a restart.
 - **Placement** matches interfaces, `namespace` isolation, worker `pool` tiers with spillover, `affinity_key` sticky routing, two-level Priority + round-robin `fairness_key`, `concurrency_key` serialization, required/preferred attributes, resource quantities, and worker credits. Workers establish outbound Session/Attempt connections and need no inbound endpoint.
-- **Edge & AI Bridges**: `anyserve connect` turns any local HTTP/SSE inference server (vLLM, Ollama, TRT-LLM, ROS/Jetson services) into an outbound Anyserve worker without inbound ports, while Python workers support `async def`, `async` generators, multi-interface `serve(...)`, and `AsyncAnyserveClient`.
+- **Workers** are application code on the Python or Rust SDK: sync or `async` handlers, generators for streamed output, and several interfaces per `serve(...)`. Connectors for inference servers live outside this repository, in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
 - **Bounded delivery** provides output events, per-attempt byte windows, replay cursors and three memory budgets. Exposed streamed output cannot silently switch attempts. `max_attempts` includes the first attempt.
 - **Operations** provides client/worker/scoped-tenant token roles, TLS for gRPC, a management API, console, health probes, pool autoscaling Prometheus metrics, and logs.
 
 ```text
-Clients -- Client gRPC --> active leader (standby replicas wait on lease) <-- Worker gRPC -- workers / `anyserve connect`
+Clients -- Client gRPC --> active leader (standby replicas wait on lease) <-- Worker gRPC -- workers
                                               |                                                      |
-                                SQLite (one process) or                                 application / HTTP backend
+                                SQLite (one process) or                                 application backend
                                 PostgreSQL (shared journal + lease)
 ```
 
@@ -69,8 +69,8 @@ python examples/python/submit.py
 ```
 
 The Python examples are an [echo worker](examples/python/worker.py) and a
-[submitter](examples/python/submit.py); workers for Triton Inference Server,
-vLLM, ComfyUI and live video
+[submitter](examples/python/submit.py); connectors for OpenAI-compatible
+servers such as vLLM and Ollama, Triton Inference Server, YOLO and VLA policies
 live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
 The [Rust example](examples/rust) uses the same protocol. Applications supply
 backend-specific worker code; the CLI starts the control plane and
