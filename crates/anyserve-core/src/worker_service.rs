@@ -243,6 +243,45 @@ async fn drain(mut inbound: Streaming<pb::AttemptUp>, limit: Duration) {
 /// Streams the job's inputs: every object in chunks, then params, then each
 /// streaming input chunk as its own object as it arrives, and always a closing
 /// trailer. `object_end` marks the last piece of each object and of params.
+#[allow(clippy::too_many_arguments)]
+async fn send_object_pieces(
+    tx: &mpsc::Sender<Result<pb::AttemptDown, Status>>,
+    sequence: &mut u64,
+    chunk: usize,
+    data: &Bytes,
+    index: Option<u32>,
+    uri: &str,
+    metadata: &Metadata,
+    parameter: bool,
+) -> bool {
+    let mut offset = 0;
+    loop {
+        let end = (offset + chunk).min(data.len());
+        *sequence += 1;
+        let msg = down(pb::attempt_down::Msg::Input(pb::InputData {
+            sequence: *sequence,
+            data: data.slice(offset..end),
+            last: false,
+            metadata: if offset == 0 {
+                crate::runtime::machine::to_proto_map(metadata)
+            } else {
+                Default::default()
+            },
+            object_index: index,
+            uri: uri.to_string(),
+            parameter_chunk: parameter,
+            object_end: end >= data.len(),
+        }));
+        if tx.send(Ok(msg)).await.is_err() {
+            return false;
+        }
+        offset = end;
+        if offset >= data.len() {
+            return true;
+        }
+    }
+}
+
 async fn send_inputs(
     plan: InputPlan,
     tx: mpsc::Sender<Result<pb::AttemptDown, Status>>,
@@ -250,48 +289,45 @@ async fn send_inputs(
 ) {
     let chunk = chunk.max(1);
     let mut sequence = 0u64;
-    let mut pieces =
-        |data: &Bytes, index: Option<u32>, uri: &str, metadata: &Metadata, parameter: bool| {
-            let mut messages = Vec::new();
-            let mut offset = 0;
-            loop {
-                let end = (offset + chunk).min(data.len());
-                sequence += 1;
-                messages.push(down(pb::attempt_down::Msg::Input(pb::InputData {
-                    sequence,
-                    data: data.slice(offset..end),
-                    last: false,
-                    metadata: if offset == 0 {
-                        metadata.clone().into_iter().collect()
-                    } else {
-                        Default::default()
-                    },
-                    object_index: index,
-                    uri: uri.to_string(),
-                    parameter_chunk: parameter,
-                    object_end: end >= data.len(),
-                })));
-                offset = end;
-                if offset >= data.len() {
-                    return messages;
-                }
-            }
-        };
-    let mut messages = Vec::new();
     for (index, object) in plan.objects.iter().enumerate() {
         let index = Some(index as u32);
-        messages.extend(match object {
-            Object::Uri { uri, metadata } => pieces(&Bytes::new(), index, uri, metadata, false),
-            Object::Inline { data, metadata } => pieces(data, index, "", metadata, false),
-        });
-    }
-    if !plan.params.is_empty() {
-        messages.extend(pieces(&plan.params, None, "", &Metadata::new(), true));
-    }
-    for message in messages {
-        if tx.send(Ok(message)).await.is_err() {
+        let ok = match object {
+            Object::Uri { uri, metadata } => {
+                send_object_pieces(
+                    &tx,
+                    &mut sequence,
+                    chunk,
+                    &Bytes::new(),
+                    index,
+                    uri,
+                    metadata,
+                    false,
+                )
+                .await
+            }
+            Object::Inline { data, metadata } => {
+                send_object_pieces(&tx, &mut sequence, chunk, data, index, "", metadata, false)
+                    .await
+            }
+        };
+        if !ok {
             return;
         }
+    }
+    if !plan.params.is_empty()
+        && !send_object_pieces(
+            &tx,
+            &mut sequence,
+            chunk,
+            &plan.params,
+            None,
+            "",
+            &Metadata::new(),
+            true,
+        )
+        .await
+    {
+        return;
     }
     if let Some(log) = plan.streaming {
         let mut next_index = plan.objects.len() as u32;
@@ -302,10 +338,19 @@ async fn send_inputs(
             let (chunks, status) = log.read_from(cursor);
             cursor += chunks.len();
             for (data, metadata) in chunks {
-                for message in pieces(&data, Some(next_index), "", &metadata, false) {
-                    if tx.send(Ok(message)).await.is_err() {
-                        return;
-                    }
+                if !send_object_pieces(
+                    &tx,
+                    &mut sequence,
+                    chunk,
+                    &data,
+                    Some(next_index),
+                    "",
+                    &metadata,
+                    false,
+                )
+                .await
+                {
+                    return;
                 }
                 next_index += 1;
             }
@@ -400,7 +445,11 @@ impl ResultAssembler {
                 .iter()
                 .map(|(k, v)| (k.len() + v.len()) as u64)
                 .sum::<u64>();
-            self.total += OBJECT_OVERHEAD + metadata_bytes + chunk.uri.len() as u64;
+            self.total = self
+                .total
+                .saturating_add(OBJECT_OVERHEAD)
+                .saturating_add(metadata_bytes)
+                .saturating_add(chunk.uri.len() as u64);
             if self.next_index >= self.limits.max_objects
                 || metadata_bytes > self.limits.max_metadata_bytes as u64
             {
@@ -416,7 +465,7 @@ impl ResultAssembler {
                 });
             }
         }
-        self.total += chunk.data.len() as u64;
+        self.total = self.total.saturating_add(chunk.data.len() as u64);
         if self.total > self.limits.max_inline_total_bytes {
             self.overflow();
         }

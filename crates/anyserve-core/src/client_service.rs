@@ -404,27 +404,18 @@ pub fn error_from_proto(error: pb::ErrorInfo) -> api::ErrorInfo {
     }
 }
 pub fn spec_to_proto(spec: &api::JobSpec) -> pb::JobSpec {
+    use crate::runtime::machine::{object_to_proto as ref_object_to_proto, to_proto_map};
     pb::JobSpec {
         demand: Some(pb::Demand {
             interface: spec.demand.interface.clone(),
-            required_attributes: spec
-                .demand
-                .required_attributes
-                .clone()
-                .into_iter()
-                .collect(),
-            preferred_attributes: spec
-                .demand
-                .preferred_attributes
-                .clone()
-                .into_iter()
-                .collect(),
-            required_capacity: spec.demand.required_capacity.clone().into_iter().collect(),
+            required_attributes: to_proto_map(&spec.demand.required_attributes),
+            preferred_attributes: to_proto_map(&spec.demand.preferred_attributes),
+            required_capacity: to_proto_map(&spec.demand.required_capacity),
             affinity_key: spec.demand.affinity_key.clone(),
         }),
-        inputs: spec.inputs.iter().cloned().map(object_to_proto).collect(),
+        inputs: spec.inputs.iter().map(ref_object_to_proto).collect(),
         params: spec.params.clone(),
-        metadata: spec.metadata.clone().into_iter().collect(),
+        metadata: to_proto_map(&spec.metadata),
         policy: Some(pb::ExecutionPolicy {
             durability: match spec.policy.durability {
                 None => pb::Durability::Unspecified as i32,

@@ -86,9 +86,8 @@ impl PriorityFairQueue {
         } else {
             fairness_key
         };
-        if let Some(pos) = self.ring.iter().position(|k| k == fkey)
-            && self.ring.len() > 1
-            && pos == 0
+        if self.ring.len() > 1
+            && self.ring.front().is_some_and(|k| k == fkey)
             && let Some(front) = self.ring.pop_front()
         {
             self.ring.push_back(front);
@@ -100,6 +99,12 @@ impl PriorityFairQueue {
     pub(crate) fn collect_fair(&self, limit: usize) -> Vec<QueueKey> {
         if self.total_len == 0 || limit == 0 {
             return Vec::new();
+        }
+        if self.ring.len() == 1
+            && let Some(front) = self.ring.front()
+            && let Some(subqueue) = self.subqueues.get(front)
+        {
+            return subqueue.iter().take(limit).cloned().collect();
         }
         let mut iters: Vec<_> = self
             .ring
@@ -530,8 +535,11 @@ pub(crate) struct Job {
     pub queue_key: Option<QueueKey>,
     pub queued_since_ms: u64,
     pub not_before_ms: u64,
-    /// Deadline timers scheduled for this job; cancelled when it ends.
+    /// Phase/attempt timers (`QueueDeadline`, `ExecutionDeadline`, spillover/backoff
+    /// `Dispatch`); cancelled when leaving the phase or when the job ends.
     pub timers: Vec<u64>,
+    /// `TotalDeadline` timer across the whole job lifetime; cancelled when terminal.
+    pub total_timer: Option<u64>,
     /// Sessions that explicitly rejected this job (`AssignReply.accepted = false`).
     pub rejected_sessions: HashSet<String>,
     /// Worker IDs that failed, timed out, crashed on, or rejected this job.

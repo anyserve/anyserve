@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator
 
 from ._native import ExecutionTransport
@@ -276,8 +276,27 @@ def _spec(
 ) -> dict[str, Any]:
     if isinstance(inputs, bytes):
         inputs = [{"inline": inputs, "metadata": {}}]
-    return {**asdict(options or ExecutionOptions()), "interface": interface,
-            "inputs": inputs, "durability": durability}
+    if options is None:
+        return {"interface": interface, "inputs": inputs, "durability": durability}
+    return {
+        "interface": interface,
+        "inputs": inputs,
+        "durability": durability,
+        "required_attributes": options.required_attributes,
+        "preferred_attributes": options.preferred_attributes,
+        "required_capacity": options.required_capacity,
+        "metadata": options.metadata,
+        "params": options.params,
+        "priority": options.priority,
+        "queue_timeout_ms": options.queue_timeout_ms,
+        "execution_timeout_ms": options.execution_timeout_ms,
+        "total_timeout_ms": options.total_timeout_ms,
+        "spillover_after_ms": options.spillover_after_ms,
+        "max_attempts": options.max_attempts,
+        "affinity_key": options.affinity_key,
+        "fairness_key": options.fairness_key,
+        "concurrency_key": options.concurrency_key,
+    }
 
 
 def _terminal_outputs(events: Iterator[dict[str, Any]]) -> list[dict[str, Any]]:

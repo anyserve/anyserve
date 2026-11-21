@@ -8,7 +8,7 @@ pub(crate) mod events;
 pub(crate) mod identity;
 mod index;
 pub(crate) mod input;
-mod machine;
+pub(crate) mod machine;
 pub(crate) mod state;
 pub(crate) mod worker;
 
@@ -23,9 +23,9 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
-    InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview, JobSpec, JobState,
-    JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeStats, SubmitOutcome, SubmitRequest,
-    WorkerView, codes,
+    InputSink, InterfaceStats, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview,
+    JobSpec, JobState, JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeStats,
+    SubmitOutcome, SubmitRequest, WorkerView, codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
@@ -142,20 +142,22 @@ impl Timers {
         due
     }
 
-    fn next_due(&self) -> Option<u64> {
-        self.lock().heap.peek().map(|Reverse((at, _))| *at)
+    #[cfg(test)]
+    fn compact(&self) {
+        let _ = self.compact_and_next_due();
     }
 
     /// Rebuilds the heap without cancelled entries once they outnumber the
-    /// live ones. The heap is filtered outside the timers lock so that lock
-    /// holders scheduling meanwhile are not held up; their entries land in a
-    /// fresh heap that is merged back afterwards. Ids cancelled meanwhile
-    /// stay in `cancelled` for the next rebuild.
-    fn compact(&self) {
+    /// live ones and returns the next due timestamp. The heap is filtered
+    /// outside the timers lock so that lock holders scheduling meanwhile are
+    /// not held up; their entries land in a fresh heap that is merged back
+    /// afterwards. Ids cancelled meanwhile stay in `cancelled` for the next
+    /// rebuild.
+    fn compact_and_next_due(&self) -> Option<u64> {
         let (mut heap, cancelled) = {
             let mut inner = self.lock();
             if inner.cancelled.len() <= inner.keys.len() + TIMER_COMPACT_SLACK {
-                return;
+                return inner.heap.peek().map(|Reverse((at, _))| *at);
             }
             (
                 std::mem::take(&mut inner.heap),
@@ -163,7 +165,9 @@ impl Timers {
             )
         };
         heap.retain(|Reverse((_, id))| !cancelled.contains(id));
-        self.lock().heap.append(&mut heap);
+        let mut inner = self.lock();
+        inner.heap.append(&mut heap);
+        inner.heap.peek().map(|Reverse((at, _))| *at)
     }
 }
 
@@ -226,9 +230,38 @@ impl Inner {
         }
     }
 
+    #[cfg(test)]
     fn fire(&self, key: TimerKey) {
         let mut st = self.lock();
         let now = now_ms();
+        self.fire_one_locked(&mut st, key, now);
+        self.dispatch_locked(&mut st, now);
+    }
+
+    fn fire_due(&self, keys: Vec<TimerKey>) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut iter = keys.into_iter().peekable();
+        while iter.peek().is_some() {
+            let mut st = self.lock();
+            let now = now_ms();
+            let mut handled = 0usize;
+            for key in iter.by_ref() {
+                if matches!(key, TimerKey::Dispatch) {
+                    continue;
+                }
+                self.fire_one_locked(&mut st, key, now);
+                handled += 1;
+                if handled >= 64 {
+                    break;
+                }
+            }
+            self.dispatch_locked(&mut st, now);
+        }
+    }
+
+    fn fire_one_locked(&self, st: &mut State, key: TimerKey, now: u64) {
         match key {
             TimerKey::Dispatch => {}
             TimerKey::QueueDeadline { job_id, since } => {
@@ -236,7 +269,7 @@ impl Inner {
                     matches!(job.phase, Phase::Queued) && job.queued_since_ms == since
                 }) {
                     self.fail_job_locked(
-                        &mut st,
+                        st,
                         &job_id,
                         codes::QUEUE_TIMEOUT,
                         "no worker took the job within its queue timeout",
@@ -253,7 +286,7 @@ impl Inner {
                             .is_some_and(|a| a.attempt_id == attempt_id)
                 }) {
                     self.attempt_ended_locked(
-                        &mut st,
+                        st,
                         &job_id,
                         ErrorInfo::new(
                             codes::EXECUTION_TIMEOUT,
@@ -266,19 +299,19 @@ impl Inner {
                     );
                 }
             }
-            TimerKey::TotalDeadline { job_id } => self.total_deadline_locked(&mut st, &job_id, now),
+            TimerKey::TotalDeadline { job_id } => self.total_deadline_locked(st, &job_id, now),
             TimerKey::SessionGrace {
                 session_id,
                 connection,
-            } => self.session_expired_locked(&mut st, &session_id, connection, now),
+            } => self.session_expired_locked(st, &session_id, connection, now),
             TimerKey::CancelGrace { lease_id } => {
                 if let Some(lease) = st.leases.get(&lease_id)
                     && lease.cancelling
                 {
                     let session_id = lease.session_id.clone();
-                    self.release_lease_locked(&mut st, &lease_id);
+                    self.release_lease_locked(st, &lease_id);
                     self.send_locked(
-                        &mut st,
+                        st,
                         &session_id,
                         anyserve_proto::v2::server_message::Msg::Fence(anyserve_proto::v2::Fence {
                             lease_id: lease_id.clone(),
@@ -288,9 +321,8 @@ impl Inner {
                     );
                 }
             }
-            TimerKey::RetryTerminal { job_id } => self.retry_terminal_locked(&mut st, &job_id, now),
+            TimerKey::RetryTerminal { job_id } => self.retry_terminal_locked(st, &job_id, now),
         }
-        self.dispatch_locked(&mut st, now);
     }
 
     fn fail_job_locked(&self, st: &mut State, job_id: &str, code: &str, message: &str, now: u64) {
@@ -579,14 +611,11 @@ async fn timer_loop(me: Weak<Inner>) {
             return;
         };
         let now = now_ms();
-        for key in inner.timers.pop_due(now) {
-            inner.fire(key);
-        }
-        inner.timers.compact();
+        let due = inner.timers.pop_due(now);
+        inner.fire_due(due);
+        let next = inner.timers.compact_and_next_due();
         let notify = Arc::clone(&inner.timers.notify);
-        let wait = inner
-            .timers
-            .next_due()
+        let wait = next
             .map(|at| Duration::from_millis(at.saturating_sub(now_ms())))
             .unwrap_or(TIMER_MAX_SLEEP)
             .min(TIMER_MAX_SLEEP);
@@ -1090,12 +1119,6 @@ impl Runtime {
                             created: true,
                         }))
                     } else {
-                        let (tx, rx) = oneshot::channel();
-                        st.jobs
-                            .get_mut(&scoped_id)
-                            .expect("job")
-                            .accept_waiters
-                            .push(tx);
                         if let Err(error) = self.inner.begin_accept(&mut st, &scoped_id) {
                             self.inner.remove_unaccepted_locked(
                                 &mut st,
@@ -1104,6 +1127,12 @@ impl Runtime {
                             );
                             return Err(error);
                         }
+                        let (tx, rx) = oneshot::channel();
+                        st.jobs
+                            .get_mut(&scoped_id)
+                            .expect("job")
+                            .accept_waiters
+                            .push(tx);
                         Next::Wait(rx, true)
                     }
                 }
@@ -1158,28 +1187,30 @@ impl Runtime {
             let mut st = self.inner.lock();
             let now = now_ms();
             let input_permit = self.inner.admit(&st, &namespace, &spec)?;
+            let mut spec_slot = Some(spec);
+            let mut permit_slot = Some(input_permit);
             match self.inner.invoke_ephemeral_direct_locked(
                 &mut st,
                 &namespace,
                 raw_id.clone(),
                 scoped_id.clone(),
-                spec.clone(),
+                &mut spec_slot,
                 max_attempts,
                 input.clone(),
-                input_permit,
+                &mut permit_slot,
                 now,
             ) {
-                Ok(direct) => direct,
-                Err(returned_permit) => {
+                Some(direct) => direct,
+                None => {
                     self.inner.insert_job(
                         &mut st,
                         scoped_id.clone(),
-                        spec,
+                        spec_slot.expect("spec"),
                         Durability::Ephemeral,
                         String::new(),
                         max_attempts,
                         input.clone(),
-                        returned_permit,
+                        permit_slot.expect("permit"),
                         now,
                     );
                     let job = st.jobs.get_mut(&scoped_id).expect("job");
@@ -1248,7 +1279,7 @@ impl Runtime {
             match runtime.get_job_in(&ns, &raw, true).await {
                 Err(error) => yield Err(error),
                 Ok(job) => {
-                    for event in runtime.replayed_events(job, after_sequence) {
+                    for event in runtime.replayed_events(&job, after_sequence) {
                         yield Ok(event);
                     }
                 }
@@ -1300,7 +1331,7 @@ impl Runtime {
             return Err(RuntimeError::not_found("job", job_id));
         }
         let job = self.get_job_in(&ns, job_id, true).await?;
-        Ok((self.replayed_events(job, after_sequence), true))
+        Ok((self.replayed_events(&job, after_sequence), true))
     }
 
     /// The specification of a job held in memory. Inputs and params are
@@ -1320,31 +1351,38 @@ impl Runtime {
     }
 
     /// Acceptance and outcome of a job known only to the journal.
-    fn replayed_events(&self, job: JobView, after_sequence: u64) -> Vec<ExecutionEvent> {
+    fn replayed_events(&self, job: &JobView, after_sequence: u64) -> Vec<ExecutionEvent> {
         // Finished takes the generation's last sequence: above anything the
         // job's live log handed out, below the next generation.
         let base = self.generation() << 32;
-        [
-            (base + 1, EventKind::Accepted),
-            (
-                base + 0xFFFF_FFFF,
-                EventKind::Finished {
+        let accepted_seq = base + 1;
+        let finished_seq = base + 0xFFFF_FFFF;
+        let mut out = Vec::with_capacity(
+            usize::from(accepted_seq > after_sequence) + usize::from(finished_seq > after_sequence),
+        );
+        if accepted_seq > after_sequence {
+            out.push(ExecutionEvent {
+                job_id: job.job_id.clone(),
+                sequence: accepted_seq,
+                attempt_id: job.current_attempt_id.clone(),
+                at_ms: job.updated_at_ms,
+                kind: EventKind::Accepted,
+            });
+        }
+        if finished_seq > after_sequence {
+            out.push(ExecutionEvent {
+                job_id: job.job_id.clone(),
+                sequence: finished_seq,
+                attempt_id: job.current_attempt_id.clone(),
+                at_ms: job.updated_at_ms,
+                kind: EventKind::Finished {
                     state: job.state,
-                    outputs: job.outputs.unwrap_or_default(),
-                    error: job.error,
+                    outputs: job.outputs.clone().unwrap_or_default(),
+                    error: job.error.clone(),
                 },
-            ),
-        ]
-        .into_iter()
-        .filter(|(sequence, _)| *sequence > after_sequence)
-        .map(|(sequence, kind)| ExecutionEvent {
-            job_id: job.job_id.clone(),
-            sequence,
-            attempt_id: job.current_attempt_id.clone(),
-            at_ms: job.updated_at_ms,
-            kind,
-        })
-        .collect()
+            });
+        }
+        out
     }
 
     pub async fn get_job(
@@ -1445,7 +1483,7 @@ impl Runtime {
                 // Admission raced the lookup: read its live log on the next pass.
                 continue;
             }
-            let events = self.replayed_events(job.clone(), 0);
+            let events = self.replayed_events(&job, 0);
             return Ok(JobInspection {
                 job,
                 spec: None,
@@ -1506,7 +1544,7 @@ impl Runtime {
                 continue;
             }
             let job = view_from_stored(stored, false);
-            let events = self.replayed_events(job.clone(), 0);
+            let events = self.replayed_events(&job, 0);
             return Ok(JobPreview {
                 job,
                 spec: None,
@@ -1600,10 +1638,10 @@ impl Runtime {
         let st = self.inner.lock();
         let (ids, total) = st.job_index.page(&filter, offset, limit);
         let page = ids.into_iter().map(|id| st.jobs[id].view(false)).collect();
+        let next_offset = offset.saturating_add(limit);
         Ok(JobPage {
             jobs: page,
-            next_page_token: (offset.saturating_add(limit) < total)
-                .then(|| (offset + limit).to_string()),
+            next_page_token: (next_offset < total).then(|| next_offset.to_string()),
         })
     }
 
@@ -1662,32 +1700,71 @@ impl Runtime {
         let st = self.inner.lock();
         let mut interfaces = st.job_index.interfaces(now);
         let [queued, running, succeeded, failed, cancelled] = st.job_index.counts();
-        let mut pools: BTreeMap<(String, String, String), PoolStats> = BTreeMap::new();
+        let generation = st.generation;
+        let retained_jobs = st.terminal_order.len();
+        let sessions = st.sessions.len();
+        let mut pools_tmp: HashMap<(&str, &str, &str), PoolStats> = HashMap::new();
+        let mut session_lease_ifaces: HashMap<&str, usize> = HashMap::new();
         for session in st.sessions.values() {
+            let free = session.free_slots() as u64;
+            if session.interfaces.len() > 1 && !session.active.is_empty() {
+                session_lease_ifaces.clear();
+                for lease_id in &session.active {
+                    if let Some(iface) = st
+                        .leases
+                        .get(lease_id)
+                        .and_then(|lease| st.jobs.get(&lease.job_id))
+                        .map(|job| job.spec.demand.interface.as_str())
+                    {
+                        *session_lease_ifaces.entry(iface).or_insert(0) += 1;
+                    }
+                }
+            }
             for interface in &session.interfaces {
-                let entry = interfaces.entry(interface.clone()).or_default();
-                entry.sessions += 1;
-                entry.free_slots += session.free_slots() as u64;
-
-                let pool_entry = pools
-                    .entry((
-                        session.namespace.clone(),
+                if let Some(entry) = interfaces.get_mut(interface.as_str()) {
+                    entry.sessions += 1;
+                    entry.free_slots += free;
+                } else {
+                    interfaces.insert(
                         interface.clone(),
-                        session.pool.clone(),
+                        InterfaceStats {
+                            sessions: 1,
+                            free_slots: free,
+                            ..Default::default()
+                        },
+                    );
+                }
+
+                let active_leases = if session.active.is_empty() {
+                    0
+                } else if session.interfaces.len() == 1 {
+                    session
+                        .active
+                        .iter()
+                        .filter(|lease_id| {
+                            st.leases
+                                .get(*lease_id)
+                                .and_then(|lease| st.jobs.get(&lease.job_id))
+                                .is_some_and(|job| job.spec.demand.interface == *interface)
+                        })
+                        .count()
+                } else {
+                    session_lease_ifaces
+                        .get(interface.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                };
+
+                let pool_entry = pools_tmp
+                    .entry((
+                        session.namespace.as_str(),
+                        interface.as_str(),
+                        session.pool.as_str(),
                     ))
                     .or_default();
                 pool_entry.sessions += 1;
-                pool_entry.free_slots += session.free_slots() as u64;
-                pool_entry.active_leases += session
-                    .active
-                    .iter()
-                    .filter(|lease_id| {
-                        st.leases
-                            .get(*lease_id)
-                            .and_then(|lease| st.jobs.get(&lease.job_id))
-                            .is_some_and(|job| job.spec.demand.interface == *interface)
-                    })
-                    .count();
+                pool_entry.free_slots += free;
+                pool_entry.active_leases += active_leases;
             }
         }
         for (namespace, ifaces) in &st.queues {
@@ -1701,24 +1778,31 @@ impl Runtime {
                     .interfaces
                     .get(interface)
                     .and_then(|policy| policy.pool_tiers.first())
-                    .map(|tier| tier.pool.clone())
-                    .unwrap_or_default();
-                let entry = pools
-                    .entry((namespace.clone(), interface.clone(), primary_pool))
+                    .map(|tier| tier.pool.as_str())
+                    .unwrap_or("");
+                let entry = pools_tmp
+                    .entry((namespace.as_str(), interface.as_str(), primary_pool))
                     .or_default();
                 entry.desired_additional_slots =
                     queue.len().saturating_sub(entry.free_slots as usize);
             }
         }
+        let pools: BTreeMap<(String, String, String), PoolStats> = pools_tmp
+            .into_iter()
+            .map(|((ns, iface, pool), stats)| {
+                ((ns.to_string(), iface.to_string(), pool.to_string()), stats)
+            })
+            .collect();
+        drop(st);
         RuntimeStats {
-            generation: st.generation,
+            generation,
             queued,
             running,
             succeeded,
             failed,
             cancelled,
-            retained_jobs: st.terminal_order.len(),
-            sessions: st.sessions.len(),
+            retained_jobs,
+            sessions,
             interfaces,
             pools,
             journal: self.inner.journal.as_ref().map(|journal| journal.stats()),

@@ -4,8 +4,8 @@
 use sha2::{Digest, Sha256};
 
 use super::api::{
-    Durability, ErrorInfo, IDENTITY_EXCLUDED_METADATA_KEYS, JobSpec, Metadata,
-    OBJECT_SHA256_METADATA_KEY, OBJECT_SIZE_METADATA_KEY, Object,
+    Durability, ErrorInfo, IDENTITY_EXCLUDED_METADATA_KEYS, JobSpec, OBJECT_SHA256_METADATA_KEY,
+    OBJECT_SIZE_METADATA_KEY, Object,
 };
 use crate::auth::DEFAULT_NAMESPACE;
 
@@ -62,6 +62,21 @@ impl Canonical {
         }
     }
 
+    fn filtered_map<'a, F>(
+        &mut self,
+        entries: impl Iterator<Item = (&'a String, &'a String)> + Clone,
+        include: F,
+    ) where
+        F: Fn(&str) -> bool,
+    {
+        let count = entries.clone().filter(|(k, _)| include(k.as_str())).count();
+        self.u64(count as u64);
+        for (key, value) in entries.filter(|(k, _)| include(k.as_str())) {
+            self.str(key);
+            self.str(value);
+        }
+    }
+
     fn object(&mut self, object: &Object) {
         match object {
             Object::Inline { data, metadata } => {
@@ -82,15 +97,9 @@ impl Canonical {
                             .map(String::as_str)
                             .unwrap_or(""),
                     );
-                    let rest: Metadata = metadata
-                        .iter()
-                        .filter(|(k, _)| {
-                            k.as_str() != OBJECT_SHA256_METADATA_KEY
-                                && k.as_str() != OBJECT_SIZE_METADATA_KEY
-                        })
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    self.map(rest.iter());
+                    self.filtered_map(metadata.iter(), |key| {
+                        key != OBJECT_SHA256_METADATA_KEY && key != OBJECT_SIZE_METADATA_KEY
+                    });
                 } else {
                     self.str("uri");
                     self.str(uri);
@@ -138,13 +147,9 @@ pub(crate) fn spec_hash(spec: &JobSpec, durability: Durability) -> String {
     hash.u64(optional_ms(policy.total_timeout));
     hash.u64(optional_ms(policy.spillover_after));
     hash.u64(policy.max_attempts.unwrap_or(0) as u64);
-    let identity: Metadata = spec
-        .metadata
-        .iter()
-        .filter(|(key, _)| !IDENTITY_EXCLUDED_METADATA_KEYS.contains(&key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    hash.map(identity.iter());
+    hash.filtered_map(spec.metadata.iter(), |key| {
+        !IDENTITY_EXCLUDED_METADATA_KEYS.contains(&key)
+    });
     hash.finish()
 }
 
@@ -182,6 +187,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::api::Metadata;
     use super::*;
 
     fn spec() -> JobSpec {

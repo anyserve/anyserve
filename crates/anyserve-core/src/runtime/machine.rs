@@ -5,7 +5,7 @@
 //! runtime, never through the RPC that caused them.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,20 @@ fn spec_payload_bytes(spec: &JobSpec) -> u64 {
         + spec.params.len() as u64
 }
 
+fn assign_inline_bytes(spec: &JobSpec) -> u64 {
+    spec_payload_bytes(spec)
+        + spec
+            .inputs
+            .iter()
+            .flat_map(|o| o.metadata())
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum::<u64>()
+}
+
+pub(crate) fn to_proto_map<V: Clone>(map: &BTreeMap<String, V>) -> HashMap<String, V> {
+    map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 fn without_payload(spec: &JobSpec) -> JobSpec {
     JobSpec {
         demand: spec.demand.clone(),
@@ -64,11 +78,11 @@ pub(crate) fn object_to_proto(object: &Object) -> pb::Object {
     match object {
         Object::Inline { data, metadata } => pb::Object {
             body: Some(pb::object::Body::Inline(data.clone())),
-            metadata: metadata.clone().into_iter().collect(),
+            metadata: to_proto_map(metadata),
         },
         Object::Uri { uri, metadata } => pb::Object {
             body: Some(pb::object::Body::Uri(uri.clone())),
-            metadata: metadata.clone().into_iter().collect(),
+            metadata: to_proto_map(metadata),
         },
     }
 }
@@ -291,6 +305,7 @@ impl Inner {
             queued_since_ms: now,
             not_before_ms: 0,
             timers: Vec::new(),
+            total_timer: None,
             rejected_sessions: HashSet::new(),
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
@@ -334,7 +349,7 @@ impl Inner {
                         job_id: job_id.to_string(),
                     },
                 );
-                job.timers.push(timer);
+                job.total_timer = Some(timer);
             }
         }
         self.enqueue_locked(st, job_id, now);
@@ -432,6 +447,10 @@ impl Inner {
 
     pub(crate) fn remove_unaccepted_locked(&self, st: &mut State, job_id: &str, reason: &str) {
         if let Some(mut job) = st.remove_job(job_id) {
+            self.timers.cancel(&std::mem::take(&mut job.timers));
+            if let Some(timer) = job.total_timer.take() {
+                self.timers.cancel(&[timer]);
+            }
             st.unfinished_jobs -= 1;
             if job.durability == Durability::Durable {
                 State::dec_in(
@@ -459,6 +478,9 @@ impl Inner {
         let Some(job) = st.jobs.get_mut(job_id) else {
             return;
         };
+        if !job.timers.is_empty() {
+            self.timers.cancel(&std::mem::take(&mut job.timers));
+        }
         let priority = job.spec.policy.priority.min(priority_cap);
         let key = QueueKey {
             priority: Reverse(priority),
@@ -504,19 +526,22 @@ impl Inner {
                 }
             }
         }
+        if let Some(spillover) = spillover {
+            let timer = self
+                .timers
+                .schedule(now.saturating_add(ms(spillover)), TimerKey::Dispatch);
+            job.timers.push(timer);
+        }
+        if not_before > now {
+            let timer = self.timers.schedule(not_before, TimerKey::Dispatch);
+            job.timers.push(timer);
+        }
         st.queue_or_insert(&namespace, &interface).insert(
             self.config.priority_levels as usize,
             priority,
             &fairness_key,
             key,
         );
-        if let Some(spillover) = spillover {
-            self.timers
-                .schedule(now.saturating_add(ms(spillover)), TimerKey::Dispatch);
-        }
-        if not_before > now {
-            self.timers.schedule(not_before, TimerKey::Dispatch);
-        }
     }
 
     pub(crate) fn dequeue_locked(&self, st: &mut State, job_id: &str) {
@@ -552,7 +577,12 @@ impl Inner {
         let mut queue_keys: Vec<(String, String)> = Vec::new();
         for (ns, ifaces) in &st.queues {
             for (iface, queue) in ifaces {
-                if !queue.is_empty() {
+                if !queue.is_empty()
+                    && st.interface_sessions(ns, iface).is_some_and(|ids| {
+                        ids.iter()
+                            .any(|id| st.sessions.get(id).is_some_and(|s| s.free_slots() > 0))
+                    })
+                {
                     queue_keys.push((ns.clone(), iface.clone()));
                 }
             }
@@ -581,7 +611,7 @@ impl Inner {
                     .scan_cursor
                     .get(namespace.as_str())
                     .and_then(|m| m.get(interface.as_str()));
-                let (window, next_cursor) = queue.collect_window(cursor, DISPATCH_SCAN);
+                let (mut window, next_cursor) = queue.collect_window(cursor, DISPATCH_SCAN);
                 if let Some(next_cursor) = next_cursor {
                     st.scan_cursor
                         .entry(namespace.clone())
@@ -591,12 +621,11 @@ impl Inner {
                 } else if let Some(m) = st.scan_cursor.get_mut(namespace.as_str()) {
                     m.remove(interface.as_str());
                 }
-                let seen: HashSet<String> = keys.iter().map(|k| k.job_id.clone()).collect();
-                for key in window {
-                    if !seen.contains(&key.job_id) {
-                        keys.push(key);
-                    }
+                {
+                    let seen: HashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
+                    window.retain(|k| !seen.contains(k.job_id.as_str()));
                 }
+                keys.extend(window);
             } else if let Some(m) = st.scan_cursor.get_mut(namespace.as_str()) {
                 m.remove(interface.as_str());
             }
@@ -626,6 +655,14 @@ impl Inner {
                     if let Some(queue) = st.queue_mut(&namespace, &interface) {
                         queue.rotate_key_to_back(prio, &fairness_key);
                     }
+                    if st
+                        .sessions
+                        .get(&session_id)
+                        .is_none_or(|s| s.free_slots() == 0)
+                        && let Some(pos) = candidates.iter().position(|id| id == &session_id)
+                    {
+                        candidates.swap_remove(pos);
+                    }
                 }
                 if candidates.is_empty() {
                     break;
@@ -648,35 +685,37 @@ impl Inner {
         namespace: &str,
         raw_id: String,
         scoped_id: String,
-        spec: JobSpec,
+        spec: &mut Option<JobSpec>,
         max_attempts: u32,
         input: Option<Arc<InputLog>>,
-        input_permit: Permit,
+        input_permit: &mut Option<Permit>,
         now: u64,
-    ) -> Result<(Arc<JobLog>, tokio::sync::watch::Receiver<u64>), Permit> {
+    ) -> Option<(Arc<JobLog>, tokio::sync::watch::Receiver<u64>)> {
+        let spec_ref = spec.as_ref().expect("spec");
         if st.shutting_down
             || st
-                .queue(namespace, &spec.demand.interface)
+                .queue(namespace, &spec_ref.demand.interface)
                 .is_some_and(|q| !q.is_empty())
         {
-            return Err(input_permit);
+            return None;
         }
-        let ckey = &spec.policy.concurrency_key;
-        if !ckey.is_empty() {
+        if !spec_ref.policy.concurrency_key.is_empty() {
             let cap = self
-                .max_in_flight_per_key(&spec.demand.interface)
+                .max_in_flight_per_key(&spec_ref.demand.interface)
                 .unwrap_or(1);
-            if st.in_flight_key_count(namespace, ckey) >= cap {
-                return Err(input_permit);
+            if st.in_flight_key_count(namespace, &spec_ref.policy.concurrency_key) >= cap {
+                return None;
             }
         }
-        let policy = self.config.interfaces.get(&spec.demand.interface);
+        let policy = self.config.interfaces.get(&spec_ref.demand.interface);
         let mut rng = st.rng;
-        let picked = pick_direct_session(st, namespace, &spec, policy, now, &mut rng);
+        let picked = pick_direct_session(st, namespace, spec_ref, policy, now, &mut rng);
         st.rng = rng;
-        let Some(session_id) = picked else {
-            return Err(input_permit);
-        };
+        let session_id = picked?;
+
+        let spec = spec.take().expect("spec");
+        let input_permit = input_permit.take().expect("permit");
+        let ckey = &spec.policy.concurrency_key;
 
         st.unfinished_jobs += 1;
         let limit = self.config.limits.assign_inline_limit as u64;
@@ -704,15 +743,15 @@ impl Inner {
             },
             now,
         );
-        let mut timers = Vec::new();
-        if let Some(total) = spec.policy.total_timeout {
-            timers.push(self.timers.schedule(
+        let total_timer = spec.policy.total_timeout.map(|total| {
+            self.timers.schedule(
                 now.saturating_add(ms(total)),
                 TimerKey::TotalDeadline {
                     job_id: scoped_id.clone(),
                 },
-            ));
-        }
+            )
+        });
+        let mut timers = Vec::new();
         if let Some(exec_timeout) = spec.policy.execution_timeout {
             timers.push(self.timers.schedule(
                 now.saturating_add(ms(exec_timeout)),
@@ -722,13 +761,7 @@ impl Inner {
                 },
             ));
         }
-        let inline_bytes = spec_payload_bytes(&spec)
-            + spec
-                .inputs
-                .iter()
-                .flat_map(|o| o.metadata())
-                .map(|(k, v)| (k.len() + v.len()) as u64)
-                .sum::<u64>();
+        let inline_bytes = assign_inline_bytes(&spec);
         let reserved = spec.demand.required_capacity.clone();
         let job = Job {
             id: scoped_id.clone(),
@@ -760,6 +793,7 @@ impl Inner {
             queued_since_ms: now,
             not_before_ms: 0,
             timers,
+            total_timer,
             rejected_sessions: HashSet::new(),
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
@@ -793,27 +827,29 @@ impl Inner {
             pb::server_message::Msg::Assign(assign),
             now,
         );
-        Ok((log, changes))
+        Some((log, changes))
     }
 
     fn begin_attempt_locked(&self, st: &mut State, job_id: &str, session_id: &str, now: u64) {
         self.dequeue_locked(st, job_id);
         let limit = self.config.limits.assign_inline_limit as u64;
-        let reserved = st.jobs[job_id].spec.demand.required_capacity.clone();
+        let (reserved, ckey, ns) = {
+            let job = st.jobs.get_mut(job_id).expect("queued job");
+            if !job.timers.is_empty() {
+                self.timers.cancel(&std::mem::take(&mut job.timers));
+            }
+            (
+                job.spec.demand.required_capacity.clone(),
+                job.spec.policy.concurrency_key.clone(),
+                job.namespace.clone(),
+            )
+        };
         let session = st.sessions.get_mut(session_id).expect("picked session");
         let worker_id = session.worker_id.clone();
         let lease_id = new_id();
         let attempt_id = new_id();
         session.attach(lease_id.clone(), &reserved);
         session.assigned_since_report += 1;
-        st.update_job(job_id, |job| job.updated_at_ms = now);
-        let (ckey, ns) = {
-            let job = st.jobs.get(job_id).expect("queued job");
-            (
-                job.spec.policy.concurrency_key.clone(),
-                job.namespace.clone(),
-            )
-        };
         let concurrency_counted = if !ckey.is_empty() {
             st.inc_in_flight_key(&ns, &ckey);
             true
@@ -822,14 +858,7 @@ impl Inner {
         };
         let job = st.jobs.get_mut(job_id).expect("queued job");
         job.attempt_count += 1;
-        let inline_bytes = spec_payload_bytes(&job.spec)
-            + job
-                .spec
-                .inputs
-                .iter()
-                .flat_map(|o| o.metadata())
-                .map(|(k, v)| (k.len() + v.len()) as u64)
-                .sum::<u64>();
+        let inline_bytes = assign_inline_bytes(&job.spec);
         job.attempt = Some(Attempt {
             attempt_id: attempt_id.clone(),
             lease_id: lease_id.clone(),
@@ -859,13 +888,17 @@ impl Inner {
             self.send_assign_locked(st, job_id, now);
             return;
         }
-        st.jobs.get_mut(job_id).expect("job").phase = Phase::Starting;
+        st.update_job(job_id, |job| {
+            job.phase = Phase::Starting;
+            job.updated_at_ms = now;
+        });
+        let job = &st.jobs[job_id];
         let op = JournalOp::AttemptStart(AttemptStartRecord {
             job_id: job_id.to_string(),
             attempt_number: number,
             at_ms: now,
-            attempt_id: st.jobs[job_id].last_attempt_id.clone(),
-            worker_id: st.jobs[job_id].last_worker_id.clone(),
+            attempt_id: job.last_attempt_id.clone(),
+            worker_id: job.last_worker_id.clone(),
         });
         let (id, lease) = (job_id.to_string(), lease_id.clone());
         if let Err(error) = self.commit(op, move |inner, outcome| {
@@ -1031,8 +1064,8 @@ fn build_assign(generation: u64, job: &Job) -> pb::Assign {
         } else {
             spec.params.clone()
         },
-        reserved_capacity: spec.demand.required_capacity.clone().into_iter().collect(),
-        metadata: spec.metadata.clone().into_iter().collect(),
+        reserved_capacity: to_proto_map(&spec.demand.required_capacity),
+        metadata: to_proto_map(&spec.metadata),
         inline_inputs: if via {
             Vec::new()
         } else {
@@ -1119,11 +1152,13 @@ impl Inner {
             )
         };
         self.release_attempt_concurrency_locked(st, job_id);
-        st.jobs
-            .get_mut(job_id)
-            .expect("job")
-            .failed_workers
-            .insert(attempt_worker_id);
+        {
+            let job = st.jobs.get_mut(job_id).expect("job");
+            if !job.timers.is_empty() {
+                self.timers.cancel(&std::mem::take(&mut job.timers));
+            }
+            job.failed_workers.insert(attempt_worker_id);
+        }
         if matches!(
             error.code.as_str(),
             codes::WORKER_FAILED
@@ -1405,6 +1440,9 @@ impl Inner {
         });
         let job = st.jobs.get_mut(job_id).expect("job");
         self.timers.cancel(&std::mem::take(&mut job.timers));
+        if let Some(timer) = job.total_timer.take() {
+            self.timers.cancel(&[timer]);
+        }
         job.error = plan.error.clone();
         let outputs = if plan.state == JobState::Succeeded {
             plan.outputs
@@ -1487,29 +1525,30 @@ impl Inner {
         let Some(job) = st.jobs.get(job_id) else {
             return;
         };
+        let (release_lease, cancel_lease) = match &job.phase {
+            Phase::Queued => (None, None),
+            Phase::Assigned | Phase::Running => {
+                let lease_id = job.attempt.as_ref().expect("attempt").lease_id.clone();
+                (None, Some(lease_id))
+            }
+            Phase::Starting => {
+                // The start committed but the worker was not told yet.
+                let lease_id = job.attempt.as_ref().expect("attempt").lease_id.clone();
+                (Some(lease_id), None)
+            }
+            Phase::Accepting | Phase::Terminating(_) | Phase::Terminal(_) => return,
+        };
         let reason = job
             .cancel_requested
             .clone()
             .unwrap_or_else(|| "cancelled".to_string());
         let error = Some(ErrorInfo::new(codes::CANCELLED, reason.clone(), false));
-        let plan = |release_lease, cancel_lease| TerminalPlan {
+        let plan = TerminalPlan {
             release_lease,
-            cancel_lease,
-            ..TerminalPlan::new(JobState::Cancelled, error.clone())
+            cancel_lease: cancel_lease.map(|lease_id| (lease_id, reason)),
+            ..TerminalPlan::new(JobState::Cancelled, error)
         };
-        match &job.phase {
-            Phase::Queued => self.finish_job_locked(st, job_id, plan(None, None), now),
-            Phase::Assigned | Phase::Running => {
-                let lease_id = job.attempt.as_ref().expect("attempt").lease_id.clone();
-                self.finish_job_locked(st, job_id, plan(None, Some((lease_id, reason))), now);
-            }
-            Phase::Starting => {
-                // The start committed but the worker was not told yet.
-                let lease_id = job.attempt.as_ref().expect("attempt").lease_id.clone();
-                self.finish_job_locked(st, job_id, plan(Some(lease_id), None), now);
-            }
-            Phase::Accepting | Phase::Terminating(_) | Phase::Terminal(_) => {}
-        }
+        self.finish_job_locked(st, job_id, plan, now);
     }
 
     // ------------------------------------------------------------ retention
@@ -1725,14 +1764,18 @@ fn pick_session(
     if best.len() == 1 {
         return Some(best[0].id.clone());
     }
-    if !demand.affinity_key.is_empty() {
-        best.sort_by_key(|s| Reverse(rendezvous_hash(&demand.affinity_key, &s.worker_id)));
-        if let Some(primary) = best
+    if !demand.affinity_key.is_empty()
+        && let Some(primary) = best
             .iter()
-            .find(|s| (s.active.len() as f64 / s.max_concurrency.max(1) as f64) < 0.85)
-        {
-            return Some(primary.id.clone());
-        }
+            .filter(|s| (s.active.len() as f64 / s.max_concurrency.max(1) as f64) < 0.85)
+            .max_by_key(|s| {
+                (
+                    rendezvous_hash(&demand.affinity_key, &s.worker_id),
+                    s.worker_id.as_str(),
+                )
+            })
+    {
+        return Some(primary.id.clone());
     }
     let n = best.len();
     let first = (next_random(rng) % n as u64) as usize;
@@ -1807,6 +1850,9 @@ fn pick_direct_session(
                     fallback = Some((score, s));
                 }
             }
+        }
+        if !best_rank.0 {
+            return None;
         }
         return under_load.or(fallback).map(|(_, s)| s.id.clone());
     }

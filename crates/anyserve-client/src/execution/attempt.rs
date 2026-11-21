@@ -31,8 +31,40 @@ pub struct Attempt {
     pub params: Bytes,
 }
 
+enum ReceivedBody {
+    Empty,
+    Single(Bytes),
+    Multi(Vec<u8>),
+}
+
+impl ReceivedBody {
+    fn push(&mut self, data: &Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        match self {
+            Self::Empty => *self = Self::Single(data.clone()),
+            Self::Single(first) => {
+                let mut buf = Vec::with_capacity(first.len() + data.len());
+                buf.extend_from_slice(first);
+                buf.extend_from_slice(data);
+                *self = Self::Multi(buf);
+            }
+            Self::Multi(buf) => buf.extend_from_slice(data),
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Empty => Bytes::new(),
+            Self::Single(bytes) => bytes,
+            Self::Multi(buf) => buf.into(),
+        }
+    }
+}
+
 struct ReceivedObject {
-    data: Vec<u8>,
+    data: ReceivedBody,
     uri: Option<String>,
     metadata: HashMap<String, String>,
 }
@@ -130,7 +162,7 @@ impl Attempt {
                         break;
                     }
                 }
-                v2::attempt_down::Msg::Input(input) => {
+                v2::attempt_down::Msg::Input(mut input) => {
                     if input.last {
                         attempt.input_done = true;
                         if assignment.inputs_via_attempt || assignment.streaming_input {
@@ -139,7 +171,7 @@ impl Attempt {
                                 .map(|object| v2::Object {
                                     body: Some(match object.uri {
                                         Some(uri) => v2::object::Body::Uri(uri),
-                                        None => v2::object::Body::Inline(object.data.into()),
+                                        None => v2::object::Body::Inline(object.data.into_bytes()),
                                     }),
                                     metadata: object.metadata,
                                 })
@@ -155,12 +187,13 @@ impl Attempt {
                         continue;
                     }
                     if let Some(index) = input.object_index {
+                        let data = std::mem::take(&mut input.data);
                         let object = inputs.entry(index).or_insert_with(|| ReceivedObject {
-                            data: Vec::new(),
-                            uri: (!input.uri.is_empty()).then(|| input.uri.clone()),
-                            metadata: input.metadata.clone(),
+                            data: ReceivedBody::Empty,
+                            uri: (!input.uri.is_empty()).then(|| std::mem::take(&mut input.uri)),
+                            metadata: std::mem::take(&mut input.metadata),
                         });
-                        object.data.extend_from_slice(&input.data);
+                        object.data.push(&data);
                     }
                 }
                 v2::attempt_down::Msg::Ack(_) => {}
@@ -178,7 +211,7 @@ impl Attempt {
     pub async fn frame(
         &mut self,
         data: Bytes,
-        metadata: HashMap<String, String>,
+        mut metadata: HashMap<String, String>,
         progress: bool,
     ) -> Result<(), Status> {
         if self.terminal_replay {
@@ -197,16 +230,22 @@ impl Attempt {
             .filter(|size| *size > 0)
             .ok_or_else(|| Status::resource_exhausted("frame metadata exceeds the attempt window"))?
             .min(self.chunk_bytes);
-        for index in 0..data.len().div_ceil(payload).max(1) {
+        let chunks = data.len().div_ceil(payload).max(1);
+        for index in 0..chunks {
             let start = index * payload;
             let chunk = data.slice(start..(start + payload).min(data.len()));
             let charged = chunk.len() + overhead;
             self.reserve(charged).await?;
             let sequence = self.next_sequence;
+            let frame_meta = if index + 1 == chunks {
+                std::mem::take(&mut metadata)
+            } else {
+                metadata.clone()
+            };
             self.send(v2::attempt_up::Msg::Frame(v2::Frame {
                 sequence,
                 data: chunk,
-                metadata: metadata.clone(),
+                metadata: frame_meta,
                 progress,
             }))
             .await?;
@@ -269,15 +308,17 @@ impl Attempt {
                 }))
                 .await?;
             } else {
-                let chunks = data.chunks(self.chunk_bytes);
-                let count = chunks.len();
-                for (part, chunk) in chunks.enumerate() {
-                    self.reserve(chunk.len()).await?;
+                let mut offset = 0;
+                while offset < data.len() {
+                    let end = (offset + self.chunk_bytes).min(data.len());
+                    let slice = data.slice(offset..end);
+                    let len = slice.len();
+                    self.reserve(len).await?;
                     self.send(v2::attempt_up::Msg::Result(v2::ResultChunk {
                         index: index as u32,
-                        data: Bytes::copy_from_slice(chunk),
-                        last: part + 1 == count,
-                        metadata: if part == 0 {
+                        data: slice,
+                        last: end == data.len(),
+                        metadata: if offset == 0 {
                             object.metadata.clone()
                         } else {
                             HashMap::new()
@@ -285,7 +326,8 @@ impl Attempt {
                         uri: String::new(),
                     }))
                     .await?;
-                    self.result_sent += chunk.len() as u64;
+                    self.result_sent += len as u64;
+                    offset = end;
                 }
             }
         }

@@ -139,6 +139,18 @@ SELECT
 const JOB_COLUMNS: &str = "SELECT job_id, state, spec_hash, spec_json, attempt_count,
     max_attempts, created_at_ms, updated_at_ms, error_json, winning_lease_id,
     result_digest, last_attempt_id, last_worker_id FROM jobs";
+const JOB_BY_ID_SQL: &str = "SELECT job_id, state, spec_hash, spec_json, attempt_count,
+    max_attempts, created_at_ms, updated_at_ms, error_json, winning_lease_id,
+    result_digest, last_attempt_id, last_worker_id FROM jobs WHERE job_id = $1";
+const RECOVERY_FIRST_SQL: &str = "SELECT job_id, state, spec_hash, spec_json, attempt_count,
+    max_attempts, created_at_ms, updated_at_ms, error_json, winning_lease_id,
+    result_digest, last_attempt_id, last_worker_id FROM jobs
+    WHERE state = 'queued' ORDER BY created_at_ms, job_id LIMIT $1";
+const RECOVERY_NEXT_SQL: &str = "SELECT job_id, state, spec_hash, spec_json, attempt_count,
+    max_attempts, created_at_ms, updated_at_ms, error_json, winning_lease_id,
+    result_digest, last_attempt_id, last_worker_id FROM jobs
+    WHERE state = 'queued' AND (created_at_ms, job_id) > ($1, $2)
+    ORDER BY created_at_ms, job_id LIMIT $3";
 
 enum WriteRequest {
     Op {
@@ -477,7 +489,7 @@ impl JournalBackend for PgJournal {
     ) -> BoxFuture<'a, Result<Option<StoredJob>>> {
         Box::pin(async move {
             if !include_outputs {
-                let row = sqlx::query(&format!("{JOB_COLUMNS} WHERE job_id = $1"))
+                let row = sqlx::query(JOB_BY_ID_SQL)
                     .bind(job_id)
                     .fetch_optional(&self.read_pool)
                     .await
@@ -544,7 +556,7 @@ impl JournalBackend for PgJournal {
                 .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 .await
                 .context("begin PostgreSQL preview read")?;
-            let Some(row) = sqlx::query(&format!("{JOB_COLUMNS} WHERE job_id = $1"))
+            let Some(row) = sqlx::query(JOB_BY_ID_SQL)
                 .bind(job_id)
                 .fetch_optional(&mut *tx)
                 .await?
@@ -835,26 +847,22 @@ async fn load_recovery(pool: &PgPool, generation: u64) -> Result<Recovery> {
     let mut active = Vec::new();
     let mut cursor: Option<(i64, String)> = None;
     loop {
-        let rows =
-            match &cursor {
-                None => sqlx::query(&format!(
-                    "{JOB_COLUMNS} WHERE state = 'queued' ORDER BY created_at_ms, job_id LIMIT $1"
-                ))
-                .bind(RECOVERY_BATCH)
-                .fetch_all(pool)
-                .await?,
-                Some((created, id)) => {
-                    sqlx::query(&format!(
-                    "{JOB_COLUMNS} WHERE state = 'queued' AND (created_at_ms, job_id) > ($1, $2)
-                     ORDER BY created_at_ms, job_id LIMIT $3"
-                ))
+        let rows = match &cursor {
+            None => {
+                sqlx::query(RECOVERY_FIRST_SQL)
+                    .bind(RECOVERY_BATCH)
+                    .fetch_all(pool)
+                    .await?
+            }
+            Some((created, id)) => {
+                sqlx::query(RECOVERY_NEXT_SQL)
                     .bind(*created)
                     .bind(id)
                     .bind(RECOVERY_BATCH)
                     .fetch_all(pool)
                     .await?
-                }
-            };
+            }
+        };
         if rows.is_empty() {
             break;
         }
@@ -951,7 +959,7 @@ async fn writer_loop(
             }
             WriteRequest::Op { term, op, reply } => {
                 let mut batch = vec![(op, reply)];
-                let mut seen_ids: HashSet<String> = batch[0].0.job_id_owned().into_iter().collect();
+                let mut seen_ids: Option<HashSet<String>> = None;
                 while batch.len() < max_batch {
                     match rx.try_recv() {
                         Ok(WriteRequest::Op {
@@ -959,8 +967,13 @@ async fn writer_loop(
                             op: next_op,
                             reply: next_reply,
                         }) => {
-                            let duplicate =
-                                op_job_id(&next_op).is_some_and(|id| seen_ids.contains(id));
+                            let seen = seen_ids.get_or_insert_with(|| {
+                                op_job_id(&batch[0].0)
+                                    .map(str::to_string)
+                                    .into_iter()
+                                    .collect()
+                            });
+                            let duplicate = op_job_id(&next_op).is_some_and(|id| seen.contains(id));
                             if next_term != term || duplicate {
                                 deferred = Some(WriteRequest::Op {
                                     term: next_term,
@@ -970,7 +983,7 @@ async fn writer_loop(
                                 break;
                             }
                             if let Some(id) = op_job_id(&next_op) {
-                                seen_ids.insert(id.to_string());
+                                seen.insert(id.to_string());
                             }
                             batch.push((next_op, next_reply));
                         }
@@ -1013,12 +1026,6 @@ async fn writer_loop(
     write_pool.close().await;
 }
 
-impl JournalOp {
-    fn job_id_owned(&self) -> Option<String> {
-        op_job_id(self).map(str::to_string)
-    }
-}
-
 enum SingleStmtError {
     Sql(String),
     Transport(String),
@@ -1031,50 +1038,33 @@ async fn execute_single_statement(
     ops: &[&JournalOp],
 ) -> std::result::Result<(bool, HashSet<String>, HashSet<String>, HashSet<String>), SingleStmtError>
 {
-    let mut acc_job_id = Vec::new();
-    let mut acc_ns = Vec::new();
-    let mut acc_hash = Vec::new();
-    let mut acc_spec = Vec::new();
-    let mut acc_max_att = Vec::new();
-    let mut acc_at = Vec::new();
+    let mut acc_job_id: Vec<&str> = Vec::new();
+    let mut acc_ns: Vec<&str> = Vec::new();
+    let mut acc_hash: Vec<&str> = Vec::new();
+    let mut acc_spec: Vec<String> = Vec::new();
+    let mut acc_max_att: Vec<i64> = Vec::new();
+    let mut acc_at: Vec<i64> = Vec::new();
 
-    let mut st_job_id = Vec::new();
-    let mut st_at = Vec::new();
-    let mut st_attempt_id = Vec::new();
-    let mut st_worker_id = Vec::new();
+    let mut st_job_id: Vec<&str> = Vec::new();
+    let mut st_at: Vec<i64> = Vec::new();
+    let mut st_attempt_id: Vec<Option<&str>> = Vec::new();
+    let mut st_worker_id: Vec<Option<&str>> = Vec::new();
 
-    let mut tm_job_id = Vec::new();
-    let mut tm_state = Vec::new();
-    let mut tm_at = Vec::new();
-    let mut tm_err = Vec::new();
-    let mut tm_lease = Vec::new();
-    let mut tm_digest = Vec::new();
-    let mut tm_attempt_id = Vec::new();
-    let mut tm_worker_id = Vec::new();
+    let mut tm_job_id: Vec<&str> = Vec::new();
+    let mut tm_state: Vec<&str> = Vec::new();
+    let mut tm_at: Vec<i64> = Vec::new();
+    let mut tm_err: Vec<Option<String>> = Vec::new();
+    let mut tm_lease: Vec<Option<&str>> = Vec::new();
+    let mut tm_digest: Vec<Option<&str>> = Vec::new();
+    let mut tm_attempt_id: Vec<Option<&str>> = Vec::new();
+    let mut tm_worker_id: Vec<Option<&str>> = Vec::new();
 
-    let mut obj_job_id = Vec::new();
-    let mut obj_role = Vec::new();
-    let mut obj_idx = Vec::new();
-    let mut obj_uri = Vec::new();
-    let mut obj_content = Vec::new();
-    let mut obj_meta = Vec::new();
-
-    let mut push_objects = |job_id: &str, role: &str, objects: &[Object]| -> Result<(), String> {
-        for (idx, obj) in objects.iter().enumerate() {
-            let (uri, content, meta) = match obj {
-                Object::Inline { data, metadata } => (None, Some(data.to_vec()), metadata),
-                Object::Uri { uri, metadata } => (Some(uri.clone()), None, metadata),
-            };
-            let meta_json = serde_json::to_string(meta).map_err(|e| e.to_string())?;
-            obj_job_id.push(job_id.to_string());
-            obj_role.push(role.to_string());
-            obj_idx.push(idx as i64);
-            obj_uri.push(uri);
-            obj_content.push(content);
-            obj_meta.push(meta_json);
-        }
-        Ok(())
-    };
+    let mut obj_job_id: Vec<&str> = Vec::new();
+    let mut obj_role: Vec<&str> = Vec::new();
+    let mut obj_idx: Vec<i64> = Vec::new();
+    let mut obj_uri: Vec<Option<&str>> = Vec::new();
+    let mut obj_content: Vec<Option<&[u8]>> = Vec::new();
+    let mut obj_meta: Vec<String> = Vec::new();
 
     for op in ops {
         match op {
@@ -1087,27 +1077,40 @@ async fn execute_single_statement(
                 };
                 let spec_json = serde_json::to_string(&stored)
                     .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
-                acc_job_id.push(r.job_id.clone());
-                acc_ns.push(ns.to_string());
-                acc_hash.push(r.spec_hash.clone());
+                acc_job_id.push(r.job_id.as_str());
+                acc_ns.push(ns);
+                acc_hash.push(r.spec_hash.as_str());
                 acc_spec.push(spec_json);
                 acc_max_att.push(i64::from(r.max_attempts));
                 acc_at.push(r.created_at_ms.min(i64::MAX as u64) as i64);
-                push_objects(&r.job_id, "input", &r.spec.inputs).map_err(SingleStmtError::Sql)?;
+                for (idx, obj) in r.spec.inputs.iter().enumerate() {
+                    let (uri, content, meta) = match obj {
+                        Object::Inline { data, metadata } => (None, Some(data.as_ref()), metadata),
+                        Object::Uri { uri, metadata } => (Some(uri.as_str()), None, metadata),
+                    };
+                    let meta_json = serde_json::to_string(meta)
+                        .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
+                    obj_job_id.push(r.job_id.as_str());
+                    obj_role.push("input");
+                    obj_idx.push(idx as i64);
+                    obj_uri.push(uri);
+                    obj_content.push(content);
+                    obj_meta.push(meta_json);
+                }
                 if !r.spec.params.is_empty() {
-                    push_objects(
-                        &r.job_id,
-                        "params",
-                        &[Object::inline(r.spec.params.clone())],
-                    )
-                    .map_err(SingleStmtError::Sql)?;
+                    obj_job_id.push(r.job_id.as_str());
+                    obj_role.push("params");
+                    obj_idx.push(0);
+                    obj_uri.push(None);
+                    obj_content.push(Some(r.spec.params.as_ref()));
+                    obj_meta.push("{}".to_string());
                 }
             }
             JournalOp::AttemptStart(r) => {
-                st_job_id.push(r.job_id.clone());
+                st_job_id.push(r.job_id.as_str());
                 st_at.push(r.at_ms.min(i64::MAX as u64) as i64);
-                st_attempt_id.push(r.attempt_id.clone());
-                st_worker_id.push(r.worker_id.clone());
+                st_attempt_id.push(r.attempt_id.as_deref());
+                st_worker_id.push(r.worker_id.as_deref());
             }
             JournalOp::Terminal(r) => {
                 let err_json = r
@@ -1116,15 +1119,28 @@ async fn execute_single_statement(
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
-                tm_job_id.push(r.job_id.clone());
-                tm_state.push(state_text(r.state).to_string());
+                tm_job_id.push(r.job_id.as_str());
+                tm_state.push(state_text(r.state));
                 tm_at.push(r.at_ms.min(i64::MAX as u64) as i64);
                 tm_err.push(err_json);
-                tm_lease.push(r.winning_lease_id.clone());
-                tm_digest.push(r.outcome_digest.clone());
-                tm_attempt_id.push(r.attempt_id.clone());
-                tm_worker_id.push(r.worker_id.clone());
-                push_objects(&r.job_id, "output", &r.outputs).map_err(SingleStmtError::Sql)?;
+                tm_lease.push(r.winning_lease_id.as_deref());
+                tm_digest.push(r.outcome_digest.as_deref());
+                tm_attempt_id.push(r.attempt_id.as_deref());
+                tm_worker_id.push(r.worker_id.as_deref());
+                for (idx, obj) in r.outputs.iter().enumerate() {
+                    let (uri, content, meta) = match obj {
+                        Object::Inline { data, metadata } => (None, Some(data.as_ref()), metadata),
+                        Object::Uri { uri, metadata } => (Some(uri.as_str()), None, metadata),
+                    };
+                    let meta_json = serde_json::to_string(meta)
+                        .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
+                    obj_job_id.push(r.job_id.as_str());
+                    obj_role.push("output");
+                    obj_idx.push(idx as i64);
+                    obj_uri.push(uri);
+                    obj_content.push(content);
+                    obj_meta.push(meta_json);
+                }
             }
             JournalOp::Probe => {}
         }

@@ -78,15 +78,18 @@ impl ExecutionClient {
         Err(last_err.expect("endpoints is non-empty"))
     }
 
-    async fn call_leader<T, F, Fut>(&self, mut op: F) -> Result<T, Status>
+    async fn call_with<R: Clone, T, F, Fut>(&self, req: R, mut op: F) -> Result<T, Status>
     where
-        F: FnMut(ClientClient<Transport>) -> Fut,
+        F: FnMut(ClientClient<Transport>, R) -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
         let (start_idx, primary) = self.slot.lock().expect("client slot poisoned").clone();
-        let mut last_status = match op(primary).await {
+        if self.endpoints.len() == 1 {
+            return op(primary, req).await;
+        }
+        let mut last_status = match op(primary, req.clone()).await {
             Ok(val) => return Ok(val),
-            Err(status) if status.code() == Code::Unavailable && self.endpoints.len() > 1 => status,
+            Err(status) if status.code() == Code::Unavailable => status,
             Err(status) => return Err(status),
         };
         let n = self.endpoints.len();
@@ -96,7 +99,7 @@ impl ExecutionClient {
                 continue;
             };
             let candidate = build_client(ch, self.auth.clone());
-            match op(candidate.clone()).await {
+            match op(candidate.clone(), req.clone()).await {
                 Ok(val) => {
                     *self.slot.lock().expect("client slot poisoned") = (idx, candidate);
                     return Ok(val);
@@ -125,9 +128,8 @@ impl ExecutionClient {
             conflict_policy: v2::ConflictPolicy::UseExisting as i32,
             spec: Some(spec),
         };
-        self.call_leader(|mut c| {
-            let r = req.clone();
-            async move { Ok(c.submit(r).await?.into_inner()) }
+        self.call_with(req, |mut c, r| async move {
+            Ok(c.submit(r).await?.into_inner())
         })
         .await
     }
@@ -141,37 +143,31 @@ impl ExecutionClient {
                 streaming_input: false,
             })),
         };
-        self.call_leader(|mut c| {
-            let r = request.clone();
-            async move {
-                Ok(ExecutionEvents::new(
-                    c.invoke(tokio_stream::iter([r])).await?.into_inner(),
-                ))
-            }
+        self.call_with(request, |mut c, r| async move {
+            Ok(ExecutionEvents::new(
+                c.invoke(tokio_stream::iter([r])).await?.into_inner(),
+            ))
         })
         .await
     }
 
     pub async fn invoke_stream(&mut self, spec: v2::JobSpec) -> Result<Invocation, Status> {
-        self.call_leader(|mut c| {
-            let s = spec.clone();
-            async move {
-                let (input, requests) = mpsc::channel(SEND_QUEUE);
-                input
-                    .send(v2::InvokeRequest {
-                        msg: Some(v2::invoke_request::Msg::Start(v2::InvokeStart {
-                            spec: Some(s),
-                            streaming_input: true,
-                        })),
-                    })
-                    .await
-                    .map_err(|_| Status::unavailable("invocation input closed"))?;
-                let events = c.invoke(ReceiverStream::new(requests)).await?.into_inner();
-                Ok(Invocation {
-                    input,
-                    events: ExecutionEvents::new(events),
+        self.call_with(spec, |mut c, s| async move {
+            let (input, requests) = mpsc::channel(SEND_QUEUE);
+            input
+                .send(v2::InvokeRequest {
+                    msg: Some(v2::invoke_request::Msg::Start(v2::InvokeStart {
+                        spec: Some(s),
+                        streaming_input: true,
+                    })),
                 })
-            }
+                .await
+                .map_err(|_| Status::unavailable("invocation input closed"))?;
+            let events = c.invoke(ReceiverStream::new(requests)).await?.into_inner();
+            Ok(Invocation {
+                input,
+                events: ExecutionEvents::new(events),
+            })
         })
         .await
     }
@@ -185,9 +181,8 @@ impl ExecutionClient {
             job_id: job_id.into(),
             after_sequence,
         };
-        self.call_leader(|mut c| {
-            let r = req.clone();
-            async move { Ok(ExecutionEvents::new(c.watch(r).await?.into_inner())) }
+        self.call_with(req, |mut c, r| async move {
+            Ok(ExecutionEvents::new(c.watch(r).await?.into_inner()))
         })
         .await
     }
@@ -201,9 +196,8 @@ impl ExecutionClient {
             job_id: job_id.into(),
             include_outputs,
         };
-        self.call_leader(|mut c| {
-            let r = req.clone();
-            async move { Ok(c.get_job(r).await?.into_inner()) }
+        self.call_with(req, |mut c, r| async move {
+            Ok(c.get_job(r).await?.into_inner())
         })
         .await
     }
@@ -217,9 +211,8 @@ impl ExecutionClient {
             job_id: job_id.into(),
             reason: reason.into(),
         };
-        self.call_leader(|mut c| {
-            let r = req.clone();
-            async move { Ok(c.cancel(r).await?.into_inner()) }
+        self.call_with(req, |mut c, r| async move {
+            Ok(c.cancel(r).await?.into_inner())
         })
         .await
     }
@@ -228,9 +221,8 @@ impl ExecutionClient {
         &mut self,
         request: v2::ListJobsRequest,
     ) -> Result<v2::ListJobsResponse, Status> {
-        self.call_leader(|mut c| {
-            let r = request.clone();
-            async move { Ok(c.list_jobs(r).await?.into_inner()) }
+        self.call_with(request, |mut c, r| async move {
+            Ok(c.list_jobs(r).await?.into_inner())
         })
         .await
     }
@@ -303,7 +295,9 @@ impl WorkerSession {
                 .await?;
             match control_client.session(ReceiverStream::new(requests)).await {
                 Ok(response) => {
-                    let data = AttemptClient::connect_with_namespace(ep, token, namespace).await?;
+                    let data_channel = connect_channel(ep).await?;
+                    let data =
+                        AttemptClient::from_channel_with_namespace(data_channel, token, namespace)?;
                     return Ok(Self {
                         control,
                         messages: response.into_inner(),

@@ -35,7 +35,7 @@ impl ByteBudget {
     pub(crate) fn try_reserve(&self, bytes: usize) -> bool {
         self.used
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                let next = used + bytes as u64;
+                let next = used.checked_add(bytes as u64)?;
                 (next <= self.limit).then_some(next)
             })
             .is_ok()
@@ -221,8 +221,8 @@ impl JobLog {
     /// they cannot fit.
     fn reserve(&self, inner: &mut LogInner, needed: usize) -> bool {
         loop {
-            let over_local =
-                inner.events.len() >= self.max_events || inner.bytes + needed > self.max_bytes;
+            let over_local = inner.events.len() >= self.max_events
+                || inner.bytes.saturating_add(needed) > self.max_bytes;
             if !over_local && self.budget.try_reserve(needed) {
                 return true;
             }
@@ -339,12 +339,16 @@ impl JobLog {
         if after != 0 && after < inner.evicted_through {
             return Err(inner.evicted_through + 1);
         }
-        let events = inner
+        if after >= inner.last_sequence {
+            return Ok((Vec::new(), inner.finished));
+        }
+        let start = inner
             .events
-            .iter()
-            .filter(|(event, _)| event.sequence > after)
-            .map(|(event, _)| event.clone())
-            .collect();
+            .partition_point(|(event, _)| event.sequence <= after);
+        let mut events = Vec::with_capacity(inner.events.len() - start);
+        for (event, _) in inner.events.range(start..) {
+            events.push(event.clone());
+        }
         Ok((events, inner.finished))
     }
 
@@ -360,7 +364,10 @@ impl JobLog {
         let mut inner = self.lock();
         inner.primary = enabled.then_some(0);
         drop(inner);
-        self.consumed.send_modify(|value| *value += 1);
+        if self.consumed.receiver_count() > 0 {
+            self.consumed
+                .send_modify(|value| *value = value.wrapping_add(1));
+        }
     }
 
     pub(crate) fn mark_consumed(&self, sequence: u64) {
@@ -416,7 +423,10 @@ impl JobLog {
     pub(crate) fn finish_ephemeral(&self) -> Vec<ExecutionEvent> {
         self.compactable.store(true, Ordering::Release);
         let removed = self.compact_if_unfollowed();
-        self.consumed.send_modify(|value| *value += 1);
+        if self.consumed.receiver_count() > 0 {
+            self.consumed
+                .send_modify(|value| *value = value.wrapping_add(1));
+        }
         removed
     }
 
@@ -668,5 +678,40 @@ mod tests {
             0,
         );
         assert_eq!(budget.used(), EVENT_OVERHEAD as u64);
+    }
+
+    #[test]
+    fn read_after_slices_sorted_log_and_budget_checks_overflow() {
+        let budget = Arc::new(ByteBudget::new(u64::MAX));
+        assert!(budget.try_reserve(100));
+        assert!(!budget.try_reserve(usize::MAX));
+        assert_eq!(budget.used(), 100);
+        budget.release(100);
+
+        let log = log(10, 1 << 20, 1 << 20);
+        let mut seqs = Vec::new();
+        for _ in 0..5 {
+            seqs.push(output(&log, 8).unwrap());
+        }
+        assert_eq!(
+            log.read_after(0)
+                .unwrap()
+                .0
+                .iter()
+                .map(|e| e.sequence)
+                .collect::<Vec<_>>(),
+            seqs
+        );
+        assert_eq!(
+            log.read_after(seqs[2])
+                .unwrap()
+                .0
+                .iter()
+                .map(|e| e.sequence)
+                .collect::<Vec<_>>(),
+            vec![seqs[3], seqs[4]]
+        );
+        assert!(log.read_after(seqs[4]).unwrap().0.is_empty());
+        assert!(log.read_after(seqs[4] + 10).unwrap().0.is_empty());
     }
 }

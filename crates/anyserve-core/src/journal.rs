@@ -485,7 +485,7 @@ impl Journal {
         let Some(mut job) = load_job_record(&mut tx, job_id).await? else {
             return Ok(None);
         };
-        {
+        if job.state == JobState::Succeeded {
             let bytes: i64 = sqlx::query_scalar(
                 "SELECT COALESCE(SUM(length(content)), 0) FROM journal_objects
                  WHERE job_id = ? AND role = 'output' AND uri IS NULL",
@@ -534,7 +534,7 @@ impl Journal {
             return Ok(None);
         };
         let mut outputs = Vec::new();
-        {
+        if job.state == JobState::Succeeded {
             let mut rows = sqlx::query(
                 "SELECT idx, uri, length(content) AS size_bytes,
                         anyserve_object_prefix(rowid) AS content, metadata_json
@@ -980,12 +980,14 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
             .await?;
             insert_objects(tx, &record.job_id, ROLE_INPUT, &spec.inputs).await?;
             if !spec.params.is_empty() {
-                insert_objects(
-                    tx,
-                    &record.job_id,
-                    ROLE_PARAMS,
-                    &[Object::inline(spec.params.clone())],
+                sqlx::query(
+                    "INSERT INTO journal_objects (job_id, role, idx, uri, content, metadata_json)
+                     VALUES (?, ?, 0, NULL, ?, '{}')",
                 )
+                .bind(&record.job_id)
+                .bind(ROLE_PARAMS)
+                .bind(&spec.params[..])
+                .execute(&mut **tx)
                 .await?;
             }
         }
@@ -1150,23 +1152,57 @@ const PURGE_BATCH: usize = 500;
 async fn purge(conn: &mut SqliteConnection, before_ms: u64) -> Result<usize> {
     let mut tx = conn.begin().await?;
     let removed: Vec<String> = sqlx::query_scalar(
-        "SELECT job_id FROM journal_jobs WHERE state != 'queued' AND updated_at_ms < ?
+        "SELECT job_id FROM journal_jobs
+         WHERE state IN ('succeeded', 'failed', 'cancelled') AND updated_at_ms < ?
          LIMIT ?",
     )
     .bind(before_ms as i64)
     .bind(PURGE_BATCH as i64)
     .fetch_all(&mut *tx)
     .await?;
-    for job_id in &removed {
-        for table in ["journal_objects", "journal_jobs"] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE job_id = ?"))
-                .bind(job_id)
-                .execute(&mut *tx)
-                .await?;
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    for prefix in [
+        "DELETE FROM journal_objects WHERE job_id IN (",
+        "DELETE FROM journal_jobs WHERE job_id IN (",
+    ] {
+        let mut query = QueryBuilder::<Sqlite>::new(prefix);
+        let mut ids = query.separated(", ");
+        for job_id in &removed {
+            ids.push_bind(job_id);
         }
+        ids.push_unseparated(")");
+        query.build().execute(&mut *tx).await?;
     }
     tx.commit().await?;
     Ok(removed.len())
+}
+
+async fn flush_batch(
+    conn: &mut SqliteConnection,
+    batch: Vec<(JournalOp, oneshot::Sender<CommitOutcome>)>,
+    pending: &AtomicUsize,
+    stats: &Mutex<JournalStats>,
+) {
+    let started = Instant::now();
+    let ops: Vec<&JournalOp> = batch.iter().map(|(op, _)| op).collect();
+    let outcomes = commit_batch(conn, &ops).await;
+    let elapsed = started.elapsed();
+    {
+        let mut stats = stats.lock().expect("journal stats poisoned");
+        stats.committed_batches += 1;
+        stats.committed_ops += outcomes
+            .iter()
+            .filter(|outcome| **outcome == CommitOutcome::Committed)
+            .count() as u64;
+        stats.last_batch_size = batch.len();
+        stats.last_commit_micros = elapsed.as_micros() as u64;
+    }
+    pending.fetch_sub(batch.len(), Ordering::Relaxed);
+    for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
+        let _ = reply.send(outcome);
+    }
 }
 
 async fn writer(
@@ -1188,13 +1224,19 @@ async fn writer(
         };
         match request {
             Request::Close { reply } => {
-                // Finish everything queued before the close request.
+                // Finish everything queued before the close request, batched.
+                let mut batch = Vec::new();
                 while let Ok(request) = rx.try_recv() {
                     if let Request::Op { op, reply } = request {
-                        let outcome = commit_batch(&mut conn, &[&op]).await;
-                        pending.fetch_sub(1, Ordering::Relaxed);
-                        let _ = reply.send(outcome.into_iter().next().expect("one outcome"));
+                        batch.push((op, reply));
+                        if batch.len() >= max_batch {
+                            flush_batch(&mut conn, std::mem::take(&mut batch), &pending, &stats)
+                                .await;
+                        }
                     }
+                }
+                if !batch.is_empty() {
+                    flush_batch(&mut conn, batch, &pending, &stats).await;
                 }
                 rx.close();
                 let _ = conn.close().await;
@@ -1216,24 +1258,7 @@ async fn writer(
                         Err(_) => break,
                     }
                 }
-                let started = Instant::now();
-                let ops: Vec<&JournalOp> = batch.iter().map(|(op, _)| op).collect();
-                let outcomes = commit_batch(&mut conn, &ops).await;
-                let elapsed = started.elapsed();
-                {
-                    let mut stats = stats.lock().expect("journal stats poisoned");
-                    stats.committed_batches += 1;
-                    stats.committed_ops += outcomes
-                        .iter()
-                        .filter(|outcome| **outcome == CommitOutcome::Committed)
-                        .count() as u64;
-                    stats.last_batch_size = batch.len();
-                    stats.last_commit_micros = elapsed.as_micros() as u64;
-                }
-                pending.fetch_sub(batch.len(), Ordering::Relaxed);
-                for ((_, reply), outcome) in batch.into_iter().zip(outcomes) {
-                    let _ = reply.send(outcome);
-                }
+                flush_batch(&mut conn, batch, &pending, &stats).await;
             }
         }
     }
@@ -1643,5 +1668,43 @@ mod tests {
             .unwrap();
         assert!(load_recovery(&mut conn, 8).await.unwrap().active.is_empty());
         conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batched_purge_deletes_only_old_terminal_jobs_and_objects() {
+        let config = config("purge-batch");
+        let journal = finished_fixture(&config).await;
+        let mut conn = connect(&config).await;
+        sqlx::query(
+            "INSERT INTO journal_jobs(job_id, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+             SELECT 'recent', 'failed', spec_hash, spec_json, max_attempts, 10, 1000 FROM journal_jobs WHERE job_id = 'result'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO journal_jobs(job_id, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+             SELECT 'still-queued', 'queued', spec_hash, spec_json, max_attempts, 1, 1 FROM journal_jobs WHERE job_id = 'result'",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+
+        assert_eq!(journal.purge(500).await.unwrap(), 1);
+        assert_eq!(journal.purge(500).await.unwrap(), 0);
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT job_id FROM journal_jobs ORDER BY job_id")
+                .fetch_all(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec!["recent", "still-queued"]);
+        let obj_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM journal_objects WHERE job_id = 'result'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        assert_eq!(obj_count, 0);
+        conn.close().await.unwrap();
+        journal.close().await;
     }
 }

@@ -368,10 +368,7 @@ async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> 
         async for item in agen:
             if attempt.cancelled:
                 return
-            payload = _encode_payload(spec.codec, item)
-            if spec.codec == _CODEC_JSON:
-                payload += b"\n"
-            attempt.frame(payload)
+            attempt.frame(_encode_stream_frame(spec.codec, item))
     finally:
         await agen.aclose()
 
@@ -415,10 +412,7 @@ def _process_assignment(
                 for item in result:
                     if attempt.cancelled:
                         return
-                    payload = _encode_payload(spec.codec, item)
-                    if spec.codec == _CODEC_JSON:
-                        payload += b"\n"
-                    attempt.frame(payload)
+                    attempt.frame(_encode_stream_frame(spec.codec, item))
             finally:
                 result.close()
             outputs = []
@@ -466,6 +460,12 @@ def _encode_payload(codec: str, value: Any) -> bytes:
     if codec == _CODEC_JSON:
         return json.dumps(value, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
     raise ValueError(f"unsupported codec: {codec}")
+
+
+def _encode_stream_frame(codec: str, value: Any) -> bytes:
+    if codec == _CODEC_JSON:
+        return (json.dumps(value, separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8")
+    return _encode_payload(codec, value)
 
 
 def _failure_reason(exc: Exception) -> str:

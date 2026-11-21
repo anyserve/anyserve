@@ -52,7 +52,11 @@ impl InputLog {
         if inner.finished || inner.aborted {
             return Err(RuntimeError::invalid("input stream is already closed"));
         }
-        if inner.accounted + cost > self.limit {
+        if inner
+            .accounted
+            .checked_add(cost)
+            .is_none_or(|next| next > self.limit)
+        {
             return Err(RuntimeError::exhausted(format!(
                 "streaming input exceeds {} bytes",
                 self.limit

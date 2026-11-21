@@ -180,7 +180,7 @@ impl Runtime {
                 Session {
                     id: session_id.clone(),
                     worker_id: worker_id.clone(),
-                    namespace,
+                    namespace: namespace.clone(),
                     pool,
                     forced_pool: principal.forced_pool,
                     interfaces,
@@ -207,17 +207,16 @@ impl Runtime {
         st.index_session(&session_id);
 
         // Leases the worker still holds move to this session when they belong
-        // to the same worker in this generation; every other one is fenced.
+        // to the same worker and namespace in this generation; every other one is fenced.
         let held: BTreeSet<String> = hello.held_lease_ids.into_iter().collect();
         let mut resumed = Vec::new();
         let mut fenced = Vec::new();
         for lease_id in &held {
             let movable = st.leases.get(lease_id).is_some_and(|lease| {
                 !lease.cancelling
-                    && st
-                        .sessions
-                        .get(&lease.session_id)
-                        .is_some_and(|owner| owner.worker_id == worker_id)
+                    && st.sessions.get(&lease.session_id).is_some_and(|owner| {
+                        owner.worker_id == worker_id && owner.namespace == namespace
+                    })
             });
             if !movable {
                 fenced.push(lease_id.clone());
@@ -259,8 +258,10 @@ impl Runtime {
             msg: Some(pb::server_message::Msg::Welcome(pb::Welcome {
                 session_id: session_id.clone(),
                 generation: st.generation,
-                heartbeat_interval_ms: inner.config.heartbeat_interval.as_millis() as u32,
-                heartbeat_timeout_ms: inner.config.heartbeat_timeout.as_millis() as u32,
+                heartbeat_interval_ms: u32::try_from(inner.config.heartbeat_interval.as_millis())
+                    .unwrap_or(u32::MAX),
+                heartbeat_timeout_ms: u32::try_from(inner.config.heartbeat_timeout.as_millis())
+                    .unwrap_or(u32::MAX),
                 limits: Some(pb::Limits {
                     max_control_message_bytes: limits.max_control_message_bytes,
                     max_chunk_bytes: limits.max_chunk_bytes,
@@ -828,11 +829,19 @@ impl Runtime {
                                 receipt,
                                 now,
                             );
-                            let job = st.jobs.get_mut(&job_id).expect("job");
-                            if retried || job.is_terminal() {
+                            let is_terminal = st.jobs.get(&job_id).is_some_and(|j| j.is_terminal());
+                            if retried {
+                                inner.dispatch_locked(&mut st, now);
                                 return Ok(FinishStatus::Committed);
                             }
-                            job.finish_waiters.push(tx);
+                            if is_terminal {
+                                return Ok(FinishStatus::Committed);
+                            }
+                            st.jobs
+                                .get_mut(&job_id)
+                                .expect("job")
+                                .finish_waiters
+                                .push(tx);
                         }
                     }
                 }
@@ -1292,5 +1301,171 @@ mod tests {
         // Finishing the second job evicted the first, result included.
         assert_eq!(*result_freed.lock().unwrap(), Some(true));
         assert!(runtime.inner.lock().released.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_namespace_held_leases_are_fenced_even_for_matching_worker_id() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let alpha_principal = crate::auth::Principal {
+            namespace: "alpha".into(),
+            role: crate::auth::Role::Worker,
+            subject: "alpha-w".into(),
+            forced_pool: None,
+            is_operator: false,
+        };
+        let beta_principal = crate::auth::Principal {
+            namespace: "beta".into(),
+            role: crate::auth::Role::Worker,
+            subject: "beta-w".into(),
+            forced_pool: None,
+            is_operator: false,
+        };
+        let mut alpha_session = runtime
+            .open_session_for(hello("shared-worker", "", Vec::new()), alpha_principal)
+            .unwrap();
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("alpha".into()),
+                job_id: Some("alpha-job".into()),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let lease_id = next_assign(&mut alpha_session).await.lease_id;
+
+        // A worker in namespace "beta" with the exact same worker_id tries to claim alpha's lease.
+        let mut beta_session = runtime
+            .open_session_for(
+                hello("shared-worker", "", vec![lease_id.clone()]),
+                beta_principal,
+            )
+            .unwrap();
+        match next_message(&mut beta_session).await {
+            pb::server_message::Msg::Welcome(welcome) => {
+                assert!(
+                    welcome.resumed_lease_ids.is_empty(),
+                    "cross-namespace lease must not resume: {:?}",
+                    welcome.resumed_lease_ids
+                );
+            }
+            other => panic!("expected Welcome, got {other:?}"),
+        }
+        match next_message(&mut beta_session).await {
+            pb::server_message::Msg::Fence(fence) => assert_eq!(fence.lease_id, lease_id),
+            other => panic!("expected Fence for stolen lease, got {other:?}"),
+        }
+        // Alpha's session still holds its lease.
+        assert_eq!(
+            runtime.inner.lock().leases[&lease_id].session_id,
+            alpha_session.session_id
+        );
+    }
+
+    #[tokio::test]
+    async fn retrying_job_cancels_stale_phase_timers_and_dispatches_queued_work() {
+        let runtime = Runtime::start(RuntimeConfig {
+            default_initial_backoff: Duration::from_secs(60),
+            default_max_backoff: Duration::from_secs(60),
+            default_max_attempts: 3,
+            default_max_in_flight_per_key: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut w1 = runtime.open_session(hello("w1", "", Vec::new())).unwrap();
+        let mut w2 = runtime.open_session(hello("w2", "", Vec::new())).unwrap();
+
+        let make_spec = || {
+            let mut spec = JobSpec::default();
+            spec.demand.interface = "echo".into();
+            spec.policy.durability = Some(Durability::Ephemeral);
+            spec.policy.concurrency_key = "arm-1".into();
+            spec.policy.queue_timeout = Some(Duration::from_secs(60));
+            spec.policy.execution_timeout = Some(Duration::from_secs(60));
+            spec.policy.total_timeout = Some(Duration::from_secs(60));
+            spec
+        };
+        runtime
+            .submit(SubmitRequest {
+                job_id: Some("job-1".into()),
+                spec: make_spec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        runtime
+            .submit(SubmitRequest {
+                job_id: Some("job-2".into()),
+                spec: make_spec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let assign1 = tokio::select! {
+            a = next_assign(&mut w1) => a,
+            a = next_assign(&mut w2) => a,
+        };
+        let (link1, _) = runtime
+            .open_attempt(&pb::AttemptOpen {
+                lease_id: assign1.lease_id.clone(),
+                generation: runtime.generation(),
+                resume_after_sequence: 0,
+            })
+            .await
+            .unwrap();
+        // Retryable failure on job-1 releases the concurrency key and immediately dispatches job-2.
+        runtime
+            .finish_attempt(
+                &link1,
+                AttemptOutcome::Failed(ErrorInfo::new("flaky", "retry", true)),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let job2_state = runtime.get_job("job-2", false).await.unwrap().state;
+        assert_eq!(job2_state, JobState::Running);
+
+        // Stale phase timers from job-1's previous queue/attempt must already be cancelled
+        // while job-1 waits for retry backoff; only its TotalDeadline and the new QueueDeadline + Dispatch remain.
+        {
+            let st = runtime.inner.lock();
+            let scoped1 =
+                super::super::identity::encode_scoped_id(crate::auth::DEFAULT_NAMESPACE, "job-1");
+            let job1 = &st.jobs[&scoped1];
+            assert!(job1.total_timer.is_some());
+            assert_eq!(job1.timers.len(), 2);
+            let timers = runtime.inner.timers.lock();
+            assert!(!timers.keys.values().any(|k| matches!(
+                k,
+                super::super::TimerKey::ExecutionDeadline { job_id, .. } if job_id == &scoped1
+            )));
+        }
+
+        // Complete job-2 cleanly and cancel waiting job-1: zero live timers remain.
+        let assign2 = tokio::select! {
+            a = next_assign(&mut w1) => a,
+            a = next_assign(&mut w2) => a,
+        };
+        let (link2, _) = runtime
+            .open_attempt(&pb::AttemptOpen {
+                lease_id: assign2.lease_id.clone(),
+                generation: runtime.generation(),
+                resume_after_sequence: 0,
+            })
+            .await
+            .unwrap();
+        runtime
+            .finish_attempt(&link2, AttemptOutcome::Succeeded, Vec::new())
+            .await
+            .unwrap();
+        runtime.cancel("job-1", "done".into()).await.unwrap();
+        let timers = runtime.inner.timers.lock();
+        assert!(timers.keys.is_empty(), "{:?}", timers.keys);
     }
 }

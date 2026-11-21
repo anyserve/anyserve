@@ -1,7 +1,7 @@
 //! Read indexes maintained alongside job transitions under the runtime lock.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 use super::api::{InterfaceStats, JobFilter, JobState};
 use super::state::Job;
@@ -111,6 +111,9 @@ impl JobIndex {
         limit: usize,
     ) -> Vec<&str> {
         use std::ops::Bound::{Excluded, Included};
+        if limit == 0 || self.namespaces.is_empty() {
+            return Vec::new();
+        }
         let lower = (from_ms, String::new());
         let upper = before.unwrap_or((to_ms, String::new()));
         if upper <= lower {
@@ -128,9 +131,6 @@ impl JobIndex {
                 None => Vec::new(),
             };
         }
-        if self.namespaces.is_empty() || limit == 0 {
-            return Vec::new();
-        }
         if self.namespaces.len() == 1
             && let Some((ns_name, index)) = self.namespaces.iter().next()
             && ns_name == crate::auth::DEFAULT_NAMESPACE
@@ -143,20 +143,25 @@ impl JobIndex {
                 .map(|(_, scoped)| scoped.as_str())
                 .collect();
         }
-        let max_upper = (to_ms, String::new());
+        let range_upper = if upper.0 < to_ms {
+            (upper.0.saturating_add(1), String::new())
+        } else {
+            (to_ms, String::new())
+        };
         let mut items: Vec<(u64, &str)> = Vec::new();
         for index in self.namespaces.values() {
+            let mut taken = 0usize;
             for ((ts, _raw), scoped) in index
                 .created
-                .range((Included(lower.clone()), Excluded(max_upper.clone())))
+                .range((Included(lower.clone()), Excluded(range_upper.clone())))
                 .rev()
             {
-                let key = (*ts, scoped.as_str());
                 if (*ts, scoped.as_str()) >= (upper.0, upper.1.as_str()) {
                     continue;
                 }
-                items.push(key);
-                if items.len() >= limit * 2 {
+                items.push((*ts, scoped.as_str()));
+                taken += 1;
+                if taken >= limit && *ts < upper.0 {
                     break;
                 }
             }
@@ -242,17 +247,58 @@ impl JobIndex {
             return (Vec::new(), 0);
         }
         let total = selected.iter().map(|jobs| jobs.len()).sum();
-        let mut cursors: Vec<_> = selected.iter().map(|jobs| jobs.iter().peekable()).collect();
-        let ordered = std::iter::from_fn(|| {
-            let next = cursors
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(i, cursor)| cursor.peek().map(|key| (i, *key)))
-                .min_by(|(_, a), (_, b)| a.cmp(b))
-                .map(|(i, _)| i)?;
-            cursors[next].next().map(|(_, id)| id.as_str())
-        });
-        (ordered.skip(offset).take(limit).collect(), total)
+        if offset >= total || limit == 0 {
+            return (Vec::new(), total);
+        }
+        if selected.len() == 1 {
+            return (
+                selected[0]
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .map(|(_, id)| id.as_str())
+                    .collect(),
+                total,
+            );
+        }
+        if selected.len() <= 8 {
+            let mut cursors: Vec<_> = selected.iter().map(|jobs| jobs.iter().peekable()).collect();
+            let ordered = std::iter::from_fn(|| {
+                let next = cursors
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(i, cursor)| cursor.peek().map(|key| (i, *key)))
+                    .min_by(|(_, a), (_, b)| a.cmp(b))
+                    .map(|(i, _)| i)?;
+                cursors[next].next().map(|(_, id)| id.as_str())
+            });
+            return (ordered.skip(offset).take(limit).collect(), total);
+        }
+        let mut iters: Vec<_> = selected.iter().map(|jobs| jobs.iter()).collect();
+        let mut heap: BinaryHeap<Reverse<(&OrderKey, usize)>> =
+            BinaryHeap::with_capacity(iters.len());
+        for (idx, iter) in iters.iter_mut().enumerate() {
+            if let Some(key) = iter.next() {
+                heap.push(Reverse((key, idx)));
+            }
+        }
+        let take = limit.min(total - offset);
+        let mut out = Vec::with_capacity(take);
+        let mut skipped = 0usize;
+        while out.len() < take {
+            let Some(Reverse((key, idx))) = heap.pop() else {
+                break;
+            };
+            if skipped < offset {
+                skipped += 1;
+            } else {
+                out.push(key.1.as_str());
+            }
+            if let Some(next_key) = iters[idx].next() {
+                heap.push(Reverse((next_key, idx)));
+            }
+        }
+        (out, total)
     }
 
     pub(crate) fn counts(&self) -> [usize; 5] {
@@ -427,5 +473,83 @@ mod tests {
         }
         assert_eq!(runtime.stats().cancelled, 3);
         assert_eq!(runtime.stats().queued, 0);
+    }
+
+    #[tokio::test]
+    async fn multi_namespace_scan_and_many_namespace_paging_preserve_global_order() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut expected_scan = Vec::new();
+        for ns_idx in 0..10 {
+            let ns = format!("tenant-{ns_idx}");
+            for j in 0..4 {
+                let mut spec = JobSpec::default();
+                spec.demand.interface = "demo".into();
+                spec.policy.durability = Some(Durability::Ephemeral);
+                let id = format!("job-{j}");
+                runtime
+                    .submit(SubmitRequest {
+                        namespace: Some(ns.clone()),
+                        job_id: Some(id.clone()),
+                        spec,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let ts = (ns_idx * 10 + j + 1) as u64;
+                let scoped = super::super::identity::encode_scoped_id(&ns, &id);
+                let mut st = runtime.inner.lock();
+                let st = &mut *st;
+                if let Some(job) = st.jobs.get_mut(&scoped) {
+                    let pos = JobIndex::position(job);
+                    st.job_index.remove_position(job, pos, false);
+                    if let Some(ns_idx_map) = st.job_index.namespaces.get_mut(&ns) {
+                        ns_idx_map
+                            .created
+                            .remove(&(job.created_at_ms, job.raw_id.clone()));
+                        job.created_at_ms = ts;
+                        job.updated_at_ms = ts * 2;
+                        ns_idx_map
+                            .created
+                            .insert((job.created_at_ms, job.raw_id.clone()), job.id.clone());
+                    }
+                    st.job_index.insert_state(job);
+                }
+                expected_scan.push((ts, scoped));
+            }
+        }
+        expected_scan.sort_by(|a, b| b.cmp(a));
+        let st = runtime.inner.lock();
+        // Global scan across 10 namespaces with small limit must not drop newer namespaces.
+        let page1 = st.job_index.scan(None, 0, 1_000, None, 3);
+        assert_eq!(
+            page1,
+            expected_scan[..3]
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let cursor = expected_scan[2].clone();
+        let page2 = st.job_index.scan(None, 0, 1_000, Some(cursor), 5);
+        assert_eq!(
+            page2,
+            expected_scan[3..8]
+                .iter()
+                .map(|(_, id)| id.as_str())
+                .collect::<Vec<_>>()
+        );
+        // BinaryHeap merge (>8 selected sets) matches full sorted order across pages.
+        let mut paged = Vec::new();
+        for offset in (0..40).step_by(7) {
+            let (ids, total) = st.job_index.page(&JobFilter::default(), offset, 7);
+            assert_eq!(total, 40);
+            paged.extend(ids.into_iter().map(str::to_string));
+        }
+        assert_eq!(
+            paged,
+            expected_scan
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect::<Vec<_>>()
+        );
     }
 }
