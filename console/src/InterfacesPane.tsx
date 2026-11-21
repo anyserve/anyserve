@@ -24,7 +24,7 @@ export function InterfacesPane(props: InterfacesPaneProps) {
     const q = search.trim().toLowerCase();
     if (!q) return interfaces;
     return interfaces.filter(
-      (item) => item.name.toLowerCase().includes(q) || (item.policy?.pool_tiers.some((t) => t.pool.toLowerCase().includes(q)) ?? false),
+      (item) => item.name.toLowerCase().includes(q) || (item.policy?.pool_tiers.some((t) => formatPool(t.pool).toLowerCase().includes(q)) ?? false),
     );
   }, [interfaces, search]);
 

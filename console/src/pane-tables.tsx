@@ -100,18 +100,22 @@ export function ProgressMeter({ percent, tone }: { percent: number; tone?: "acce
 export function TierChain({ tiers, highlightPool }: { tiers: PoolTierPolicy[]; highlightPool?: string }) {
   return (
     <div className="tier-chain">
-      {tiers.map((tier, idx) => (
-        <div key={`${tier.pool}-${idx}`} className={`tier-node${highlightPool === tier.pool ? " is-current" : ""}`}>
-          <span className="tier-node__rank">#{idx + 1}</span>
-          <div className="tier-node__body">
-            <strong className="mono">{tier.pool}</strong>
-            <span>
-              {tier.spillover_after_ms === 0 ? "Primary" : `Spillover after ${formatDuration(tier.spillover_after_ms)}`}
-              {tier.reconnect_grace_ms != null ? ` · Reconnect grace ${formatDuration(tier.reconnect_grace_ms)}` : ""}
-            </span>
+      {tiers.map((tier, idx) => {
+        const poolName = formatPool(tier.pool);
+        const isCurrent = highlightPool != null && formatPool(highlightPool) === poolName;
+        return (
+          <div key={`${tier.pool}-${idx}`} className={`tier-node${isCurrent ? " is-current" : ""}`}>
+            <span className="tier-node__rank">#{idx + 1}</span>
+            <div className="tier-node__body">
+              <strong className="mono">{poolName}</strong>
+              <span>
+                {tier.spillover_after_ms === 0 ? "Primary" : `Spillover after ${formatDuration(tier.spillover_after_ms)}`}
+                {tier.reconnect_grace_ms != null ? ` · Reconnect grace ${formatDuration(tier.reconnect_grace_ms)}` : ""}
+              </span>
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -227,7 +231,7 @@ export function InterfacesTable(props: {
         <tbody>
           {interfaces.map((item) => {
             const tiers = item.policy?.pool_tiers ?? [];
-            const tip = tiers.map((t, i) => `${i > 0 ? "→ " : ""}${t.pool}${t.spillover_after_ms > 0 ? ` (${formatDuration(t.spillover_after_ms)})` : ""}`).join(" ");
+            const tip = tiers.map((t, i) => `${i > 0 ? "→ " : ""}${formatPool(t.pool)}${t.spillover_after_ms > 0 ? ` (${formatDuration(t.spillover_after_ms)})` : ""}`).join(" ");
             return (
               <tr
                 key={item.name}
@@ -246,7 +250,7 @@ export function InterfacesTable(props: {
                       {tiers.map((tier, idx) => (
                         <span key={`${tier.pool}-${idx}`} className="tag ellipsis">
                           {idx > 0 ? "→ " : ""}
-                          {tier.pool}
+                          {formatPool(tier.pool)}
                           {!compact && tier.spillover_after_ms > 0 ? ` (${formatDuration(tier.spillover_after_ms)})` : ""}
                         </span>
                       ))}

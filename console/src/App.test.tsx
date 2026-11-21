@@ -111,7 +111,7 @@ const richOverview = (): OverviewResponse => ({
         queue_timeout_ms: 30_000,
         max_in_flight_per_key: 4,
         pool_tiers: [
-          { pool: "gpu-primary", spillover_after_ms: 0, reconnect_grace_ms: 2_000 },
+          { pool: "", spillover_after_ms: 0, reconnect_grace_ms: 2_000 },
           { pool: "gpu-burst", spillover_after_ms: 500, reconnect_grace_ms: 5_000 },
         ],
       },
@@ -374,7 +374,7 @@ it("polls only /api/overview on Overview, renders draining count, and supports c
 
   fireEvent.click(screen.getAllByText("llm.generate")[0]);
   expect(await screen.findByText("Pool Tiers Spillover Chain")).toBeTruthy();
-  expect(screen.getAllByText("gpu-primary").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("default").length).toBeGreaterThan(0);
   expect(screen.getAllByText("gpu-burst").length).toBeGreaterThan(0);
 
   fireEvent.click(screen.getByRole("button", { name: "View Jobs" }));

@@ -143,7 +143,7 @@ export function PoolsPane(props: PoolsPaneProps) {
                     <div className="tier-chain-inline">
                       {iface.policy!.pool_tiers.map((tier, idx) => (
                         <span key={`${tier.pool}-${idx}`} className="tag">
-                          #{idx + 1} {tier.pool}
+                          #{idx + 1} {formatPool(tier.pool)}
                           {tier.spillover_after_ms > 0 ? ` · +${formatDuration(tier.spillover_after_ms)}` : ""}
                           {tier.reconnect_grace_ms != null ? ` · grace ${formatDuration(tier.reconnect_grace_ms)}` : ""}
                         </span>
