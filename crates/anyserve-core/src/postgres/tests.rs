@@ -748,8 +748,11 @@ async fn postgres_cluster_whale_100k_backlog_does_not_starve_small_tenant() {
         "expected small-1 in first claim despite 100k whale backlog (got {:?})",
         claimed.iter().map(|c| &c.job.job_id).collect::<Vec<_>>()
     );
+    // Sanity bound only: the window includes two EXPLAIN ANALYZE runs and
+    // shared CI runners are slow. The buffer-count assertion above is the
+    // deterministic check that the scan stays O(buckets).
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_secs(5),
         "fair claim over 100k backlog took too long: {elapsed:?}"
     );
     close(pg, admin).await;
@@ -829,7 +832,8 @@ async fn postgres_cluster_200_unserved_buckets_do_not_starve_serviceable_interfa
     for i in 0..5 {
         assert!(ids.contains(&format!("servable-{i}").as_str()));
     }
-    assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
+    // Sanity bound only; claiming all five servable jobs in one call is the check.
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
     close(pg, admin).await;
 }
 

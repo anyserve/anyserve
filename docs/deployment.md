@@ -33,6 +33,11 @@ Failover must preserve acknowledged commits and leave only one authoritative
 writable primary; application fencing cannot recover transactions lost when an
 asynchronous standby is promoted.
 
+Each replica issues one best-effort `ANALYZE jobs` after its first claim of 16
+or more jobs, so a backlog loaded before autovacuum refreshed planner statistics
+is claimed with current estimates. The statement does not block reads or writes,
+and its failure is ignored.
+
 Task admission uses a unique job ID and atomic fingerprint comparison. Schedulers
 claim matching work with `FOR UPDATE SKIP LOCKED`; ownership changes increment a
 job epoch. A node lease is a time-limited permission to own work, renewed against
