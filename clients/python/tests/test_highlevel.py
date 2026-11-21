@@ -255,6 +255,63 @@ class HighLevelTests(unittest.TestCase):
         self.assertTrue(all(0 <= credit <= 2 for credit in connection.credits))
         self.assertIn(2, connection.credits)
 
+    def test_assignment_arriving_while_the_last_lease_finishes_is_accepted(self):
+        # The control plane frees a slot when it commits the terminal message
+        # and may assign the next job before the handler thread has returned.
+        first, second = Assignment("one"), Assignment("two")
+        decided = threading.Event()
+        decisions = {}
+
+        @worker(interface="single", max_active_leases=1)
+        def handler(payload):
+            return payload
+
+        class Connection:
+            def __init__(self):
+                self.messages = deque([first])
+
+            def credit(self, free):
+                pass
+
+            def accept(self, lease_id, accepted, reason):
+                decisions[lease_id] = (accepted, reason)
+                if lease_id == "two":
+                    decided.set()
+
+            def receive(self, timeout):
+                if self.messages:
+                    assignment = self.messages.popleft()
+                    return {"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}
+                if second.attempt.outputs is not None or (decided.is_set() and not decisions["two"][0]):
+                    raise KeyboardInterrupt
+                time.sleep(0.001)
+                return None
+
+            def drain(self):
+                pass
+
+            def close(self):
+                pass
+
+            def cancel_ack(self, lease_id):
+                pass
+
+        connection = Connection()
+
+        def complete_then_next(outputs):
+            # The terminal message is committed: the next assignment is on the
+            # wire while this thread is still inside the handler call.
+            first.attempt.outputs = outputs
+            connection.messages.append(second)
+            self.assertTrue(decided.wait(timeout=2), "the control loop never saw the second assignment")
+
+        first.attempt.complete = complete_then_next
+        with self.assertRaises(KeyboardInterrupt):
+            serve(handler, connection=connection)
+        self.assertEqual(decisions["one"], (True, ""))
+        self.assertEqual(decisions["two"], (True, ""))
+        self.assertEqual(second.attempt.outputs, [{"inline": b"hello", "metadata": {}}])
+
     def test_success_requires_a_terminal_event(self):
         with self.assertRaisesRegex(RuntimeError, "without a terminal"):
             _terminal_outputs(iter([{"type": "output", "data": b"partial"}]))

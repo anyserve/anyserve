@@ -177,6 +177,14 @@ def serve(
     session_pool = pool if pool is not None else specs[0].pool
     active: dict[str, tuple[Any, Future]] = {}
     active_lock = threading.Lock()
+    # Leases whose terminal message is being sent. The control plane frees the
+    # slot when it commits that message and may assign the next job before the
+    # handler thread has returned here, so these no longer count as occupied.
+    finishing: set[str] = set()
+
+    def mark_finishing(lease_id: str) -> None:
+        with active_lock:
+            finishing.add(lease_id)
     credit_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=total_concurrency)
     session_id = ""
@@ -206,6 +214,7 @@ def serve(
     def completed(lease_id: str, future: Future) -> None:
         with active_lock:
             entry = active.pop(lease_id, None)
+            finishing.discard(lease_id)
         failure = None if future.cancelled() else future.exception()
         if failure is not None and (entry is None or not entry[0].cancelled):
             _LOG.warning("attempt %s ended: %s", lease_id, failure)
@@ -268,7 +277,8 @@ def serve(
                     assignment = message["assignment"]
                     iface = getattr(assignment, "interface", specs[0].interface)
                     target = by_interface.get(iface)
-                    entries = _active_snapshot(active, active_lock)
+                    with active_lock:
+                        entries = [item for item in active.items() if item[0] not in finishing]
                     used: dict[str, int] = {}
                     for _, (held, _) in entries:
                         for resource, amount in held.reserved_capacity.items():
@@ -290,7 +300,10 @@ def serve(
                     conn.accept(lease_id, accepted, reason)
                     if accepted:
                         fn, target_spec = target
-                        future = executor.submit(_process_assignment, fn, target_spec, assignment)
+                        future = executor.submit(
+                            _process_assignment, fn, target_spec, assignment,
+                            lambda lease_id=lease_id: mark_finishing(lease_id),
+                        )
                         with active_lock:
                             active[lease_id] = (assignment, future)
                         future.add_done_callback(lambda done, lease_id=lease_id: completed(lease_id, done))
@@ -363,7 +376,10 @@ async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> 
         await agen.aclose()
 
 
-def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -> None:
+def _process_assignment(
+    handler: Callable, spec: HandlerSpec, assignment: Any,
+    finishing: Callable[[], None] = lambda: None,
+) -> None:
     attempt = assignment.open_stream() if spec.streaming_input else assignment.open()
     if attempt.cancelled or attempt.terminal_replay:
         return
@@ -409,6 +425,7 @@ def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -
         else:
             outputs = [{"inline": _encode_payload(spec.codec, result), "metadata": {}}]
         if not attempt.cancelled:
+            finishing()
             attempt.complete(outputs)
     except Exception as exc:
         code = getattr(exc, "status_code", None)
@@ -416,6 +433,7 @@ def _process_assignment(handler: Callable, spec: HandlerSpec, assignment: Any) -
             raise
         if not attempt.cancelled:
             retryable = getattr(exc, "retryable", code == 8)
+            finishing()
             attempt.fail(_failure_reason(exc), retryable=bool(retryable))
 
 
