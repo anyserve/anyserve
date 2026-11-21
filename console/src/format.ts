@@ -1,4 +1,4 @@
-import { TAB_PATHS, type ConsoleTab } from "./app-constants";
+import { routeFromPathname, TAB_PATHS, type ConsoleTab } from "./app-constants";
 import type { JobDetailResponse, JobSummary, WorkerSummary } from "./types";
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
@@ -18,11 +18,14 @@ export function sortWorkers(workers: WorkerSummary[]): WorkerSummary[] {
     if (left.healthy !== right.healthy) {
       return Number(right.healthy) - Number(left.healthy);
     }
+    if (left.connected !== right.connected) {
+      return Number(right.connected) - Number(left.connected);
+    }
     return right.last_seen_at_ms - left.last_seen_at_ms;
   });
 }
 
-export function formatTimestamp(value: number | null): string {
+export function formatTimestamp(value: number | null | undefined): string {
   if (!value) {
     return "N/A";
   }
@@ -37,7 +40,7 @@ export function formatTimestamp(value: number | null): string {
     .join("");
 }
 
-export function formatDuration(value: number | null): string {
+export function formatDuration(value: number | null | undefined): string {
   if (value == null) {
     return "N/A";
   }
@@ -50,6 +53,60 @@ export function formatDuration(value: number | null): string {
   }
   const minutes = Math.floor(seconds / 60);
   return `${minutes}m ${(seconds % 60).toFixed(0)}s`;
+}
+
+export function formatRustDuration(
+  value: { secs: number; nanos: number } | null | undefined,
+): string {
+  if (!value) {
+    return "Default";
+  }
+  const totalMs = Math.round(value.secs * 1_000 + value.nanos / 1_000_000);
+  return formatDuration(totalMs);
+}
+
+export function formatMicros(value: number | null | undefined): string {
+  if (value == null) {
+    return "N/A";
+  }
+  if (value < 1_000) {
+    return `${formatNumber(value)} µs`;
+  }
+  return `${(value / 1_000).toFixed(2)} ms`;
+}
+
+export function formatBytes(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) {
+    return "N/A";
+  }
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  const kib = value / 1024;
+  if (kib < 1024) {
+    return `${kib.toFixed(1)} KiB`;
+  }
+  const mib = kib / 1024;
+  if (mib < 1024) {
+    return `${mib.toFixed(1)} MiB`;
+  }
+  const gib = mib / 1024;
+  return `${gib.toFixed(2)} GiB`;
+}
+
+export function formatPercent(ratio: number | null | undefined): string {
+  if (ratio == null || !Number.isFinite(ratio)) {
+    return "0%";
+  }
+  const pct = Math.max(0, Math.min(100, ratio * 100));
+  return pct >= 10 || pct === 0 ? `${Math.round(pct)}%` : `${pct.toFixed(1)}%`;
+}
+
+export function budgetPercent(used: number, max: number): number {
+  if (!Number.isFinite(used) || !Number.isFinite(max) || max <= 0) {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, (used / max) * 100));
 }
 
 export function formatNumber(value: number): string {
@@ -107,9 +164,8 @@ export function asErrorMessage(error: unknown): string {
 }
 
 export function readTabFromLocation(): ConsoleTab {
-  const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
-  const match = (Object.entries(TAB_PATHS) as Array<[ConsoleTab, string]>).find(
-    ([, path]) => pathname === path,
-  );
-  return match?.[0] ?? "queue";
+  const route = routeFromPathname(window.location.pathname);
+  return route.tab;
 }
+
+export { TAB_PATHS };
