@@ -9,31 +9,22 @@ export function usePollingEffect<T>(
   enabled = true,
 ) {
   const callbacks = useRef({ task, onSuccess, onError });
-
   useEffect(() => {
     callbacks.current = { task, onSuccess, onError };
   }, [task, onSuccess, onError]);
 
   useEffect(() => {
-    if (!enabled) {
-      return;
-    }
-
+    if (!enabled) return;
     let controller: AbortController | undefined;
     let timeoutId: number | undefined;
 
     async function refresh(current: AbortController) {
       try {
         const value = await callbacks.current.task(current.signal);
-        if (!current.signal.aborted) {
-          callbacks.current.onSuccess(value);
-        }
+        if (!current.signal.aborted) callbacks.current.onSuccess(value);
       } catch (error) {
-        if (!current.signal.aborted) {
-          callbacks.current.onError(error);
-        }
+        if (!current.signal.aborted) callbacks.current.onError(error);
       } finally {
-        // Schedule from completion so a slow request cannot overlap the next.
         if (!current.signal.aborted) {
           timeoutId = window.setTimeout(() => void refresh(current), pollMs);
         }

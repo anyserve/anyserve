@@ -1,5 +1,4 @@
-import { routeFromPathname, TAB_PATHS, type ConsoleTab } from "./app-constants";
-import type { JobDetailResponse, JobSummary, WorkerSummary } from "./types";
+import type { JobDetailResponse, JobSummary, RustDuration, WorkerSummary } from "./types";
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -9,103 +8,74 @@ const timeFormatter = new Intl.DateTimeFormat(undefined, {
   second: "2-digit",
 });
 
+const shortTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
 export function sortJobs(jobs: JobSummary[]): JobSummary[] {
-  return [...jobs].sort((left, right) => right.updated_at_ms - left.updated_at_ms);
+  return [...jobs].sort((a, b) => b.updated_at_ms - a.updated_at_ms);
 }
 
 export function sortWorkers(workers: WorkerSummary[]): WorkerSummary[] {
-  return [...workers].sort((left, right) => {
-    if (left.healthy !== right.healthy) {
-      return Number(right.healthy) - Number(left.healthy);
-    }
-    if (left.connected !== right.connected) {
-      return Number(right.connected) - Number(left.connected);
-    }
-    return right.last_seen_at_ms - left.last_seen_at_ms;
+  return [...workers].sort((a, b) => {
+    if (a.healthy !== b.healthy) return Number(b.healthy) - Number(a.healthy);
+    if (a.connected !== b.connected) return Number(b.connected) - Number(a.connected);
+    return b.last_seen_at_ms - a.last_seen_at_ms;
   });
 }
 
 export function formatTimestamp(value: number | null | undefined): string {
-  if (!value) {
-    return "N/A";
-  }
+  if (!value) return "N/A";
   const date = new Date(value);
-  const milliseconds = String(date.getMilliseconds()).padStart(3, "0");
-  const parts = timeFormatter.formatToParts(date);
-
-  return parts
-    .flatMap((part) =>
-      part.type === "second" ? [part.value, ".", milliseconds] : [part.value],
-    )
+  const ms = String(date.getMilliseconds()).padStart(3, "0");
+  return timeFormatter
+    .formatToParts(date)
+    .flatMap((part) => (part.type === "second" ? [part.value, ".", ms] : [part.value]))
     .join("");
 }
 
-export function formatDuration(value: number | null | undefined): string {
-  if (value == null) {
-    return "N/A";
-  }
-  if (value < 1_000) {
-    return `${value} ms`;
-  }
-  const seconds = value / 1_000;
-  if (seconds < 60) {
-    return `${seconds.toFixed(1)} s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${(seconds % 60).toFixed(0)}s`;
+export function formatShortTime(value: number | null | undefined): string {
+  return value ? shortTimeFormatter.format(new Date(value)) : "—";
 }
 
-export function formatRustDuration(
-  value: { secs: number; nanos: number } | null | undefined,
-): string {
-  if (!value) {
-    return "Default";
-  }
-  const totalMs = Math.round(value.secs * 1_000 + value.nanos / 1_000_000);
-  return formatDuration(totalMs);
+export function formatDuration(value: number | null | undefined): string {
+  if (value == null) return "N/A";
+  if (value < 1_000) return `${value} ms`;
+  const seconds = value / 1_000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  return `${Math.floor(seconds / 60)}m ${(seconds % 60).toFixed(0)}s`;
+}
+
+export function formatRustDuration(value: RustDuration | null | undefined): string {
+  if (!value) return "Default";
+  return formatDuration(Math.round(value.secs * 1_000 + value.nanos / 1_000_000));
 }
 
 export function formatMicros(value: number | null | undefined): string {
-  if (value == null) {
-    return "N/A";
-  }
-  if (value < 1_000) {
-    return `${formatNumber(value)} µs`;
-  }
-  return `${(value / 1_000).toFixed(2)} ms`;
+  if (value == null) return "N/A";
+  return value < 1_000 ? `${formatNumber(value)} µs` : `${(value / 1_000).toFixed(2)} ms`;
 }
 
 export function formatBytes(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) {
-    return "N/A";
-  }
-  if (value < 1024) {
-    return `${value} B`;
-  }
+  if (value == null || !Number.isFinite(value)) return "N/A";
+  if (value < 1024) return `${value} B`;
   const kib = value / 1024;
-  if (kib < 1024) {
-    return `${kib.toFixed(1)} KiB`;
-  }
+  if (kib < 1024) return `${kib.toFixed(1)} KiB`;
   const mib = kib / 1024;
-  if (mib < 1024) {
-    return `${mib.toFixed(1)} MiB`;
-  }
-  const gib = mib / 1024;
-  return `${gib.toFixed(2)} GiB`;
+  return mib < 1024 ? `${mib.toFixed(1)} MiB` : `${(mib / 1024).toFixed(2)} GiB`;
 }
 
 export function formatPercent(ratio: number | null | undefined): string {
-  if (ratio == null || !Number.isFinite(ratio)) {
-    return "0%";
-  }
+  if (ratio == null || !Number.isFinite(ratio)) return "0%";
   const pct = Math.max(0, Math.min(100, ratio * 100));
   return pct >= 10 || pct === 0 ? `${Math.round(pct)}%` : `${pct.toFixed(1)}%`;
 }
 
 export function budgetPercent(used: number, max: number): number {
-  if (!Number.isFinite(used) || !Number.isFinite(max) || max <= 0) {
-    return 0;
-  }
+  if (!Number.isFinite(used) || !Number.isFinite(max) || max <= 0) return 0;
   return Math.max(0, Math.min(100, (used / max) * 100));
 }
 
@@ -115,57 +85,94 @@ export function formatNumber(value: number): string {
 
 export function formatCapacityMap(value: Record<string, string | number>): string {
   const entries = Object.entries(value);
-  if (entries.length === 0) {
-    return "N/A";
-  }
-  return entries.map(([key, item]) => `${key}:${item}`).join(" ");
+  return entries.length === 0 ? "N/A" : entries.map(([k, v]) => `${k}:${v}`).join(" ");
 }
 
-export function formatObjectMeta(value: {
-  size_bytes: number | null;
-  metadata: Record<string, string>;
-}): string {
+export function formatObjectMeta(value: { size_bytes: number | null; metadata: Record<string, string> }): string {
   const parts: string[] = [];
-  if (value.size_bytes != null) {
-    parts.push(`${formatNumber(value.size_bytes)} B`);
-  }
-  const metadataEntries = Object.entries(value.metadata)
-    .filter(([key]) => key !== "content_type")
-    .map(([key, item]) => `${key}:${item}`);
-  if (metadataEntries.length > 0) {
-    parts.push(metadataEntries.join(" "));
-  }
+  if (value.size_bytes != null) parts.push(`${formatNumber(value.size_bytes)} B`);
+  const meta = Object.entries(value.metadata)
+    .filter(([k]) => k !== "content_type")
+    .map(([k, v]) => `${k}:${v}`);
+  if (meta.length > 0) parts.push(meta.join(" "));
   return parts.join(" · ") || "No metadata";
 }
 
-export function truncateMiddle(value: string, maxLength: number): string {
-  if (value.length <= maxLength) {
-    return value;
-  }
-  const half = Math.max(4, Math.floor((maxLength - 1) / 2));
-  return `${value.slice(0, half)}…${value.slice(-half)}`;
-}
-
 export function latestAttemptWorker(detail: JobDetailResponse): string | null {
-  for (let index = detail.attempts.length - 1; index >= 0; index -= 1) {
-    const workerId = detail.attempts[index]?.worker_id;
-    if (workerId) {
-      return workerId;
-    }
+  for (let i = detail.attempts.length - 1; i >= 0; i -= 1) {
+    if (detail.attempts[i]?.worker_id) return detail.attempts[i].worker_id;
   }
   return null;
 }
 
 export function asErrorMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return error.message;
+  return error instanceof Error ? error.message : "Unknown error";
+}
+
+/** Compact primitive JSON arrays inline so KServe tensor payloads remain scannable. */
+function formatJsonValue(value: unknown, indent = 0): string {
+  if (Array.isArray(value)) {
+    const isPrimitiveArray = value.every((v) => v === null || typeof v !== "object");
+    if (isPrimitiveArray && value.length <= 16) return JSON.stringify(value);
+    if (value.length === 0) return "[]";
+    const pad = "  ".repeat(indent + 1);
+    if (isPrimitiveArray) {
+      const sample = value.slice(0, 12).map((v) => JSON.stringify(v)).join(", ");
+      return `[${sample}, … (${value.length} items)]`;
+    }
+    return `[\n${value.map((v) => `${pad}${formatJsonValue(v, indent + 1)}`).join(",\n")}\n${"  ".repeat(indent)}]`;
   }
-  return "Unknown error";
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (entries.length === 0) return "{}";
+    const pad = "  ".repeat(indent + 1);
+    return `{\n${entries
+      .map(([k, v]) => `${pad}${JSON.stringify(k)}: ${formatJsonValue(v, indent + 1)}`)
+      .join(",\n")}\n${"  ".repeat(indent)}}`;
+  }
+  return JSON.stringify(value);
 }
 
-export function readTabFromLocation(): ConsoleTab {
-  const route = routeFromPathname(window.location.pathname);
-  return route.tab;
+export interface FormattedPreview {
+  text: string;
+  streamText?: string;
+  frameCount?: number;
+  kind?: "json" | "sse";
 }
 
-export { TAB_PATHS };
+export function formatPayloadPreview(raw: string, contentType?: string | null): FormattedPreview {
+  const trimmed = raw.trim();
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const sseLines = lines.filter((line) => line.startsWith("data:"));
+  if (sseLines.length > 0 && sseLines.length >= lines.length / 2) {
+    let tokens = "";
+    for (const line of sseLines) {
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const chunk = JSON.parse(payload) as {
+          choices?: Array<{ delta?: { content?: string }; text?: string }>;
+        };
+        for (const c of chunk.choices ?? []) {
+          tokens += c.delta?.content ?? c.text ?? "";
+        }
+      } catch {
+        // Trailing partial frame after preview truncation.
+      }
+    }
+    return {
+      text: sseLines.join("\n"),
+      streamText: tokens || undefined,
+      frameCount: sseLines.length,
+      kind: "sse",
+    };
+  }
+  if (contentType?.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      return { text: formatJsonValue(JSON.parse(trimmed)), kind: "json" };
+    } catch {
+      // Truncated or non-JSON body; preserve raw string.
+    }
+  }
+  return { text: raw };
+}

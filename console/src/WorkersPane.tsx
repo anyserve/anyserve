@@ -1,27 +1,8 @@
 import { useMemo, useState } from "react";
 
-import {
-  formatCapacityMap,
-  formatNumber,
-  formatPercent,
-  formatTimestamp,
-  truncateMiddle,
-} from "./format";
-import { t, type Lang } from "./i18n";
-import { IconSearch } from "./icons";
-import {
-  InspectorGroup,
-  InspectorSection,
-  KeyValueGrid,
-  MetaItem,
-} from "./pane-inspector-details";
-import {
-  EmptyState,
-  PanelHeader,
-  ProgressMeter,
-  StatsRow,
-  WorkerStateBadge,
-} from "./pane-tables";
+import { formatCapacityMap, formatNumber, formatPercent, formatShortTime, formatTimestamp } from "./format";
+import { InspectorGroup, InspectorSection, InspectorShell, KeyValueGrid, MetaGrid } from "./pane-inspector";
+import { EmptyState, PanelHeader, ProgressMeter, SearchInput, SelectField, StatsRow, WorkerStateBadge } from "./pane-tables";
 import type { OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 
 type HealthFilter = "all" | "healthy" | "draining" | "disconnected";
@@ -34,41 +15,19 @@ interface WorkersPaneProps {
   onSelectWorker: (workerId: string) => void;
   onViewJobsForWorker: (workerId: string) => void;
   onOpenInterface: (interfaceName: string) => void;
-  lang: Lang;
 }
 
-export function WorkersPane(props: WorkersPaneProps) {
-  const {
-    overview,
-    workersResponse,
-    workers,
-    selectedWorkerId,
-    onSelectWorker,
-    onViewJobsForWorker,
-    onOpenInterface,
-    lang,
-  } = props;
+const HEALTH_LABELS: Record<HealthFilter, string> = { all: "All", healthy: "Healthy", draining: "Draining", disconnected: "Disconnected" };
 
+export function WorkersPane(props: WorkersPaneProps) {
+  const { overview, workersResponse, workers, selectedWorkerId, onSelectWorker, onViewJobsForWorker, onOpenInterface } = props;
   const [healthFilter, setHealthFilter] = useState<HealthFilter>("all");
   const [poolFilter, setPoolFilter] = useState("all");
   const [interfaceFilter, setInterfaceFilter] = useState("all");
   const [search, setSearch] = useState("");
 
-  const poolOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const w of workers) {
-      if (w.pool) set.add(w.pool);
-    }
-    return Array.from(set).sort();
-  }, [workers]);
-
-  const interfaceOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const w of workers) {
-      for (const iface of w.interfaces) set.add(iface);
-    }
-    return Array.from(set).sort();
-  }, [workers]);
+  const poolOptions = useMemo(() => ["all", ...Array.from(new Set(workers.map((w) => w.pool).filter(Boolean) as string[])).sort()], [workers]);
+  const interfaceOptions = useMemo(() => ["all", ...Array.from(new Set(workers.flatMap((w) => w.interfaces))).sort()], [workers]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -78,181 +37,85 @@ export function WorkersPane(props: WorkersPaneProps) {
       if (healthFilter === "disconnected" && w.connected) return false;
       if (poolFilter !== "all" && (w.pool ?? "default") !== poolFilter) return false;
       if (interfaceFilter !== "all" && !w.interfaces.includes(interfaceFilter)) return false;
-      if (
-        q &&
-        !w.worker_id.toLowerCase().includes(q) &&
-        !(w.session_id ?? "").toLowerCase().includes(q) &&
-        !(w.pool ?? "").toLowerCase().includes(q) &&
-        !(w.namespace ?? "").toLowerCase().includes(q)
-      ) {
-        return false;
-      }
-      return true;
+      return !q || [w.worker_id, w.session_id, w.pool, w.namespace].some((s) => (s ?? "").toLowerCase().includes(q));
     });
   }, [workers, healthFilter, poolFilter, interfaceFilter, search]);
 
-  const activeWorker =
-    filtered.find((w) => w.worker_id === selectedWorkerId) ?? filtered[0] ?? null;
-
-  const totalCount = workersResponse?.total ?? overview?.workers.total ?? workers.length;
-  const healthyCount =
-    workersResponse?.healthy ??
-    overview?.workers.healthy ??
-    workers.filter((w) => w.healthy).length;
-  const drainingCount =
-    workersResponse?.draining ?? workers.filter((w) => w.connected && w.draining).length;
-  const disconnectedCount =
-    workersResponse?.disconnected ?? workers.filter((w) => !w.connected).length;
+  const activeWorker = filtered.find((w) => w.worker_id === selectedWorkerId) ?? filtered[0] ?? null;
 
   return (
     <div className="content-grid">
       <section className="panel">
         <StatsRow
           stats={[
-            { label: t(lang, "workers.stat.total"), value: totalCount },
-            { label: t(lang, "workers.stat.healthy"), value: healthyCount },
-            { label: t(lang, "workers.stat.draining"), value: drainingCount },
-            { label: t(lang, "workers.stat.disconnected"), value: disconnectedCount },
-            { label: t(lang, "workers.stat.leases"), value: overview?.workers.active_leases ?? 0 },
+            { label: "Total", value: workersResponse?.total ?? overview?.workers.total ?? workers.length },
+            { label: "Healthy", value: workersResponse?.healthy ?? overview?.workers.healthy ?? workers.filter((w) => w.healthy).length },
+            { label: "Draining", value: workersResponse?.draining ?? workers.filter((w) => w.connected && w.draining).length },
+            { label: "Disconnected", value: workersResponse?.disconnected ?? workers.filter((w) => !w.connected).length },
+            { label: "Active leases", value: overview?.workers.active_leases ?? 0 },
           ]}
         />
-
         <PanelHeader
-          title={t(lang, "workers.title")}
-          meta={
-            overview
-              ? `${formatNumber(filtered.length)} · ${formatCapacityMap(overview.workers.total_capacity)}`
-              : t(lang, "workers.subtitle")
-          }
+          title="Workers"
+          meta={overview && Object.keys(overview.workers.total_capacity).length > 0 ? `${formatNumber(filtered.length)} · ${formatCapacityMap(overview.workers.total_capacity)}` : formatNumber(filtered.length)}
         />
 
         <div className="panel__toolbar panel__toolbar--wrap">
           <div className="seg-control" role="group" aria-label="Worker health filter">
             {(["all", "healthy", "draining", "disconnected"] as const).map((item) => (
-              <button
-                key={item}
-                type="button"
-                className={`seg-control__btn${healthFilter === item ? " is-active" : ""}`}
-                aria-pressed={healthFilter === item}
-                onClick={() => setHealthFilter(item)}
-              >
-                {t(lang, `workers.filter.${item}`)}
+              <button key={item} type="button" className={`seg-control__btn${healthFilter === item ? " is-active" : ""}`} aria-pressed={healthFilter === item} onClick={() => setHealthFilter(item)}>
+                {HEALTH_LABELS[item]}
               </button>
             ))}
           </div>
-
           <div className="toolbar-filters">
-            <label className="field">
-              <span className="field__label">{t(lang, "workers.filter.pool")}</span>
-              <select
-                className="field__control"
-                value={poolFilter}
-                onChange={(event) => setPoolFilter(event.target.value)}
-              >
-                <option value="all">{t(lang, "workers.filter.allPools")}</option>
-                {poolOptions.map((pool) => (
-                  <option key={pool} value={pool}>
-                    {pool}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="field">
-              <span className="field__label">{t(lang, "workers.filter.interface")}</span>
-              <select
-                className="field__control"
-                value={interfaceFilter}
-                onChange={(event) => setInterfaceFilter(event.target.value)}
-              >
-                <option value="all">{t(lang, "workers.filter.allInterfaces")}</option>
-                {interfaceOptions.map((iface) => (
-                  <option key={iface} value={iface}>
-                    {iface}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div className="search-box">
-              <IconSearch className="search-box__icon" />
-              <input
-                type="search"
-                className="search-box__input"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder={t(lang, "workers.filter.searchPlaceholder")}
-                aria-label={t(lang, "workers.filter.searchPlaceholder")}
-              />
-            </div>
+            <SelectField label="Pool" value={poolFilter} options={poolOptions.map((p) => ({ value: p, label: p === "all" ? "All pools" : p }))} onChange={setPoolFilter} />
+            <SelectField label="Interface" value={interfaceFilter} options={interfaceOptions.map((i) => ({ value: i, label: i === "all" ? "All interfaces" : i }))} onChange={setInterfaceFilter} />
+            <SearchInput value={search} placeholder="Search worker, session, pool…" onChange={setSearch} />
           </div>
         </div>
 
         {filtered.length === 0 ? (
-          <EmptyState message={t(lang, "workers.empty")} />
+          <EmptyState message="No workers match the current filters" />
         ) : (
           <div className="table-wrap">
-            <table className="table table--interactive">
+            <table className="table table--fixed table--interactive">
               <thead>
                 <tr>
-                  <th>{t(lang, "workers.table.status")}</th>
-                  <th>{t(lang, "workers.table.worker")}</th>
-                  <th>{t(lang, "workers.table.pool")}</th>
-                  <th>{t(lang, "workers.table.interfaces")}</th>
-                  <th>{t(lang, "workers.table.leases")}</th>
-                  <th>{t(lang, "workers.table.utilization")}</th>
-                  <th>{t(lang, "workers.table.lastSeen")}</th>
+                  <th style={{ width: "18%" }}>Status</th>
+                  <th style={{ width: "22%" }}>Worker</th>
+                  <th style={{ width: "14%" }}>Pool</th>
+                  <th style={{ width: "16%" }}>Interfaces</th>
+                  <th style={{ width: "17%" }}>Occupancy</th>
+                  <th style={{ width: "13%" }}>Last seen</th>
                 </tr>
               </thead>
               <tbody>
                 {filtered.map((worker) => {
-                  const isSelected = activeWorker?.worker_id === worker.worker_id;
-                  const utilPct = Math.max(0, Math.min(100, (worker.utilization ?? 0) * 100));
+                  const slotRatio = worker.max_concurrency > 0 ? worker.active_leases / worker.max_concurrency : 0;
+                  const ifaces = worker.interfaces.join(", ") || "None";
                   return (
-                    <tr
-                      key={worker.session_id ?? worker.worker_id}
-                      className={isSelected ? "is-selected" : ""}
-                      onClick={() => onSelectWorker(worker.worker_id)}
-                    >
+                    <tr key={worker.session_id ?? worker.worker_id} className={activeWorker?.worker_id === worker.worker_id ? "is-selected" : ""} onClick={() => onSelectWorker(worker.worker_id)}>
+                      <td><WorkerStateBadge worker={worker} /></td>
                       <td>
-                        <WorkerStateBadge worker={worker} lang={lang} />
+                        <div className="table__primary mono ellipsis" title={worker.worker_id}>{worker.worker_id}</div>
+                        {worker.session_id ? <div className="table__secondary mono ellipsis" title={worker.session_id}>{worker.session_id}</div> : null}
                       </td>
                       <td>
-                        <div className="table__primary table__mono">
-                          {truncateMiddle(worker.worker_id, 26)}
-                        </div>
-                        {worker.session_id ? (
-                          <div className="table__secondary table__mono">
-                            {truncateMiddle(worker.session_id, 22)}
+                        <div className="table__primary mono ellipsis" title={worker.pool ?? "default"}>{worker.pool ?? "default"}</div>
+                        {worker.namespace && worker.namespace !== "default" ? <div className="table__secondary ellipsis">{worker.namespace}</div> : null}
+                      </td>
+                      <td className="mono ellipsis" title={ifaces}>{ifaces}</td>
+                      <td>
+                        <div className="occupancy-cell" title={`${worker.active_leases} active / ${worker.max_concurrency} max (${worker.free_slots} free)`}>
+                          <div className="occupancy-cell__row num">
+                            <span>{worker.active_leases} / {worker.max_concurrency}</span>
+                            <span className="muted">{formatPercent(slotRatio)}</span>
                           </div>
-                        ) : null}
-                      </td>
-                      <td>
-                        <div className="cell-stack">
-                          <span className="tag-inline">{worker.namespace ?? "default"}</span>
-                          <span className="table__mono table__secondary">
-                            {worker.pool ?? "default"}
-                          </span>
+                          <ProgressMeter percent={slotRatio * 100} />
                         </div>
                       </td>
-                      <td className="table__mono">
-                        {worker.interfaces.join(", ") || t(lang, "common.none")}
-                      </td>
-                      <td className="num">
-                        <div>
-                          {worker.active_leases} / {worker.max_concurrency}
-                        </div>
-                        <div className="table__secondary">{worker.free_slots} free</div>
-                      </td>
-                      <td>
-                        <div className="util-cell">
-                          <ProgressMeter percent={utilPct} />
-                          <span className="num">{formatPercent(worker.utilization)}</span>
-                        </div>
-                      </td>
-                      <td className="table__mono table__timestamp">
-                        {formatTimestamp(worker.last_seen_at_ms)}
-                      </td>
+                      <td className="mono table__timestamp" title={formatTimestamp(worker.last_seen_at_ms)}>{formatShortTime(worker.last_seen_at_ms)}</td>
                     </tr>
                   );
                 })}
@@ -262,146 +125,81 @@ export function WorkersPane(props: WorkersPaneProps) {
         )}
       </section>
 
-      <aside className="panel panel--aside panel--detail">
-        {!activeWorker ? (
+      <InspectorShell
+        isEmpty={!activeWorker}
+        emptyTitle="Worker & Session Inspector"
+        emptyHint="Select a worker"
+        emptyMessage="Select a worker to inspect its outbound gRPC session, load, attributes, and capacity."
+        title={activeWorker?.worker_id ?? ""}
+        subtitle={activeWorker ? `${activeWorker.namespace ?? "default"} · ${activeWorker.pool ?? "default"}` : null}
+        actions={
+          activeWorker ? (
+            <>
+              <WorkerStateBadge worker={activeWorker} />
+              <button type="button" className="button button--primary" onClick={() => onViewJobsForWorker(activeWorker.worker_id)}>
+                View Worker Jobs
+              </button>
+            </>
+          ) : null
+        }
+      >
+        {activeWorker ? (
           <>
-            <div className="panel__header">
-              <div className="panel__header-title">
-                <h1>{t(lang, "workers.inspector.title")}</h1>
-                <span>{t(lang, "workers.inspector.select")}</span>
-              </div>
-            </div>
-            <EmptyState message={t(lang, "workers.inspector.empty")} />
-          </>
-        ) : (
-          <>
-            <div className="panel__header panel__header--stack">
-              <div className="inspector__identity">
-                <h1>{truncateMiddle(activeWorker.worker_id, 34)}</h1>
-                <span>
-                  {activeWorker.namespace ?? "default"} · {activeWorker.pool ?? "default"}
-                </span>
-              </div>
-              <div className="inspector__actions">
-                <WorkerStateBadge worker={activeWorker} lang={lang} />
-                <button
-                  type="button"
-                  className="button button--primary"
-                  onClick={() => onViewJobsForWorker(activeWorker.worker_id)}
-                >
-                  {t(lang, "workers.inspector.viewJobs")}
-                </button>
-              </div>
-            </div>
-
             {!activeWorker.connected && activeWorker.active_leases > 0 ? (
-              <p className="inline-notice" role="status">
-                {t(lang, "workers.inspector.graceNote")}
-              </p>
+              <p className="inline-notice" role="status">Session disconnected; active leases survive until reconnect grace expires.</p>
             ) : null}
 
-            <InspectorGroup
-              title={t(lang, "workers.inspector.session")}
-              meta={activeWorker.connected ? "gRPC stream active" : "gRPC stream closed"}
-            >
-              <div className="meta-grid">
-                <MetaItem
-                  label={t(lang, "workers.inspector.sessionId")}
-                  value={activeWorker.session_id ?? t(lang, "common.na")}
-                  mono
-                />
-                <MetaItem
-                  label={t(lang, "workers.inspector.transport")}
-                  value={`${activeWorker.connected ? "connected" : "disconnected"}${
-                    activeWorker.draining ? " · draining" : ""
-                  }`}
-                />
-                <MetaItem
-                  label={t(lang, "workers.inspector.connectedAt")}
-                  value={formatTimestamp(activeWorker.connected_at_ms)}
-                  mono
-                />
-                <MetaItem
-                  label={t(lang, "workers.inspector.lastSeen")}
-                  value={formatTimestamp(activeWorker.last_seen_at_ms)}
-                  mono
-                />
-              </div>
+            <InspectorGroup title="Outbound Session" meta={activeWorker.connected ? "gRPC stream active" : "gRPC stream closed"}>
+              <MetaGrid
+                items={[
+                  { label: "Session ID", value: activeWorker.session_id ?? "N/A", mono: true },
+                  { label: "Transport state", value: `${activeWorker.connected ? "connected" : "disconnected"}${activeWorker.draining ? " · draining" : ""}` },
+                  { label: "Connected at", value: formatTimestamp(activeWorker.connected_at_ms), mono: true },
+                  { label: "Last seen", value: formatTimestamp(activeWorker.last_seen_at_ms), mono: true },
+                ]}
+              />
             </InspectorGroup>
 
-            <InspectorGroup
-              title={t(lang, "workers.inspector.load")}
-              meta={`${activeWorker.active_leases} / ${activeWorker.max_concurrency} leases`}
-            >
-              <div className="meta-grid">
-                <MetaItem
-                  label={t(lang, "workers.inspector.queued")}
-                  value={formatNumber(activeWorker.load?.queued ?? 0)}
-                />
-                <MetaItem
-                  label={t(lang, "workers.inspector.running")}
-                  value={formatNumber(activeWorker.load?.running ?? activeWorker.active_leases)}
-                />
-                <MetaItem
-                  label={t(lang, "workers.inspector.utilization")}
-                  value={formatPercent(activeWorker.load?.utilization ?? activeWorker.utilization)}
-                />
-                <MetaItem
-                  label={t(lang, "interfaces.table.freeSlots")}
-                  value={formatNumber(activeWorker.free_slots)}
-                />
-              </div>
-
+            <InspectorGroup title="Reported Load" meta={`${activeWorker.active_leases} / ${activeWorker.max_concurrency} leases`}>
+              <MetaGrid
+                items={[
+                  { label: "Worker queued", value: formatNumber(activeWorker.load?.queued ?? 0) },
+                  { label: "Worker running", value: formatNumber(activeWorker.load?.running ?? activeWorker.active_leases) },
+                  { label: "Utilization", value: formatPercent(activeWorker.load?.utilization ?? activeWorker.utilization) },
+                  { label: "Free slots", value: formatNumber(activeWorker.free_slots) },
+                ]}
+              />
               {activeWorker.load && Object.keys(activeWorker.load.custom).length > 0 ? (
-                <InspectorSection title={t(lang, "workers.inspector.customLoad")}>
-                  <KeyValueGrid
-                    entries={activeWorker.load.custom}
-                    emptyMessage={t(lang, "common.none")}
-                  />
+                <InspectorSection title="Custom load metrics">
+                  <KeyValueGrid entries={activeWorker.load.custom} emptyMessage="None" />
                 </InspectorSection>
               ) : null}
             </InspectorGroup>
 
-            <InspectorGroup
-              title={t(lang, "workers.inspector.capacity")}
-              meta={formatCapacityMap(activeWorker.total_capacity)}
-            >
-              <InspectorSection title={t(lang, "workers.inspector.totalCapacity")}>
-                <KeyValueGrid
-                  entries={activeWorker.total_capacity}
-                  emptyMessage={t(lang, "common.none")}
-                />
+            <InspectorGroup title="Capacity & Attributes" meta={formatCapacityMap(activeWorker.total_capacity)}>
+              <InspectorSection title="Total capacity">
+                <KeyValueGrid entries={activeWorker.total_capacity} emptyMessage="None" />
               </InspectorSection>
-
-              <InspectorSection title={t(lang, "workers.inspector.interfaces")}>
+              <InspectorSection title="Served interfaces">
                 {activeWorker.interfaces.length === 0 ? (
-                  <EmptyState message={t(lang, "common.none")} compact />
+                  <EmptyState message="None" inline />
                 ) : (
                   <div className="chip-list">
                     {activeWorker.interfaces.map((iface) => (
-                      <button
-                        key={iface}
-                        type="button"
-                        className="chip-btn"
-                        onClick={() => onOpenInterface(iface)}
-                      >
-                        <span className="table__mono">{iface}</span>
+                      <button key={iface} type="button" className="chip-btn" onClick={() => onOpenInterface(iface)}>
+                        <span className="mono">{iface}</span>
                       </button>
                     ))}
                   </div>
                 )}
               </InspectorSection>
-
-              <InspectorSection title={t(lang, "workers.inspector.attributes")}>
-                <KeyValueGrid
-                  entries={activeWorker.attributes}
-                  emptyMessage={t(lang, "common.none")}
-                />
+              <InspectorSection title="Worker attributes">
+                <KeyValueGrid entries={activeWorker.attributes} emptyMessage="None" />
               </InspectorSection>
             </InspectorGroup>
           </>
-        )}
-      </aside>
+        ) : null}
+      </InspectorShell>
     </div>
   );
 }

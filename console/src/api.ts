@@ -29,7 +29,7 @@ export function clearConsoleToken(): void {
   try {
     sessionStorage.removeItem(tokenKey);
   } catch {
-    // Ignore storage errors in restricted environments.
+    // Ignore restricted storage environments.
   }
 }
 
@@ -38,38 +38,9 @@ export function hasConsoleToken(): boolean {
   return Boolean(token && token.trim().length > 0);
 }
 
-export function getAnalyticsJobs(
-  source: AnalyticsSource,
-  fromMs: number,
-  toMs: number,
-  limit: number,
-  cursor: string | null,
-  signal: AbortSignal,
-  namespace?: string,
-): Promise<AnalyticsResponse> {
-  const params = new URLSearchParams({
-    source,
-    from_ms: String(fromMs),
-    to_ms: String(toMs),
-    limit: String(limit),
-  });
-  if (cursor) params.set("cursor", cursor);
-  const ns = namespace?.trim();
-  if (ns) params.set("namespace", ns);
-  return request(`/api/analytics/jobs?${params}`, { signal });
-}
-
-interface ApiErrorPayload {
-  error?: string | { message?: string };
-}
-
-function apiUrl(path: string): string {
-  return apiBase ? `${apiBase}${path}` : path;
-}
-
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getConsoleToken();
-  const response = await fetch(apiUrl(path), {
+  const response = await fetch(apiBase ? `${apiBase}${path}` : path, {
     ...init,
     headers: {
       Accept: "application/json",
@@ -81,26 +52,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
     try {
-      const payload = (await response.json()) as ApiErrorPayload;
-      if (typeof payload.error === "string") {
-        message = payload.error;
-      } else if (payload.error?.message) {
-        message = payload.error.message;
-      }
+      const payload = (await response.json()) as { error?: string | { message?: string } };
+      if (typeof payload.error === "string") message = payload.error;
+      else if (payload.error?.message) message = payload.error.message;
     } catch {
       // Ignore non-JSON error bodies.
     }
-    if (response.status === 401 || response.status === 403) {
-      throw new AuthenticationError(message);
-    }
+    if (response.status === 401 || response.status === 403) throw new AuthenticationError(message);
     throw new Error(message);
   }
 
-  if (response.status === 204) {
-    return undefined as T;
-  }
+  return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
+}
 
-  return (await response.json()) as T;
+function withNamespace(path: string, namespace?: string): string {
+  const ns = namespace?.trim();
+  return ns && ns !== "default" ? `${path}?namespace=${encodeURIComponent(ns)}` : path;
 }
 
 export function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
@@ -120,49 +87,38 @@ export function getJobs(
   filters?: JobsQueryFilters,
 ): Promise<JobsResponse> {
   const params = new URLSearchParams();
-  if (states.length > 0) {
-    params.set("states", states.join(","));
-  }
+  if (states.length > 0) params.set("states", states.join(","));
   params.set("limit", String(limit));
   params.set(typeof offset === "string" ? "page_token" : "offset", String(offset));
-
   const iface = filters?.interface?.trim();
-  if (iface && iface !== "all") {
-    params.set("interface", iface);
-  }
+  if (iface && iface !== "all") params.set("interface", iface);
   const ns = filters?.namespace?.trim();
-  if (ns && ns !== "all") {
-    params.set("namespace", ns);
-  }
-
-  return request(`/api/jobs?${params.toString()}`, { signal });
+  if (ns && ns !== "all") params.set("namespace", ns);
+  return request(`/api/jobs?${params}`, { signal });
 }
 
-function appendNamespaceQuery(path: string, namespace?: string): string {
-  const ns = namespace?.trim();
-  if (!ns || ns === "default") {
-    return path;
-  }
-  return `${path}?namespace=${encodeURIComponent(ns)}`;
-}
-
-export function getJob(
-  jobId: string,
-  signal?: AbortSignal,
+export function getAnalyticsJobs(
+  source: AnalyticsSource,
+  fromMs: number,
+  toMs: number,
+  limit: number,
+  cursor: string | null,
+  signal: AbortSignal,
   namespace?: string,
-): Promise<JobDetailResponse> {
-  return request(appendNamespaceQuery(`/api/jobs/${encodeURIComponent(jobId)}`, namespace), {
-    signal,
-  });
+): Promise<AnalyticsResponse> {
+  const params = new URLSearchParams({ source, from_ms: String(fromMs), to_ms: String(toMs), limit: String(limit) });
+  if (cursor) params.set("cursor", cursor);
+  const ns = namespace?.trim();
+  if (ns) params.set("namespace", ns);
+  return request(`/api/analytics/jobs?${params}`, { signal });
+}
+
+export function getJob(jobId: string, signal?: AbortSignal, namespace?: string): Promise<JobDetailResponse> {
+  return request(withNamespace(`/api/jobs/${encodeURIComponent(jobId)}`, namespace), { signal });
 }
 
 export function cancelJob(jobId: string, namespace?: string): Promise<CancelJobResponse> {
-  return request(
-    appendNamespaceQuery(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, namespace),
-    {
-      method: "POST",
-    },
-  );
+  return request(withNamespace(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, namespace), { method: "POST" });
 }
 
 export function getWorkers(signal?: AbortSignal): Promise<WorkersResponse> {

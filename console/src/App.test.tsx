@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
 import {
@@ -93,6 +93,7 @@ const richOverview = (): OverviewResponse => ({
     total: 3,
     healthy: 2,
     unavailable: 1,
+    draining: 1,
     active_leases: 4,
     total_capacity: { gpu: 4, cpu: 16 },
     last_seen_at_ms: 1_700_000_000_000,
@@ -180,15 +181,15 @@ const richWorkers = (): WorkersResponse => ({
       interfaces: ["llm.generate"],
       attributes: { arch: "cuda", zone: "us-east" },
       total_capacity: { gpu: 2 },
-      max_concurrency: 4,
+      max_concurrency: 3,
       free_slots: 2,
-      utilization: 0.5,
+      utilization: 0,
       connected: true,
       draining: false,
-      active_leases: 2,
+      active_leases: 1,
       connected_at_ms: 1_700_000_000_000,
       last_seen_at_ms: 1_700_000_004_000,
-      load: { queued: 1, running: 2, utilization: 0.5, custom: { vram_gb: 24 } },
+      load: { queued: 1, running: 2, utilization: 0, custom: { vram_gb: 24 } },
     },
     {
       worker_id: "worker-drain-02",
@@ -241,8 +242,7 @@ beforeEach(() => {
   window.history.replaceState(null, "", "/queue");
   replies = new Map();
   vi.mocked(getJobs).mockImplementation(async (states) => ({
-    jobs:
-      states.length === 0 || states.includes("queued") ? [summary("A"), summary("B")] : [],
+    jobs: states.length === 0 || states.includes("queued") ? [summary("A"), summary("B")] : [],
     next_page_token: null,
   }));
   vi.mocked(getJob).mockImplementation((id) => new Promise((resolve) => replies.set(id, resolve)));
@@ -312,12 +312,10 @@ it("keeps each scope's selection and follows the worker filter", async () => {
   expect(screen.queryByRole("button", { name: "Cancel job" })).toBeNull();
 });
 
-it("polls the active pane and fetches completed details only once per selection", async () => {
+it("polls only active panes and fetches completed details only once per selection", async () => {
   vi.useFakeTimers();
   vi.mocked(getJobs).mockImplementation(async (states) => ({
-    jobs: states.includes("queued")
-      ? [summary("A")]
-      : [{ ...summary("B"), state: "succeeded" }],
+    jobs: states.includes("queued") ? [summary("A")] : [{ ...summary("B"), state: "succeeded" }],
     next_page_token: null,
   }));
   vi.mocked(getJob).mockImplementation(async (id) => ({
@@ -349,40 +347,37 @@ it("polls the active pane and fetches completed details only once per selection"
   expect(getJob).toHaveBeenCalledWith("B", expect.any(AbortSignal), undefined);
 });
 
-it("renders Overview with control plane, budgets, journal stats, and click-throughs", async () => {
+it("polls only /api/overview on Overview, renders draining count, and supports click-throughs", async () => {
   window.history.replaceState(null, "", "/");
   vi.mocked(getOverview).mockResolvedValue(richOverview());
   vi.mocked(getWorkers).mockResolvedValue(richWorkers());
 
   render(<App />);
   expect(await screen.findByText("Memory Byte Budgets")).toBeTruthy();
+  expect(getWorkers).not.toHaveBeenCalled();
   expect(screen.getByText("127.0.0.1:50052")).toBeTruthy();
   expect(screen.getByText("127.0.0.1:3001")).toBeTruthy();
   expect(screen.getByText(/42 \/ 310/)).toBeTruthy();
   expect(screen.getByText("8 ops · 650 µs")).toBeTruthy();
   expect(screen.getByText("2.0 KiB / 16.0 KiB (12.5%)")).toBeTruthy();
-  expect(await screen.findByText("Draining")).toBeTruthy();
+  expect(screen.getByText("Draining")).toBeTruthy();
+  expect(screen.getAllByText("Memory + SQLite journal")).toHaveLength(1);
 
-  // Click an interface row in Overview -> opens Interfaces view with inspector
   fireEvent.click(screen.getAllByText("llm.generate")[0]);
   expect(await screen.findByText("Pool Tiers Spillover Chain")).toBeTruthy();
   expect(screen.getAllByText("gpu-primary").length).toBeGreaterThan(0);
   expect(screen.getAllByText("gpu-burst").length).toBeGreaterThan(0);
 
-  // Click View Jobs -> jumps to Jobs filtered by interface
   fireEvent.click(screen.getByRole("button", { name: "View Jobs" }));
   await waitFor(() =>
-    expect(getJobs).toHaveBeenCalledWith(
-      [],
-      100,
-      0,
-      expect.any(AbortSignal),
-      { interface: "llm.generate", namespace: "all" },
-    ),
+    expect(getJobs).toHaveBeenCalledWith([], 100, 0, expect.any(AbortSignal), {
+      interface: "llm.generate",
+      namespace: "all",
+    }),
   );
 });
 
-it("renders Pools and Workers with inspectors, filters, and navigation", async () => {
+it("renders Pools and Workers with slot occupancy meters, reported load, and navigation", async () => {
   window.history.replaceState(null, "", "/pools");
   vi.mocked(getOverview).mockResolvedValue(richOverview());
   vi.mocked(getWorkers).mockResolvedValue(richWorkers());
@@ -393,21 +388,18 @@ it("renders Pools and Workers with inspectors, filters, and navigation", async (
   expect(screen.getByText("+3")).toBeTruthy();
   expect(screen.getByText("Spillover Tier Position")).toBeTruthy();
 
-  // Navigate to Workers from sidebar
   fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
   expect(await screen.findByRole("heading", { name: "worker-gpu-01" })).toBeTruthy();
+  expect(screen.getByText("1 / 3")).toBeTruthy();
+  expect(screen.getByText("33%")).toBeTruthy();
   expect(screen.getAllByText("sess-111").length).toBeGreaterThan(0);
   expect(screen.getByText("vram_gb")).toBeTruthy();
 
-  // Filter by disconnected
   fireEvent.click(screen.getByRole("button", { name: "Disconnected" }));
   expect(screen.queryByRole("heading", { name: "worker-gpu-01" })).toBeNull();
   expect(screen.getByRole("heading", { name: "worker-lost-03" })).toBeTruthy();
-  expect(
-    screen.getByText("Session disconnected; active leases survive until reconnect grace expires."),
-  ).toBeTruthy();
+  expect(screen.getByText("Session disconnected; active leases survive until reconnect grace expires.")).toBeTruthy();
 
-  // Jump from WorkerInspector -> Jobs filtered by worker
   fireEvent.click(screen.getByRole("button", { name: "View Worker Jobs" }));
   await waitFor(() => expect(window.location.pathname).toBe("/jobs"));
 });
@@ -422,7 +414,7 @@ it("renders resiliently when optional overview and worker fields are absent", as
   expect(screen.getByText("Control plane metadata unavailable on this server payload.")).toBeTruthy();
 });
 
-it("supports job search, server filters, Load more pagination, and real scheduling fields in JobInspector", async () => {
+it("formats OpenAI SSE / JSON payloads, shows retryable attempts, and collapses empty payload boxes", async () => {
   window.history.replaceState(null, "", "/jobs");
   vi.mocked(getOverview).mockResolvedValue(richOverview());
   vi.mocked(getJobs)
@@ -431,72 +423,105 @@ it("supports job search, server filters, Load more pagination, and real scheduli
         summary("job-1", {
           namespace: "tenant-a",
           durability: "durable",
-          interface_name: "llm.generate",
+          interface_name: "openai/chat/qwen2.5-7b",
           source: "sdk-py",
           error_code: "worker_failed",
           error_retryable: true,
-          last_error: "OOM",
+          last_error: "HTTP 503: upstream busy",
           state: "failed",
         }),
       ],
       next_page_token: "cursor-2",
     })
     .mockResolvedValueOnce({
-      jobs: [summary("job-2", { namespace: "tenant-a", interface_name: "llm.generate" })],
+      jobs: [summary("job-2", { namespace: "tenant-a", interface_name: "triton/minilm" })],
       next_page_token: null,
     });
-  vi.mocked(getJob).mockImplementation(async (id) => ({
-    ...detail(id, {
-      namespace: "tenant-a",
-      durability: "durable",
-      state: id === "job-1" ? "failed" : "queued",
-      error_code: id === "job-1" ? "worker_failed" : null,
-      error_retryable: id === "job-1" ? true : null,
-      last_error: id === "job-1" ? "OOM" : null,
-      demand: {
-        interface: "llm.generate",
-        required_attributes: { arch: "cuda" },
-        preferred_attributes: {},
-        required_capacity: { gpu: 1 },
-        affinity_key: "model-llama3",
-      },
-      policy: {
-        priority: 3,
-        max_attempts: 5,
-        durability: "Durable",
-        queue_timeout: { secs: 10, nanos: 0 },
-        execution_timeout: { secs: 60, nanos: 0 },
-        total_timeout: null,
-        spillover_after: { secs: 0, nanos: 500_000_000 },
-        fairness_key: "org-42",
-        concurrency_key: "slot-A",
-      },
-    }),
-  }));
+  vi.mocked(getJob).mockImplementation(async (id) =>
+    id === "job-1"
+      ? {
+          ...detail(id, {
+            namespace: "tenant-a",
+            durability: "durable",
+            interface_name: "openai/chat/qwen2.5-7b",
+            state: "failed",
+            error_code: "worker_failed",
+            error_retryable: true,
+            last_error: "HTTP 503: upstream busy",
+            params_size_bytes: 42,
+            params_preview: '{"messages":[{"role":"user","content":"hi"}],"stream":true}',
+            output_preview: {
+              size_bytes: 95,
+              content_type: "text/event-stream",
+              preview: 'data: {"choices":[{"delta":{"content":"Hello"}}]}\ndata: {"choices":[{"delta":{"content":"!"}}]}\ndata: [DONE]',
+              truncated: false,
+            },
+            demand: {
+              interface: "openai/chat/qwen2.5-7b",
+              required_attributes: { arch: "cuda" },
+              preferred_attributes: {},
+              required_capacity: { gpu: 1 },
+              affinity_key: "model-llama3",
+            },
+            policy: {
+              priority: 3,
+              max_attempts: 5,
+              durability: "Durable",
+              queue_timeout: { secs: 10, nanos: 0 },
+              execution_timeout: { secs: 60, nanos: 0 },
+              total_timeout: null,
+              spillover_after: { secs: 0, nanos: 500_000_000 },
+              fairness_key: "org-42",
+              concurrency_key: "slot-A",
+            },
+          }),
+          attempts: [
+            {
+              attempt_id: "att-1",
+              state: "restarted",
+              worker_id: "w-1",
+              created_at_ms: 10,
+              finished_at_ms: 20,
+              duration_ms: 10,
+              last_error: "HTTP 503: upstream busy",
+            },
+            {
+              attempt_id: "att-2",
+              state: "failed",
+              worker_id: "w-2",
+              created_at_ms: 30,
+              finished_at_ms: 40,
+              duration_ms: 10,
+              last_error: "HTTP 503: upstream busy",
+            },
+          ],
+        }
+      : detail(id, { namespace: "tenant-a", interface_name: "triton/minilm" }),
+  );
 
   render(<App />);
   expect(await screen.findByText("job-1")).toBeTruthy();
-  await waitFor(() =>
-    expect(getJob).toHaveBeenCalledWith("job-1", expect.any(AbortSignal), "tenant-a"),
-  );
+  await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-1", expect.any(AbortSignal), "tenant-a"));
   expect(await screen.findByText(/Affinity key: model-llama3/)).toBeTruthy();
   expect(screen.getByText(/Fairness key: org-42/)).toBeTruthy();
   expect(screen.getByText(/Concurrency key: slot-A/)).toBeTruthy();
   expect(screen.getByText("Retryable")).toBeTruthy();
+  expect(screen.getByText("retryable · retried")).toBeTruthy();
+  expect(screen.getByText("Streamed text · 3 SSE frames")).toBeTruthy();
+  expect(screen.getByText("Hello!")).toBeTruthy();
 
-  // Load more pagination
   fireEvent.click(screen.getByRole("button", { name: "Load more" }));
   expect(await screen.findByText("job-2")).toBeTruthy();
 
-  // Search box filters visible jobs
-  fireEvent.change(screen.getByPlaceholderText("Search job ID, source, error…"), {
-    target: { value: "job-2" },
-  });
+  fireEvent.change(screen.getByPlaceholderText("Search job ID, source, error…"), { target: { value: "job-2" } });
   expect(screen.queryByText("job-1")).toBeNull();
   expect(screen.getByText("job-2")).toBeTruthy();
+
+  fireEvent.click(screen.getByText("job-2"));
+  expect(await screen.findByText("No retained request or response payloads.")).toBeTruthy();
 });
 
-it("toggles EN/中文 language, Light/Dark theme, and disconnects token cleanly", async () => {
+it("toggles Light/Dark theme and disconnects token cleanly", async () => {
   window.history.replaceState(null, "", "/");
   setConsoleToken("secret-token");
   vi.mocked(getOverview).mockResolvedValue(richOverview());
@@ -505,21 +530,10 @@ it("toggles EN/中文 language, Light/Dark theme, and disconnects token cleanly"
   expect(await screen.findByText("Memory Byte Budgets")).toBeTruthy();
   expect(document.documentElement.getAttribute("data-theme")).toBe("light");
 
-  // Toggle theme -> dark
   fireEvent.click(screen.getByRole("button", { name: "Switch theme" }));
   expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
 
-  // Toggle language -> zh
-  fireEvent.click(screen.getByRole("button", { name: "Switch language" }));
-  expect(screen.getByText("内存字节预算")).toBeTruthy();
-  const nav = screen.getByRole("navigation", { name: "Console sections" });
-  expect(within(nav).getByText("概览")).toBeTruthy();
-  expect(within(nav).getByText("请求")).toBeTruthy();
-  expect(within(nav).getByText("路由")).toBeTruthy();
-  expect(within(nav).getByText("路由组")).toBeTruthy();
-
-  // Disconnect clears token and opens auth prompt
-  fireEvent.click(screen.getByRole("button", { name: "断开连接" }));
+  fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
   expect(hasConsoleToken()).toBe(false);
-  expect(screen.getByRole("button", { name: "连接" })).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
 });

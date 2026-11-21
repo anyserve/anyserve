@@ -1,408 +1,179 @@
 import type { ConsoleTab } from "./app-constants";
-import {
-  budgetPercent,
-  formatBytes,
-  formatCapacityMap,
-  formatDuration,
-  formatMicros,
-  formatNumber,
-  formatTimestamp,
-} from "./format";
-import { t, type Lang } from "./i18n";
+import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber } from "./format";
 import { IconArrowRight } from "./icons";
+import { MetaGrid } from "./pane-inspector";
 import { EmptyState, InterfacesTable, PanelHeader, ProgressMeter } from "./pane-tables";
-import type { OverviewResponse, WorkersResponse } from "./types";
+import type { OverviewResponse } from "./types";
 
 interface OverviewPaneProps {
   overview: OverviewResponse | null;
-  workersResponse: WorkersResponse | null;
-  lang: Lang;
   onNavigate: (tab: ConsoleTab) => void;
   onOpenInterface: (interfaceName: string) => void;
   onOpenPool: (poolKey: string) => void;
 }
 
-export function OverviewPane(props: OverviewPaneProps) {
-  const { overview, workersResponse, lang, onNavigate, onOpenInterface, onOpenPool } = props;
+export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool }: OverviewPaneProps) {
   const cp = overview?.control_plane;
   const health = overview?.health;
   const budgets = overview?.budgets;
-  const journalStats = overview?.journal_stats;
+  const js = overview?.journal_stats;
   const pools = overview?.pools ?? [];
   const interfaces = overview?.interfaces ?? [];
+  const draining = overview?.workers.draining;
+  const journalStatus = health?.journal.status ?? (overview?.runtime.journal === "disabled" ? "disabled" : "healthy");
+  const healthDot = !overview ? "offline" : health && !health.live ? "bad" : health && !health.ready ? "warn" : "ok";
+  const healthLabel = !overview ? "Connecting" : health && !health.live ? "Not live" : health && !health.ready ? "Not ready" : "Ready";
 
-  const drainingCount =
-    workersResponse?.draining ??
-    workersResponse?.workers.filter((w) => w.connected && w.draining).length ??
-    null;
-
-  const journalStatus =
-    health?.journal.status ??
-    (overview?.runtime.journal === "disabled" ? "disabled" : "healthy");
+  const cpItems = cp
+    ? [
+        { label: "gRPC listen", value: cp.grpc_listen, mono: true, tag: `TLS: ${cp.grpc_tls_enabled ? "On" : "Off"}` },
+        { label: "Console listen", value: cp.console_listen, mono: true, tag: `Auth: ${cp.auth_enabled ? "On" : "Off"}` },
+        { label: "Leader generation", value: `#${formatNumber(cp.generation)}` },
+        { label: "Priority / Max attempts", value: `${cp.priority_levels} / ${cp.default_max_attempts}` },
+        { label: "Heartbeat / Timeout", value: `${formatDuration(cp.heartbeat_interval_ms)} / ${formatDuration(cp.heartbeat_timeout_ms)}` },
+        { label: "Reconnect grace", value: cp.reconnect_grace_ms != null ? formatDuration(cp.reconnect_grace_ms) : "Default" },
+        ...(js
+          ? [
+              { label: "Pending ops", value: formatNumber(js.pending_ops) },
+              { label: "Committed batches / ops", value: `${formatNumber(js.committed_batches)} / ${formatNumber(js.committed_ops)}` },
+              { label: "Last batch / Latency", value: `${formatNumber(js.last_batch_size)} ops · ${formatMicros(js.last_commit_micros)}` },
+            ]
+          : []),
+      ]
+    : [];
 
   return (
     <div className="overview-page">
       <section className="panel overview-hero">
-        <PanelHeader
-          title={t(lang, "overview.title")}
-          meta={t(lang, "overview.subtitle")}
-          actions={
-            overview ? (
-              <span className="pill-meta">
-                {overview.runtime.label} · {formatTimestamp(overview.refreshed_at_ms)}
-              </span>
-            ) : null
-          }
-        />
-
+        <PanelHeader title="Overview" />
         <div className="kpi-grid">
-          {/* Queue */}
           <div className="kpi-card">
             <div className="kpi-card__head">
-              <span>{t(lang, "overview.card.queue")}</span>
-              <button
-                type="button"
-                className="link-inline"
-                onClick={() => onNavigate("jobs")}
-              >
-                {t(lang, "common.viewAll")}
-                <IconArrowRight />
-              </button>
+              <span>Queue</span>
+              <button type="button" className="link-inline" onClick={() => onNavigate("jobs")}>View all <IconArrowRight /></button>
             </div>
-            <div className="kpi-card__value num">
-              {formatNumber(overview?.queue.active ?? 0)}
-            </div>
+            <div className="kpi-card__value num">{formatNumber(overview?.queue.active ?? 0)}</div>
             <div className="kpi-card__sub">
-              <span>
-                {t(lang, "overview.card.queued")}{" "}
-                <strong className="num">{formatNumber(overview?.queue.queued ?? 0)}</strong>
-              </span>
-              <span>
-                {t(lang, "overview.card.running")}{" "}
-                <strong className="num">{formatNumber(overview?.queue.running ?? 0)}</strong>
-              </span>
+              <span>Queued <strong className="num">{formatNumber(overview?.queue.queued ?? 0)}</strong></span>
+              <span>Running <strong className="num">{formatNumber(overview?.queue.running ?? 0)}</strong></span>
             </div>
           </div>
 
-          {/* Outcomes */}
           <div className="kpi-card">
             <div className="kpi-card__head">
-              <span>{t(lang, "overview.card.outcomes")}</span>
-              {cp ? (
-                <span className="tag-inline num">
-                  {t(lang, "overview.card.retained")} {formatNumber(cp.retained_jobs)}
-                </span>
-              ) : null}
+              <span>Outcomes</span>
+              {cp ? <span className="tag num">Retained {formatNumber(cp.retained_jobs)}</span> : null}
             </div>
-            <div className="kpi-card__value num">
-              {formatNumber(overview?.history.total ?? 0)}
-            </div>
+            <div className="kpi-card__value num">{formatNumber(overview?.history.total ?? 0)}</div>
             <div className="kpi-card__sub">
-              <span className="tone-ok">
-                {t(lang, "overview.card.succeeded")}{" "}
-                <strong className="num">{formatNumber(overview?.history.succeeded ?? 0)}</strong>
-              </span>
-              <span className="tone-danger">
-                {t(lang, "overview.card.failed")}{" "}
-                <strong className="num">{formatNumber(overview?.history.failed ?? 0)}</strong>
-              </span>
-              <span>
-                {t(lang, "overview.card.cancelled")}{" "}
-                <strong className="num">{formatNumber(overview?.history.cancelled ?? 0)}</strong>
-              </span>
+              <span className="tone-ok">Succeeded <strong className="num">{formatNumber(overview?.history.succeeded ?? 0)}</strong></span>
+              <span className="tone-danger">Failed <strong className="num">{formatNumber(overview?.history.failed ?? 0)}</strong></span>
+              <span>Cancelled <strong className="num">{formatNumber(overview?.history.cancelled ?? 0)}</strong></span>
             </div>
           </div>
 
-          {/* Workers & Sessions */}
           <div className="kpi-card">
             <div className="kpi-card__head">
-              <span>{t(lang, "overview.card.fleet")}</span>
-              <button
-                type="button"
-                className="link-inline"
-                onClick={() => onNavigate("workers")}
-              >
-                {t(lang, "common.viewAll")}
-                <IconArrowRight />
-              </button>
+              <span>Workers &amp; Sessions</span>
+              <button type="button" className="link-inline" onClick={() => onNavigate("workers")}>View all <IconArrowRight /></button>
             </div>
-            <div className="kpi-card__value num">
-              {overview ? `${formatNumber(overview.workers.healthy)} / ${formatNumber(overview.workers.total)}` : "0 / 0"}
-            </div>
+            <div className="kpi-card__value num">{overview ? `${formatNumber(overview.workers.healthy)} / ${formatNumber(overview.workers.total)}` : "0 / 0"}</div>
             <div className="kpi-card__sub">
-              {cp ? (
-                <span>
-                  {t(lang, "overview.card.sessions")}{" "}
-                  <strong className="num">
-                    {formatNumber(cp.sessions)}/{formatNumber(cp.max_sessions)}
-                  </strong>
-                </span>
-              ) : null}
-              <span>
-                {t(lang, "overview.card.activeLeases")}{" "}
-                <strong className="num">{formatNumber(overview?.workers.active_leases ?? 0)}</strong>
-              </span>
-              {drainingCount != null ? (
-                <span className={drainingCount > 0 ? "tone-warn" : undefined}>
-                  {t(lang, "overview.card.draining")}{" "}
-                  <strong className="num">{formatNumber(drainingCount)}</strong>
-                </span>
-              ) : null}
+              {cp ? <span>Sessions <strong className="num">{formatNumber(cp.sessions)}/{formatNumber(cp.max_sessions)}</strong></span> : null}
+              <span>Active leases <strong className="num">{formatNumber(overview?.workers.active_leases ?? 0)}</strong></span>
+              {draining != null ? <span className={draining > 0 ? "tone-warn" : undefined}>Draining <strong className="num">{formatNumber(draining)}</strong></span> : null}
             </div>
             {overview && Object.keys(overview.workers.total_capacity).length > 0 ? (
-              <div className="kpi-card__extra">
-                {t(lang, "overview.card.totalCapacity")}:{" "}
-                <code>{formatCapacityMap(overview.workers.total_capacity)}</code>
-              </div>
+              <div className="kpi-card__extra">Capacity: <code>{formatCapacityMap(overview.workers.total_capacity)}</code></div>
             ) : null}
           </div>
 
-          {/* Runtime Health */}
           <div className="kpi-card">
             <div className="kpi-card__head">
-              <span>{t(lang, "overview.card.health")}</span>
-              {cp ? (
-                <span className="tag-inline num">
-                  {t(lang, "sidebar.leaderGen")} #{cp.generation}
-                </span>
-              ) : null}
+              <span>Runtime Health</span>
             </div>
-            <div className="health-pills">
-              <span
-                className={`badge ${
-                  health == null || health.live ? "badge--worker-healthy" : "badge--failed"
-                }`}
-              >
-                <i className="badge__dot" aria-hidden="true" />
-                {t(lang, "overview.card.live")}:{" "}
-                {health == null
-                  ? overview
-                    ? t(lang, "common.yes")
-                    : t(lang, "common.na")
-                  : health.live
-                    ? t(lang, "common.yes")
-                    : t(lang, "common.no")}
-              </span>
-              <span
-                className={`badge ${
-                  health == null || health.ready ? "badge--worker-healthy" : "badge--queued"
-                }`}
-              >
-                <i className="badge__dot" aria-hidden="true" />
-                {t(lang, "overview.card.ready")}:{" "}
-                {health == null
-                  ? overview
-                    ? t(lang, "common.yes")
-                    : t(lang, "common.na")
-                  : health.ready
-                    ? t(lang, "common.yes")
-                    : t(lang, "common.no")}
-              </span>
+            <div className="status-inline">
+              <span className={`status-dot status-dot--${healthDot}`} aria-hidden="true" />
+              <strong>{healthLabel}</strong>
+              {cp ? <span className="muted">· Gen #{cp.generation}</span> : null}
             </div>
             <div className="kpi-card__sub">
-              <span>
-                {t(lang, "overview.card.journal")}:{" "}
-                <strong
-                  className={
-                    journalStatus === "unavailable"
-                      ? "tone-danger"
-                      : journalStatus === "healthy"
-                        ? "tone-ok"
-                        : ""
-                  }
-                >
-                  {t(lang, `overview.journal.${journalStatus}`)}
-                </strong>
+              <span className={health?.live === false ? "tone-danger" : undefined}>Live <strong>{health == null ? (overview ? "Yes" : "N/A") : health.live ? "Yes" : "No"}</strong></span>
+              <span className={health?.ready === false ? "tone-warn" : undefined}>Ready <strong>{health == null ? (overview ? "Yes" : "N/A") : health.ready ? "Yes" : "No"}</strong></span>
+              <span className={journalStatus === "unavailable" ? "tone-danger" : undefined}>
+                Journal <strong>{journalStatus === "healthy" ? "Healthy" : journalStatus === "disabled" ? "Disabled" : "Unavailable"}</strong>
               </span>
             </div>
-            {health?.journal.message ? (
-              <div className="kpi-card__extra tone-danger">{health.journal.message}</div>
-            ) : null}
+            {health?.journal.message ? <div className="kpi-card__extra tone-danger">{health.journal.message}</div> : null}
           </div>
         </div>
       </section>
 
       <div className="overview-grid-2">
-        {/* Memory Byte Budgets */}
         <section className="panel">
-          <PanelHeader
-            title={t(lang, "overview.budgets.title")}
-            meta={t(lang, "overview.budgets.subtitle")}
-          />
+          <PanelHeader title="Memory Byte Budgets" />
           <div className="panel__body">
             {budgets ? (
               <div className="budget-list">
-                <BudgetRow
-                  label={t(lang, "overview.budgets.input")}
-                  used={budgets.input_bytes}
-                  max={budgets.max_pending_bytes}
-                />
-                <BudgetRow
-                  label={t(lang, "overview.budgets.result")}
-                  used={budgets.result_bytes}
-                  max={budgets.max_result_bytes}
-                />
-                <BudgetRow
-                  label={t(lang, "overview.budgets.event")}
-                  used={budgets.event_bytes}
-                  max={budgets.max_event_bytes}
-                />
+                {[
+                  { label: "Input bytes", used: budgets.input_bytes, max: budgets.max_pending_bytes },
+                  { label: "Result bytes", used: budgets.result_bytes, max: budgets.max_result_bytes },
+                  { label: "Event bytes", used: budgets.event_bytes, max: budgets.max_event_bytes },
+                ].map((b) => {
+                  const pct = budgetPercent(b.used, b.max);
+                  return (
+                    <div key={b.label} className="budget-row">
+                      <div className="budget-row__head">
+                        <span className="budget-row__label">{b.label}</span>
+                        <span className="budget-row__meta num">{formatBytes(b.used)} / {formatBytes(b.max)} ({pct.toFixed(1)}%)</span>
+                      </div>
+                      <ProgressMeter percent={pct} />
+                    </div>
+                  );
+                })}
               </div>
-            ) : (
-              <EmptyState message={t(lang, "overview.budgets.unavailable")} compact />
-            )}
+            ) : <EmptyState message="Budget metrics unavailable on this server payload." inline />}
           </div>
         </section>
 
-        {/* Control Plane & Journal */}
         <section className="panel">
-          <PanelHeader
-            title={t(lang, "overview.cp.title")}
-            meta={t(lang, "overview.cp.subtitle")}
-          />
+          <PanelHeader title="Control Plane & Journal" />
           <div className="panel__body">
-            {cp ? (
-              <div className="cp-grid">
-                <div className="cp-item">
-                  <span>{t(lang, "overview.cp.grpcListen")}</span>
-                  <strong className="table__mono">
-                    {cp.grpc_listen}{" "}
-                    <em className="tag-inline">
-                      TLS: {t(lang, cp.grpc_tls_enabled ? "common.enabled" : "common.disabled")}
-                    </em>
-                  </strong>
-                </div>
-                <div className="cp-item">
-                  <span>{t(lang, "overview.cp.consoleListen")}</span>
-                  <strong className="table__mono">
-                    {cp.console_listen}{" "}
-                    <em className="tag-inline">
-                      Auth: {t(lang, cp.auth_enabled ? "common.enabled" : "common.disabled")}
-                    </em>
-                  </strong>
-                </div>
-                <div className="cp-item">
-                  <span>{t(lang, "overview.cp.generation")}</span>
-                  <strong className="num">#{formatNumber(cp.generation)}</strong>
-                </div>
-                <div className="cp-item">
-                  <span>
-                    {t(lang, "overview.cp.priorityLevels")} / {t(lang, "overview.cp.defaultMaxAttempts")}
-                  </span>
-                  <strong className="num">
-                    {cp.priority_levels} / {cp.default_max_attempts}
-                  </strong>
-                </div>
-                <div className="cp-item">
-                  <span>{t(lang, "overview.cp.heartbeat")}</span>
-                  <strong className="num">
-                    {formatDuration(cp.heartbeat_interval_ms)} / {formatDuration(cp.heartbeat_timeout_ms)}
-                  </strong>
-                </div>
-                <div className="cp-item">
-                  <span>{t(lang, "overview.cp.reconnectGrace")}</span>
-                  <strong className="num">
-                    {cp.reconnect_grace_ms != null
-                      ? formatDuration(cp.reconnect_grace_ms)
-                      : t(lang, "common.default")}
-                  </strong>
-                </div>
-                <div className="cp-item">
-                  <span>{t(lang, "overview.cp.journalMode")}</span>
-                  <strong>{overview?.runtime.label ?? t(lang, "common.na")}</strong>
-                </div>
-                {journalStats ? (
-                  <>
-                    <div className="cp-item">
-                      <span>{t(lang, "overview.cp.pendingOps")}</span>
-                      <strong className="num">{formatNumber(journalStats.pending_ops)}</strong>
-                    </div>
-                    <div className="cp-item">
-                      <span>
-                        {t(lang, "overview.cp.committedBatches")} / {t(lang, "overview.cp.committedOps")}
-                      </span>
-                      <strong className="num">
-                        {formatNumber(journalStats.committed_batches)} / {formatNumber(journalStats.committed_ops)}
-                      </strong>
-                    </div>
-                    <div className="cp-item">
-                      <span>{t(lang, "overview.cp.lastBatch")}</span>
-                      <strong className="num">
-                        {formatNumber(journalStats.last_batch_size)} ops ·{" "}
-                        {formatMicros(journalStats.last_commit_micros)}
-                      </strong>
-                    </div>
-                  </>
-                ) : null}
-              </div>
-            ) : (
-              <EmptyState message={t(lang, "overview.cp.unavailable")} compact />
-            )}
+            {cp ? <MetaGrid items={cpItems} /> : <EmptyState message="Control plane metadata unavailable on this server payload." inline />}
           </div>
         </section>
       </div>
 
       <div className="overview-grid-2">
-        {/* Live Interfaces preview */}
         <section className="panel">
           <PanelHeader
-            title={t(lang, "overview.interfaces.title")}
-            meta={`${formatNumber(interfaces.length)}`}
-            actions={
-              <button
-                type="button"
-                className="link-inline"
-                onClick={() => onNavigate("interfaces")}
-              >
-                {t(lang, "common.viewAll")}
-                <IconArrowRight />
-              </button>
-            }
+            title="Interfaces"
+            meta={formatNumber(interfaces.length)}
+            actions={<button type="button" className="link-inline" onClick={() => onNavigate("interfaces")}>View all <IconArrowRight /></button>}
           />
           {interfaces.length === 0 ? (
-            <div className="panel__body">
-              <EmptyState message={t(lang, "overview.interfaces.empty")} compact />
-            </div>
-          ) : (
-            <InterfacesTable
-              interfaces={interfaces.slice(0, 8)}
-              onSelect={onOpenInterface}
-              lang={lang}
-              compact
-            />
-          )}
+            <div className="panel__body"><EmptyState message="No active or configured interfaces" inline /></div>
+          ) : <InterfacesTable interfaces={interfaces.slice(0, 8)} onSelect={onOpenInterface} compact />}
         </section>
 
-        {/* Live Pools preview */}
         <section className="panel">
           <PanelHeader
-            title={t(lang, "overview.pools.title")}
-            meta={`${formatNumber(pools.length)}`}
-            actions={
-              <button
-                type="button"
-                className="link-inline"
-                onClick={() => onNavigate("pools")}
-              >
-                {t(lang, "common.viewAll")}
-                <IconArrowRight />
-              </button>
-            }
+            title="Pools"
+            meta={formatNumber(pools.length)}
+            actions={<button type="button" className="link-inline" onClick={() => onNavigate("pools")}>View all <IconArrowRight /></button>}
           />
           {pools.length === 0 ? (
-            <div className="panel__body">
-              <EmptyState message={t(lang, "overview.pools.empty")} compact />
-            </div>
+            <div className="panel__body"><EmptyState message="No active worker pools" inline /></div>
           ) : (
             <div className="table-wrap">
-              <table className="table table--interactive">
+              <table className="table table--fixed table--interactive">
                 <thead>
                   <tr>
-                    <th>{t(lang, "pools.table.pool")}</th>
-                    <th>{t(lang, "pools.table.namespace")} / {t(lang, "pools.table.interface")}</th>
-                    <th>{t(lang, "pools.table.sessions")}</th>
-                    <th>{t(lang, "pools.table.leases")}</th>
-                    <th>{t(lang, "pools.table.desired")}</th>
+                    <th style={{ width: "24%" }}>Pool</th>
+                    <th style={{ width: "34%" }}>Interface</th>
+                    <th style={{ width: "14%" }}>Sessions</th>
+                    <th style={{ width: "14%" }}>Leases</th>
+                    <th style={{ width: "14%" }}>Desired</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -410,24 +181,17 @@ export function OverviewPane(props: OverviewPaneProps) {
                     const key = `${pool.namespace}::${pool.interface}::${pool.pool}`;
                     return (
                       <tr key={key} onClick={() => onOpenPool(key)}>
-                        <td className="table__primary table__mono">{pool.pool}</td>
+                        <td className="table__primary mono ellipsis" title={pool.pool}>{pool.pool}</td>
                         <td>
-                          <span className="tag-inline">{pool.namespace}</span>{" "}
-                          <span className="table__mono">{pool.interface}</span>
+                          <div className="cell-inline" title={`${pool.namespace} / ${pool.interface}`}>
+                            {pool.namespace !== "default" ? <span className="tag">{pool.namespace}</span> : null}
+                            <span className="mono ellipsis">{pool.interface}</span>
+                          </div>
                         </td>
                         <td className="num">{formatNumber(pool.sessions)}</td>
+                        <td className="num">{formatNumber(pool.active_leases)} / {formatNumber(pool.active_leases + pool.free_slots)}</td>
                         <td className="num">
-                          {formatNumber(pool.active_leases)} /{" "}
-                          {formatNumber(pool.active_leases + pool.free_slots)}
-                        </td>
-                        <td className="num">
-                          {pool.desired_additional_slots > 0 ? (
-                            <span className="pill-sub pill-sub--warn">
-                              +{formatNumber(pool.desired_additional_slots)}
-                            </span>
-                          ) : (
-                            "0"
-                          )}
+                          {pool.desired_additional_slots > 0 ? <span className="tag tag--warn">+{formatNumber(pool.desired_additional_slots)}</span> : "0"}
                         </td>
                       </tr>
                     );
@@ -438,21 +202,6 @@ export function OverviewPane(props: OverviewPaneProps) {
           )}
         </section>
       </div>
-    </div>
-  );
-}
-
-function BudgetRow(props: { label: string; used: number; max: number }) {
-  const pct = budgetPercent(props.used, props.max);
-  return (
-    <div className="budget-row">
-      <div className="budget-row__head">
-        <span className="budget-row__label">{props.label}</span>
-        <span className="budget-row__meta num">
-          {formatBytes(props.used)} / {formatBytes(props.max)} ({pct.toFixed(1)}%)
-        </span>
-      </div>
-      <ProgressMeter percent={pct} />
     </div>
   );
 }
