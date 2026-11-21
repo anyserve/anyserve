@@ -51,14 +51,6 @@ gRPC returns `UNAVAILABLE`) and poll `scheduler_lease` every `poll_interval_ms`.
   counts toward `attempt_count`; keep `max_attempts >= 2` (default `3`) and
   idempotent handlers so recovered durable jobs execute on the new leader.
 
-## Edge sites
-
-At factory, warehouse, or robot edge sites, run a single `anyserve serve`
-process with a local SQLite journal under `systemd` or K3s (`replicaCount=1`).
-Local hardware failure is handled by supervisor restart (seconds) or by
-configuring `pool_tiers` with `spillover_after_ms` to spill queued work to a
-site-rack or cloud worker pool rather than operating multi-node PG HA on the edge.
-
 For Kubernetes with PostgreSQL, create a Secret containing `ANYSERVE_DATABASE_URL`
 and install the chart (which does not install PostgreSQL itself):
 
@@ -71,6 +63,14 @@ helm install anyserve-pg deploy/helm/anyserve \
 
 The PG release creates no journal PVC. Keep an existing SQLite release and its
 volume until its work has drained.
+
+## Edge sites
+
+At factory, warehouse, or robot edge sites, run a single `anyserve serve`
+process with a local SQLite journal under `systemd` or K3s (`replicaCount=1`).
+Local hardware failure is handled by supervisor restart (seconds) or by
+configuring `pool_tiers` with `spillover_after_ms` to spill queued work to a
+site-rack or cloud worker pool rather than operating multi-node PG HA on the edge.
 
 ## Containers
 
@@ -167,7 +167,8 @@ management listener on port 3001; this keeps browser API requests on the same
 origin. For a separate API origin, set `VITE_CONSOLE_API_BASE_URL` at build time
 and include the frontend origin in `[console].allowed_origins`.
 
-Use a client-role token at the Console sign-in prompt. Enable compression and
+Use an operator token from `[auth].client_tokens` at the Console sign-in prompt
+(scoped tenant tokens receive `403 Forbidden`). Enable compression and
 immutable caching for hashed assets, including the Explore WASM and Worker.
 See [Explore limits](configuration.md#console-explore); a partial metadata load
 does not represent the whole task history.
