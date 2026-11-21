@@ -36,6 +36,19 @@ export interface WorkerRollup {
   last_seen_at_ms: number | null;
 }
 
+export interface PoolTierPolicy {
+  pool: string;
+  spillover_after_ms: number;
+  reconnect_grace_ms: number | null;
+}
+
+export interface InterfacePolicySummary {
+  max_queue: number | null;
+  queue_timeout_ms: number | null;
+  max_in_flight_per_key: number | null;
+  pool_tiers: PoolTierPolicy[];
+}
+
 export interface InterfaceSummary {
   name: string;
   queued: number;
@@ -43,6 +56,61 @@ export interface InterfaceSummary {
   oldest_queued_age_ms: number;
   sessions: number;
   free_slots: number;
+  policy?: InterfacePolicySummary | null;
+}
+
+export interface JournalHealthSummary {
+  status: "disabled" | "healthy" | "unavailable";
+  message: string | null;
+}
+
+export interface HealthSummary {
+  live: boolean;
+  ready: boolean;
+  journal: JournalHealthSummary;
+}
+
+export interface ControlPlaneSummary {
+  grpc_listen: string;
+  grpc_tls_enabled: boolean;
+  console_listen: string;
+  auth_enabled: boolean;
+  generation: number;
+  retained_jobs: number;
+  sessions: number;
+  max_sessions: number;
+  priority_levels: number;
+  default_max_attempts: number;
+  heartbeat_interval_ms: number;
+  heartbeat_timeout_ms: number;
+  reconnect_grace_ms: number | null;
+}
+
+export interface BudgetsSummary {
+  input_bytes: number;
+  max_pending_bytes: number;
+  result_bytes: number;
+  max_result_bytes: number;
+  event_bytes: number;
+  max_event_bytes: number;
+}
+
+export interface JournalStatsSummary {
+  pending_ops: number;
+  committed_batches: number;
+  committed_ops: number;
+  last_batch_size: number;
+  last_commit_micros: number;
+}
+
+export interface PoolSummary {
+  namespace: string;
+  interface: string;
+  pool: string;
+  sessions: number;
+  free_slots: number;
+  active_leases: number;
+  desired_additional_slots: number;
 }
 
 export interface OverviewResponse {
@@ -52,12 +120,19 @@ export interface OverviewResponse {
   workers: WorkerRollup;
   interfaces: InterfaceSummary[];
   refreshed_at_ms: number;
+  health?: HealthSummary;
+  control_plane?: ControlPlaneSummary;
+  budgets?: BudgetsSummary;
+  journal_stats?: JournalStatsSummary | null;
+  pools?: PoolSummary[];
 }
 
 export interface JobSummary {
   job_id: string;
   state: JobState;
   interface_name: string;
+  namespace?: string;
+  durability?: "durable" | "ephemeral";
   source: string | null;
   created_at_ms: number;
   updated_at_ms: number;
@@ -66,6 +141,8 @@ export interface JobSummary {
   latest_worker_id: string | null;
   attempt_count: number;
   last_error: string | null;
+  error_code?: string | null;
+  error_retryable?: boolean | null;
   metadata: MetadataMap;
 }
 
@@ -105,6 +182,7 @@ export interface Demand {
   required_attributes: MetadataMap;
   preferred_attributes: MetadataMap;
   required_capacity: CapacityMap;
+  affinity_key?: string;
 }
 
 export interface ExecutionPolicy {
@@ -115,18 +193,24 @@ export interface ExecutionPolicy {
   execution_timeout: { secs: number; nanos: number } | null;
   total_timeout: { secs: number; nanos: number } | null;
   spillover_after: { secs: number; nanos: number } | null;
+  fairness_key?: string;
+  concurrency_key?: string;
 }
 
 export interface JobDetail {
   job_id: string;
   state: JobState;
   interface_name: string;
+  namespace?: string;
+  durability?: "durable" | "ephemeral";
   source: string | null;
   created_at_ms: number;
   updated_at_ms: number;
   duration_ms: number | null;
   current_attempt_id: string | null;
   last_error: string | null;
+  error_code?: string | null;
+  error_retryable?: boolean | null;
   metadata: MetadataMap;
   demand: Demand | null;
   policy: ExecutionPolicy | null;
@@ -155,8 +239,18 @@ export interface JobEventSummary {
   payload_size_bytes: number;
 }
 
+export interface WorkerLoadSummary {
+  queued: number;
+  running: number;
+  utilization: number;
+  custom: Record<string, number>;
+}
+
 export interface WorkerSummary {
   worker_id: string;
+  session_id?: string;
+  namespace?: string;
+  pool?: string;
   healthy: boolean;
   interfaces: string[];
   attributes: MetadataMap;
@@ -167,13 +261,17 @@ export interface WorkerSummary {
   connected: boolean;
   draining: boolean;
   active_leases: number;
+  connected_at_ms?: number;
   last_seen_at_ms: number;
+  load?: WorkerLoadSummary;
 }
 
 export interface WorkersResponse {
   workers: WorkerSummary[];
   total: number;
   healthy: number;
+  draining?: number;
+  disconnected?: number;
 }
 
 export interface JobDetailResponse {

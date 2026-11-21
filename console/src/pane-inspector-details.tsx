@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import { formatObjectMeta } from "./format";
+import { t, type Lang } from "./i18n";
 import type { ObjectRefSummary } from "./types";
 import { EmptyState } from "./pane-tables";
 
@@ -50,10 +51,32 @@ export function InlineList(props: { values: string[]; className?: string }) {
   );
 }
 
+export function KeyValueGrid(props: {
+  entries: Record<string, string | number>;
+  emptyMessage: string;
+}) {
+  const items = Object.entries(props.entries);
+  if (items.length === 0) {
+    return <EmptyState message={props.emptyMessage} compact />;
+  }
+  return (
+    <div className="kv-list">
+      {items.map(([key, value]) => (
+        <div key={key} className="kv-item">
+          <span className="kv-item__key">{key}</span>
+          <code className="kv-item__val">{String(value)}</code>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function ObjectRefList(props: {
   objects: ObjectRefSummary[];
   emptyMessage: string;
+  lang?: Lang;
 }) {
+  const lang = props.lang ?? "en";
   if (props.objects.length === 0) {
     return <EmptyState message={props.emptyMessage} compact />;
   }
@@ -71,9 +94,11 @@ export function ObjectRefList(props: {
           </div>
           {object.preview ? <CodeBlock value={object.preview} /> : null}
           {!object.preview && object.uri == null ? (
-            <div className="timeline__meta">Preview unavailable</div>
+            <div className="timeline__meta">{t(lang, "inspector.previewUnavailable")}</div>
           ) : null}
-          {object.truncated ? <div className="timeline__meta">Preview truncated</div> : null}
+          {object.truncated ? (
+            <div className="timeline__meta">{t(lang, "inspector.previewTruncated")}</div>
+          ) : null}
         </div>
       ))}
     </div>
