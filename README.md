@@ -70,7 +70,7 @@ python examples/python/submit.py
 
 The Python examples are an [echo worker](examples/python/worker.py) and a
 [submitter](examples/python/submit.py); connectors for OpenAI-compatible
-servers such as vLLM and Ollama, Triton Inference Server, ComfyUI and live video
+servers such as vLLM and Ollama, Triton Inference Server, YOLO and VLA policies
 live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
 The [Rust example](examples/rust) uses the same protocol. Applications supply
 backend-specific worker code; the CLI starts the control plane and
