@@ -109,8 +109,9 @@ private CA.
 `max_queue` limits queued/accepting jobs per interface; `max_pending_jobs` limits
 unfinished jobs in the active Runtime. Admission beyond these limits returns
 `RESOURCE_EXHAUSTED`. Heartbeat timeout closes a silent session, then gives its
-leases another heartbeat-timeout interval to reconnect. Cancellation keeps a
-worker reservation until acknowledgement or `cancel_grace_ms` expires.
+leases `reconnect_grace_ms` (per-tier `pool_tiers.reconnect_grace_ms`, else
+`[runtime].reconnect_grace_ms`, defaulting to `heartbeat_timeout_ms`) to reconnect.
+Cancellation keeps a worker reservation until acknowledgement or `cancel_grace_ms` expires.
 
 | Byte budget | Default | What it retains / pressure behavior |
 |---|---|---|
@@ -188,10 +189,11 @@ needs no cross-origin isolation headers. See
 
 ## CLI
 
-Global flags: `--endpoint URL` (job commands; default
-`http://127.0.0.1:50052`), `--log-level LEVEL` (default `info`), `-v/--verbose`
-(`debug`), `-h/--help` and `-V/--version`. `RUST_LOG` takes precedence over the
-logging flags. Job commands read the client token from `ANYSERVE_TOKEN`.
+Global flags: `--endpoint URL` (`job` commands; default
+`http://127.0.0.1:50052`, accepts comma-separated URLs for sequential leader
+discovery), `--log-level LEVEL` (default `info`), `-v/--verbose` (`debug`),
+`-h/--help` and `-V/--version`. `RUST_LOG` takes precedence over the logging
+flags. `job` commands read `ANYSERVE_TOKEN` and `ANYSERVE_NAMESPACE`.
 
 | Command | Flags / arguments |
 |---|---|
@@ -200,9 +202,9 @@ logging flags. Job commands read the client token from `ANYSERVE_TOKEN`.
 | `job inspect` | `JOB_ID` |
 | `job cancel` | One or more `JOB_ID` arguments, or `--stdin` for IDs from standard input |
 
-All job commands accept `-o/--output text|json` (default `text`). `--journal` and
-`--ephemeral` are mutually exclusive. No token flag is provided. Use each
-command's `--help` for accepted values.
+All `job` commands accept `-o/--output text|json` (default `text`) and have no
+`--token` flag (use `ANYSERVE_TOKEN`). `--journal` and `--ephemeral` are
+mutually exclusive. Use each command's `--help` for accepted values.
 
 ## Embedded Rust Runtime
 

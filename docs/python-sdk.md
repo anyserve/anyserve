@@ -13,9 +13,11 @@ output = client.call("demo.echo.v1", b"hello",
                      options=ExecutionOptions(total_timeout_ms=5000))
 ```
 
-`AnyserveClient` is an alias of `ExecutionClient`; `AsyncAnyserveClient` wraps the
-same operations for `asyncio` applications (`await client.call(...)`,
-`async with await client.invoke(...) as events: ...`). Endpoint resolution is
+`AnyserveClient` is an alias of `ExecutionClient`; `AsyncAnyserveClient` wraps
+`call`, `execute`, `invoke`, `submit`, `get`, `watch`, `cancel` and `result` for
+`asyncio` applications (`await client.call(...)`,
+`async with await client.invoke(...) as events: ...`; duplex `invoke_stream` is on
+`AnyserveClient`). Endpoint resolution is
 the explicit argument, then `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`
 (comma-separated URLs probe sequentially on `UNAVAILABLE` and stick to the
 active leader).
@@ -153,15 +155,19 @@ and `metadata` (empty maps), `codec="bytes"` (`"json"` decodes/encodes JSON),
 and `uri_resolver=None`. Handlers may be synchronous
 functions, synchronous generators, `async def` coroutines, or `async` generators.
 
-`serve(handler_or_handlers, endpoint=None, *, worker_id=None, token=None,
-namespace=None, pool=None, reconnect_interval_secs=1.0, connection=None)`
-blocks until stopped or a permanent connection error, and can multiplex a list
-of `@worker` handlers onto one session (`serve([h1, h2], endpoint=...)`). Endpoint/token defaults match the client, but workers need a
-worker-role token. The default ID is hostname plus process ID; `connection` is
-an optional transport supplied by embedded callers. Transport failures reconnect;
-authentication and invalid-argument failures propagate.
-A server Drain stops new assignments; the worker keeps in-flight handlers until
-completion or cancellation/fencing and reconnects when the session ends.
+`serve(...)` takes one handler and an optional endpoint
+(`serve(handler, "http://host:50052")`), several handlers
+(`serve(h1, h2, endpoint=...)`) or a list (`serve([h1, h2], endpoint)`), with
+the keyword options `endpoint`, `worker_id`, `token`, `namespace`, `pool`,
+`reconnect_interval_secs=1.0` and `connection`. It blocks until stopped or a
+permanent connection error and multiplexes the handlers onto one session.
+Endpoint/token defaults match the client, but
+workers need a worker-role token. The default ID is hostname plus process ID;
+`connection` is an optional transport supplied by embedded callers. Transport
+failures reconnect; authentication and invalid-argument failures propagate.
+On the main thread, `SIGTERM` triggers preemptive drain (`preempting=True`) so
+unexposed in-flight jobs reschedule immediately; a server-sent `Drain` stops new
+assignments while keeping in-flight handlers until completion or cancellation.
 
 With `pass_context=True`, the second argument exposes `job_id`, `attempt_id`,
 `lease_id`, `metadata`, `inputs`, `params`, `cancelled` and `terminal_replay`.

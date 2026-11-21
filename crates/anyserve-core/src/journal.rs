@@ -211,7 +211,7 @@ pub(crate) struct TerminalRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommitOutcome {
     Committed,
-    /// Another replica/cancellation owns the row now; discard local state.
+    /// Leadership lease expired or was superseded; fence local state and exit.
     Fenced(String),
     /// Definitely not written.
     RolledBack(String),

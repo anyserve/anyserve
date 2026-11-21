@@ -87,8 +87,8 @@ When `[console]` is enabled, its listener exposes the console API plus
 `/healthz`, `/readyz` and `/metrics`. Metrics describe the shared Runtime,
 interfaces, workers, byte budgets and journal. Job state gauges count entries
 currently retained in memory, not cumulative completions. With authentication
-enabled, `/metrics` and console reads require a client token; health probes
-remain accessible without one.
+enabled, `/metrics` and console reads require an operator token from
+`[auth].client_tokens`; health probes remain accessible without one.
 
 For the browser console, run `npm --prefix console ci` and
 `npm --prefix console run dev`, then open the URL printed by Vite. The dev server
@@ -110,7 +110,7 @@ versions; see [configuration](docs/configuration.md#console-explore) for query l
 - `clients/python`: Python bindings and the application worker API.
 - `console`: views of interfaces, jobs, workers and retained execution events.
 - `bench/load`: native execution workloads and separate CPU profiling.
-- `deploy/helm/anyserve`: Helm chart for PostgreSQL replicas or one SQLite control plane, and an optional worker fleet.
+- `deploy/helm/anyserve`: Helm chart for a PostgreSQL leader-standby or single SQLite control plane, and an optional worker fleet.
 
 References cover [configuration](docs/configuration.md), the
 [Python SDK](docs/python-sdk.md), [deployment and recovery](docs/deployment.md)
