@@ -199,15 +199,56 @@ function startServer(data) {
       const states = (url.searchParams.get("states") || "").split(",").filter(Boolean);
       const iface = url.searchParams.get("interface");
       const ns = url.searchParams.get("namespace");
+      const worker = url.searchParams.get("worker");
+      const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+      const fromMs = url.searchParams.has("from_ms") ? Number(url.searchParams.get("from_ms")) : null;
+      const toMs = url.searchParams.has("to_ms") ? Number(url.searchParams.get("to_ms")) : null;
+      const windowMs = url.searchParams.has("window_ms") ? Number(url.searchParams.get("window_ms")) : null;
+      const bucketsCount = Number(url.searchParams.get("buckets") || 0);
       const limit = Number(url.searchParams.get("limit") || 100);
-      const filtered = data.jobs.filter(
-        (j) =>
-          (states.length === 0 || states.includes(j.state)) &&
-          (!iface || j.interface_name === iface) &&
-          (!ns || j.namespace === ns),
-      );
+      const effFrom = fromMs ?? (windowMs != null ? Date.now() - windowMs : null);
+      const effTo = toMs ?? (windowMs != null ? Date.now() + 1 : null);
+      const filtered = data.jobs.filter((j) => {
+        if (states.length > 0 && !states.includes(j.state)) return false;
+        if (iface && j.interface_name !== iface) return false;
+        if (ns && j.namespace !== ns) return false;
+        if (worker && j.latest_worker_id !== worker) return false;
+        if (effFrom != null && j.created_at_ms < effFrom) return false;
+        if (effTo != null && j.created_at_ms >= effTo) return false;
+        if (q) {
+          const hit = [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id, ...Object.values(j.metadata)]
+            .some((v) => String(v || "").toLowerCase().includes(q));
+          if (!hit) return false;
+        }
+        return true;
+      });
+      let histogram = null;
+      if (bucketsCount > 0 && filtered.length > 0) {
+        const minTs = effFrom ?? Math.min(...filtered.map((j) => j.created_at_ms));
+        const maxTs = effTo ?? Math.max(...filtered.map((j) => j.created_at_ms)) + 1;
+        const n = Math.min(96, Math.max(8, bucketsCount));
+        const span = Math.max(n, maxTs - minTs);
+        const endTs = minTs + span;
+        const buckets = Array.from({ length: n }, (_, i) => ({
+          start_ms: minTs + Math.floor((i * span) / n),
+          end_ms: minTs + Math.floor(((i + 1) * span) / n),
+          active: 0,
+          succeeded: 0,
+          failed: 0,
+          cancelled: 0,
+        }));
+        for (const j of filtered) {
+          if (j.created_at_ms < minTs || j.created_at_ms >= endTs) continue;
+          const idx = Math.min(n - 1, Math.floor(((j.created_at_ms - minTs + 1) * n - 1) / span));
+          if (j.state === "queued" || j.state === "running") buckets[idx].active += 1;
+          else if (j.state === "succeeded") buckets[idx].succeeded += 1;
+          else if (j.state === "failed") buckets[idx].failed += 1;
+          else buckets[idx].cancelled += 1;
+        }
+        histogram = { start_ms: minTs, end_ms: endTs, bucket_ms: Math.max(1, Math.floor(span / n)), buckets };
+      }
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ jobs: filtered.slice(0, limit), next_page_token: null }));
+      return res.end(JSON.stringify({ jobs: filtered.slice(0, limit), total: filtered.length, next_page_token: null, histogram }));
     }
     if (url.pathname.startsWith("/api/jobs/")) {
       const id = decodeURIComponent(url.pathname.slice("/api/jobs/".length));
@@ -343,6 +384,10 @@ async function main() {
     const collapsedDomNodes = await cdp.eval(`document.querySelectorAll("*").length`);
     const expandLargeMs = await measureFrame(cdp, `document.querySelector(".payload-bar button")?.click();`);
     const expandedDomNodes = await cdp.eval(`document.querySelectorAll("*").length`);
+    await waitForSelector(cdp, ".histogram__col");
+    const zoomHistogramMs = await measureFrame(cdp, `document.querySelector(".histogram__col:not(.is-empty)")?.click();`);
+    await waitForSelector(cdp, ".histogram .link-inline");
+    const resetTimeMs = await measureFrame(cdp, `document.querySelector(".histogram .link-inline")?.click();`);
     const searchFilterMs = await measureFrame(cdp, `
       const input = document.querySelector(".search-box__input");
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
@@ -372,6 +417,8 @@ async function main() {
         select_small_job: smallJobMs,
         select_large_job_collapsed: largeJobMs,
         expand_large_payload_preview: expandLargeMs,
+        zoom_histogram_bucket: zoomHistogramMs,
+        reset_time_filter: resetTimeMs,
         search_250_jobs: searchFilterMs,
         clear_search_250_jobs: clearSearchMs,
         tab_jobs_to_interfaces: jobsToInterfacesMs,

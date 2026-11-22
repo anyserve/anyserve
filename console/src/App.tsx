@@ -8,19 +8,38 @@ import {
 import { ConnectWorkerModal } from "./ConnectWorkerModal";
 import { asErrorMessage, formatPool, sortJobs, sortWorkers } from "./format";
 import { InterfacesPane } from "./InterfacesPane";
+import { DEFAULT_TIME_FILTER, TIME_PRESET_MS, type TimeFilterState } from "./JobsHistogram";
 import { JobsPane } from "./JobsPane";
 import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
 import { PoolsPane, poolKey, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
-import type { JobDetailResponse, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
+import type { JobDetailResponse, JobsHistogram, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
 import { WorkersPane, type HealthFilter, type WorkerFilterSeed } from "./WorkersPane";
 
 const ExplorePane = lazy(() => import("./ExplorePane"));
 const THEME_KEY = "anyserve.console.theme";
-interface JobsPageState { loadedKey: string | null; page1: JobSummary[]; extra: JobSummary[]; page1Next: string | null; extraNext: string | null; loadingMore: boolean; }
-const EMPTY_JOBS: JobsPageState = { loadedKey: null, page1: [], extra: [], page1Next: null, extraNext: null, loadingMore: false };
+interface JobsPageState {
+  loadedKey: string | null;
+  page1: JobSummary[];
+  extra: JobSummary[];
+  page1Next: string | null;
+  extraNext: string | null;
+  total: number | null;
+  histogram: JobsHistogram | null;
+  loadingMore: boolean;
+}
+const EMPTY_JOBS: JobsPageState = {
+  loadedKey: null,
+  page1: [],
+  extra: [],
+  page1Next: null,
+  extraNext: null,
+  total: null,
+  histogram: null,
+  loadingMore: false,
+};
 
 function readTheme(): Theme {
   try { const s = localStorage.getItem(THEME_KEY); if (s === "dark" || s === "light") return s; } catch { /* ignore */ }
@@ -66,6 +85,26 @@ function sameWorkers(a: WorkerSummary[], b: WorkerSummary[]): boolean {
   return true;
 }
 
+function sameHistogram(a: JobsHistogram | null, b: JobsHistogram | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  if (a.start_ms !== b.start_ms || a.end_ms !== b.end_ms || a.buckets.length !== b.buckets.length) return false;
+  for (let i = 0; i < a.buckets.length; i += 1) {
+    const x = a.buckets[i];
+    const y = b.buckets[i];
+    if (
+      x.start_ms !== y.start_ms ||
+      x.active !== y.active ||
+      x.succeeded !== y.succeeded ||
+      x.failed !== y.failed ||
+      x.cancelled !== y.cancelled
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export default function App() {
   const init = useMemo(() => routeFromPathname(window.location.pathname), []);
   const [activeTab, setActiveTab] = useState<ConsoleTab>(init.tab);
@@ -75,9 +114,12 @@ export default function App() {
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [workersResponse, setWorkersResponse] = useState<WorkersResponse | null>(null);
   const [workers, setWorkers] = useState<WorkerSummary[]>([]);
+  const [knownWorkers, setKnownWorkers] = useState<string[]>([]);
   const [jobsPage, setJobsPage] = useState<JobsPageState>(EMPTY_JOBS);
 
   const [filters, setFilters] = useState({ iface: "all", ns: "all", worker: "all", q: "" });
+  const [serverSearch, setServerSearch] = useState("");
+  const [timeFilter, setTimeFilter] = useState<TimeFilterState>(DEFAULT_TIME_FILTER);
   const deferredSearch = useDeferredValue(filters.q);
   const [selectedJobByScope, setSelectedJobByScope] = useState<Record<JobScope, string | null>>({ all: null, queue: null, history: null });
   const [selectedInterface, setSelectedInterface] = useState<string | null>(null);
@@ -116,6 +158,23 @@ export default function App() {
 
   useEffect(() => () => loadMoreAbort.current?.abort(), []);
 
+  useEffect(() => {
+    const trimmed = filters.q.trim();
+    if (trimmed === "") {
+      setServerSearch("");
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setServerSearch(trimmed), 150);
+    return () => window.clearTimeout(timer);
+  }, [filters.q]);
+
+  const rememberWorkers = useCallback((ids: Array<string | null | undefined>) => {
+    setKnownWorkers((prev) => {
+      const missing = ids.filter((id): id is string => Boolean(id && !prev.includes(id)));
+      return missing.length === 0 ? prev : [...prev, ...missing];
+    });
+  }, []);
+
   const handleError = useCallback((err: unknown) => {
     setError(asErrorMessage(err));
     if (err instanceof AuthenticationError) setAuthRequired(true);
@@ -130,7 +189,27 @@ export default function App() {
   const polling = !authRequired;
   const activeSelectedJobId = activeTab === "jobs" ? selectedJobByScope[jobScope] : null;
   const jobStates = jobScope === "queue" ? QUEUE_STATES : jobScope === "history" ? HISTORY_STATES : ALL_JOB_STATES;
-  const jobsQueryKey = `${jobScope}|${filters.iface}|${filters.ns}`;
+  const timeKey =
+    timeFilter.preset === "custom"
+      ? `custom:${timeFilter.fromMs ?? ""}:${timeFilter.toMs ?? ""}`
+      : timeFilter.preset;
+  const timeWindowMs =
+    timeFilter.preset !== "all" && timeFilter.preset !== "custom"
+      ? TIME_PRESET_MS[timeFilter.preset]
+      : undefined;
+  const jobsApiFilters = useMemo(
+    () => ({
+      interface: filters.iface,
+      namespace: filters.ns,
+      worker: filters.worker,
+      ...(serverSearch ? { q: serverSearch } : {}),
+      ...(timeWindowMs != null ? { windowMs: timeWindowMs } : {}),
+      ...(timeFilter.preset === "custom" && timeFilter.fromMs != null ? { fromMs: timeFilter.fromMs } : {}),
+      ...(timeFilter.preset === "custom" && timeFilter.toMs != null ? { toMs: timeFilter.toMs } : {}),
+    }),
+    [filters.iface, filters.ns, filters.worker, serverSearch, timeWindowMs, timeFilter],
+  );
+  const jobsQueryKey = `${jobScope}|${filters.iface}|${filters.ns}|${filters.worker}|${serverSearch}|${timeKey}`;
 
   usePollingEffect(
     getOverview,
@@ -142,19 +221,33 @@ export default function App() {
   );
 
   usePollingEffect(
-    (signal) => getJobs(jobStates, 100, 0, signal, { interface: filters.iface, namespace: filters.ns }),
+    (signal) => getJobs(jobStates, 100, 0, signal, { ...jobsApiFilters, buckets: 32 }),
     (res) => {
       const sorted = sortJobs(res.jobs);
+      const nextTotal = res.total ?? null;
+      const nextHistogram = res.histogram ?? null;
+      rememberWorkers(sorted.map((j) => j.latest_worker_id));
       setJobsPage((p) =>
-        p.loadedKey === jobsQueryKey && p.page1Next === res.next_page_token && sameJobs(p.page1, sorted)
+        p.loadedKey === jobsQueryKey &&
+        p.page1Next === res.next_page_token &&
+        p.total === nextTotal &&
+        sameHistogram(p.histogram, nextHistogram) &&
+        sameJobs(p.page1, sorted)
           ? p
-          : { ...p, loadedKey: jobsQueryKey, page1: sorted, page1Next: res.next_page_token },
+          : {
+              ...p,
+              loadedKey: jobsQueryKey,
+              page1: sorted,
+              page1Next: res.next_page_token,
+              total: nextTotal,
+              histogram: nextHistogram,
+            },
       );
       setError(null);
     },
     handleError,
     jobScope === "history" ? JOBS_HISTORY_POLL_MS : JOBS_ACTIVE_POLL_MS,
-    [jobScope, filters.iface, filters.ns],
+    [jobScope, filters.iface, filters.ns, filters.worker, serverSearch, timeKey],
     polling && activeTab === "jobs",
   );
 
@@ -162,6 +255,7 @@ export default function App() {
     getWorkers,
     (res) => {
       const sorted = sortWorkers(res.workers);
+      rememberWorkers(sorted.map((w) => w.worker_id));
       setWorkersResponse((cur) =>
         cur && cur.total === res.total && cur.healthy === res.healthy && cur.draining === res.draining && cur.disconnected === res.disconnected && sameWorkers(cur.workers, sorted)
           ? cur
@@ -192,14 +286,19 @@ export default function App() {
   const filterOptions = useMemo(() => ({
     iface: toOptions([...(overview?.interfaces.map((i) => i.name) ?? []), ...loadedJobs.map((j) => j.interface_name), ...(filters.iface !== "all" ? [filters.iface] : [])], "All interfaces"),
     ns: toOptions([...(overview?.pools?.map((p) => p.namespace) ?? []), ...workers.map((w) => w.namespace).filter(Boolean) as string[], ...loadedJobs.map((j) => j.namespace).filter(Boolean) as string[], ...(filters.ns !== "all" ? [filters.ns] : [])], "All namespaces"),
-    worker: toOptions([...workers.map((w) => w.worker_id), ...loadedJobs.map((j) => j.latest_worker_id).filter(Boolean) as string[], ...(filters.worker !== "all" ? [filters.worker] : [])], "All workers"),
-  }), [overview, workers, loadedJobs, filters.iface, filters.ns, filters.worker]);
+    worker: toOptions([...knownWorkers, ...(filters.worker !== "all" ? [filters.worker] : [])], "All workers"),
+  }), [overview, workers, knownWorkers, loadedJobs, filters.iface, filters.ns, filters.worker]);
 
   const visibleJobs = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
     return loadedJobs.filter((j) => {
       if (filters.worker !== "all" && j.latest_worker_id !== filters.worker) return false;
-      return !q || [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id].some((f) => (f ?? "").toLowerCase().includes(q));
+      return (
+        !q ||
+        [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id, ...Object.values(j.metadata)].some((f) =>
+          (f ?? "").toLowerCase().includes(q),
+        )
+      );
     });
   }, [loadedJobs, filters.worker, deferredSearch]);
 
@@ -225,10 +324,6 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (filters.worker !== "all" && !filterOptions.worker.some((o) => o.value === filters.worker)) setFilters((f) => ({ ...f, worker: "all" }));
-  }, [filters.worker, filterOptions.worker]);
-
-  useEffect(() => {
     if (activeTab !== "jobs" || !jobsQueryMatches || selectedJob) return;
     const nextId = visibleJobs[0]?.job_id ?? null;
     if (selectedJobByScope[jobScope] !== nextId) setSelectedJobByScope((c) => ({ ...c, [jobScope]: nextId }));
@@ -242,8 +337,11 @@ export default function App() {
     loadMoreAbort.current = controller;
     setJobsPage((p) => ({ ...p, loadingMore: true }));
     try {
-      const res = await getJobs(jobStates, 100, cursor, controller.signal, { interface: filters.iface, namespace: filters.ns });
-      if (!controller.signal.aborted) setJobsPage((p) => ({ ...p, extra: [...p.extra, ...res.jobs], extraNext: res.next_page_token }));
+      const res = await getJobs(jobStates, 100, cursor, controller.signal, jobsApiFilters);
+      if (!controller.signal.aborted) {
+        rememberWorkers(res.jobs.map((j) => j.latest_worker_id));
+        setJobsPage((p) => ({ ...p, extra: [...p.extra, ...res.jobs], extraNext: res.next_page_token, total: res.total ?? p.total }));
+      }
       setError(null);
     } catch (err) {
       if (!controller.signal.aborted) handleError(err);
@@ -281,10 +379,13 @@ export default function App() {
   const jumpToJobs = useCallback((opts: { scope?: JobScope; iface?: string; ns?: string; worker?: string; jobId?: string }) => {
     const scope = opts.scope ?? "all";
     resetExtraJobs();
+    if (opts.worker && opts.worker !== "all") rememberWorkers([opts.worker]);
     setFilters({ iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: "" });
+    setServerSearch("");
+    setTimeFilter(DEFAULT_TIME_FILTER);
     if (opts.jobId) setSelectedJobByScope((c) => ({ ...c, [scope]: opts.jobId! }));
     navigateTo("jobs", scope);
-  }, [navigateTo]);
+  }, [navigateTo, rememberWorkers]);
 
   const openInterface = useCallback((name: string) => {
     setSelectedInterface(name);
@@ -399,12 +500,17 @@ export default function App() {
           {activeTab === "jobs" ? (
             <JobsPane
               scope={jobScope} onScopeChange={(next) => navigateTo("jobs", next)} stats={jobStats} jobs={visibleJobs} totalLoaded={loadedJobs.length}
+              totalMatching={jobsQueryMatches && filters.q.trim() === serverSearch ? jobsPage.total : null}
+              histogram={jobsQueryMatches ? jobsPage.histogram : null}
+              timeFilter={timeFilter}
+              onTimeFilterChange={(next) => { resetExtraJobs(); setTimeFilter(next); }}
               selectedJobId={selectedJob?.job_id ?? null} onSelect={(id) => setSelectedJobByScope((c) => ({ ...c, [jobScope]: id }))}
               onOpenInterface={openInterface} onOpenWorker={openWorker} onFilterNamespace={filterJobNamespace}
               interfaceFilter={filters.iface} interfaceOptions={filterOptions.iface} onInterfaceFilterChange={(iface) => { resetExtraJobs(); setFilters((f) => ({ ...f, iface })); }}
               namespaceFilter={filters.ns} namespaceOptions={filterOptions.ns} onNamespaceFilterChange={(ns) => { resetExtraJobs(); setFilters((f) => ({ ...f, ns })); }}
-              workerFilter={filters.worker} workerOptions={filterOptions.worker} onWorkerFilterChange={(worker) => setFilters((f) => ({ ...f, worker }))}
-              searchQuery={filters.q} onSearchQueryChange={(q) => setFilters((f) => ({ ...f, q }))}
+              workerFilter={filters.worker} workerOptions={filterOptions.worker} onWorkerFilterChange={(worker) => { resetExtraJobs(); setFilters((f) => ({ ...f, worker })); }}
+              searchQuery={filters.q} onSearchQueryChange={(q) => { if (!q.trim()) { resetExtraJobs(); setServerSearch(""); } setFilters((f) => ({ ...f, q })); }}
+              onResetAllFilters={() => { resetExtraJobs(); setFilters({ iface: "all", ns: "all", worker: "all", q: "" }); setServerSearch(""); setTimeFilter(DEFAULT_TIME_FILTER); }}
               hasMore={(jobsPage.extra.length > 0 ? jobsPage.extraNext : jobsPage.page1Next) != null} loadingMore={jobsPage.loadingMore} onLoadMore={() => void handleLoadMoreJobs()}
               inspector={
                 <JobInspector

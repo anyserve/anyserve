@@ -186,9 +186,30 @@ pub(crate) struct PoolSummary {
 }
 
 #[derive(Serialize)]
+pub(crate) struct JobsHistogramBucketSummary {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) active: usize,
+    pub(crate) succeeded: usize,
+    pub(crate) failed: usize,
+    pub(crate) cancelled: usize,
+}
+
+#[derive(Serialize)]
+pub(crate) struct JobsHistogramSummary {
+    pub(crate) start_ms: u64,
+    pub(crate) end_ms: u64,
+    pub(crate) bucket_ms: u64,
+    pub(crate) buckets: Vec<JobsHistogramBucketSummary>,
+}
+
+#[derive(Serialize)]
 pub(crate) struct JobsResponse {
     pub(crate) jobs: Vec<JobSummary>,
+    pub(crate) total: usize,
     pub(crate) next_page_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) histogram: Option<JobsHistogramSummary>,
 }
 #[derive(Serialize)]
 pub(crate) struct JobSummary {
@@ -308,6 +329,12 @@ pub(crate) struct JobsQuery {
     pub(crate) states: Option<String>,
     pub(crate) interface: Option<String>,
     pub(crate) namespace: Option<String>,
+    pub(crate) worker: Option<String>,
+    pub(crate) q: Option<String>,
+    pub(crate) from_ms: Option<u64>,
+    pub(crate) to_ms: Option<u64>,
+    pub(crate) window_ms: Option<u64>,
+    pub(crate) buckets: Option<usize>,
     pub(crate) limit: Option<usize>,
     pub(crate) offset: Option<usize>,
     pub(crate) page_token: Option<String>,

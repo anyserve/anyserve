@@ -2,6 +2,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::ops::{Bound, ControlFlow};
 
 use super::api::{InterfaceStats, JobFilter, JobState};
 use super::state::Job;
@@ -193,13 +194,12 @@ impl JobIndex {
         }
     }
 
-    /// Merge sorted state indexes across selected namespace/interface sets.
-    pub(crate) fn page(
+    fn select_sets(
         &self,
-        filter: &JobFilter,
-        offset: usize,
-        limit: usize,
-    ) -> (Vec<&str>, usize) {
+        filter_states: &[JobState],
+        namespace: Option<&str>,
+        interface: Option<&str>,
+    ) -> Vec<&BTreeSet<OrderKey>> {
         let mut selected: Vec<&BTreeSet<OrderKey>> = Vec::new();
         fn collect_states<'a>(
             selected: &mut Vec<&'a BTreeSet<OrderKey>>,
@@ -207,37 +207,158 @@ impl JobIndex {
             jobs: &'a ByState,
         ) {
             for (state, set) in STATES.iter().zip(jobs) {
-                if filter_states.is_empty() || filter_states.contains(state) {
+                if !set.is_empty() && (filter_states.is_empty() || filter_states.contains(state)) {
                     selected.push(set);
                 }
             }
         }
-        match (&filter.namespace, &filter.interface) {
+        match (namespace, interface) {
             (Some(ns), Some(name)) => {
-                if let Some(interface) =
-                    self.namespaces.get(ns).and_then(|i| i.interfaces.get(name))
-                {
-                    collect_states(&mut selected, &filter.states, &interface.jobs);
+                if let Some(iface) = self.namespaces.get(ns).and_then(|i| i.interfaces.get(name)) {
+                    collect_states(&mut selected, filter_states, &iface.jobs);
                 }
             }
             (Some(ns), None) => {
                 if let Some(index) = self.namespaces.get(ns) {
-                    collect_states(&mut selected, &filter.states, &index.jobs);
+                    collect_states(&mut selected, filter_states, &index.jobs);
                 }
             }
             (None, Some(name)) => {
                 for index in self.namespaces.values() {
-                    if let Some(interface) = index.interfaces.get(name) {
-                        collect_states(&mut selected, &filter.states, &interface.jobs);
+                    if let Some(iface) = index.interfaces.get(name) {
+                        collect_states(&mut selected, filter_states, &iface.jobs);
                     }
                 }
             }
             (None, None) => {
                 for index in self.namespaces.values() {
-                    collect_states(&mut selected, &filter.states, &index.jobs);
+                    collect_states(&mut selected, filter_states, &index.jobs);
                 }
             }
         }
+        selected
+    }
+
+    fn walk_sets<'a>(
+        selected: &[&'a BTreeSet<OrderKey>],
+        mut visit: impl FnMut(&'a str) -> ControlFlow<()>,
+    ) {
+        if selected.is_empty() {
+            return;
+        }
+        if selected.len() == 1 {
+            for (_, id) in selected[0] {
+                if visit(id.as_str()).is_break() {
+                    break;
+                }
+            }
+            return;
+        }
+        if selected.len() <= 8 {
+            let mut cursors: Vec<_> = selected.iter().map(|jobs| jobs.iter().peekable()).collect();
+            while let Some((next, _)) = cursors
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, cursor)| cursor.peek().map(|key| (i, *key)))
+                .min_by(|(_, a), (_, b)| a.cmp(b))
+            {
+                if let Some((_, id)) = cursors[next].next()
+                    && visit(id.as_str()).is_break()
+                {
+                    break;
+                }
+            }
+            return;
+        }
+        let mut iters: Vec<_> = selected.iter().map(|jobs| jobs.iter()).collect();
+        let mut heap: BinaryHeap<Reverse<(&OrderKey, usize)>> =
+            BinaryHeap::with_capacity(iters.len());
+        for (idx, iter) in iters.iter_mut().enumerate() {
+            if let Some(key) = iter.next() {
+                heap.push(Reverse((key, idx)));
+            }
+        }
+        while let Some(Reverse((key, idx))) = heap.pop() {
+            if visit(key.1.as_str()).is_break() {
+                break;
+            }
+            if let Some(next_key) = iters[idx].next() {
+                heap.push(Reverse((next_key, idx)));
+            }
+        }
+    }
+
+    pub(crate) fn visit_ordered<'a>(
+        &'a self,
+        states: &[JobState],
+        namespace: Option<&str>,
+        interface: Option<&str>,
+        mut visit: impl FnMut(&'a str),
+    ) {
+        let selected = self.select_sets(states, namespace, interface);
+        Self::walk_sets(&selected, |id| {
+            visit(id);
+            ControlFlow::Continue(())
+        });
+    }
+
+    pub(crate) fn visit_created_range<'a>(
+        &'a self,
+        namespace: Option<&str>,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+        mut visit: impl FnMut(&'a str),
+    ) {
+        if let (Some(f), Some(t)) = (from_ms, to_ms)
+            && f >= t
+        {
+            return;
+        }
+        if self.namespaces.is_empty() {
+            return;
+        }
+        let lower = from_ms.map_or(Bound::Unbounded, |f| Bound::Included((f, String::new())));
+        let upper = to_ms.map_or(Bound::Unbounded, |t| Bound::Excluded((t, String::new())));
+        if let Some(ns) = namespace {
+            if let Some(index) = self.namespaces.get(ns) {
+                for (_, scoped) in index.created.range((lower, upper)) {
+                    visit(scoped.as_str());
+                }
+            }
+            return;
+        }
+        for index in self.namespaces.values() {
+            for (_, scoped) in index.created.range((lower.clone(), upper.clone())) {
+                visit(scoped.as_str());
+            }
+        }
+    }
+
+    /// Merge sorted state indexes across selected namespace/interface sets.
+    pub(crate) fn page(
+        &self,
+        filter: &JobFilter,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<&str>, usize) {
+        self.page_raw(
+            &filter.states,
+            filter.namespace.as_deref(),
+            filter.interface.as_deref(),
+            offset,
+            limit,
+        )
+    }
+
+    pub(crate) fn page_raw(
+        &self,
+        states: &[JobState],
+        namespace: Option<&str>,
+        interface: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<&str>, usize) {
+        let selected = self.select_sets(states, namespace, interface);
         if selected.is_empty() {
             return (Vec::new(), 0);
         }
@@ -256,43 +377,22 @@ impl JobIndex {
                 total,
             );
         }
-        if selected.len() <= 8 {
-            let mut cursors: Vec<_> = selected.iter().map(|jobs| jobs.iter().peekable()).collect();
-            let ordered = std::iter::from_fn(|| {
-                let next = cursors
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(|(i, cursor)| cursor.peek().map(|key| (i, *key)))
-                    .min_by(|(_, a), (_, b)| a.cmp(b))
-                    .map(|(i, _)| i)?;
-                cursors[next].next().map(|(_, id)| id.as_str())
-            });
-            return (ordered.skip(offset).take(limit).collect(), total);
-        }
-        let mut iters: Vec<_> = selected.iter().map(|jobs| jobs.iter()).collect();
-        let mut heap: BinaryHeap<Reverse<(&OrderKey, usize)>> =
-            BinaryHeap::with_capacity(iters.len());
-        for (idx, iter) in iters.iter_mut().enumerate() {
-            if let Some(key) = iter.next() {
-                heap.push(Reverse((key, idx)));
-            }
-        }
         let take = limit.min(total - offset);
         let mut out = Vec::with_capacity(take);
         let mut skipped = 0usize;
-        while out.len() < take {
-            let Some(Reverse((key, idx))) = heap.pop() else {
-                break;
-            };
+        Self::walk_sets(&selected, |id| {
             if skipped < offset {
                 skipped += 1;
+                ControlFlow::Continue(())
             } else {
-                out.push(key.1.as_str());
+                out.push(id);
+                if out.len() >= take {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
             }
-            if let Some(next_key) = iters[idx].next() {
-                heap.push(Reverse((next_key, idx)));
-            }
-        }
+        });
         (out, total)
     }
 

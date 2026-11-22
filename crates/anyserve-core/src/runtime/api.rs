@@ -394,6 +394,51 @@ pub struct JobPage {
     pub next_page_token: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobQuery {
+    /// Empty matches every state.
+    pub states: Vec<JobState>,
+    pub interface: Option<String>,
+    pub namespace: Option<String>,
+    pub worker_id: Option<String>,
+    pub search: Option<String>,
+    /// Inclusive lower bound on `created_at_ms`.
+    pub from_ms: Option<u64>,
+    /// Exclusive upper bound on `created_at_ms`.
+    pub to_ms: Option<u64>,
+    /// 0 uses a default page size.
+    pub limit: usize,
+    pub page_token: Option<String>,
+    /// 0 skips histogram computation; positive values compute `clamp(8, 96)` buckets.
+    pub histogram_buckets: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobHistogramBucket {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub active: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobHistogram {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub bucket_ms: u64,
+    pub buckets: Vec<JobHistogramBucket>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobQueryResult {
+    pub jobs: Vec<JobView>,
+    pub total: usize,
+    pub next_page_token: Option<String>,
+    pub histogram: Option<JobHistogram>,
+}
+
 /// Bounded metadata scan in descending (creation time, job id) order.
 /// Archived scans include completed durable jobs; retained scans include live
 /// and recently completed jobs. Neither reads request or result bodies.

@@ -71,7 +71,28 @@ export interface JobSummary {
   metadata: MetadataMap;
 }
 
-export interface JobsResponse { jobs: JobSummary[]; next_page_token: string | null; }
+export interface JobsHistogramBucket {
+  start_ms: number;
+  end_ms: number;
+  active: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+}
+
+export interface JobsHistogram {
+  start_ms: number;
+  end_ms: number;
+  bucket_ms: number;
+  buckets: JobsHistogramBucket[];
+}
+
+export interface JobsResponse {
+  jobs: JobSummary[];
+  total?: number;
+  next_page_token: string | null;
+  histogram?: JobsHistogram | null;
+}
 export interface AnalyticsJob extends JobSummary { durability: "durable" | "ephemeral"; }
 export interface AnalyticsResponse { jobs: AnalyticsJob[]; next_cursor: string | null; }
 

@@ -77,6 +77,12 @@ export function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
 export interface JobsQueryFilters {
   interface?: string;
   namespace?: string;
+  worker?: string;
+  q?: string;
+  windowMs?: number;
+  fromMs?: number;
+  toMs?: number;
+  buckets?: number;
 }
 
 export function getJobs(
@@ -94,6 +100,16 @@ export function getJobs(
   if (iface && iface !== "all") params.set("interface", iface);
   const ns = filters?.namespace?.trim();
   if (ns && ns !== "all") params.set("namespace", ns);
+  const worker = filters?.worker?.trim();
+  if (worker && worker !== "all") params.set("worker", worker);
+  const q = filters?.q?.trim();
+  if (q) params.set("q", q);
+  if (filters?.fromMs != null) params.set("from_ms", String(filters.fromMs));
+  if (filters?.toMs != null) params.set("to_ms", String(filters.toMs));
+  if (filters?.windowMs != null && filters.fromMs == null && filters.toMs == null) {
+    params.set("window_ms", String(filters.windowMs));
+  }
+  if (filters?.buckets != null && filters.buckets > 0) params.set("buckets", String(filters.buckets));
   return request(`/api/jobs?${params}`, { signal });
 }
 

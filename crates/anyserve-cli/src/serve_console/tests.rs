@@ -452,11 +452,184 @@ async fn jobs_endpoint_filters_and_paginates() {
             None,
         )
         .await;
+    assert_eq!(body["total"], 1);
     assert!(body["next_page_token"].is_null());
     assert_eq!(body["jobs"].as_array().unwrap().len(), 1);
     assert_eq!(body["jobs"][0]["state"], "cancelled");
     assert_eq!(body["jobs"][0]["job_id"], second_id);
     assert_ne!(body["jobs"][0]["job_id"], first_id);
+}
+
+#[tokio::test]
+async fn jobs_endpoint_supports_search_worker_time_window_total_and_histogram() {
+    let server = Server::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+    let (mut worker_alpha, limits_a, hb_a) = connect_session(
+        &server.endpoint,
+        None,
+        v2::Hello {
+            worker_id: "worker-alpha".into(),
+            interfaces: vec!["embed.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+        Some(2),
+    )
+    .await;
+    let (mut worker_beta, limits_b, hb_b) = connect_session(
+        &server.endpoint,
+        None,
+        v2::Hello {
+            worker_id: "worker-beta".into(),
+            interfaces: vec!["chat.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+        Some(2),
+    )
+    .await;
+
+    let mut s1 = spec("embed.v1", Durability::Ephemeral);
+    s1.metadata.insert("source".into(), "mobile-ios".into());
+    s1.metadata.insert("trace".into(), "tr-ALPHA-99".into());
+    let id1 = submit(&server.runtime, None, s1).await;
+    let a1 = accept_assign(&mut worker_alpha).await;
+    Attempt::open(&mut worker_alpha.data, &a1, &limits_a, hb_a)
+        .await
+        .unwrap()
+        .finish(&[], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let split_ts = anyserve_core::now_ms();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let mut s2 = spec("chat.v1", Durability::Ephemeral);
+    s2.metadata.insert("source".into(), "web-console".into());
+    let id2 = submit(&server.runtime, None, s2).await;
+    let a2 = accept_assign(&mut worker_beta).await;
+    Attempt::open(&mut worker_beta.data, &a2, &limits_b, hb_b)
+        .await
+        .unwrap()
+        .finish(
+            &[],
+            v2::finish::Outcome::Failed(v2::ErrorInfo {
+                code: "rate_limited".into(),
+                message: "Quota Exceeded on GPU".into(),
+                retryable: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut s3 = spec("embed.v1", Durability::Ephemeral);
+    s3.metadata.insert("source".into(), "cli-batch".into());
+    let id3 = submit(&server.runtime, None, s3).await;
+    let a3 = accept_assign(&mut worker_alpha).await;
+    Attempt::open(&mut worker_alpha.data, &a3, &limits_a, hb_a)
+        .await
+        .unwrap()
+        .finish(&[], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+        .await
+        .unwrap();
+
+    let c = spawn_console(server.runtime.clone()).await;
+
+    // Exact total persists across paginated requests.
+    let page1 = c
+        .json(Method::GET, "/api/jobs?limit=2&offset=0&buckets=16", None)
+        .await;
+    assert_eq!(page1["total"], 3);
+    assert_eq!(page1["next_page_token"], "2");
+    assert_eq!(page1["jobs"].as_array().unwrap().len(), 2);
+
+    let histogram = &page1["histogram"];
+    let buckets = histogram["buckets"].as_array().unwrap();
+    assert_eq!(buckets.len(), 16);
+    let mut bucket_sum = 0u64;
+    let mut non_empty_bucket: Option<(u64, u64, u64)> = None;
+    for b in buckets {
+        let count = b["active"].as_u64().unwrap()
+            + b["succeeded"].as_u64().unwrap()
+            + b["failed"].as_u64().unwrap()
+            + b["cancelled"].as_u64().unwrap();
+        bucket_sum += count;
+        if count > 0 && non_empty_bucket.is_none() {
+            non_empty_bucket = Some((
+                b["start_ms"].as_u64().unwrap(),
+                b["end_ms"].as_u64().unwrap(),
+                count,
+            ));
+        }
+    }
+    assert_eq!(bucket_sum, 3);
+
+    // Clicking a single bucket yields the exact same matching count via from_ms/to_ms.
+    let (b_start, b_end, b_count) = non_empty_bucket.unwrap();
+    let clicked = c
+        .json(
+            Method::GET,
+            &format!("/api/jobs?from_ms={b_start}&to_ms={b_end}&buckets=16"),
+            None,
+        )
+        .await;
+    assert_eq!(clicked["total"].as_u64().unwrap(), b_count);
+
+    // Worker filter narrows results accurately.
+    let by_worker = c
+        .json(Method::GET, "/api/jobs?worker=worker-beta", None)
+        .await;
+    assert_eq!(by_worker["total"], 1);
+    assert_eq!(by_worker["jobs"][0]["job_id"], id2);
+
+    // Server-side search matches metadata value, error message, and job_id (case-insensitive).
+    let by_meta = c.json(Method::GET, "/api/jobs?q=alpha-99", None).await;
+    assert_eq!(by_meta["total"], 1);
+    assert_eq!(by_meta["jobs"][0]["job_id"], id1);
+
+    let by_error = c
+        .json(Method::GET, "/api/jobs?q=quota%20exceeded", None)
+        .await;
+    assert_eq!(by_error["total"], 1);
+    assert_eq!(by_error["jobs"][0]["job_id"], id2);
+
+    // Time window filter + search compose together cleanly.
+    let after_split = c
+        .json(
+            Method::GET,
+            &format!("/api/jobs?from_ms={split_ts}&worker=worker-alpha"),
+            None,
+        )
+        .await;
+    assert_eq!(after_split["total"], 1);
+    assert_eq!(after_split["jobs"][0]["job_id"], id3);
+
+    let recent = c
+        .json(Method::GET, "/api/jobs?window_ms=60000&buckets=8", None)
+        .await;
+    assert_eq!(recent["total"], 3);
+
+    // Invalid ranges/queries return 400.
+    assert_eq!(
+        c.status(Method::GET, "/api/jobs?from_ms=100&to_ms=100", None)
+            .await,
+        400
+    );
+    assert_eq!(
+        c.status(Method::GET, "/api/jobs?window_ms=0", None).await,
+        400
+    );
+    let long_q = "x".repeat(257);
+    assert_eq!(
+        c.status(Method::GET, &format!("/api/jobs?q={long_q}"), None)
+            .await,
+        400
+    );
+
+    drop(c);
+    drop(worker_alpha);
+    drop(worker_beta);
+    server.stop().await;
 }
 
 #[tokio::test]

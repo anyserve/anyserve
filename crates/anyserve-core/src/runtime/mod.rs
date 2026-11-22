@@ -9,6 +9,7 @@ pub(crate) mod identity;
 mod index;
 pub(crate) mod input;
 pub(crate) mod machine;
+mod query;
 pub(crate) mod state;
 pub(crate) mod worker;
 

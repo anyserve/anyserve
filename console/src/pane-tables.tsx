@@ -2,7 +2,7 @@ import { memo, type ReactNode } from "react";
 
 import type { PaneStat } from "./app-constants";
 import { formatDuration, formatNumber, formatPool, formatShortTime, formatTimestamp } from "./format";
-import { IconSearch } from "./icons";
+import { IconClose, IconSearch } from "./icons";
 import type { InterfaceSummary, JobState, JobSummary, PoolTierPolicy, WorkerSummary } from "./types";
 
 export function StatsRow({ stats }: { stats: PaneStat[] }) {
@@ -61,6 +61,16 @@ export function SearchInput(props: { value: string; placeholder: string; onChang
         placeholder={props.placeholder}
         aria-label={props.placeholder}
       />
+      {props.value ? (
+        <button
+          type="button"
+          className="search-box__clear"
+          aria-label="Clear search"
+          onClick={() => props.onChange("")}
+        >
+          <IconClose width={12} height={12} />
+        </button>
+      ) : null}
     </div>
   );
 }

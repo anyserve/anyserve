@@ -584,6 +584,13 @@ impl Job {
         matches!(self.phase, Phase::Terminal(_))
     }
 
+    pub(crate) fn current_worker_id(&self) -> Option<&str> {
+        self.attempt
+            .as_ref()
+            .map(|attempt| attempt.worker_id.as_str())
+            .or(self.last_worker_id.as_deref())
+    }
+
     pub(crate) fn view(&self, include_outputs: bool) -> JobView {
         JobView {
             job_id: self.raw_id.clone(),
@@ -597,11 +604,7 @@ impl Job {
                 .as_ref()
                 .map(|attempt| attempt.attempt_id.clone())
                 .or_else(|| self.last_attempt_id.clone()),
-            current_worker_id: self
-                .attempt
-                .as_ref()
-                .map(|attempt| attempt.worker_id.clone())
-                .or_else(|| self.last_worker_id.clone()),
+            current_worker_id: self.current_worker_id().map(str::to_owned),
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,
             error: self.error.clone(),

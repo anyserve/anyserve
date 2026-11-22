@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyserve_core::auth::{AuthPolicy, DEFAULT_NAMESPACE};
 use anyserve_core::error::{ErrorKind, RuntimeError};
 use anyserve_core::now_ms;
-use anyserve_core::runtime::api::{JobFilter, JobScan, JobState};
+use anyserve_core::runtime::api::{JobQuery, JobScan, JobState};
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -25,7 +25,7 @@ use super::api::{
 };
 use super::snapshot::{
     duration_ms, health_summary, interface_policy_summary, job_detail_response, job_summary,
-    journal_stats_summary, worker_rollup, worker_summary,
+    jobs_histogram_summary, journal_stats_summary, worker_rollup, worker_summary,
 };
 
 pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
@@ -197,20 +197,43 @@ async fn list_jobs(
             .filter(|o| *o > 0)
             .map(|offset| offset.to_string())
     });
-    let page = state
+    let search = normalize_optional_filter(query.q);
+    if search.as_ref().is_some_and(|s| s.len() > 256) {
+        return Err(ApiError::bad_request("search query exceeds 256 bytes"));
+    }
+    if query.window_ms == Some(0) {
+        return Err(ApiError::bad_request("window_ms must be positive"));
+    }
+    let (from_ms, to_ms) = if query.from_ms.is_some() || query.to_ms.is_some() {
+        (query.from_ms, query.to_ms)
+    } else if let Some(window) = query.window_ms {
+        let end = now_ms().saturating_add(1);
+        (Some(end.saturating_sub(window)), Some(end))
+    } else {
+        (None, None)
+    };
+    let worker_id = normalize_optional_filter(query.worker)
+        .filter(|worker| !worker.eq_ignore_ascii_case("all"));
+    let result = state
         .runtime
-        .list_jobs(JobFilter {
+        .query_jobs(JobQuery {
             states: parse_states(query.states.as_deref())?,
             interface: normalize_optional_filter(query.interface),
             namespace: normalize_optional_filter(query.namespace),
+            worker_id,
+            search,
+            from_ms,
+            to_ms,
             limit: query.limit.unwrap_or(50).clamp(1, 200),
             page_token,
+            histogram_buckets: query.buckets.unwrap_or(0),
         })
-        .await
         .map_err(api_error)?;
     Ok(Json(JobsResponse {
-        jobs: page.jobs.into_iter().map(job_summary).collect(),
-        next_page_token: page.next_page_token,
+        jobs: result.jobs.into_iter().map(job_summary).collect(),
+        total: result.total,
+        next_page_token: result.next_page_token,
+        histogram: result.histogram.map(jobs_histogram_summary),
     }))
 }
 

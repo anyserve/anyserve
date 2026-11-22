@@ -15,6 +15,14 @@ const shortTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour12: false,
 });
 
+const dateTimeAxisFormatter = new Intl.DateTimeFormat(undefined, {
+  month: "short",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hour12: false,
+});
+
 const numberFormatter = new Intl.NumberFormat();
 
 export function sortJobs(jobs: JobSummary[]): JobSummary[] {
@@ -41,6 +49,24 @@ export function formatTimestamp(value: number | null | undefined): string {
 
 export function formatShortTime(value: number | null | undefined): string {
   return value ? shortTimeFormatter.format(new Date(value)) : "—";
+}
+
+export function formatAxisTime(value: number, spanMs: number): string {
+  if (!Number.isFinite(value)) return "—";
+  return spanMs <= 6 * 3_600_000 ? shortTimeFormatter.format(new Date(value)) : dateTimeAxisFormatter.format(new Date(value));
+}
+
+export function toDatetimeLocal(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+export function fromDatetimeLocal(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parsed = Date.parse(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export function formatDuration(value: number | null | undefined): string {

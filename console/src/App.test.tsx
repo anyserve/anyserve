@@ -379,10 +379,16 @@ it("polls only /api/overview on Overview, renders draining count, and supports c
 
   fireEvent.click(screen.getByRole("button", { name: "View Jobs" }));
   await waitFor(() =>
-    expect(getJobs).toHaveBeenCalledWith([], 100, 0, expect.any(AbortSignal), {
-      interface: "llm.generate",
-      namespace: "all",
-    }),
+    expect(getJobs).toHaveBeenCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({
+        interface: "llm.generate",
+        namespace: "all",
+      }),
+    ),
   );
 });
 
@@ -612,10 +618,16 @@ it("uses AnyServe branding and navigates directly from JobInspector links to Wor
   // Clicking Namespace filters Jobs to tenant-a; clicking it again jumps to Pools filtered by tenant-a.
   fireEvent.click(screen.getAllByRole("button", { name: "tenant-a" })[0]);
   await waitFor(() =>
-    expect(getJobs).toHaveBeenLastCalledWith([], 100, 0, expect.any(AbortSignal), {
-      interface: "all",
-      namespace: "tenant-a",
-    }),
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({
+        interface: "all",
+        namespace: "tenant-a",
+      }),
+    ),
   );
 
   // Clicking Interface in JobInspector subtitle jumps directly to /interfaces and selects llm.generate.
@@ -679,4 +691,165 @@ it("collapses large payloads by default and opens Connect Worker onboarding moda
 
   fireEvent.keyDown(window, { key: "Escape" });
   expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+it("supports time presets, interactive histogram bar click & brush zoom, server search, and bounded total progress", async () => {
+  window.history.replaceState(null, "", "/jobs");
+  vi.mocked(getOverview).mockResolvedValue(richOverview());
+  const baseTs = 1_700_000_000_000;
+  const sampleHistogram = {
+    start_ms: baseTs,
+    end_ms: baseTs + 60_000,
+    bucket_ms: 15_000,
+    buckets: [
+      { start_ms: baseTs, end_ms: baseTs + 15_000, active: 0, succeeded: 12, failed: 0, cancelled: 0 },
+      { start_ms: baseTs + 15_000, end_ms: baseTs + 30_000, active: 0, succeeded: 8, failed: 2, cancelled: 0 },
+      { start_ms: baseTs + 30_000, end_ms: baseTs + 45_000, active: 1, succeeded: 2, failed: 0, cancelled: 0 },
+      { start_ms: baseTs + 45_000, end_ms: baseTs + 60_000, active: 0, succeeded: 0, failed: 0, cancelled: 0 },
+    ],
+  };
+
+  vi.mocked(getJobs).mockImplementation(async (_states, _limit, offset, _signal, filters) => {
+    if (filters?.q === "needle-older") {
+      return {
+        jobs: [summary("job-older-needle", { state: "succeeded", source: "needle-older", latest_worker_id: "worker-gpu-01" })],
+        total: 1,
+        next_page_token: null,
+        histogram: {
+          ...sampleHistogram,
+          buckets: [{ ...sampleHistogram.buckets[0], succeeded: 1 }, { ...sampleHistogram.buckets[1], succeeded: 0, failed: 0 }, { ...sampleHistogram.buckets[2], active: 0, succeeded: 0 }, sampleHistogram.buckets[3]],
+        },
+      };
+    }
+    if (offset === "page-2") {
+      return {
+        jobs: [summary("job-page-2", { state: "succeeded", latest_worker_id: "worker-gpu-01" })],
+        total: 25,
+        next_page_token: null,
+      };
+    }
+    if (filters?.fromMs != null && filters?.toMs != null) {
+      return {
+        jobs: [summary("job-zoomed", { state: "failed", error_code: "timeout", latest_worker_id: "worker-gpu-01" })],
+        total: 10,
+        next_page_token: null,
+        histogram: sampleHistogram,
+      };
+    }
+    return {
+      jobs: [summary("job-page-1", { state: "succeeded", latest_worker_id: "worker-gpu-01" })],
+      total: 25,
+      next_page_token: "page-2",
+      histogram: sampleHistogram,
+    };
+  });
+  vi.mocked(getJob).mockImplementation(async (id) => detail(id));
+
+  render(<App />);
+  expect(await screen.findByText("1 of 25 jobs")).toBeTruthy();
+  expect(screen.getByText("Showing 1 of 25")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Load more (24 remaining)" })).toBeTruthy();
+
+  // Loading the last page clears Load more and displays the bounded end-of-list caption.
+  fireEvent.click(screen.getByRole("button", { name: "Load more (24 remaining)" }));
+  expect(await screen.findByText("End of list · all 25 jobs loaded")).toBeTruthy();
+
+  // Selecting a preset time window passes windowMs to /api/jobs.
+  fireEvent.click(screen.getByRole("button", { name: "15m" }));
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({ windowMs: 15 * 60_000, buckets: 32 }),
+    ),
+  );
+
+  // Custom time editor applies explicit [fromMs, toMs] bounds.
+  fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+  fireEvent.change(screen.getByLabelText("From time"), { target: { value: "2026-01-01T10:00:00" } });
+  fireEvent.change(screen.getByLabelText("To time"), { target: { value: "2026-01-01T10:30:00" } });
+  fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({
+        fromMs: Date.parse("2026-01-01T10:00:00"),
+        toMs: Date.parse("2026-01-01T10:30:00"),
+        buckets: 32,
+      }),
+    ),
+  );
+
+  // Worker filter forwards worker_id to /api/jobs.
+  fireEvent.change(screen.getByLabelText("Worker"), { target: { value: "worker-gpu-01" } });
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({ worker: "worker-gpu-01" }),
+    ),
+  );
+  fireEvent.change(screen.getByLabelText("Worker"), { target: { value: "all" } });
+
+  // Clicking a single histogram bar zooms to that exact bucket's [start_ms, end_ms).
+  await waitFor(() => expect(document.querySelectorAll(".histogram__col").length).toBe(4));
+  const bars = document.querySelectorAll<HTMLButtonElement>(".histogram__col");
+  fireEvent.click(bars[1]);
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({
+        fromMs: baseTs + 15_000,
+        toMs: baseTs + 30_000,
+        buckets: 32,
+      }),
+    ),
+  );
+  expect(await screen.findByRole("heading", { name: "job-zoomed" })).toBeTruthy();
+
+  // Drag-brushing across multiple histogram bars selects the combined [start_ms, end_ms] range.
+  const zoomedBars = document.querySelectorAll<HTMLButtonElement>(".histogram__col");
+  fireEvent.pointerDown(zoomedBars[0], { button: 0, clientX: 10 });
+  fireEvent.pointerMove(zoomedBars[2], { clientX: 90 });
+  fireEvent.pointerUp(window);
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({
+        fromMs: baseTs,
+        toMs: baseTs + 45_000,
+        buckets: 32,
+      }),
+    ),
+  );
+
+  // Reset time returns to All time.
+  fireEvent.click(screen.getByRole("button", { name: "Reset time" }));
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      [],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.not.objectContaining({ fromMs: expect.any(Number) }),
+    ),
+  );
+
+  // Server-backed search debounces 150ms, fetches deeper matches, and shows exact end-of-results total.
+  fireEvent.change(screen.getByPlaceholderText("Search job ID, source, error…"), { target: { value: "needle-older" } });
+  expect(await screen.findByRole("heading", { name: "job-older-needle" }, { timeout: 2_000 })).toBeTruthy();
+  expect(screen.getByText("End of results · all 1 matching jobs loaded")).toBeTruthy();
 });

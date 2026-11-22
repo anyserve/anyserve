@@ -1,11 +1,13 @@
 use super::api::{
     AttemptSummary, HealthSummary, InlinePreviewSummary, InterfacePolicySummary, JobDetail,
-    JobDetailResponse, JobEventSummary, JobSummary, JournalHealthSummary, JournalStatsSummary,
-    ObjectRefSummary, PoolTierSummary, WorkerLoadSummary, WorkerRollup, WorkerSummary,
+    JobDetailResponse, JobEventSummary, JobSummary, JobsHistogramBucketSummary,
+    JobsHistogramSummary, JournalHealthSummary, JournalStatsSummary, ObjectRefSummary,
+    PoolTierSummary, WorkerLoadSummary, WorkerRollup, WorkerSummary,
 };
 use anyserve_core::runtime::api::{
-    Durability, EventKind, ExecutionEvent, Health, InterfacePolicy, JobPreview, JobState, JobView,
-    JournalHealth, JournalStats, Metadata, Object, ObjectPreview, WorkerStats, WorkerView,
+    Durability, EventKind, ExecutionEvent, Health, InterfacePolicy, JobHistogram, JobPreview,
+    JobState, JobView, JournalHealth, JournalStats, Metadata, Object, ObjectPreview, WorkerStats,
+    WorkerView,
 };
 use std::time::Duration;
 
@@ -376,6 +378,26 @@ pub(crate) fn inline_preview(bytes: &[u8]) -> Option<String> {
             .trim()
             .to_string(),
     )
+}
+
+pub(crate) fn jobs_histogram_summary(histogram: JobHistogram) -> JobsHistogramSummary {
+    JobsHistogramSummary {
+        start_ms: histogram.start_ms,
+        end_ms: histogram.end_ms,
+        bucket_ms: histogram.bucket_ms,
+        buckets: histogram
+            .buckets
+            .into_iter()
+            .map(|b| JobsHistogramBucketSummary {
+                start_ms: b.start_ms,
+                end_ms: b.end_ms,
+                active: b.active,
+                succeeded: b.succeeded,
+                failed: b.failed,
+                cancelled: b.cancelled,
+            })
+            .collect(),
+    }
 }
 
 pub(crate) fn metadata_value(metadata: &Metadata, key: &str) -> Option<String> {
