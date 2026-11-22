@@ -19,7 +19,8 @@ version = "0.5.0"
 [workspace.dependencies]
 anyhow = "1.0.98"
 async-stream = "0.3.6"
-axum = "0.7.9"
+axum = { version = "0.7.9", features = ["ws"] }
+base64 = "0.22"
 bytes = { version = "1.10", features = ["serde"] }
 clap = { version = "4.5.37", features = ["derive"] }
 futures = "0.3.31"
@@ -27,7 +28,7 @@ fs2 = "0.4.3"
 http = "1.3.1"
 prost = "0.13.5"
 pyo3 = { version = "0.29.0", features = ["abi3-py312", "extension-module"] }
-reqwest = { version = "0.12.15", default-features = false, features = ["json"] }
+reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 # The preview function uses SQLx's locked SQLite handle; upgrade these together.
@@ -35,6 +36,7 @@ sqlx = { version = "=0.8.6", default-features = false, features = ["sqlite", "po
 libsqlite3-sys = { version = "=0.30.1", default-features = false }
 tokio = { version = "1.45.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8.23"
 tonic = { version = "0.12.3", features = ["transport", "tls", "tls-webpki-roots"] }
 tonic-health = "0.12.3"

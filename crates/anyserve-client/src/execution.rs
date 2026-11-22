@@ -13,34 +13,62 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-use tonic::{Code, Status, Streaming};
+use tonic::{Code, Status};
 
 pub use anyserve_proto::v2;
 use v2::client_client::ClientClient;
 use v2::worker_client::WorkerClient;
 
-use crate::{BearerAuth, NAMESPACE_ENV, TOKEN_ENV, connect_channel, parse_endpoints};
+use crate::{
+    BearerAuth, NAMESPACE_ENV, TOKEN_ENV, connect_channel, is_ws_endpoint, parse_endpoints,
+    ws_transport::{self, HttpWsClient},
+};
 
 mod attempt;
 pub use attempt::Attempt;
 mod events;
-pub use events::ExecutionEvents;
+pub use events::{ExecutionEvents, RpcStream};
 
 const SEND_QUEUE: usize = 8;
 const CONTROL_MESSAGE_BYTES: usize = 256 * 1024;
 type Transport = InterceptedService<Channel, BearerAuth>;
 
 #[derive(Clone)]
+enum SlotClient {
+    Grpc(ClientClient<Transport>),
+    HttpWs(HttpWsClient),
+}
+
+#[derive(Clone)]
 pub struct ExecutionClient {
     endpoints: Arc<Vec<String>>,
     auth: BearerAuth,
-    slot: Arc<Mutex<(usize, ClientClient<Transport>)>>,
+    http: reqwest::Client,
+    slot: Arc<Mutex<(usize, SlotClient)>>,
 }
 
 fn build_client(channel: Channel, auth: BearerAuth) -> ClientClient<Transport> {
     ClientClient::with_interceptor(channel, auth)
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+}
+
+async fn connect_slot(
+    endpoint: &str,
+    auth: &BearerAuth,
+    http: &reqwest::Client,
+) -> Result<SlotClient> {
+    if is_ws_endpoint(endpoint) {
+        ws_transport::probe_tcp(endpoint).await?;
+        Ok(SlotClient::HttpWs(HttpWsClient::new(
+            endpoint,
+            auth.clone(),
+            http.clone(),
+        )?))
+    } else {
+        let ch = connect_channel(endpoint).await?;
+        Ok(SlotClient::Grpc(build_client(ch, auth.clone())))
+    }
 }
 
 impl ExecutionClient {
@@ -61,14 +89,15 @@ impl ExecutionClient {
     ) -> Result<Self> {
         let endpoints = parse_endpoints(endpoint)?;
         let auth = BearerAuth::with_namespace(token, namespace)?;
+        let http = ws_transport::build_http_client()?;
         let mut last_err = None;
         for (idx, ep) in endpoints.iter().enumerate() {
-            match connect_channel(ep).await {
-                Ok(ch) => {
-                    let client = build_client(ch, auth.clone());
+            match connect_slot(ep, &auth, &http).await {
+                Ok(client) => {
                     return Ok(Self {
                         endpoints: Arc::new(endpoints),
                         auth,
+                        http,
                         slot: Arc::new(Mutex::new((idx, client))),
                     });
                 }
@@ -80,7 +109,7 @@ impl ExecutionClient {
 
     async fn call_with<R: Clone, T, F, Fut>(&self, req: R, mut op: F) -> Result<T, Status>
     where
-        F: FnMut(ClientClient<Transport>, R) -> Fut,
+        F: FnMut(SlotClient, R) -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
         let (start_idx, primary) = self.slot.lock().expect("client slot poisoned").clone();
@@ -95,10 +124,10 @@ impl ExecutionClient {
         let n = self.endpoints.len();
         for offset in 1..n {
             let idx = (start_idx + offset) % n;
-            let Ok(ch) = connect_channel(&self.endpoints[idx]).await else {
+            let Ok(candidate) = connect_slot(&self.endpoints[idx], &self.auth, &self.http).await
+            else {
                 continue;
             };
-            let candidate = build_client(ch, self.auth.clone());
             match op(candidate.clone(), req.clone()).await {
                 Ok(val) => {
                     *self.slot.lock().expect("client slot poisoned") = (idx, candidate);
@@ -128,8 +157,11 @@ impl ExecutionClient {
             conflict_policy: v2::ConflictPolicy::UseExisting as i32,
             spec: Some(spec),
         };
-        self.call_with(req, |mut c, r| async move {
-            Ok(c.submit(r).await?.into_inner())
+        self.call_with(req, |slot, r| async move {
+            match slot {
+                SlotClient::Grpc(mut c) => Ok(c.submit(r).await?.into_inner()),
+                SlotClient::HttpWs(ws) => ws.unary("/rpc/v2/client/submit", &r).await,
+            }
         })
         .await
     }
@@ -143,31 +175,40 @@ impl ExecutionClient {
                 streaming_input: false,
             })),
         };
-        self.call_with(request, |mut c, r| async move {
-            Ok(ExecutionEvents::new(
-                c.invoke(tokio_stream::iter([r])).await?.into_inner(),
-            ))
+        self.call_with(request, |slot, r| async move {
+            match slot {
+                SlotClient::Grpc(mut c) => Ok(ExecutionEvents::new(RpcStream::Grpc(
+                    c.invoke(tokio_stream::iter([r])).await?.into_inner(),
+                ))),
+                SlotClient::HttpWs(ws) => ws.invoke(r).await,
+            }
         })
         .await
     }
 
     pub async fn invoke_stream(&mut self, spec: v2::JobSpec) -> Result<Invocation, Status> {
-        self.call_with(spec, |mut c, s| async move {
-            let (input, requests) = mpsc::channel(SEND_QUEUE);
-            input
-                .send(v2::InvokeRequest {
-                    msg: Some(v2::invoke_request::Msg::Start(v2::InvokeStart {
-                        spec: Some(s),
-                        streaming_input: true,
-                    })),
-                })
-                .await
-                .map_err(|_| Status::unavailable("invocation input closed"))?;
-            let events = c.invoke(ReceiverStream::new(requests)).await?.into_inner();
-            Ok(Invocation {
-                input,
-                events: ExecutionEvents::new(events),
-            })
+        self.call_with(spec, |slot, s| async move {
+            let start = v2::InvokeRequest {
+                msg: Some(v2::invoke_request::Msg::Start(v2::InvokeStart {
+                    spec: Some(s),
+                    streaming_input: true,
+                })),
+            };
+            match slot {
+                SlotClient::Grpc(mut c) => {
+                    let (input, requests) = mpsc::channel(SEND_QUEUE);
+                    input
+                        .send(start)
+                        .await
+                        .map_err(|_| Status::unavailable("invocation input closed"))?;
+                    let events = c.invoke(ReceiverStream::new(requests)).await?.into_inner();
+                    Ok(Invocation {
+                        input,
+                        events: ExecutionEvents::new(RpcStream::Grpc(events)),
+                    })
+                }
+                SlotClient::HttpWs(ws) => ws.invoke_stream(start, SEND_QUEUE).await,
+            }
         })
         .await
     }
@@ -181,8 +222,13 @@ impl ExecutionClient {
             job_id: job_id.into(),
             after_sequence,
         };
-        self.call_with(req, |mut c, r| async move {
-            Ok(ExecutionEvents::new(c.watch(r).await?.into_inner()))
+        self.call_with(req, |slot, r| async move {
+            match slot {
+                SlotClient::Grpc(mut c) => Ok(ExecutionEvents::new(RpcStream::Grpc(
+                    c.watch(r).await?.into_inner(),
+                ))),
+                SlotClient::HttpWs(ws) => ws.watch(r).await,
+            }
         })
         .await
     }
@@ -196,8 +242,11 @@ impl ExecutionClient {
             job_id: job_id.into(),
             include_outputs,
         };
-        self.call_with(req, |mut c, r| async move {
-            Ok(c.get_job(r).await?.into_inner())
+        self.call_with(req, |slot, r| async move {
+            match slot {
+                SlotClient::Grpc(mut c) => Ok(c.get_job(r).await?.into_inner()),
+                SlotClient::HttpWs(ws) => ws.unary("/rpc/v2/client/get_job", &r).await,
+            }
         })
         .await
     }
@@ -211,8 +260,11 @@ impl ExecutionClient {
             job_id: job_id.into(),
             reason: reason.into(),
         };
-        self.call_with(req, |mut c, r| async move {
-            Ok(c.cancel(r).await?.into_inner())
+        self.call_with(req, |slot, r| async move {
+            match slot {
+                SlotClient::Grpc(mut c) => Ok(c.cancel(r).await?.into_inner()),
+                SlotClient::HttpWs(ws) => ws.unary("/rpc/v2/client/cancel", &r).await,
+            }
         })
         .await
     }
@@ -221,8 +273,11 @@ impl ExecutionClient {
         &mut self,
         request: v2::ListJobsRequest,
     ) -> Result<v2::ListJobsResponse, Status> {
-        self.call_with(request, |mut c, r| async move {
-            Ok(c.list_jobs(r).await?.into_inner())
+        self.call_with(request, |slot, r| async move {
+            match slot {
+                SlotClient::Grpc(mut c) => Ok(c.list_jobs(r).await?.into_inner()),
+                SlotClient::HttpWs(ws) => ws.unary("/rpc/v2/client/list_jobs", &r).await,
+            }
         })
         .await
     }
@@ -258,7 +313,7 @@ impl Invocation {
 
 pub struct WorkerSession {
     pub control: mpsc::Sender<v2::WorkerMessage>,
-    pub messages: Streaming<v2::ServerMessage>,
+    pub messages: RpcStream<v2::ServerMessage>,
     pub data: AttemptClient,
 }
 
@@ -277,6 +332,23 @@ impl WorkerSession {
         let auth = BearerAuth::with_namespace(token, namespace)?;
         let mut last_err = None;
         for ep in &endpoints {
+            if is_ws_endpoint(ep) {
+                match ws_transport::open_worker_session(ep, &auth, &hello, SEND_QUEUE).await {
+                    Ok((control, messages)) => {
+                        let data = AttemptClient::from_ws_endpoint(ep, auth);
+                        return Ok(Self {
+                            control,
+                            messages: RpcStream::Ws(messages),
+                            data,
+                        });
+                    }
+                    Err(status) if status.code() == Code::Unavailable && endpoints.len() > 1 => {
+                        last_err = Some(status.into());
+                    }
+                    Err(status) => return Err(status.into()),
+                }
+                continue;
+            }
             let channel = match connect_channel(ep).await {
                 Ok(ch) => ch,
                 Err(err) => {
@@ -300,7 +372,7 @@ impl WorkerSession {
                         AttemptClient::from_channel_with_namespace(data_channel, token, namespace)?;
                     return Ok(Self {
                         control,
-                        messages: response.into_inner(),
+                        messages: RpcStream::Grpc(response.into_inner()),
                         data,
                     });
                 }
@@ -326,8 +398,14 @@ impl WorkerSession {
 }
 
 #[derive(Clone)]
+enum AttemptTransport {
+    Grpc(WorkerClient<Transport>),
+    HttpWs { ws_base: String, auth: BearerAuth },
+}
+
+#[derive(Clone)]
 pub struct AttemptClient {
-    inner: WorkerClient<Transport>,
+    inner: AttemptTransport,
 }
 
 impl AttemptClient {
@@ -341,11 +419,19 @@ impl AttemptClient {
         namespace: Option<&str>,
     ) -> Result<Self> {
         let endpoints = parse_endpoints(endpoint)?;
+        let auth = BearerAuth::with_namespace(token, namespace)?;
         let mut last_err = None;
         for ep in &endpoints {
-            match connect_channel(ep).await {
-                Ok(ch) => return Self::from_channel_with_namespace(ch, token, namespace),
-                Err(err) => last_err = Some(err),
+            if is_ws_endpoint(ep) {
+                match ws_transport::probe_tcp(ep).await {
+                    Ok(()) => return Ok(Self::from_ws_endpoint(ep, auth)),
+                    Err(err) => last_err = Some(err),
+                }
+            } else {
+                match connect_channel(ep).await {
+                    Ok(ch) => return Self::from_channel_with_namespace(ch, token, namespace),
+                    Err(err) => last_err = Some(err),
+                }
             }
         }
         Err(last_err.expect("endpoints is non-empty"))
@@ -360,7 +446,18 @@ impl AttemptClient {
             WorkerClient::with_interceptor(channel, BearerAuth::with_namespace(token, namespace)?)
                 .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
                 .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
-        Ok(Self { inner })
+        Ok(Self {
+            inner: AttemptTransport::Grpc(inner),
+        })
+    }
+
+    fn from_ws_endpoint(endpoint: &str, auth: BearerAuth) -> Self {
+        Self {
+            inner: AttemptTransport::HttpWs {
+                ws_base: endpoint.trim_end_matches('/').to_owned(),
+                auth,
+            },
+        }
     }
 
     pub async fn open(
@@ -369,22 +466,37 @@ impl AttemptClient {
         generation: u64,
         resume_after_sequence: u64,
     ) -> Result<AttemptLink, Status> {
-        let (send, requests) = mpsc::channel(SEND_QUEUE);
-        send.send(v2::AttemptUp {
-            msg: Some(v2::attempt_up::Msg::Open(v2::AttemptOpen {
-                lease_id,
-                generation,
-                resume_after_sequence,
-            })),
-        })
-        .await
-        .map_err(|_| Status::unavailable("attempt data link closed"))?;
-        let events = self
-            .inner
-            .attempt(ReceiverStream::new(requests))
-            .await?
-            .into_inner();
-        Ok(AttemptLink { send, events })
+        let open = v2::AttemptOpen {
+            lease_id,
+            generation,
+            resume_after_sequence,
+        };
+        match &mut self.inner {
+            AttemptTransport::Grpc(inner) => {
+                let (send, requests) = mpsc::channel(SEND_QUEUE);
+                send.send(v2::AttemptUp {
+                    msg: Some(v2::attempt_up::Msg::Open(open)),
+                })
+                .await
+                .map_err(|_| Status::unavailable("attempt data link closed"))?;
+                let events = inner
+                    .attempt(ReceiverStream::new(requests))
+                    .await?
+                    .into_inner();
+                Ok(AttemptLink {
+                    send,
+                    events: RpcStream::Grpc(events),
+                })
+            }
+            AttemptTransport::HttpWs { ws_base, auth } => {
+                let (send, events) =
+                    ws_transport::open_worker_attempt(ws_base, auth, open, SEND_QUEUE).await?;
+                Ok(AttemptLink {
+                    send,
+                    events: RpcStream::Ws(events),
+                })
+            }
+        }
     }
 }
 
@@ -392,5 +504,5 @@ impl AttemptClient {
 /// for Ack before exceeding its advertised application window.
 pub struct AttemptLink {
     pub send: mpsc::Sender<v2::AttemptUp>,
-    pub events: Streaming<v2::AttemptDown>,
+    pub events: RpcStream<v2::AttemptDown>,
 }

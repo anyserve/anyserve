@@ -1,5 +1,6 @@
 //! Native clients and outbound worker sessions for the execution protocol.
 pub mod execution;
+pub(crate) mod ws_transport;
 pub use anyserve_proto::v2;
 pub use execution::ExecutionClient;
 
@@ -48,6 +49,18 @@ impl BearerAuth {
             .transpose()?;
         Ok(Self { header, namespace })
     }
+
+    /// Returns the formatted `authorization` header value (`Bearer <token>`), if configured.
+    pub fn authorization_header(&self) -> Option<&str> {
+        self.header.as_ref().and_then(|value| value.to_str().ok())
+    }
+
+    /// Returns the configured `x-anyserve-namespace` header value, if configured.
+    pub fn namespace_header(&self) -> Option<&str> {
+        self.namespace
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+    }
 }
 
 impl Interceptor for BearerAuth {
@@ -66,6 +79,17 @@ impl Interceptor for BearerAuth {
     }
 }
 
+pub(crate) fn is_ws_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| {
+            uri.scheme_str()
+                .map(|s| s.eq_ignore_ascii_case("ws") || s.eq_ignore_ascii_case("wss"))
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn parse_endpoints(raw: &str) -> Result<Vec<String>> {
     let endpoints: Vec<String> = raw
         .split(',')
@@ -74,11 +98,29 @@ pub(crate) fn parse_endpoints(raw: &str) -> Result<Vec<String>> {
         .map(str::to_owned)
         .collect();
     if endpoints.is_empty() {
-        return Err(anyhow!("anyserve gRPC endpoint must not be empty"));
+        return Err(anyhow!("anyserve endpoint must not be empty"));
     }
     for ep in &endpoints {
-        Endpoint::from_shared(ep.clone())
-            .with_context(|| format!("parse anyserve gRPC endpoint '{ep}'"))?;
+        let uri: http::Uri = ep
+            .parse()
+            .with_context(|| format!("parse anyserve endpoint '{ep}'"))?;
+        let scheme = uri
+            .scheme_str()
+            .ok_or_else(|| anyhow!("anyserve endpoint '{ep}' is missing a scheme"))?;
+        let authority = uri
+            .authority()
+            .ok_or_else(|| anyhow!("anyserve endpoint '{ep}' is missing an authority"))?;
+        if authority.host().is_empty() {
+            return Err(anyhow!("anyserve endpoint '{ep}' has an empty host"));
+        }
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            Endpoint::from_shared(ep.clone())
+                .with_context(|| format!("parse anyserve gRPC endpoint '{ep}'"))?;
+        } else if !scheme.eq_ignore_ascii_case("ws") && !scheme.eq_ignore_ascii_case("wss") {
+            return Err(anyhow!(
+                "unsupported anyserve endpoint scheme '{scheme}' in '{ep}'"
+            ));
+        }
     }
     Ok(endpoints)
 }
