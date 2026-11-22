@@ -4,8 +4,8 @@
  * `crates/anyserve-core/src/runtime/identity.rs`.
  *
  * Runs in both Cloudflare `workerd` (uses `crypto.DigestStream` when streaming)
- * and plain Node 24 Vitest (falls back to a zero-concatenation incremental SHA-256).
- * Does NOT import `cloudflare:workers` or `node:*`.
+ * and plain Node 24 Vitest (falls back to a zero-concatenation incremental SHA-256),
+ * with zero host-specific runtime imports.
  */
 
 import {

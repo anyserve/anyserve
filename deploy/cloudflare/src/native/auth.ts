@@ -3,8 +3,8 @@
  * comparison, and gRPC-over-HTTP error status responses with full parity against
  * `crates/anyserve-core/src/auth.rs` and `crates/anyserve-core/src/http_ws_service.rs`.
  *
- * Compatible with both Cloudflare `workerd` and plain Node 24 Vitest.
- * Does NOT import `cloudflare:workers` or `node:*`.
+ * Compatible with both Cloudflare `workerd` and plain Node 24 Vitest,
+ * with zero host-specific runtime imports.
  */
 
 import { DEFAULT_NAMESPACE } from "./identity";

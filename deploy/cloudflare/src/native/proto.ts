@@ -2,8 +2,8 @@
  * Hand-written zero-eval Protobuf v3 codec for `crates/anyserve-proto/protos/execution.proto`
  * (`package anyserve.v2`), plus AnyServe WebSocket binary frame helpers.
  *
- * Compatible with both Cloudflare `workerd` (strict CSP: no `eval` / `new Function`)
- * and plain Node 24. Does NOT import `cloudflare:workers` or `node:*`.
+ * Compatible with both Cloudflare `workerd` (strict CSP: no dynamic code generation)
+ * and plain Node 24, with zero host-specific runtime imports.
  */
 
 const WIRE_VARINT = 0;
