@@ -1,0 +1,28 @@
+[server]
+grpc_enabled = false
+
+[console]
+enabled = true
+listen = "0.0.0.0:3001"
+public_endpoint = "wss://anyserve.example.com"
+
+[auth]
+client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
+worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+
+[journal]
+enabled = true
+backend = "cloudflare"
+endpoint = "http://journal.internal"
+queue_capacity = 1024
+max_batch = 64
+retention_secs = 604800
+
+[runtime]
+max_pending_jobs = 2000
+max_terminal_jobs = 1000
+max_pending_bytes = 67108864
+max_result_bytes = 67108864
+max_event_bytes = 33554432
+max_inline_object_bytes = 8388608
+max_inline_total_bytes = 25165824
