@@ -196,9 +196,17 @@ export interface ConsoleOverviewSnapshot {
     active_leases: number;
     desired_additional_slots: number;
   }>;
+  quotaDayUtc: string;
+  quotaMonthUtc: string;
   quotaRowsWritten: number;
   quotaRowsRead: number;
   quotaDoRequests: number;
+  quotaWsMessages: number;
+  quotaR2ClassA: number;
+  quotaR2ClassB: number;
+  quotaLargeJobs: number;
+  databaseSizeBytes: number;
+  reservedRetainedBytes: number;
 }
 
 export interface AdminResetResult {
@@ -527,6 +535,24 @@ export function renderPrometheusMetrics(snap: ConsoleOverviewSnapshot): string {
     "# HELP anyserve_native_quota_do_requests Daily metered DO requests.",
     "# TYPE anyserve_native_quota_do_requests gauge",
     `anyserve_native_quota_do_requests ${snap.quotaDoRequests}`,
+    "# HELP anyserve_native_quota_ws_messages Daily inbound WebSocket messages.",
+    "# TYPE anyserve_native_quota_ws_messages gauge",
+    `anyserve_native_quota_ws_messages ${snap.quotaWsMessages}`,
+    "# HELP anyserve_native_quota_r2_class_a Monthly metered R2 Class A operations.",
+    "# TYPE anyserve_native_quota_r2_class_a gauge",
+    `anyserve_native_quota_r2_class_a ${snap.quotaR2ClassA}`,
+    "# HELP anyserve_native_quota_r2_class_b Monthly metered R2 Class B operations.",
+    "# TYPE anyserve_native_quota_r2_class_b gauge",
+    `anyserve_native_quota_r2_class_b ${snap.quotaR2ClassB}`,
+    "# HELP anyserve_native_quota_large_jobs Daily metered multi-chunk or R2-spilled jobs.",
+    "# TYPE anyserve_native_quota_large_jobs gauge",
+    `anyserve_native_quota_large_jobs ${snap.quotaLargeJobs}`,
+    "# HELP anyserve_native_database_size_bytes Durable Object SQLite database size in bytes.",
+    "# TYPE anyserve_native_database_size_bytes gauge",
+    `anyserve_native_database_size_bytes ${snap.databaseSizeBytes}`,
+    "# HELP anyserve_native_reserved_retained_bytes Reserved retained SQLite bytes for accepted work.",
+    "# TYPE anyserve_native_reserved_retained_bytes gauge",
+    `anyserve_native_reserved_retained_bytes ${snap.reservedRetainedBytes}`,
     "",
   );
   return lines.join("\n");
@@ -687,6 +713,19 @@ async function dispatchAuthorizedConsoleRoute(
           : null,
       })),
       pools: snap.pools,
+      quota: {
+        day_utc: snap.quotaDayUtc,
+        month_utc: snap.quotaMonthUtc,
+        do_requests: snap.quotaDoRequests,
+        ws_messages: snap.quotaWsMessages,
+        rows_written: snap.quotaRowsWritten,
+        rows_read: snap.quotaRowsRead,
+        r2_class_a: snap.quotaR2ClassA,
+        r2_class_b: snap.quotaR2ClassB,
+        large_jobs: snap.quotaLargeJobs,
+        database_size_bytes: snap.databaseSizeBytes,
+        reserved_retained_bytes: snap.reservedRetainedBytes,
+      },
       refreshed_at_ms: nowMs,
     };
     return jsonResponse(body);

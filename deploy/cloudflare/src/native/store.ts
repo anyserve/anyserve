@@ -603,6 +603,7 @@ export class NativeStore {
   private flushedDoRequests = 0;
   private inTransactionDepth = 0;
   private flushingMeter = false;
+  private pendingGcHint = false;
 
   // Exact cumulative counters since this instance booted (useful for per-step row accounting tests!)
   bootRowsWritten = 0;
@@ -721,6 +722,10 @@ export class NativeStore {
       }
       this.flushedRowsWritten = this.rowsWritten;
       this.flushedDoRequests = this.doRequests;
+    }
+
+    if (!freshInit && this.r2) {
+      this.pendingGcHint = true;
     }
 
     return { generation, connSeq, queueSeq, freshInit };
@@ -1000,6 +1005,7 @@ export class NativeStore {
         expiresAtMs,
         nowMs,
       );
+      this.pendingGcHint = true;
     });
 
     try {
@@ -1082,7 +1088,26 @@ export class NativeStore {
         nowMs,
         nowMs,
       );
+      this.pendingGcHint = true;
     }
+  }
+
+  /**
+   * Returns the earliest due timestamp across `native_r2_gc` when GC entries exist,
+   * performing ZERO SQL reads in steady state when `pendingGcHint` is false!
+   */
+  nextR2GcDueMs(): number | null {
+    if (!this.pendingGcHint || !this.r2) {
+      return null;
+    }
+    const row = this.exec<{ due_ms: number | null }>(
+      `SELECT MIN(CASE WHEN state = 'staging' THEN expires_at_ms ELSE retry_after_ms END) AS due_ms FROM native_r2_gc`,
+    )[0];
+    const due = row?.due_ms ?? null;
+    if (due === null) {
+      this.pendingGcHint = false;
+    }
+    return due;
   }
 
   /**

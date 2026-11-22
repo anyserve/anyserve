@@ -1951,37 +1951,54 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
 
-    // Background maintenance bucket (>= 5s) ONLY when there is state requiring periodic sweep
-    let needsMaintenance = false;
+    // Background maintenance (>= 5s bucket): schedule connected-session liveness
+    // checks at `effectiveLastSeen + heartbeatTimeoutMs` (bucketed to maintenanceBucketMs,
+    // or exact when heartbeatTimeoutMs < maintenanceBucketMs) rather than waking every 5s!
+    const b = this.config.maintenanceBucketMs;
+    let maintenanceDue: number | null = null;
+    const considerMaintenance = (rawAtMs: number) => {
+      const bucketed = Math.ceil(Math.max(nowMs + 1, rawAtMs) / b) * b;
+      if (maintenanceDue === null || bucketed < maintenanceDue) {
+        maintenanceDue = bucketed;
+      }
+    };
+
     for (const s of this.sessions.values()) {
       if (s.connected) {
-        needsMaintenance = true;
-        break;
+        const ws = this.socketsByConnId.get(s.currentConnId);
+        const att =
+          ws && ws.readyState === WS_READY_STATE_OPEN
+            ? readSocketAttachment(ws)
+            : null;
+        const effectiveLastSeen =
+          att && att.kind === "session" && att.connId === s.currentConnId
+            ? Math.max(s.lastSeenMs, att.lastSeenAtMs)
+            : s.lastSeenMs;
+        const rawTimeoutAt = effectiveLastSeen + this.config.heartbeatTimeoutMs;
+        if (this.config.heartbeatTimeoutMs < b) {
+          considerBusiness(rawTimeoutAt);
+        } else {
+          considerMaintenance(rawTimeoutAt);
+        }
       }
     }
-    if (!needsMaintenance && this.jobs.size > 0) {
-      // Check if any terminal job is due within next bucket or if GC/receipts exist
+
+    const r2GcDueMs = this.store.nextR2GcDueMs();
+    if (r2GcDueMs !== null) {
+      considerMaintenance(r2GcDueMs);
+    }
+
+    if (maintenanceDue === null && this.jobs.size > 0) {
+      // Schedule retention purge for retained terminal jobs
       for (const j of this.jobs.values()) {
         if (
           j.state === "succeeded" ||
           j.state === "failed" ||
           j.state === "cancelled"
         ) {
-          const purgeAt = j.updatedAtMs + this.config.terminalRetentionMs;
-          const bucketedPurge =
-            Math.ceil(Math.max(nowMs + 1, purgeAt) / this.config.maintenanceBucketMs) *
-            this.config.maintenanceBucketMs;
-          if (earliestBusiness === null || bucketedPurge < earliestBusiness) {
-            earliestBusiness = bucketedPurge;
-          }
+          considerMaintenance(j.updatedAtMs + this.config.terminalRetentionMs);
         }
       }
-    }
-
-    let maintenanceDue: number | null = null;
-    if (needsMaintenance) {
-      const b = this.config.maintenanceBucketMs;
-      maintenanceDue = Math.ceil((nowMs + 1) / b) * b;
     }
 
     if (earliestBusiness !== null && maintenanceDue !== null) {
@@ -7812,9 +7829,17 @@ export class NativeEngine implements ConsoleBackend {
       },
       interfaces,
       pools,
+      quotaDayUtc: quota.dayUtc,
+      quotaMonthUtc: quota.monthUtc,
       quotaRowsWritten: quota.rowsWritten,
       quotaRowsRead: quota.rowsRead,
       quotaDoRequests: quota.doRequests,
+      quotaWsMessages: quota.wsMessages,
+      quotaR2ClassA: quota.r2ClassA,
+      quotaR2ClassB: quota.r2ClassB,
+      quotaLargeJobs: quota.largeJobs,
+      databaseSizeBytes: quota.databaseSizeBytes,
+      reservedRetainedBytes: quota.reservedRetainedBytes,
     };
   }
 

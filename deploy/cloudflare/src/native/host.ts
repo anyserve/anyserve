@@ -385,6 +385,7 @@ export interface NativeEnvConfig {
   ANYSERVE_PUBLIC_ENDPOINT?: string;
   ANYSERVE_CONSOLE_POLL_MS?: string;
   ANYSERVE_ALLOWED_ORIGINS?: string;
+  ANYSERVE_RUNTIME_OVERRIDES_JSON?: string;
 }
 
 export interface NativeHost {

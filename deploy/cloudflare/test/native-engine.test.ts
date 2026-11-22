@@ -4126,4 +4126,44 @@ describe("Size boundaries (2 MiB Invoke, 8 MiB object, 32 MiB WS boundary), admi
     }
     expect(buffersEqual(rebuiltParams, eightMiBParams)).toBe(true);
   });
+
+  it("schedules connected-session liveness alarm at lastSeen + heartbeatTimeoutMs (not 5s loop) and exposes full quota & databaseSize metrics", async () => {
+    const platform = new SimulatedNativePlatform();
+    const { ws } = await connectWorkerSession(platform, {
+      workerId: "w-hibernatable",
+      interfaces: ["hib.v1"],
+    });
+
+    // With Free defaults (heartbeatTimeoutMs = 90_000, maintenanceBucketMs = 5_000),
+    // the armed alarm MUST be >= nowMs + 90_000 so the DO can hibernate across 30s+ idle!
+    const armed = (platform as unknown as { scheduledAlarmMs: number | null }).scheduledAlarmMs;
+    expect(armed).not.toBeNull();
+    expect(armed! - platform.nowMs()).toBeGreaterThanOrEqual(90_000);
+
+    const rwBefore = platform.engine.store.quotaSnapshot(platform.nowMs()).rowsWritten;
+    await ws.sendBinary(
+      pb.encodeWorkerMessage({
+        msg: {
+          case: "heartbeat",
+          value: { load: { queued: 0, running: 1, utilization: 0.5, custom: {} } },
+        },
+      }),
+    );
+    expect(platform.engine.store.quotaSnapshot(platform.nowMs()).rowsWritten).toBe(rwBefore);
+
+    const ov = (await (
+      await platform.engine.fetch(new Request("https://anyserve.example.com/api/overview"))
+    ).json()) as Record<string, any>;
+    expect(ov.quota).toBeDefined();
+    expect(typeof ov.quota.database_size_bytes).toBe("number");
+    expect(typeof ov.quota.r2_class_a).toBe("number");
+    expect(typeof ov.quota.r2_class_b).toBe("number");
+
+    const metricsTxt = await (
+      await platform.engine.fetch(new Request("https://anyserve.example.com/metrics"))
+    ).text();
+    expect(metricsTxt).toContain("anyserve_native_database_size_bytes ");
+    expect(metricsTxt).toContain("anyserve_native_quota_r2_class_a ");
+    expect(metricsTxt).toContain("anyserve_native_quota_r2_class_b ");
+  });
 });

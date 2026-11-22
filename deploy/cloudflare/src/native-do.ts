@@ -5,6 +5,7 @@ import type {
   NativeEnvConfig,
   NativeHost,
   NativeR2Bucket,
+  NativeRuntimeOverrides,
   NativeWebSocket,
   NativeWebSocketPairResult,
 } from "./native/host";
@@ -12,6 +13,18 @@ import type {
 export interface NativeWorkerEnv extends Env, NativeEnvConfig {}
 
 const constructorRunsByDoId = new Map<string, number>();
+
+function parseRuntimeOverrides(raw?: string): NativeRuntimeOverrides | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = JSON.parse(trimmed) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("ANYSERVE_RUNTIME_OVERRIDES_JSON must be a JSON object");
+  }
+  return parsed as NativeRuntimeOverrides;
+}
 
 /**
  * Cloudflare Workers Free native Durable Object control plane (no Containers).
@@ -24,6 +37,7 @@ export class AnyserveNativeDO extends DurableObject<NativeWorkerEnv> {
   constructor(ctx: DurableObjectState, env: NativeWorkerEnv) {
     super(ctx, env);
     const doId = ctx.id.toString();
+    const overrides = parseRuntimeOverrides(env.ANYSERVE_RUNTIME_OVERRIDES_JSON);
     const host: NativeHost = {
       doId,
       storage: {
@@ -33,6 +47,7 @@ export class AnyserveNativeDO extends DurableObject<NativeWorkerEnv> {
       },
       r2: (env.ANYSERVE_R2 as unknown as NativeR2Bucket | undefined) ?? null,
       env,
+      overrides,
       acceptWebSocket: (ws: NativeWebSocket, tags?: string[]) => {
         ctx.acceptWebSocket(ws as unknown as WebSocket, tags);
       },
