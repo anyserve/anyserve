@@ -70,7 +70,7 @@ pub fn validate_namespace(namespace: &str) -> Result<&str, Status> {
     Ok(namespace)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScopedToken {
     pub token: String,
     pub role: Role,
@@ -79,11 +79,33 @@ pub struct ScopedToken {
     pub forced_pool: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl std::fmt::Debug for ScopedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedToken")
+            .field("token", &"[redacted]")
+            .field("role", &self.role)
+            .field("namespace", &self.namespace)
+            .field("subject", &self.subject)
+            .field("forced_pool", &self.forced_pool)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct AuthPolicy {
     client_tokens: BTreeSet<String>,
     worker_tokens: BTreeSet<String>,
     scoped_tokens: Vec<ScopedToken>,
+}
+
+impl std::fmt::Debug for AuthPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthPolicy")
+            .field("client_token_count", &self.client_tokens.len())
+            .field("worker_token_count", &self.worker_tokens.len())
+            .field("scoped_tokens", &self.scoped_tokens)
+            .finish()
+    }
 }
 
 #[allow(clippy::result_large_err)] // tonic::Status is the natural error for gRPC auth.
@@ -563,5 +585,36 @@ mod tests {
             scoped_principal.forced_pool.as_deref(),
             Some("jetson-local")
         );
+    }
+
+    #[test]
+    fn debug_redacts_all_secret_tokens_in_scoped_token_and_auth_policy() {
+        let scoped = ScopedToken {
+            token: "super-secret-scoped-tok".into(),
+            role: Role::Worker,
+            namespace: "factory-a".into(),
+            subject: "jetson-1".into(),
+            forced_pool: Some("jetson-local".into()),
+        };
+        let scoped_dbg = format!("{scoped:?}");
+        assert!(!scoped_dbg.contains("super-secret-scoped-tok"));
+        assert!(scoped_dbg.contains("[redacted]"));
+        assert!(scoped_dbg.contains("factory-a"));
+        assert!(scoped_dbg.contains("jetson-1"));
+        assert!(scoped_dbg.contains("jetson-local"));
+
+        let policy = AuthPolicy::new(
+            ["super-secret-client-tok".into()],
+            ["super-secret-worker-tok".into()],
+        )
+        .with_scoped_tokens([scoped]);
+        let policy_dbg = format!("{policy:?}");
+        assert!(!policy_dbg.contains("super-secret-client-tok"));
+        assert!(!policy_dbg.contains("super-secret-worker-tok"));
+        assert!(!policy_dbg.contains("super-secret-scoped-tok"));
+        assert!(policy_dbg.contains("[redacted]"));
+        assert!(policy_dbg.contains("client_token_count: 1"));
+        assert!(policy_dbg.contains("worker_token_count: 1"));
+        assert!(policy_dbg.contains("factory-a"));
     }
 }

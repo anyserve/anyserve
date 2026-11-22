@@ -266,3 +266,32 @@ max_inline_total_bytes = 25165824
     assert_eq!(journal.queue_capacity, 1024);
     assert_eq!(journal.max_batch, 64);
 }
+
+#[test]
+fn resolved_serve_config_debug_redacts_all_auth_tokens() {
+    let resolved = config(
+        r#"
+[auth]
+client_tokens = ["raw-client-secret-abc"]
+worker_tokens = ["raw-worker-secret-def"]
+
+[[auth.scoped_tokens]]
+token = "raw-scoped-secret-ghi"
+role = "worker"
+namespace = "tenant-z"
+subject = "edge-node-1"
+forced_pool = "gpu-pool"
+"#,
+        ServeOverrides::default(),
+    )
+    .unwrap();
+
+    let dbg = format!("{resolved:?}");
+    assert!(!dbg.contains("raw-client-secret-abc"));
+    assert!(!dbg.contains("raw-worker-secret-def"));
+    assert!(!dbg.contains("raw-scoped-secret-ghi"));
+    assert!(dbg.contains("[redacted]"));
+    assert!(dbg.contains("tenant-z"));
+    assert!(dbg.contains("edge-node-1"));
+    assert!(dbg.contains("gpu-pool"));
+}

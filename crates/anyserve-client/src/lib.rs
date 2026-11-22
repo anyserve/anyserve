@@ -18,10 +18,19 @@ pub const NAMESPACE_ENV: &str = "ANYSERVE_NAMESPACE";
 
 /// Attaches `authorization: Bearer <token>` and optional `x-anyserve-namespace`
 /// to every request.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BearerAuth {
     header: Option<AsciiMetadataValue>,
     namespace: Option<AsciiMetadataValue>,
+}
+
+impl std::fmt::Debug for BearerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerAuth")
+            .field("header", &self.header.as_ref().map(|_| "[redacted]"))
+            .field("namespace", &self.namespace_header())
+            .finish()
+    }
 }
 
 impl BearerAuth {
@@ -144,4 +153,24 @@ pub(crate) async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .connect()
         .await
         .context("connect anyserve gRPC endpoint")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_bearer_token_while_keeping_namespace() {
+        let auth = BearerAuth::with_namespace(Some("client-secret-123"), Some("tenant-x")).unwrap();
+        let dbg = format!("{auth:?}");
+        assert!(!dbg.contains("client-secret-123"));
+        assert!(!dbg.contains("Bearer "));
+        assert!(dbg.contains("[redacted]"));
+        assert!(dbg.contains("tenant-x"));
+
+        let anon = BearerAuth::with_namespace(None, Some("tenant-y")).unwrap();
+        let anon_dbg = format!("{anon:?}");
+        assert!(anon_dbg.contains("header: None"));
+        assert!(anon_dbg.contains("tenant-y"));
+    }
 }
