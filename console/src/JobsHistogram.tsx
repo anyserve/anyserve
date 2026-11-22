@@ -180,7 +180,6 @@ export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, 
               {totals.succeeded > 0 ? <span><i className="histogram__dot histogram__dot--ok" />{formatNumber(totals.succeeded)} ok</span> : null}
               {totals.errors > 0 ? <span><i className="histogram__dot histogram__dot--err" />{formatNumber(totals.errors)} err</span> : null}
               {totals.active > 0 ? <span><i className="histogram__dot histogram__dot--act" />{formatNumber(totals.active)} active</span> : null}
-              <span className="muted">Click or drag bar to zoom</span>
             </span>
           )}
         </div>
@@ -189,6 +188,7 @@ export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, 
       <div
         ref={barsRef}
         className="histogram__bars"
+        title="Click a bar or drag across bars to zoom time range"
         style={{ gridTemplateColumns: `repeat(${buckets.length}, minmax(0, 1fr))` }}
         onPointerMove={(e) => {
           const idx = resolveIndexFromEvent(e.target, e.clientX);

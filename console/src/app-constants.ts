@@ -1,4 +1,4 @@
-import type { JobState } from "./types";
+import type { JobState, OverviewResponse } from "./types";
 
 export type ConsoleTab = "overview" | "jobs" | "interfaces" | "pools" | "workers" | "explore";
 export type JobScope = "all" | "queue" | "history";
@@ -158,4 +158,42 @@ export function buildUrlSearch(input: {
   }
   const qs = params.toString();
   return qs ? `?${qs}` : "";
+}
+
+export function scopeMap(scope: JobScope, id: string | null): Record<JobScope, string | null> {
+  return {
+    all: scope === "all" ? id : null,
+    queue: scope === "queue" ? id : null,
+    history: scope === "history" ? id : null,
+  };
+}
+
+export function resolveEffectiveStates(scope: JobScope, status: JobStatusFilter): JobState[] {
+  if (status !== "all") return [status];
+  if (scope === "queue") return QUEUE_STATES;
+  if (scope === "history") return HISTORY_STATES;
+  return ALL_JOB_STATES;
+}
+
+export function buildJobStats(scope: JobScope, status: JobStatusFilter, overview: OverviewResponse | null): PaneStat[] {
+  const q = overview?.queue;
+  const h = overview?.history;
+  const stat = (label: string, value: number, state: JobStatusFilter, tone?: PaneStat["tone"]): PaneStat => ({
+    label,
+    value,
+    state,
+    active: status === state,
+    ...(tone ? { tone } : {}),
+  });
+  if (scope === "queue") {
+    return [stat("Active", q?.active ?? 0, "all"), stat("Queued", q?.queued ?? 0, "queued", "warn"), stat("Running", q?.running ?? 0, "running", "warn")];
+  }
+  const outcomes = [
+    stat("Succeeded", h?.succeeded ?? 0, "succeeded", "ok"),
+    stat("Failed", h?.failed ?? 0, "failed", "danger"),
+    stat("Cancelled", h?.cancelled ?? 0, "cancelled", "danger"),
+  ];
+  return scope === "history"
+    ? [...outcomes, stat("Total", h?.total ?? 0, "all")]
+    : [stat("Queued", q?.queued ?? 0, "queued", "warn"), stat("Running", q?.running ?? 0, "running", "warn"), ...outcomes];
 }

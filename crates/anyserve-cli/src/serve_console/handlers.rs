@@ -246,11 +246,10 @@ async fn get_job(
     Path(job_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
-    let namespace = normalize_optional_filter(query.namespace);
-    let ns = namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE);
+    let ns = resolve_namespace(query.namespace);
     let preview = state
         .runtime
-        .inspect_job_preview_in(ns, &job_id)
+        .inspect_job_preview_in(&ns, &job_id)
         .await
         .map_err(api_error)?;
     Ok(Json(job_detail_response(preview, |ns, worker_id| {
@@ -263,11 +262,10 @@ async fn cancel_job(
     Path(job_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<CancelJobResponse>, ApiError> {
-    let namespace = normalize_optional_filter(query.namespace);
-    let ns = namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE);
+    let ns = resolve_namespace(query.namespace);
     let job = state
         .runtime
-        .cancel_in(ns, &job_id, "cancelled from console".into())
+        .cancel_in(&ns, &job_id, "cancelled from console".into())
         .await
         .map_err(api_error)?;
     Ok(Json(CancelJobResponse {
@@ -346,6 +344,10 @@ async fn cors_middleware(
     }
 
     response
+}
+
+fn resolve_namespace(raw: Option<String>) -> String {
+    normalize_optional_filter(raw).unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned())
 }
 
 fn normalize_optional_filter(raw: Option<String>) -> Option<String> {

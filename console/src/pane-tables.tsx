@@ -1,9 +1,44 @@
-import { memo, type ReactNode } from "react";
+import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 
 import type { JobStatusFilter, PaneStat } from "./app-constants";
 import { formatDuration, formatNumber, formatPool, formatShortTime, formatTimestamp } from "./format";
-import { IconClose, IconSearch } from "./icons";
+import { IconCheck, IconClose, IconCopy, IconSearch } from "./icons";
 import type { InterfaceSummary, JobState, JobSummary, PoolTierPolicy, WorkerSummary } from "./types";
+
+export function CopyButton({ text, label = "Copy", resetKey }: { text: string | (() => string); label?: string; resetKey?: string }) {
+  const [copied, setCopied] = useState(false);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setCopied(false);
+    if (timerRef.current != null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, [resetKey]);
+
+  useEffect(() => () => {
+    if (timerRef.current != null) window.clearTimeout(timerRef.current);
+  }, []);
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard?.writeText(typeof text === "function" ? text() : text);
+      setCopied(true);
+      if (timerRef.current != null) window.clearTimeout(timerRef.current);
+      timerRef.current = window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Ignore clipboard unavailability in headless or non-HTTPS contexts.
+    }
+  }
+
+  return (
+    <button type="button" className="button button--sm" onClick={() => void handleCopy()}>
+      {copied ? <IconCheck /> : <IconCopy />}
+      <span>{copied ? "Copied" : label}</span>
+    </button>
+  );
+}
 
 export function StatsRow({ stats, onSelectState }: { stats: PaneStat[]; onSelectState?: (state: JobStatusFilter) => void }) {
   return (

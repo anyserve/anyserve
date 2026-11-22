@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { formatDuration, formatNumber, formatPool } from "./format";
+import { formatDuration, formatNumber, formatPool, poolKey } from "./format";
 import { InspectorGroup, InspectorSection, InspectorShell, MetaGrid } from "./pane-inspector";
 import { EmptyState, InterfacesTable, PanelHeader, SearchInput, TierChain, WorkerMiniList } from "./pane-tables";
 import type { InterfaceSummary, PoolSummary, WorkerSummary } from "./types";
@@ -109,7 +109,7 @@ export function InterfacesPane(props: InterfacesPaneProps) {
               ) : (
                 <div className="chip-list">
                   {matchingPools.map((pool) => {
-                    const key = `${pool.namespace}::${pool.interface}::${pool.pool}`;
+                    const key = poolKey(pool);
                     return (
                       <button key={key} type="button" className="chip-btn" onClick={() => onOpenPool(key)}>
                         <span className="mono">{formatPool(pool.pool)}</span>

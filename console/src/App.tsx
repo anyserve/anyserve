@@ -2,18 +2,18 @@ import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useR
 
 import { AuthenticationError, cancelJob, clearConsoleToken, getJob, getJobs, getOverview, getWorkers, hasConsoleToken, setConsoleToken } from "./api";
 import {
-  ALL_JOB_STATES, buildUrlSearch, DEFAULT_TIME_FILTER, DETAIL_POLL_MS, HISTORY_STATES,
+  buildJobStats, buildUrlSearch, DEFAULT_TIME_FILTER, DETAIL_POLL_MS, HISTORY_STATES,
   JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, QUEUE_STATES,
-  routePath, WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type Theme, type TimeFilterState,
+  resolveEffectiveStates, routePath, scopeMap, WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type Theme, type TimeFilterState,
 } from "./app-constants";
 import { ConnectWorkerModal } from "./ConnectWorkerModal";
-import { asErrorMessage, formatPool, sortJobs, sortWorkers } from "./format";
+import { asErrorMessage, formatPool, poolKey, sameHistogram, sameJobs, sameWorkers, sortJobs, sortWorkers, toSelectOptions } from "./format";
 import { InterfacesPane } from "./InterfacesPane";
 import { TIME_PRESET_MS } from "./JobsHistogram";
 import { JobsPane } from "./JobsPane";
 import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
-import { PoolsPane, poolKey, type PoolFilterSeed } from "./PoolsPane";
+import { PoolsPane, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
 import type { JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
@@ -46,64 +46,6 @@ function readTheme(): Theme {
   try { const s = localStorage.getItem(THEME_KEY); if (s === "dark" || s === "light") return s; } catch { /* ignore */ }
   return "light";
 }
-const toOptions = (values: Iterable<string>, allLabel: string) => [
-  { value: "all", label: allLabel },
-  ...Array.from(new Set(values)).sort().map((v) => ({ value: v, label: v })),
-];
-
-function sameJobs(a: JobSummary[], b: JobSummary[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) {
-    if (
-      a[i].job_id !== b[i].job_id ||
-      a[i].state !== b[i].state ||
-      a[i].updated_at_ms !== b[i].updated_at_ms ||
-      a[i].attempt_count !== b[i].attempt_count ||
-      a[i].latest_worker_id !== b[i].latest_worker_id
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function sameWorkers(a: WorkerSummary[], b: WorkerSummary[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i += 1) {
-    if (
-      a[i].worker_id !== b[i].worker_id ||
-      a[i].session_id !== b[i].session_id ||
-      a[i].healthy !== b[i].healthy ||
-      a[i].draining !== b[i].draining ||
-      a[i].connected !== b[i].connected ||
-      a[i].active_leases !== b[i].active_leases ||
-      a[i].last_seen_at_ms !== b[i].last_seen_at_ms
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function sameHistogram(a: JobsHistogram | null, b: JobsHistogram | null): boolean {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  if (a.start_ms !== b.start_ms || a.end_ms !== b.end_ms || a.buckets.length !== b.buckets.length) return false;
-  for (let i = 0; i < a.buckets.length; i += 1) {
-    const x = a.buckets[i];
-    const y = b.buckets[i];
-    if (
-      x.start_ms !== y.start_ms ||
-      x.active !== y.active ||
-      x.succeeded !== y.succeeded ||
-      x.failed !== y.failed ||
-      x.cancelled !== y.cancelled
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
 
 export default function App() {
   const init = useMemo(() => parseUrlState(window.location.pathname, window.location.search), []);
@@ -129,16 +71,8 @@ export default function App() {
   const deferredSearch = useDeferredValue(filters.q);
 
   const initialPinned = init.tab === "jobs" ? init.pinnedJobId : null;
-  const [pinnedJobByScope, setPinnedJobByScope] = useState<Record<JobScope, string | null>>({
-    all: init.jobScope === "all" ? initialPinned : null,
-    queue: init.jobScope === "queue" ? initialPinned : null,
-    history: init.jobScope === "history" ? initialPinned : null,
-  });
-  const [selectedJobByScope, setSelectedJobByScope] = useState<Record<JobScope, string | null>>({
-    all: init.jobScope === "all" ? initialPinned : null,
-    queue: init.jobScope === "queue" ? initialPinned : null,
-    history: init.jobScope === "history" ? initialPinned : null,
-  });
+  const [pinnedJobByScope, setPinnedJobByScope] = useState<Record<JobScope, string | null>>(() => scopeMap(init.jobScope, initialPinned));
+  const [selectedJobByScope, setSelectedJobByScope] = useState<Record<JobScope, string | null>>(() => scopeMap(init.jobScope, initialPinned));
 
   const [selectedInterface, setSelectedInterface] = useState<string | null>(init.selectedInterface);
   const [selectedPoolKey, setSelectedPoolKey] = useState<string | null>(init.selectedPoolKey);
@@ -235,14 +169,7 @@ export default function App() {
 
   const polling = !authRequired;
   const activeSelectedJobId = activeTab === "jobs" ? selectedJobByScope[jobScope] : null;
-  const effectiveStates: JobState[] =
-    filters.status !== "all"
-      ? [filters.status]
-      : jobScope === "queue"
-        ? QUEUE_STATES
-        : jobScope === "history"
-          ? HISTORY_STATES
-          : ALL_JOB_STATES;
+  const effectiveStates: JobState[] = resolveEffectiveStates(jobScope, filters.status);
   const timeKey =
     timeFilter.preset === "custom"
       ? `custom:${timeFilter.fromMs ?? ""}:${timeFilter.toMs ?? ""}`
@@ -338,9 +265,9 @@ export default function App() {
   }, [jobsPage.loadedKey, jobsPage.page1, jobsPage.extra]);
 
   const filterOptions = useMemo(() => ({
-    iface: toOptions([...(overview?.interfaces.map((i) => i.name) ?? []), ...loadedJobs.map((j) => j.interface_name), ...(filters.iface !== "all" ? [filters.iface] : [])], "All interfaces"),
-    ns: toOptions([...(overview?.pools?.map((p) => p.namespace) ?? []), ...workers.map((w) => w.namespace).filter(Boolean) as string[], ...loadedJobs.map((j) => j.namespace).filter(Boolean) as string[], ...(filters.ns !== "all" ? [filters.ns] : [])], "All namespaces"),
-    worker: toOptions([...knownWorkers, ...(filters.worker !== "all" ? [filters.worker] : [])], "All workers"),
+    iface: toSelectOptions([...(overview?.interfaces.map((i) => i.name) ?? []), ...loadedJobs.map((j) => j.interface_name), ...(filters.iface !== "all" ? [filters.iface] : [])], "All interfaces"),
+    ns: toSelectOptions([...(overview?.pools?.map((p) => p.namespace) ?? []), ...workers.map((w) => w.namespace).filter(Boolean) as string[], ...loadedJobs.map((j) => j.namespace).filter(Boolean) as string[], ...(filters.ns !== "all" ? [filters.ns] : [])], "All namespaces"),
+    worker: toSelectOptions([...knownWorkers, ...(filters.worker !== "all" ? [filters.worker] : [])], "All workers"),
   }), [overview, workers, knownWorkers, loadedJobs, filters.iface, filters.ns, filters.worker]);
 
   const visibleJobs = useMemo(() => {
@@ -535,27 +462,7 @@ export default function App() {
     );
   }
 
-  const jobStats =
-    jobScope === "queue"
-      ? [
-          { label: "Active", value: overview?.queue.active ?? 0, state: "all" as const, active: filters.status === "all" },
-          { label: "Queued", value: overview?.queue.queued ?? 0, state: "queued" as const, active: filters.status === "queued", tone: "warn" as const },
-          { label: "Running", value: overview?.queue.running ?? 0, state: "running" as const, active: filters.status === "running", tone: "warn" as const },
-        ]
-      : jobScope === "history"
-        ? [
-            { label: "Succeeded", value: overview?.history.succeeded ?? 0, state: "succeeded" as const, active: filters.status === "succeeded", tone: "ok" as const },
-            { label: "Failed", value: overview?.history.failed ?? 0, state: "failed" as const, active: filters.status === "failed", tone: "danger" as const },
-            { label: "Cancelled", value: overview?.history.cancelled ?? 0, state: "cancelled" as const, active: filters.status === "cancelled", tone: "danger" as const },
-            { label: "Total", value: overview?.history.total ?? 0, state: "all" as const, active: filters.status === "all" },
-          ]
-        : [
-            { label: "Queued", value: overview?.queue.queued ?? 0, state: "queued" as const, active: filters.status === "queued", tone: "warn" as const },
-            { label: "Running", value: overview?.queue.running ?? 0, state: "running" as const, active: filters.status === "running", tone: "warn" as const },
-            { label: "Succeeded", value: overview?.history.succeeded ?? 0, state: "succeeded" as const, active: filters.status === "succeeded", tone: "ok" as const },
-            { label: "Failed", value: overview?.history.failed ?? 0, state: "failed" as const, active: filters.status === "failed", tone: "danger" as const },
-            { label: "Cancelled", value: overview?.history.cancelled ?? 0, state: "cancelled" as const, active: filters.status === "cancelled", tone: "danger" as const },
-          ];
+  const jobStats = buildJobStats(jobScope, filters.status, overview);
 
   return (
     <div className="app-shell">

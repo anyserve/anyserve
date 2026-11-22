@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::ops::{Bound, ControlFlow};
 
-use super::api::{InterfaceStats, JobFilter, JobState};
+use super::api::{InterfaceStats, JobState};
 use super::state::Job;
 
 type OrderKey = (Reverse<u64>, String);
@@ -337,21 +337,6 @@ impl JobIndex {
     /// Merge sorted state indexes across selected namespace/interface sets.
     pub(crate) fn page(
         &self,
-        filter: &JobFilter,
-        offset: usize,
-        limit: usize,
-    ) -> (Vec<&str>, usize) {
-        self.page_raw(
-            &filter.states,
-            filter.namespace.as_deref(),
-            filter.interface.as_deref(),
-            offset,
-            limit,
-        )
-    }
-
-    pub(crate) fn page_raw(
-        &self,
         states: &[JobState],
         namespace: Option<&str>,
         interface: Option<&str>,
@@ -475,25 +460,18 @@ pub(crate) fn assert_matches_jobs(st: &super::state::State) {
             vec![JobState::Queued],
             vec![JobState::Running, JobState::Cancelled, JobState::Running],
         ] {
-            let filter = JobFilter {
-                interface: interface.clone(),
-                states,
-                ..Default::default()
-            };
+            let iface_ref = interface.as_deref();
             let mut expected: Vec<_> = st
                 .jobs
                 .values()
                 .filter(|job| {
-                    filter
-                        .interface
-                        .as_ref()
-                        .is_none_or(|name| name == &job.spec.demand.interface)
-                        && (filter.states.is_empty() || filter.states.contains(&job.state()))
+                    iface_ref.is_none_or(|name| name == job.spec.demand.interface)
+                        && (states.is_empty() || states.contains(&job.state()))
                 })
                 .collect();
             expected.sort_by_key(|job| (Reverse(job.updated_at_ms), &job.id));
             for offset in [0, 1, 7, usize::MAX] {
-                let (actual, total) = st.job_index.page(&filter, offset, 3);
+                let (actual, total) = st.job_index.page(&states, None, iface_ref, offset, 3);
                 assert_eq!(total, expected.len());
                 assert_eq!(
                     actual,
@@ -639,7 +617,7 @@ mod tests {
         // BinaryHeap merge (>8 selected sets) matches full sorted order across pages.
         let mut paged = Vec::new();
         for offset in (0..40).step_by(7) {
-            let (ids, total) = st.job_index.page(&JobFilter::default(), offset, 7);
+            let (ids, total) = st.job_index.page(&[], None, None, offset, 7);
             assert_eq!(total, 40);
             paged.extend(ids.into_iter().map(str::to_string));
         }

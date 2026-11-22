@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { formatDuration, formatNumber, formatPool } from "./format";
-import { InspectorSection, InspectorShell, MetaGrid } from "./pane-inspector";
+import { formatDuration, formatNumber, formatPool, poolKey, toSelectOptions } from "./format";
+import { InspectorSection, InspectorShell, MetaGrid, SubtitlePair } from "./pane-inspector";
 import { EmptyState, PanelHeader, SearchInput, SelectField, StatsRow, TierChain, WorkerMiniList } from "./pane-tables";
 import type { InterfaceSummary, PoolSummary, WorkerSummary } from "./types";
 
@@ -23,9 +23,7 @@ interface PoolsPaneProps {
   onOpenWorker: (workerId: string) => void;
 }
 
-export function poolKey(pool: PoolSummary): string {
-  return `${pool.namespace}::${pool.interface}::${pool.pool}`;
-}
+export { poolKey };
 
 export function PoolsPane(props: PoolsPaneProps) {
   const { pools, interfaces, workers, selectedPoolKey, poolFilterSeed, onSelectPool, onViewJobs, onOpenInterface, onOpenWorker } = props;
@@ -41,8 +39,8 @@ export function PoolsPane(props: PoolsPaneProps) {
     setSearch("");
   }, [poolFilterSeed]);
 
-  const namespaceOptions = useMemo(() => ["all", ...Array.from(new Set(pools.map((p) => p.namespace))).sort()], [pools]);
-  const interfaceOptions = useMemo(() => ["all", ...Array.from(new Set(pools.map((p) => p.interface))).sort()], [pools]);
+  const namespaceOptions = useMemo(() => toSelectOptions(pools.map((p) => p.namespace), "All namespaces"), [pools]);
+  const interfaceOptions = useMemo(() => toSelectOptions(pools.map((p) => p.interface), "All interfaces"), [pools]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -114,18 +112,8 @@ export function PoolsPane(props: PoolsPaneProps) {
 
         <div className="panel__toolbar panel__toolbar--wrap">
           <div className="toolbar-filters">
-            <SelectField
-              label="Namespace"
-              value={namespaceFilter}
-              options={namespaceOptions.map((ns) => ({ value: ns, label: ns === "all" ? "All namespaces" : ns }))}
-              onChange={setNamespaceFilter}
-            />
-            <SelectField
-              label="Interface"
-              value={interfaceFilter}
-              options={interfaceOptions.map((iface) => ({ value: iface, label: iface === "all" ? "All interfaces" : iface }))}
-              onChange={setInterfaceFilter}
-            />
+            <SelectField label="Namespace" value={namespaceFilter} options={namespaceOptions} onChange={setNamespaceFilter} />
+            <SelectField label="Interface" value={interfaceFilter} options={interfaceOptions} onChange={setInterfaceFilter} />
             <SearchInput value={search} placeholder="Search pool, interface, namespace…" onChange={setSearch} />
           </div>
         </div>
@@ -233,15 +221,10 @@ export function PoolsPane(props: PoolsPaneProps) {
         title={activePool ? formatPool(activePool.pool) : ""}
         subtitle={
           activePool ? (
-            <span className="inspector__subtitle-row">
-              <button type="button" className="entity-link mono" onClick={() => setNamespaceFilter(activePool.namespace)}>
-                {activePool.namespace}
-              </button>
-              <span>·</span>
-              <button type="button" className="entity-link mono" onClick={() => onOpenInterface(activePool.interface)}>
-                {activePool.interface}
-              </button>
-            </span>
+            <SubtitlePair
+              left={{ text: activePool.namespace, onClick: () => setNamespaceFilter(activePool.namespace) }}
+              right={{ text: activePool.interface, onClick: () => onOpenInterface(activePool.interface) }}
+            />
           ) : null
         }
         actions={

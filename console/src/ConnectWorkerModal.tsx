@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
-import { IconCheck, IconClose, IconCopy } from "./icons";
+import { IconClose } from "./icons";
+import { CopyButton } from "./pane-tables";
 import type { ControlPlaneSummary } from "./types";
 
 type OnboardingTab = "python" | "connectors" | "rust" | "container" | "linux";
@@ -31,26 +32,11 @@ function deriveEndpoint(controlPlane?: ControlPlaneSummary): string {
 }
 
 function CopyableBlock({ title, code }: { title: string; code: string }) {
-  const [copied, setCopied] = useState(false);
-
-  async function handleCopy() {
-    try {
-      await navigator.clipboard?.writeText(code);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    } catch {
-      // Ignore clipboard denials in non-HTTPS environments.
-    }
-  }
-
   return (
     <div className="snippet-card">
       <div className="snippet-card__head">
         <span>{title}</span>
-        <button type="button" className="button button--sm" onClick={() => void handleCopy()}>
-          {copied ? <IconCheck /> : <IconCopy />}
-          <span>{copied ? "Copied" : "Copy"}</span>
-        </button>
+        <CopyButton text={code} />
       </div>
       <pre className="code-block code-block--snippet">{code}</pre>
     </div>

@@ -46,7 +46,7 @@ impl Runtime {
         let guard = self.inner.lock();
         let st = &*guard;
         if !has_extra_filters && query.histogram_buckets == 0 {
-            let (ids, total) = st.job_index.page_raw(
+            let (ids, total) = st.job_index.page(
                 &query.states,
                 query.namespace.as_deref(),
                 query.interface.as_deref(),

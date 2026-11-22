@@ -2,13 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationError, getAnalyticsJobs, getJob } from "./api";
 import { MAX_DATA_BYTES, MAX_RESULT_ROWS, QUERY_PRESETS, resultCsv, type QueryResult } from "./analytics-data";
 import type { AnalyticsEngine } from "./analytics-engine";
-import { asErrorMessage, formatTimestamp } from "./format";
+import { asErrorMessage, formatTimestamp, toDatetimeLocal } from "./format";
 import { JobInspector } from "./pane-inspector";
 import { PanelHeader } from "./pane-tables";
 import type { AnalyticsSource, JobDetailResponse } from "./types";
 
 interface Dataset { count: number; bytes: number; limited: boolean; from: number; to: number; source: AnalyticsSource; }
-const localDate = (v: number) => new Date(v - new Date(v).getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
 
 interface ExplorePaneProps {
   journalEnabled: boolean | null;
@@ -30,8 +29,8 @@ export default function ExplorePane({
   const [chosenSource, setSource] = useState<AnalyticsSource | null>(null);
   const source = chosenSource ?? (journalEnabled ? "archive" : "retained");
   const [windowMinutes, setWindowMinutes] = useState("15");
-  const [from, setFrom] = useState(() => localDate(Date.now() - 3600_000));
-  const [to, setTo] = useState(() => localDate(Date.now()));
+  const [from, setFrom] = useState(() => toDatetimeLocal(Date.now() - 3600_000));
+  const [to, setTo] = useState(() => toDatetimeLocal(Date.now()));
   const [rowLimit, setRowLimit] = useState(10_000);
   const [sql, setSql] = useState<string>(QUERY_PRESETS[0].sql);
   const [dataset, setDataset] = useState<Dataset | null>(null);

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { formatCapacityMap, formatNumber, formatPercent, formatPool, formatShortTime, formatTimestamp } from "./format";
+import { formatCapacityMap, formatNumber, formatPercent, formatPool, formatShortTime, formatTimestamp, toSelectOptions } from "./format";
 import { IconPlus } from "./icons";
-import { InspectorGroup, InspectorSection, InspectorShell, KeyValueGrid, MetaGrid } from "./pane-inspector";
+import { InspectorGroup, InspectorSection, InspectorShell, KeyValueGrid, MetaGrid, SubtitlePair } from "./pane-inspector";
 import { EmptyState, PanelHeader, ProgressMeter, SearchInput, SelectField, StatsRow, WorkerStateBadge } from "./pane-tables";
 import type { OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 
@@ -57,8 +57,8 @@ export function WorkersPane(props: WorkersPaneProps) {
     setSearch("");
   }, [workerFilterSeed]);
 
-  const poolOptions = useMemo(() => ["all", ...Array.from(new Set(workers.map((w) => formatPool(w.pool)))).sort()], [workers]);
-  const interfaceOptions = useMemo(() => ["all", ...Array.from(new Set(workers.flatMap((w) => w.interfaces))).sort()], [workers]);
+  const poolOptions = useMemo(() => toSelectOptions(workers.map((w) => formatPool(w.pool)), "All pools"), [workers]);
+  const interfaceOptions = useMemo(() => toSelectOptions(workers.flatMap((w) => w.interfaces), "All interfaces"), [workers]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -117,8 +117,8 @@ export function WorkersPane(props: WorkersPaneProps) {
             ))}
           </div>
           <div className="toolbar-filters">
-            <SelectField label="Pool" value={poolFilter} options={poolOptions.map((p) => ({ value: p, label: p === "all" ? "All pools" : p }))} onChange={setPoolFilter} />
-            <SelectField label="Interface" value={interfaceFilter} options={interfaceOptions.map((i) => ({ value: i, label: i === "all" ? "All interfaces" : i }))} onChange={setInterfaceFilter} />
+            <SelectField label="Pool" value={poolFilter} options={poolOptions} onChange={setPoolFilter} />
+            <SelectField label="Interface" value={interfaceFilter} options={interfaceOptions} onChange={setInterfaceFilter} />
             <SearchInput value={search} placeholder="Search worker, session, pool…" onChange={setSearch} />
           </div>
         </div>
@@ -217,25 +217,18 @@ export function WorkersPane(props: WorkersPaneProps) {
         title={activeWorker?.worker_id ?? ""}
         subtitle={
           activeWorker ? (
-            <span className="inspector__subtitle-row">
-              <button
-                type="button"
-                className="entity-link mono"
-                title={`Filter jobs by namespace ${activeWorker.namespace ?? "default"}`}
-                onClick={() => onViewJobsForNamespace(activeWorker.namespace ?? "default")}
-              >
-                {activeWorker.namespace ?? "default"}
-              </button>
-              <span>·</span>
-              <button
-                type="button"
-                className="entity-link mono"
-                title={`Open pool ${formatPool(activeWorker.pool)}`}
-                onClick={() => onOpenPool(activeWorker.namespace ?? "default", activeWorker.interfaces[0], activeWorker.pool ?? "")}
-              >
-                {formatPool(activeWorker.pool)}
-              </button>
-            </span>
+            <SubtitlePair
+              left={{
+                text: activeWorker.namespace ?? "default",
+                title: `Filter jobs by namespace ${activeWorker.namespace ?? "default"}`,
+                onClick: () => onViewJobsForNamespace(activeWorker.namespace ?? "default"),
+              }}
+              right={{
+                text: formatPool(activeWorker.pool),
+                title: `Open pool ${formatPool(activeWorker.pool)}`,
+                onClick: () => onOpenPool(activeWorker.namespace ?? "default", activeWorker.interfaces[0], activeWorker.pool ?? ""),
+              }}
+            />
           ) : null
         }
         actions={

@@ -1,5 +1,5 @@
 import type { ConsoleTab, JobScope } from "./app-constants";
-import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber, formatPool } from "./format";
+import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber, formatPool, poolKey } from "./format";
 import { IconArrowRight } from "./icons";
 import { EmptyState, InterfacesTable, PanelHeader, ProgressMeter } from "./pane-tables";
 import type { JobState, OverviewResponse } from "./types";
@@ -225,7 +225,7 @@ export function OverviewPane({
                 </thead>
                 <tbody>
                   {pools.slice(0, 8).map((pool) => {
-                    const key = `${pool.namespace}::${pool.interface}::${pool.pool}`;
+                    const key = poolKey(pool);
                     const poolName = formatPool(pool.pool);
                     return (
                       <tr key={key} onClick={() => onOpenPool(key)}>

@@ -1,4 +1,4 @@
-import type { JobDetailResponse, JobSummary, RustDuration, WorkerSummary } from "./types";
+import type { JobDetailResponse, JobsHistogram, JobSummary, PoolSummary, RustDuration, WorkerSummary } from "./types";
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -118,6 +118,52 @@ export function formatCapacityMap(value: Record<string, string | number>): strin
 
 export function formatPool(pool: string | null | undefined): string {
   return pool?.trim() || "default";
+}
+
+export function poolKey(pool: Pick<PoolSummary, "namespace" | "interface" | "pool">): string {
+  return `${pool.namespace}::${pool.interface}::${pool.pool}`;
+}
+
+export function toSelectOptions(values: Iterable<string>, allLabel: string): Array<{ value: string; label: string }> {
+  return [
+    { value: "all", label: allLabel },
+    ...Array.from(new Set(values)).sort().map((value) => ({ value, label: value })),
+  ];
+}
+
+export function sameJobs(a: JobSummary[], b: JobSummary[]): boolean {
+  return a.length === b.length && a.every((x, i) =>
+    x.job_id === b[i].job_id &&
+    x.state === b[i].state &&
+    x.updated_at_ms === b[i].updated_at_ms &&
+    x.attempt_count === b[i].attempt_count &&
+    x.latest_worker_id === b[i].latest_worker_id,
+  );
+}
+
+export function sameWorkers(a: WorkerSummary[], b: WorkerSummary[]): boolean {
+  return a.length === b.length && a.every((x, i) =>
+    x.worker_id === b[i].worker_id &&
+    x.session_id === b[i].session_id &&
+    x.healthy === b[i].healthy &&
+    x.draining === b[i].draining &&
+    x.connected === b[i].connected &&
+    x.active_leases === b[i].active_leases &&
+    x.last_seen_at_ms === b[i].last_seen_at_ms,
+  );
+}
+
+export function sameHistogram(a: JobsHistogram | null, b: JobsHistogram | null): boolean {
+  return a === b || (
+    Boolean(a && b) &&
+    a!.start_ms === b!.start_ms &&
+    a!.end_ms === b!.end_ms &&
+    a!.buckets.length === b!.buckets.length &&
+    a!.buckets.every((x, i) => {
+      const y = b!.buckets[i];
+      return x.start_ms === y.start_ms && x.active === y.active && x.succeeded === y.succeeded && x.failed === y.failed && x.cancelled === y.cancelled;
+    })
+  );
 }
 
 export function formatObjectMeta(value: { size_bytes: number | null; metadata: Record<string, string> }): string {

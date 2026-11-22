@@ -12,8 +12,7 @@ import {
   formatTimestamp,
   latestAttemptWorker,
 } from "./format";
-import { IconCheck, IconCopy } from "./icons";
-import { EmptyState, PanelHeader, StateBadge } from "./pane-tables";
+import { CopyButton, EmptyState, PanelHeader, StateBadge } from "./pane-tables";
 import type { JobDetailResponse, ObjectRefSummary } from "./types";
 
 const LARGE_PAYLOAD_BYTES = 1024;
@@ -107,6 +106,30 @@ export function KeyValueGrid({ entries, emptyMessage }: { entries: Record<string
   );
 }
 
+export interface SubtitleItem {
+  text: string;
+  title?: string;
+  onClick?: () => void;
+}
+
+function SubtitleNode({ text, title, onClick }: SubtitleItem) {
+  return onClick ? (
+    <button type="button" className="entity-link mono" title={title} onClick={onClick}>{text}</button>
+  ) : (
+    <span className="mono">{text}</span>
+  );
+}
+
+export function SubtitlePair({ left, right }: { left: SubtitleItem; right: SubtitleItem }) {
+  return (
+    <span className="inspector__subtitle-row">
+      <SubtitleNode {...left} />
+      <span>·</span>
+      <SubtitleNode {...right} />
+    </span>
+  );
+}
+
 function PayloadPreview({
   raw,
   contentType,
@@ -123,24 +146,12 @@ function PayloadPreview({
   const effectiveBytes = sizeBytes ?? raw.length;
   const isLarge = Boolean(truncated) || effectiveBytes > LARGE_PAYLOAD_BYTES || raw.length > LARGE_PREVIEW_CHARS;
   const [expanded, setExpanded] = useState(!isLarge);
-  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     setExpanded(!isLarge);
-    setCopied(false);
   }, [resetKey, isLarge]);
 
   const formatted = useMemo(() => (expanded ? formatPayloadPreview(raw, contentType) : null), [expanded, raw, contentType]);
-
-  async function copyPayload() {
-    try {
-      await navigator.clipboard?.writeText(formatted?.text ?? raw);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Ignore clipboard unavailability in headless or non-HTTPS contexts.
-    }
-  }
 
   return (
     <div className="payload-preview">
@@ -159,10 +170,7 @@ function PayloadPreview({
               {expanded ? "Hide preview" : "Show preview"}
             </button>
           ) : null}
-          <button type="button" className="button button--sm" onClick={() => void copyPayload()}>
-            {copied ? <IconCheck /> : <IconCopy />}
-            <span>{copied ? "Copied" : truncated ? "Copy preview" : "Copy"}</span>
-          </button>
+          <CopyButton text={() => formatted?.text ?? raw} label={truncated ? "Copy preview" : "Copy"} resetKey={resetKey} />
         </div>
       </div>
 
@@ -299,33 +307,18 @@ export const JobInspector = memo(function JobInspector({
   const hasPayload = hasParams || job.inputs.length > 0 || showOutputs || Boolean(job.output_preview);
 
   const subtitle = (
-    <span className="inspector__subtitle-row">
-      {onOpenInterface ? (
-        <button
-          type="button"
-          className="entity-link mono"
-          title={`Inspect interface ${job.interface_name}`}
-          onClick={() => onOpenInterface(job.interface_name)}
-        >
-          {job.interface_name}
-        </button>
-      ) : (
-        <span className="mono">{job.interface_name}</span>
-      )}
-      <span>·</span>
-      {onFilterNamespace ? (
-        <button
-          type="button"
-          className="entity-link mono"
-          title={`Filter by namespace ${ns}`}
-          onClick={() => onFilterNamespace(ns)}
-        >
-          {ns}
-        </button>
-      ) : (
-        <span className="mono">{ns}</span>
-      )}
-    </span>
+    <SubtitlePair
+      left={{
+        text: job.interface_name,
+        title: `Inspect interface ${job.interface_name}`,
+        onClick: onOpenInterface ? () => onOpenInterface(job.interface_name) : undefined,
+      }}
+      right={{
+        text: ns,
+        title: `Filter by namespace ${ns}`,
+        onClick: onFilterNamespace ? () => onFilterNamespace(ns) : undefined,
+      }}
+    />
   );
 
   return (

@@ -1615,25 +1615,17 @@ impl Runtime {
     }
 
     pub async fn list_jobs(&self, filter: JobFilter) -> Result<JobPage, RuntimeError> {
-        self.ensure_active_leader()?;
-        let offset = match filter.page_token.as_deref().filter(|t| !t.is_empty()) {
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| RuntimeError::invalid("invalid page_token"))?,
-            None => 0,
-        };
-        let limit = if filter.limit == 0 {
-            DEFAULT_PAGE_SIZE
-        } else {
-            filter.limit
-        };
-        let st = self.inner.lock();
-        let (ids, total) = st.job_index.page(&filter, offset, limit);
-        let page = ids.into_iter().map(|id| st.jobs[id].view(false)).collect();
-        let next_offset = offset.saturating_add(limit);
+        let result = self.query_jobs(api::JobQuery {
+            states: filter.states,
+            interface: filter.interface,
+            namespace: filter.namespace,
+            limit: filter.limit,
+            page_token: filter.page_token,
+            ..Default::default()
+        })?;
         Ok(JobPage {
-            jobs: page,
-            next_page_token: (next_offset < total).then(|| next_offset.to_string()),
+            jobs: result.jobs,
+            next_page_token: result.next_page_token,
         })
     }
 
