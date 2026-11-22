@@ -184,77 +184,82 @@ function makeDataset() {
 }
 
 function startServer(data) {
+  let apiDelayMs = 0;
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
-    if (url.pathname === "/api/overview") {
-      data.overview.refreshed_at_ms = Date.now();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(data.overview));
-    }
-    if (url.pathname === "/api/workers") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(data.workers));
-    }
-    if (url.pathname === "/api/jobs") {
-      const states = (url.searchParams.get("states") || "").split(",").filter(Boolean);
-      const iface = url.searchParams.get("interface");
-      const ns = url.searchParams.get("namespace");
-      const worker = url.searchParams.get("worker");
-      const q = (url.searchParams.get("q") || "").trim().toLowerCase();
-      const fromMs = url.searchParams.has("from_ms") ? Number(url.searchParams.get("from_ms")) : null;
-      const toMs = url.searchParams.has("to_ms") ? Number(url.searchParams.get("to_ms")) : null;
-      const windowMs = url.searchParams.has("window_ms") ? Number(url.searchParams.get("window_ms")) : null;
-      const bucketsCount = Number(url.searchParams.get("buckets") || 0);
-      const limit = Number(url.searchParams.get("limit") || 100);
-      const effFrom = fromMs ?? (windowMs != null ? Date.now() - windowMs : null);
-      const effTo = toMs ?? (windowMs != null ? Date.now() + 1 : null);
-      const filtered = data.jobs.filter((j) => {
-        if (states.length > 0 && !states.includes(j.state)) return false;
-        if (iface && j.interface_name !== iface) return false;
-        if (ns && j.namespace !== ns) return false;
-        if (worker && j.latest_worker_id !== worker) return false;
-        if (effFrom != null && j.created_at_ms < effFrom) return false;
-        if (effTo != null && j.created_at_ms >= effTo) return false;
-        if (q) {
-          const hit = [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id, ...Object.values(j.metadata)]
-            .some((v) => String(v || "").toLowerCase().includes(q));
-          if (!hit) return false;
+    if (url.pathname === "/api/overview" || url.pathname === "/api/jobs" || url.pathname === "/api/workers" || url.pathname.startsWith("/api/jobs/")) {
+      const handleApi = () => {
+        if (url.pathname === "/api/overview") {
+          data.overview.refreshed_at_ms = Date.now();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify(data.overview));
         }
-        return true;
-      });
-      let histogram = null;
-      if (bucketsCount > 0 && filtered.length > 0) {
-        const minTs = effFrom ?? Math.min(...filtered.map((j) => j.created_at_ms));
-        const maxTs = effTo ?? Math.max(...filtered.map((j) => j.created_at_ms)) + 1;
-        const n = Math.min(96, Math.max(8, bucketsCount));
-        const span = Math.max(n, maxTs - minTs);
-        const endTs = minTs + span;
-        const buckets = Array.from({ length: n }, (_, i) => ({
-          start_ms: minTs + Math.floor((i * span) / n),
-          end_ms: minTs + Math.floor(((i + 1) * span) / n),
-          active: 0,
-          succeeded: 0,
-          failed: 0,
-          cancelled: 0,
-        }));
-        for (const j of filtered) {
-          if (j.created_at_ms < minTs || j.created_at_ms >= endTs) continue;
-          const idx = Math.min(n - 1, Math.floor(((j.created_at_ms - minTs + 1) * n - 1) / span));
-          if (j.state === "queued" || j.state === "running") buckets[idx].active += 1;
-          else if (j.state === "succeeded") buckets[idx].succeeded += 1;
-          else if (j.state === "failed") buckets[idx].failed += 1;
-          else buckets[idx].cancelled += 1;
+        if (url.pathname === "/api/workers") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify(data.workers));
         }
-        histogram = { start_ms: minTs, end_ms: endTs, bucket_ms: Math.max(1, Math.floor(span / n)), buckets };
-      }
-      res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ jobs: filtered.slice(0, limit), total: filtered.length, next_page_token: null, histogram }));
-    }
-    if (url.pathname.startsWith("/api/jobs/")) {
-      const id = decodeURIComponent(url.pathname.slice("/api/jobs/".length));
-      const detail = data.detailMap.get(id);
-      res.writeHead(detail ? 200 : 404, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(detail ?? { error: "not found" }));
+        if (url.pathname === "/api/jobs") {
+          const states = (url.searchParams.get("states") || "").split(",").filter(Boolean);
+          const iface = url.searchParams.get("interface");
+          const ns = url.searchParams.get("namespace");
+          const worker = url.searchParams.get("worker");
+          const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+          const fromMs = url.searchParams.has("from_ms") ? Number(url.searchParams.get("from_ms")) : null;
+          const toMs = url.searchParams.has("to_ms") ? Number(url.searchParams.get("to_ms")) : null;
+          const windowMs = url.searchParams.has("window_ms") ? Number(url.searchParams.get("window_ms")) : null;
+          const bucketsCount = Number(url.searchParams.get("buckets") || 0);
+          const limit = Number(url.searchParams.get("limit") || 100);
+          const effFrom = fromMs ?? (windowMs != null ? Date.now() - windowMs : null);
+          const effTo = toMs ?? (windowMs != null ? Date.now() + 1 : null);
+          const filtered = data.jobs.filter((j) => {
+            if (states.length > 0 && !states.includes(j.state)) return false;
+            if (iface && j.interface_name !== iface) return false;
+            if (ns && j.namespace !== ns) return false;
+            if (worker && j.latest_worker_id !== worker) return false;
+            if (effFrom != null && j.created_at_ms < effFrom) return false;
+            if (effTo != null && j.created_at_ms >= effTo) return false;
+            if (q) {
+              const hit = [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id, ...Object.values(j.metadata)]
+                .some((v) => String(v || "").toLowerCase().includes(q));
+              if (!hit) return false;
+            }
+            return true;
+          });
+          let histogram = null;
+          if (bucketsCount > 0 && filtered.length > 0) {
+            const minTs = effFrom ?? Math.min(...filtered.map((j) => j.created_at_ms));
+            const maxTs = effTo ?? Math.max(...filtered.map((j) => j.created_at_ms)) + 1;
+            const n = Math.min(96, Math.max(8, bucketsCount));
+            const span = Math.max(n, maxTs - minTs);
+            const endTs = minTs + span;
+            const buckets = Array.from({ length: n }, (_, i) => ({
+              start_ms: minTs + Math.floor((i * span) / n),
+              end_ms: minTs + Math.floor(((i + 1) * span) / n),
+              active: 0,
+              succeeded: 0,
+              failed: 0,
+              cancelled: 0,
+            }));
+            for (const j of filtered) {
+              if (j.created_at_ms < minTs || j.created_at_ms >= endTs) continue;
+              const idx = Math.min(n - 1, Math.floor(((j.created_at_ms - minTs + 1) * n - 1) / span));
+              if (j.state === "queued" || j.state === "running") buckets[idx].active += 1;
+              else if (j.state === "succeeded") buckets[idx].succeeded += 1;
+              else if (j.state === "failed") buckets[idx].failed += 1;
+              else buckets[idx].cancelled += 1;
+            }
+            histogram = { start_ms: minTs, end_ms: endTs, bucket_ms: Math.max(1, Math.floor(span / n)), buckets };
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ jobs: filtered.slice(0, limit), total: filtered.length, next_page_token: null, histogram }));
+        }
+        const id = decodeURIComponent(url.pathname.slice("/api/jobs/".length));
+        const detail = data.detailMap.get(id);
+        res.writeHead(detail ? 200 : 404, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify(detail ?? { error: "not found" }));
+      };
+      if (apiDelayMs > 0) return setTimeout(handleApi, apiDelayMs);
+      return handleApi();
     }
 
     let filePath = path.join(DIST_DIR, url.pathname === "/" ? "index.html" : url.pathname);
@@ -269,7 +274,13 @@ function startServer(data) {
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
-      resolve({ server, url: `http://127.0.0.1:${port}` });
+      resolve({
+        server,
+        url: `http://127.0.0.1:${port}`,
+        setApiDelayMs: (ms) => {
+          apiDelayMs = ms;
+        },
+      });
     });
   });
 }
@@ -368,7 +379,7 @@ async function measureFrame(cdp, fnExpr) {
 
 async function main() {
   const dataset = makeDataset();
-  const { server, url } = await startServer(dataset);
+  const { server, url, setApiDelayMs } = await startServer(dataset);
   let chrome;
   try {
     chrome = await launchChrome(url);
@@ -388,6 +399,18 @@ async function main() {
     const zoomHistogramMs = await measureFrame(cdp, `document.querySelector(".histogram__col:not(.is-empty)")?.click();`);
     await waitForSelector(cdp, ".histogram .link-inline");
     const resetTimeMs = await measureFrame(cdp, `document.querySelector(".histogram .link-inline")?.click();`);
+    const filterStatusFailedMs = await measureFrame(cdp, `
+      const sel = document.querySelector(".toolbar-filters select");
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+      setter.call(sel, "failed");
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    `);
+    await measureFrame(cdp, `
+      const sel = document.querySelector(".toolbar-filters select");
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set;
+      setter.call(sel, "all");
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    `);
     const searchFilterMs = await measureFrame(cdp, `
       const input = document.querySelector(".search-box__input");
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
@@ -400,6 +423,30 @@ async function main() {
       setter.call(input, "");
       input.dispatchEvent(new Event("input", { bubbles: true }));
     `);
+
+    // Measure F5 refresh layout stability (initial skeleton frame vs loaded frame) on /jobs?state=succeeded&time=15m
+    setApiDelayMs(150);
+    await cdp.send("Page.navigate", { url: `${url}/jobs?state=succeeded&time=15m` });
+    await waitForSelector(cdp, ".histogram");
+    const initialMetrics = await cdp.eval(`({
+      anchorTop: Math.round(document.querySelector(".histogram").getBoundingClientRect().bottom),
+      selectWidths: Array.from(document.querySelectorAll(".toolbar-filters select")).map((s) => Math.round(s.getBoundingClientRect().width)),
+      urlSearch: window.location.search,
+    })`);
+    setApiDelayMs(0);
+    await waitForSelector(cdp, ".table tbody tr");
+    await waitForSelector(cdp, ".histogram__col");
+    const settledMetrics = await cdp.eval(`({
+      anchorTop: Math.round(document.querySelector(".histogram").getBoundingClientRect().bottom),
+      selectWidths: Array.from(document.querySelectorAll(".toolbar-filters select")).map((s) => Math.round(s.getBoundingClientRect().width)),
+      urlSearch: window.location.search,
+    })`);
+    const refreshHistogramBottomDeltaPx = Math.abs(settledMetrics.anchorTop - initialMetrics.anchorTop);
+    const refreshSelectWidthDeltaPx = Math.max(
+      0,
+      ...initialMetrics.selectWidths.map((w, i) => Math.abs((settledMetrics.selectWidths[i] ?? w) - w)),
+    );
+
     const jobsToInterfacesMs = await measureFrame(cdp, `document.querySelectorAll(".sidebar__item")[2].click();`);
     const interfacesToPoolsMs = await measureFrame(cdp, `document.querySelectorAll(".sidebar__item")[3].click();`);
     const poolsToWorkersMs = await measureFrame(cdp, `document.querySelectorAll(".sidebar__item")[4].click();`);
@@ -419,12 +466,18 @@ async function main() {
         expand_large_payload_preview: expandLargeMs,
         zoom_histogram_bucket: zoomHistogramMs,
         reset_time_filter: resetTimeMs,
+        filter_status_failed: filterStatusFailedMs,
         search_250_jobs: searchFilterMs,
         clear_search_250_jobs: clearSearchMs,
         tab_jobs_to_interfaces: jobsToInterfacesMs,
         tab_interfaces_to_pools: interfacesToPoolsMs,
         tab_pools_to_workers: poolsToWorkersMs,
         open_connect_worker_modal: openConnectModalMs,
+      },
+      refresh_stability: {
+        histogram_bottom_delta_px: refreshHistogramBottomDeltaPx,
+        select_width_delta_px: refreshSelectWidthDeltaPx,
+        url_preserved: initialMetrics.urlSearch === settledMetrics.urlSearch && settledMetrics.urlSearch === "?state=succeeded&time=15m",
       },
       dom_nodes: { collapsed_large_job: collapsedDomNodes, expanded_large_job: expandedDomNodes },
       horizontal_overflow: horizontalOverflow,

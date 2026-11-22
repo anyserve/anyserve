@@ -207,7 +207,11 @@ async fn list_jobs(
     let (from_ms, to_ms) = if query.from_ms.is_some() || query.to_ms.is_some() {
         (query.from_ms, query.to_ms)
     } else if let Some(window) = query.window_ms {
-        let end = now_ms().saturating_add(1);
+        // Snap upper bound to a deterministic bucket-step grid so live polling
+        // does not shift histogram bar boundaries every 800 ms.
+        let buckets = query.buckets.unwrap_or(32).clamp(8, 96) as u64;
+        let step = (window / buckets).clamp(1_000, 60_000);
+        let end = ((now_ms() / step) + 1).saturating_mul(step);
         (Some(end.saturating_sub(window)), Some(end))
     } else {
         (None, None)

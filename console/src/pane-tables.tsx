@@ -1,19 +1,37 @@
 import { memo, type ReactNode } from "react";
 
-import type { PaneStat } from "./app-constants";
+import type { JobStatusFilter, PaneStat } from "./app-constants";
 import { formatDuration, formatNumber, formatPool, formatShortTime, formatTimestamp } from "./format";
 import { IconClose, IconSearch } from "./icons";
 import type { InterfaceSummary, JobState, JobSummary, PoolTierPolicy, WorkerSummary } from "./types";
 
-export function StatsRow({ stats }: { stats: PaneStat[] }) {
+export function StatsRow({ stats, onSelectState }: { stats: PaneStat[]; onSelectState?: (state: JobStatusFilter) => void }) {
   return (
     <div className="stat-row" style={{ gridTemplateColumns: `repeat(${Math.max(1, stats.length)}, minmax(0, 1fr))` }}>
-      {stats.map((stat) => (
-        <div key={stat.label} className="stat-card">
-          <span>{stat.label}</span>
-          <strong>{typeof stat.value === "number" ? formatNumber(stat.value) : stat.value}</strong>
-        </div>
-      ))}
+      {stats.map((stat) => {
+        const cls = `stat-card${stat.tone ? ` tone-${stat.tone}` : ""}${stat.active ? " is-active" : ""}`;
+        if (onSelectState && stat.state != null) {
+          const targetState = stat.active && stat.state !== "all" ? "all" : stat.state;
+          return (
+            <button
+              key={stat.label}
+              type="button"
+              className={`${cls} stat-card--interactive`}
+              aria-pressed={Boolean(stat.active)}
+              onClick={() => onSelectState(targetState)}
+            >
+              <span>{stat.label}</span>{" "}
+              <strong>{typeof stat.value === "number" ? formatNumber(stat.value) : stat.value}</strong>
+            </button>
+          );
+        }
+        return (
+          <div key={stat.label} className={cls}>
+            <span>{stat.label}</span>{" "}
+            <strong>{typeof stat.value === "number" ? formatNumber(stat.value) : stat.value}</strong>
+          </div>
+        );
+      })}
     </div>
   );
 }

@@ -853,3 +853,90 @@ it("supports time presets, interactive histogram bar click & brush zoom, server 
   expect(await screen.findByRole("heading", { name: "job-older-needle" }, { timeout: 2_000 })).toBeTruthy();
   expect(screen.getByText("End of results · all 1 matching jobs loaded")).toBeTruthy();
 });
+
+it("filters by job status via select or KPI cards and preserves filters & selection across reload", async () => {
+  vi.mocked(getOverview).mockResolvedValue(richOverview());
+  const jobs = [
+    summary("job-fail-1", { state: "failed", error_code: "timeout", last_error: "timeout waiting" }),
+    summary("job-fail-2", { state: "failed", error_code: "timeout", last_error: "timeout reading" }),
+    summary("job-ok-1", { state: "succeeded", updated_at_ms: 5 }),
+  ];
+  vi.mocked(getJobs).mockImplementation(async (states, _limit, _offset, _signal, filters) => {
+    const matched = jobs.filter(
+      (j) =>
+        (states.length === 0 || states.includes(j.state)) &&
+        (!filters?.q || (j.error_code ?? "").includes(filters.q) || j.job_id.includes(filters.q)),
+    );
+    return {
+      jobs: matched,
+      total: matched.length,
+      next_page_token: null,
+      histogram: {
+        start_ms: 1_700_000_000_000,
+        end_ms: 1_700_000_060_000,
+        bucket_ms: 30_000,
+        buckets: [
+          { start_ms: 1_700_000_000_000, end_ms: 1_700_000_030_000, active: 0, succeeded: states.includes("succeeded") || states.length === 0 ? 1 : 0, failed: states.includes("failed") || states.length === 0 ? 2 : 0, cancelled: 0 },
+          { start_ms: 1_700_000_030_000, end_ms: 1_700_000_060_000, active: 0, succeeded: 0, failed: 0, cancelled: 0 },
+        ],
+      },
+    };
+  });
+  vi.mocked(getJob).mockImplementation(async (id) => detail(id, { state: id.startsWith("job-fail") ? "failed" : "succeeded" }));
+
+  const view = render(<App />);
+  // Choosing a history status while on /queue promotes scope cleanly to /jobs and updates the URL.
+  fireEvent.change(screen.getByLabelText("Status"), { target: { value: "failed" } });
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      ["failed"],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({ buckets: 32 }),
+    ),
+  );
+  expect(window.location.pathname).toBe("/jobs");
+
+  fireEvent.click(screen.getByRole("button", { name: "15m" }));
+  fireEvent.change(screen.getByPlaceholderText("Search job ID, source, error…"), { target: { value: "timeout" } });
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith(
+      ["failed"],
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({ q: "timeout", windowMs: 15 * 60_000 }),
+    ),
+  );
+
+  fireEvent.click(await screen.findByText("job-fail-2"));
+  await screen.findByRole("heading", { name: "job-fail-2" });
+  expect(window.location.search).toContain("state=failed");
+  expect(window.location.search).toContain("q=timeout");
+  expect(window.location.search).toContain("time=15m");
+  expect(window.location.search).toContain("job=job-fail-2");
+
+  // Simulate full browser reload with the current URL intact.
+  view.unmount();
+  vi.mocked(getJobs).mockClear();
+  render(<App />);
+
+  await waitFor(() => expect(getJobs).toHaveBeenCalled());
+  expect(vi.mocked(getJobs).mock.calls[0][0]).toEqual(["failed"]);
+  expect(vi.mocked(getJobs).mock.calls[0][4]).toEqual(
+    expect.objectContaining({ q: "timeout", windowMs: 15 * 60_000 }),
+  );
+  expect(await screen.findByRole("heading", { name: "job-fail-2" })).toBeTruthy();
+  expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("failed");
+  expect((screen.getByPlaceholderText("Search job ID, source, error…") as HTMLInputElement).value).toBe("timeout");
+
+  // Clicking the active Failed KPI card toggles back to All statuses; clearing search and clicking Succeeded switches to succeeded.
+  fireEvent.click(screen.getByRole("button", { name: /^Failed\b/i }));
+  await waitFor(() => expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("all"));
+
+  fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+  fireEvent.click(screen.getByRole("button", { name: /^Succeeded\b/i }));
+  await waitFor(() => expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("succeeded"));
+  expect(await screen.findByRole("heading", { name: "job-ok-1" })).toBeTruthy();
+});

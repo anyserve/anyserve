@@ -609,6 +609,22 @@ async fn jobs_endpoint_supports_search_worker_time_window_total_and_histogram() 
         .await;
     assert_eq!(recent["total"], 3);
 
+    // Consecutive rolling window_ms queries share snapped bucket bounds within a step interval.
+    let recent_2 = c
+        .json(Method::GET, "/api/jobs?window_ms=900000&buckets=32", None)
+        .await;
+    let recent_3 = c
+        .json(Method::GET, "/api/jobs?window_ms=900000&buckets=32", None)
+        .await;
+    assert_eq!(
+        recent_2["histogram"]["start_ms"],
+        recent_3["histogram"]["start_ms"]
+    );
+    assert_eq!(
+        recent_2["histogram"]["end_ms"],
+        recent_3["histogram"]["end_ms"]
+    );
+
     // Invalid ranges/queries return 400.
     assert_eq!(
         c.status(Method::GET, "/api/jobs?from_ms=100&to_ms=100", None)

@@ -1,14 +1,10 @@
 import { useEffect, useState, type ReactNode } from "react";
 
-import type { JobScope, PaneStat } from "./app-constants";
-import { formatNumber, fromDatetimeLocal, toDatetimeLocal } from "./format";
 import {
-  DEFAULT_TIME_FILTER,
-  JobsHistogram,
-  TIME_PRESETS,
-  TIME_PRESET_MS,
-  type TimeFilterState,
-} from "./JobsHistogram";
+  DEFAULT_TIME_FILTER, type JobScope, type JobStatusFilter, type PaneStat, type TimeFilterState,
+} from "./app-constants";
+import { formatNumber, fromDatetimeLocal, toDatetimeLocal } from "./format";
+import { JobsHistogram, TIME_PRESETS, TIME_PRESET_MS } from "./JobsHistogram";
 import { JobsTable, PanelHeader, SearchInput, SelectField, StatsRow } from "./pane-tables";
 import type { JobsHistogram as JobsHistogramData, JobSummary } from "./types";
 
@@ -22,6 +18,7 @@ interface JobsPaneProps {
   totalLoaded: number;
   totalMatching: number | null;
   histogram: JobsHistogramData | null;
+  histogramRefreshing?: boolean;
   timeFilter: TimeFilterState;
   onTimeFilterChange: (next: TimeFilterState) => void;
   selectedJobId: string | null;
@@ -29,6 +26,8 @@ interface JobsPaneProps {
   onOpenInterface: (interfaceName: string) => void;
   onOpenWorker: (workerId: string) => void;
   onFilterNamespace: (namespace: string) => void;
+  statusFilter: JobStatusFilter;
+  onStatusFilterChange: (value: JobStatusFilter) => void;
   interfaceFilter: string;
   interfaceOptions: FilterOption[];
   onInterfaceFilterChange: (value: string) => void;
@@ -48,6 +47,14 @@ interface JobsPaneProps {
 }
 
 const SCOPE_LABELS: Record<JobScope, string> = { all: "All", queue: "Queue", history: "History" };
+const STATUS_OPTIONS: Array<{ value: JobStatusFilter; label: string }> = [
+  { value: "all", label: "All statuses" },
+  { value: "queued", label: "Queued" },
+  { value: "running", label: "Running" },
+  { value: "succeeded", label: "Succeeded" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+];
 const EMPTY_MESSAGES: Record<JobScope, string> = { all: "No jobs match the current filters", queue: "No active jobs", history: "No historical jobs" };
 
 export function JobsPane(props: JobsPaneProps) {
@@ -61,6 +68,7 @@ export function JobsPane(props: JobsPaneProps) {
   }, [props.timeFilter.preset]);
 
   const isFiltered =
+    props.statusFilter !== "all" ||
     props.interfaceFilter !== "all" ||
     props.namespaceFilter !== "all" ||
     props.workerFilter !== "all" ||
@@ -113,7 +121,7 @@ export function JobsPane(props: JobsPaneProps) {
   return (
     <div className="content-grid">
       <section className="panel">
-        <StatsRow stats={props.stats} />
+        <StatsRow stats={props.stats} onSelectState={props.onStatusFilterChange} />
         <PanelHeader
           title="Jobs"
           meta={meta}
@@ -126,7 +134,7 @@ export function JobsPane(props: JobsPaneProps) {
           }
         />
 
-        <div className="panel__toolbar panel__toolbar--wrap">
+        <div className="panel__toolbar panel__toolbar--jobs">
           <div className="toolbar-row">
             <div className="seg-control" role="group" aria-label="Job state filter">
               {(["all", "queue", "history"] as const).map((item) => (
@@ -168,13 +176,20 @@ export function JobsPane(props: JobsPaneProps) {
                 );
               })}
             </div>
+
+            <SearchInput value={props.searchQuery} placeholder="Search job ID, source, error…" onChange={props.onSearchQueryChange} />
           </div>
 
           <div className="toolbar-filters">
+            <SelectField
+              label="Status"
+              value={props.statusFilter}
+              options={STATUS_OPTIONS}
+              onChange={(value) => props.onStatusFilterChange(value as JobStatusFilter)}
+            />
             <SelectField label="Interface" value={props.interfaceFilter} options={props.interfaceOptions} onChange={props.onInterfaceFilterChange} />
             <SelectField label="Namespace" value={props.namespaceFilter} options={props.namespaceOptions} onChange={props.onNamespaceFilterChange} />
             <SelectField label="Worker" value={props.workerFilter} options={props.workerOptions} onChange={props.onWorkerFilterChange} />
-            <SearchInput value={props.searchQuery} placeholder="Search job ID, source, error…" onChange={props.onSearchQueryChange} />
           </div>
         </div>
 
@@ -226,6 +241,7 @@ export function JobsPane(props: JobsPaneProps) {
         <JobsHistogram
           histogram={props.histogram}
           timeFilter={props.timeFilter}
+          refreshing={props.histogramRefreshing}
           onZoomRange={(fromMs, toMs) => {
             setCustomOpen(false);
             props.onTimeFilterChange({ preset: "custom", fromMs, toMs });

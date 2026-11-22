@@ -1,17 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import type { TimeFilterState, TimePreset } from "./app-constants";
 import { formatAxisTime, formatDuration, formatNumber } from "./format";
 import type { JobsHistogram } from "./types";
 
-export type TimePreset = "all" | "5m" | "15m" | "1h" | "6h" | "24h" | "custom";
-
-export interface TimeFilterState {
-  preset: TimePreset;
-  fromMs: number | null;
-  toMs: number | null;
-}
-
-export const DEFAULT_TIME_FILTER: TimeFilterState = { preset: "all", fromMs: null, toMs: null };
+export type { TimeFilterState, TimePreset };
 
 export const TIME_PRESETS: Array<{ value: TimePreset; label: string; windowMs: number | null }> = [
   { value: "all", label: "All", windowMs: null },
@@ -31,9 +24,12 @@ export const TIME_PRESET_MS: Record<Exclude<TimePreset, "all" | "custom">, numbe
   "24h": 24 * 3_600_000,
 };
 
+const PLACEHOLDER_COUNT = 32;
+
 interface JobsHistogramProps {
   histogram: JobsHistogram | null;
   timeFilter: TimeFilterState;
+  refreshing?: boolean;
   onZoomRange: (fromMs: number, toMs: number) => void;
   onResetTime: () => void;
 }
@@ -54,7 +50,7 @@ function activeTimeSummary(filter: TimeFilterState): string {
   return filter.preset === "all" ? "All time" : `Last ${filter.preset}`;
 }
 
-export function JobsHistogram({ histogram, timeFilter, onZoomRange, onResetTime }: JobsHistogramProps) {
+export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, onResetTime }: JobsHistogramProps) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const [brush, setBrush] = useState<{ anchor: number; current: number } | null>(null);
   const barsRef = useRef<HTMLDivElement | null>(null);
@@ -104,16 +100,23 @@ export function JobsHistogram({ histogram, timeFilter, onZoomRange, onResetTime 
   }, [brush != null, histogram, onZoomRange]);
 
   if (!histogram || totals.sum === 0) {
-    if (timeFilter.preset === "all") return null;
     return (
-      <div className="histogram histogram--empty" aria-label="Jobs time distribution">
+      <div className={`histogram histogram--empty${refreshing ? " histogram--refreshing" : ""}`} aria-label="Jobs time distribution">
         <div className="histogram__head">
           <div className="histogram__span">
             <span className="mono">{activeTimeSummary(timeFilter)}</span>
-            <span className="muted">No matching jobs in this time window</span>
+            {timeFilter.preset !== "all" ? (
+              <button type="button" className="link-inline" onClick={onResetTime}>Reset time</button>
+            ) : null}
           </div>
-          <button type="button" className="link-inline" onClick={onResetTime}>Reset time</button>
+          <span className="muted">{histogram === null ? "Loading timeline…" : "No matching jobs in window"}</span>
         </div>
+        <div className="histogram__bars histogram__bars--idle" style={{ gridTemplateColumns: `repeat(${PLACEHOLDER_COUNT}, minmax(0, 1fr))` }} aria-hidden="true">
+          {Array.from({ length: PLACEHOLDER_COUNT }, (_, idx) => (
+            <span key={idx} className="histogram__idle-track" />
+          ))}
+        </div>
+        <div className="histogram__axis mono"><span>—</span><span>—</span></div>
       </div>
     );
   }
@@ -153,7 +156,7 @@ export function JobsHistogram({ histogram, timeFilter, onZoomRange, onResetTime 
     : [0];
 
   return (
-    <div className="histogram" aria-label="Jobs time distribution">
+    <div className={`histogram${refreshing ? " histogram--refreshing" : ""}`} aria-label="Jobs time distribution">
       <div className="histogram__head">
         <div className="histogram__span">
           <span className="mono">
@@ -207,7 +210,7 @@ export function JobsHistogram({ histogram, timeFilter, onZoomRange, onResetTime 
 
           return (
             <button
-              key={bucket.start_ms}
+              key={idx}
               type="button"
               data-bucket-index={idx}
               className={`histogram__col${inBrush ? " is-brushed" : ""}${hoveredIdx === idx ? " is-hovered" : ""}${total === 0 ? " is-empty" : ""}`}

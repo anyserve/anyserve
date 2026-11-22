@@ -2,19 +2,20 @@ import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useR
 
 import { AuthenticationError, cancelJob, clearConsoleToken, getJob, getJobs, getOverview, getWorkers, hasConsoleToken, setConsoleToken } from "./api";
 import {
-  ALL_JOB_STATES, DETAIL_POLL_MS, HISTORY_STATES, JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, JOB_SCOPE_PATHS,
-  OVERVIEW_POLL_MS, QUEUE_STATES, TAB_PATHS, WORKERS_POLL_MS, routeFromPathname, type ConsoleTab, type JobScope, type Theme,
+  ALL_JOB_STATES, buildUrlSearch, DEFAULT_TIME_FILTER, DETAIL_POLL_MS, HISTORY_STATES,
+  JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, QUEUE_STATES,
+  routePath, WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type Theme, type TimeFilterState,
 } from "./app-constants";
 import { ConnectWorkerModal } from "./ConnectWorkerModal";
 import { asErrorMessage, formatPool, sortJobs, sortWorkers } from "./format";
 import { InterfacesPane } from "./InterfacesPane";
-import { DEFAULT_TIME_FILTER, TIME_PRESET_MS, type TimeFilterState } from "./JobsHistogram";
+import { TIME_PRESET_MS } from "./JobsHistogram";
 import { JobsPane } from "./JobsPane";
 import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
 import { PoolsPane, poolKey, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
-import type { JobDetailResponse, JobsHistogram, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
+import type { JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
 import { WorkersPane, type HealthFilter, type WorkerFilterSeed } from "./WorkersPane";
 
@@ -45,7 +46,6 @@ function readTheme(): Theme {
   try { const s = localStorage.getItem(THEME_KEY); if (s === "dark" || s === "light") return s; } catch { /* ignore */ }
   return "light";
 }
-const routePath = (tab: ConsoleTab, scope: JobScope) => (tab === "jobs" ? JOB_SCOPE_PATHS[scope] : TAB_PATHS[tab]);
 const toOptions = (values: Iterable<string>, allLabel: string) => [
   { value: "all", label: allLabel },
   ...Array.from(new Set(values)).sort().map((v) => ({ value: v, label: v })),
@@ -106,26 +106,44 @@ function sameHistogram(a: JobsHistogram | null, b: JobsHistogram | null): boolea
 }
 
 export default function App() {
-  const init = useMemo(() => routeFromPathname(window.location.pathname), []);
+  const init = useMemo(() => parseUrlState(window.location.pathname, window.location.search), []);
   const [activeTab, setActiveTab] = useState<ConsoleTab>(init.tab);
-  const [jobScope, setJobScope] = useState<JobScope>(init.jobScope ?? "all");
+  const [jobScope, setJobScope] = useState<JobScope>(init.jobScope);
   const [theme, setTheme] = useState<Theme>(readTheme);
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [workersResponse, setWorkersResponse] = useState<WorkersResponse | null>(null);
   const [workers, setWorkers] = useState<WorkerSummary[]>([]);
-  const [knownWorkers, setKnownWorkers] = useState<string[]>([]);
+  const [knownWorkers, setKnownWorkers] = useState<string[]>(() => (init.worker !== "all" ? [init.worker] : []));
   const [jobsPage, setJobsPage] = useState<JobsPageState>(EMPTY_JOBS);
 
-  const [filters, setFilters] = useState({ iface: "all", ns: "all", worker: "all", q: "" });
-  const [serverSearch, setServerSearch] = useState("");
-  const [timeFilter, setTimeFilter] = useState<TimeFilterState>(DEFAULT_TIME_FILTER);
+  const [filters, setFilters] = useState({
+    status: init.status as JobStatusFilter,
+    iface: init.iface,
+    ns: init.ns,
+    worker: init.worker,
+    q: init.q,
+  });
+  const [serverSearch, setServerSearch] = useState(() => init.q.trim());
+  const [timeFilter, setTimeFilter] = useState<TimeFilterState>(init.time);
   const deferredSearch = useDeferredValue(filters.q);
-  const [selectedJobByScope, setSelectedJobByScope] = useState<Record<JobScope, string | null>>({ all: null, queue: null, history: null });
-  const [selectedInterface, setSelectedInterface] = useState<string | null>(null);
-  const [selectedPoolKey, setSelectedPoolKey] = useState<string | null>(null);
+
+  const initialPinned = init.tab === "jobs" ? init.pinnedJobId : null;
+  const [pinnedJobByScope, setPinnedJobByScope] = useState<Record<JobScope, string | null>>({
+    all: init.jobScope === "all" ? initialPinned : null,
+    queue: init.jobScope === "queue" ? initialPinned : null,
+    history: init.jobScope === "history" ? initialPinned : null,
+  });
+  const [selectedJobByScope, setSelectedJobByScope] = useState<Record<JobScope, string | null>>({
+    all: init.jobScope === "all" ? initialPinned : null,
+    queue: init.jobScope === "queue" ? initialPinned : null,
+    history: init.jobScope === "history" ? initialPinned : null,
+  });
+
+  const [selectedInterface, setSelectedInterface] = useState<string | null>(init.selectedInterface);
+  const [selectedPoolKey, setSelectedPoolKey] = useState<string | null>(init.selectedPoolKey);
   const [poolFilterSeed, setPoolFilterSeed] = useState<PoolFilterSeed | null>(null);
-  const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
+  const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(init.selectedWorkerId);
   const [workerFilterSeed, setWorkerFilterSeed] = useState<WorkerFilterSeed | null>(null);
   const [connectOpen, setConnectOpen] = useState(false);
 
@@ -144,17 +162,46 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    const r = routeFromPathname(window.location.pathname);
-    const p = routePath(r.tab, r.jobScope ?? "all");
-    if (window.location.pathname !== p) window.history.replaceState(null, "", p);
     const onPop = () => {
-      const n = routeFromPathname(window.location.pathname);
-      setActiveTab(n.tab);
-      if (n.jobScope) setJobScope(n.jobScope);
+      const p = parseUrlState(window.location.pathname, window.location.search);
+      loadMoreAbort.current?.abort();
+      loadMoreAbort.current = null;
+      setJobsPage((cur) => (cur.extra.length === 0 && !cur.extraNext && !cur.loadingMore ? cur : { ...cur, extra: [], extraNext: null, loadingMore: false }));
+      setActiveTab(p.tab);
+      setJobScope(p.jobScope);
+      setFilters({ status: p.status, iface: p.iface, ns: p.ns, worker: p.worker, q: p.q });
+      setServerSearch(p.q.trim());
+      setTimeFilter(p.time);
+      if (p.pinnedJobId) {
+        setPinnedJobByScope((c) => ({ ...c, [p.jobScope]: p.pinnedJobId }));
+        setSelectedJobByScope((c) => ({ ...c, [p.jobScope]: p.pinnedJobId }));
+      }
+      if (p.selectedInterface !== null) setSelectedInterface(p.selectedInterface);
+      if (p.selectedPoolKey !== null) setSelectedPoolKey(p.selectedPoolKey);
+      if (p.selectedWorkerId !== null) setSelectedWorkerId(p.selectedWorkerId);
     };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
+
+  useEffect(() => {
+    const search = buildUrlSearch({
+      tab: activeTab,
+      status: filters.status,
+      iface: filters.iface,
+      ns: filters.ns,
+      worker: filters.worker,
+      q: filters.q,
+      time: timeFilter,
+      pinnedJobId: pinnedJobByScope[jobScope],
+      selectedInterface,
+      selectedPoolKey,
+      selectedWorkerId,
+    });
+    const target = `${routePath(activeTab, jobScope)}${search}`;
+    const current = `${window.location.pathname}${window.location.search}`;
+    if (current !== target) window.history.replaceState(null, "", target);
+  }, [activeTab, jobScope, filters, timeFilter, pinnedJobByScope, selectedInterface, selectedPoolKey, selectedWorkerId]);
 
   useEffect(() => () => loadMoreAbort.current?.abort(), []);
 
@@ -188,7 +235,14 @@ export default function App() {
 
   const polling = !authRequired;
   const activeSelectedJobId = activeTab === "jobs" ? selectedJobByScope[jobScope] : null;
-  const jobStates = jobScope === "queue" ? QUEUE_STATES : jobScope === "history" ? HISTORY_STATES : ALL_JOB_STATES;
+  const effectiveStates: JobState[] =
+    filters.status !== "all"
+      ? [filters.status]
+      : jobScope === "queue"
+        ? QUEUE_STATES
+        : jobScope === "history"
+          ? HISTORY_STATES
+          : ALL_JOB_STATES;
   const timeKey =
     timeFilter.preset === "custom"
       ? `custom:${timeFilter.fromMs ?? ""}:${timeFilter.toMs ?? ""}`
@@ -209,7 +263,7 @@ export default function App() {
     }),
     [filters.iface, filters.ns, filters.worker, serverSearch, timeWindowMs, timeFilter],
   );
-  const jobsQueryKey = `${jobScope}|${filters.iface}|${filters.ns}|${filters.worker}|${serverSearch}|${timeKey}`;
+  const jobsQueryKey = `${jobScope}|${filters.status}|${filters.iface}|${filters.ns}|${filters.worker}|${serverSearch}|${timeKey}`;
 
   usePollingEffect(
     getOverview,
@@ -221,7 +275,7 @@ export default function App() {
   );
 
   usePollingEffect(
-    (signal) => getJobs(jobStates, 100, 0, signal, { ...jobsApiFilters, buckets: 32 }),
+    (signal) => getJobs(effectiveStates, 100, 0, signal, { ...jobsApiFilters, buckets: 32 }),
     (res) => {
       const sorted = sortJobs(res.jobs);
       const nextTotal = res.total ?? null;
@@ -247,7 +301,7 @@ export default function App() {
     },
     handleError,
     jobScope === "history" ? JOBS_HISTORY_POLL_MS : JOBS_ACTIVE_POLL_MS,
-    [jobScope, filters.iface, filters.ns, filters.worker, serverSearch, timeKey],
+    [jobScope, filters.status, filters.iface, filters.ns, filters.worker, serverSearch, timeKey],
     polling && activeTab === "jobs",
   );
 
@@ -272,7 +326,7 @@ export default function App() {
 
   const jobsQueryMatches = jobsPage.loadedKey === jobsQueryKey;
   const loadedJobs = useMemo(() => {
-    if (!jobsQueryMatches) return [];
+    if (jobsPage.loadedKey === null) return [];
     if (jobsPage.extra.length === 0) return jobsPage.page1;
     const seen = new Set<string>();
     return [...jobsPage.page1, ...jobsPage.extra].filter((j) => {
@@ -281,7 +335,7 @@ export default function App() {
       seen.add(k);
       return true;
     });
-  }, [jobsQueryMatches, jobsPage.page1, jobsPage.extra]);
+  }, [jobsPage.loadedKey, jobsPage.page1, jobsPage.extra]);
 
   const filterOptions = useMemo(() => ({
     iface: toOptions([...(overview?.interfaces.map((i) => i.name) ?? []), ...loadedJobs.map((j) => j.interface_name), ...(filters.iface !== "all" ? [filters.iface] : [])], "All interfaces"),
@@ -292,6 +346,9 @@ export default function App() {
   const visibleJobs = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
     return loadedJobs.filter((j) => {
+      if (effectiveStates.length > 0 && !effectiveStates.includes(j.state)) return false;
+      if (filters.iface !== "all" && j.interface_name !== filters.iface) return false;
+      if (filters.ns !== "all" && (j.namespace ?? "default") !== filters.ns) return false;
       if (filters.worker !== "all" && j.latest_worker_id !== filters.worker) return false;
       return (
         !q ||
@@ -300,7 +357,7 @@ export default function App() {
         )
       );
     });
-  }, [loadedJobs, filters.worker, deferredSearch]);
+  }, [loadedJobs, effectiveStates, filters.iface, filters.ns, filters.worker, deferredSearch]);
 
   const selectedJob = useMemo(() => visibleJobs.find((j) => j.job_id === activeSelectedJobId) ?? null, [visibleJobs, activeSelectedJobId]);
   const activeSelectedNs = selectedJob?.namespace && selectedJob.namespace !== "default" ? selectedJob.namespace : undefined;
@@ -327,7 +384,8 @@ export default function App() {
     if (activeTab !== "jobs" || !jobsQueryMatches || selectedJob) return;
     const nextId = visibleJobs[0]?.job_id ?? null;
     if (selectedJobByScope[jobScope] !== nextId) setSelectedJobByScope((c) => ({ ...c, [jobScope]: nextId }));
-  }, [activeTab, jobsQueryMatches, jobScope, visibleJobs, selectedJob, selectedJobByScope]);
+    if (pinnedJobByScope[jobScope] !== null) setPinnedJobByScope((c) => ({ ...c, [jobScope]: null }));
+  }, [activeTab, jobsQueryMatches, jobScope, visibleJobs, selectedJob, selectedJobByScope, pinnedJobByScope]);
 
   async function handleLoadMoreJobs() {
     const cursor = jobsPage.extra.length > 0 ? jobsPage.extraNext : jobsPage.page1Next;
@@ -337,7 +395,7 @@ export default function App() {
     loadMoreAbort.current = controller;
     setJobsPage((p) => ({ ...p, loadingMore: true }));
     try {
-      const res = await getJobs(jobStates, 100, cursor, controller.signal, jobsApiFilters);
+      const res = await getJobs(effectiveStates, 100, cursor, controller.signal, jobsApiFilters);
       if (!controller.signal.aborted) {
         rememberWorkers(res.jobs.map((j) => j.latest_worker_id));
         setJobsPage((p) => ({ ...p, extra: [...p.extra, ...res.jobs], extraNext: res.next_page_token, total: res.total ?? p.total }));
@@ -370,22 +428,42 @@ export default function App() {
     if (nextScope) {
       if (nextScope !== jobScope) resetExtraJobs();
       setJobScope(nextScope);
+      if (nextScope === "all") {
+        setFilters((f) => (f.status === "all" ? f : { ...f, status: "all" }));
+      } else if (nextScope === "queue") {
+        setFilters((f) => (f.status !== "all" && !QUEUE_STATES.includes(f.status) ? { ...f, status: "all" } : f));
+      } else if (nextScope === "history") {
+        setFilters((f) => (f.status !== "all" && !HISTORY_STATES.includes(f.status) ? { ...f, status: "all" } : f));
+      }
     }
     setActiveTab(nextTab);
-    const p = routePath(nextTab, scope);
-    if (window.location.pathname !== p) window.history.pushState(null, "", p);
+    const nextPath = routePath(nextTab, scope);
+    if (window.location.pathname !== nextPath) window.history.pushState(null, "", nextPath);
   }, [jobScope]);
 
-  const jumpToJobs = useCallback((opts: { scope?: JobScope; iface?: string; ns?: string; worker?: string; jobId?: string }) => {
+  const handleStatusFilterChange = useCallback((nextStatus: JobStatusFilter) => {
+    resetExtraJobs();
+    if (nextStatus !== "all") {
+      if (jobScope === "queue" && !QUEUE_STATES.includes(nextStatus)) setJobScope("all");
+      else if (jobScope === "history" && !HISTORY_STATES.includes(nextStatus)) setJobScope("all");
+    }
+    setFilters((f) => ({ ...f, status: nextStatus }));
+  }, [jobScope]);
+
+  const jumpToJobs = useCallback((opts: { scope?: JobScope; status?: JobStatusFilter; iface?: string; ns?: string; worker?: string; jobId?: string }) => {
     const scope = opts.scope ?? "all";
     resetExtraJobs();
     if (opts.worker && opts.worker !== "all") rememberWorkers([opts.worker]);
-    setFilters({ iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: "" });
+    setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: "" });
     setServerSearch("");
     setTimeFilter(DEFAULT_TIME_FILTER);
+    setPinnedJobByScope((c) => ({ ...c, [scope]: opts.jobId ?? null }));
     if (opts.jobId) setSelectedJobByScope((c) => ({ ...c, [scope]: opts.jobId! }));
-    navigateTo("jobs", scope);
-  }, [navigateTo, rememberWorkers]);
+    setJobScope(scope);
+    setActiveTab("jobs");
+    const nextPath = routePath("jobs", scope);
+    if (window.location.pathname !== nextPath) window.history.pushState(null, "", nextPath);
+  }, [rememberWorkers]);
 
   const openInterface = useCallback((name: string) => {
     setSelectedInterface(name);
@@ -458,19 +536,26 @@ export default function App() {
   }
 
   const jobStats =
-    jobScope === "history"
+    jobScope === "queue"
       ? [
-          { label: "Succeeded", value: overview?.history.succeeded ?? 0 },
-          { label: "Failed", value: overview?.history.failed ?? 0 },
-          { label: "Cancelled", value: overview?.history.cancelled ?? 0 },
-          { label: "All", value: overview?.history.total ?? 0 },
+          { label: "Active", value: overview?.queue.active ?? 0, state: "all" as const, active: filters.status === "all" },
+          { label: "Queued", value: overview?.queue.queued ?? 0, state: "queued" as const, active: filters.status === "queued", tone: "warn" as const },
+          { label: "Running", value: overview?.queue.running ?? 0, state: "running" as const, active: filters.status === "running", tone: "warn" as const },
         ]
-      : [
-          { label: "Active", value: overview?.queue.active ?? 0 },
-          { label: "Queued", value: overview?.queue.queued ?? 0 },
-          { label: "Running", value: overview?.queue.running ?? 0 },
-          { label: "Succeeded", value: overview?.history.succeeded ?? 0 },
-        ];
+      : jobScope === "history"
+        ? [
+            { label: "Succeeded", value: overview?.history.succeeded ?? 0, state: "succeeded" as const, active: filters.status === "succeeded", tone: "ok" as const },
+            { label: "Failed", value: overview?.history.failed ?? 0, state: "failed" as const, active: filters.status === "failed", tone: "danger" as const },
+            { label: "Cancelled", value: overview?.history.cancelled ?? 0, state: "cancelled" as const, active: filters.status === "cancelled", tone: "danger" as const },
+            { label: "Total", value: overview?.history.total ?? 0, state: "all" as const, active: filters.status === "all" },
+          ]
+        : [
+            { label: "Queued", value: overview?.queue.queued ?? 0, state: "queued" as const, active: filters.status === "queued", tone: "warn" as const },
+            { label: "Running", value: overview?.queue.running ?? 0, state: "running" as const, active: filters.status === "running", tone: "warn" as const },
+            { label: "Succeeded", value: overview?.history.succeeded ?? 0, state: "succeeded" as const, active: filters.status === "succeeded", tone: "ok" as const },
+            { label: "Failed", value: overview?.history.failed ?? 0, state: "failed" as const, active: filters.status === "failed", tone: "danger" as const },
+            { label: "Cancelled", value: overview?.history.cancelled ?? 0, state: "cancelled" as const, active: filters.status === "cancelled", tone: "danger" as const },
+          ];
 
   return (
     <div className="app-shell">
@@ -490,7 +575,7 @@ export default function App() {
             <OverviewPane
               overview={overview}
               onNavigate={handleSelectTab}
-              onOpenJobs={(scope) => navigateTo("jobs", scope)}
+              onOpenJobs={(scope, status) => (status ? jumpToJobs({ scope, status }) : navigateTo("jobs", scope))}
               onOpenWorkersHealth={openWorkersHealth}
               onOpenInterface={openInterface}
               onOpenPool={openPoolKey}
@@ -501,17 +586,29 @@ export default function App() {
             <JobsPane
               scope={jobScope} onScopeChange={(next) => navigateTo("jobs", next)} stats={jobStats} jobs={visibleJobs} totalLoaded={loadedJobs.length}
               totalMatching={jobsQueryMatches && filters.q.trim() === serverSearch ? jobsPage.total : null}
-              histogram={jobsQueryMatches ? jobsPage.histogram : null}
+              histogram={jobsPage.histogram}
+              histogramRefreshing={!jobsQueryMatches && jobsPage.loadedKey !== null}
               timeFilter={timeFilter}
               onTimeFilterChange={(next) => { resetExtraJobs(); setTimeFilter(next); }}
-              selectedJobId={selectedJob?.job_id ?? null} onSelect={(id) => setSelectedJobByScope((c) => ({ ...c, [jobScope]: id }))}
+              selectedJobId={selectedJob?.job_id ?? null}
+              onSelect={(id) => {
+                setPinnedJobByScope((c) => ({ ...c, [jobScope]: id }));
+                setSelectedJobByScope((c) => ({ ...c, [jobScope]: id }));
+              }}
               onOpenInterface={openInterface} onOpenWorker={openWorker} onFilterNamespace={filterJobNamespace}
+              statusFilter={filters.status} onStatusFilterChange={handleStatusFilterChange}
               interfaceFilter={filters.iface} interfaceOptions={filterOptions.iface} onInterfaceFilterChange={(iface) => { resetExtraJobs(); setFilters((f) => ({ ...f, iface })); }}
               namespaceFilter={filters.ns} namespaceOptions={filterOptions.ns} onNamespaceFilterChange={(ns) => { resetExtraJobs(); setFilters((f) => ({ ...f, ns })); }}
               workerFilter={filters.worker} workerOptions={filterOptions.worker} onWorkerFilterChange={(worker) => { resetExtraJobs(); setFilters((f) => ({ ...f, worker })); }}
               searchQuery={filters.q} onSearchQueryChange={(q) => { if (!q.trim()) { resetExtraJobs(); setServerSearch(""); } setFilters((f) => ({ ...f, q })); }}
-              onResetAllFilters={() => { resetExtraJobs(); setFilters({ iface: "all", ns: "all", worker: "all", q: "" }); setServerSearch(""); setTimeFilter(DEFAULT_TIME_FILTER); }}
-              hasMore={(jobsPage.extra.length > 0 ? jobsPage.extraNext : jobsPage.page1Next) != null} loadingMore={jobsPage.loadingMore} onLoadMore={() => void handleLoadMoreJobs()}
+              onResetAllFilters={() => {
+                resetExtraJobs();
+                setFilters({ status: "all", iface: "all", ns: "all", worker: "all", q: "" });
+                setServerSearch("");
+                setTimeFilter(DEFAULT_TIME_FILTER);
+                setPinnedJobByScope((c) => ({ ...c, [jobScope]: null }));
+              }}
+              hasMore={jobsQueryMatches && (jobsPage.extra.length > 0 ? jobsPage.extraNext : jobsPage.page1Next) != null} loadingMore={jobsPage.loadingMore} onLoadMore={() => void handleLoadMoreJobs()}
               inspector={
                 <JobInspector
                   detail={selectedJob ? selectedJobDetail : null}

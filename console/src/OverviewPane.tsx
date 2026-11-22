@@ -2,12 +2,12 @@ import type { ConsoleTab, JobScope } from "./app-constants";
 import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber, formatPool } from "./format";
 import { IconArrowRight } from "./icons";
 import { EmptyState, InterfacesTable, PanelHeader, ProgressMeter } from "./pane-tables";
-import type { OverviewResponse } from "./types";
+import type { JobState, OverviewResponse } from "./types";
 
 interface OverviewPaneProps {
   overview: OverviewResponse | null;
   onNavigate: (tab: ConsoleTab) => void;
-  onOpenJobs: (scope: JobScope) => void;
+  onOpenJobs: (scope: JobScope, status?: JobState) => void;
   onOpenWorkersHealth: (health: "all" | "draining") => void;
   onOpenInterface: (interfaceName: string) => void;
   onOpenPool: (poolKey: string) => void;
@@ -64,10 +64,10 @@ export function OverviewPane({
             </div>
             <div className="kpi-card__value num">{formatNumber(overview?.queue.active ?? 0)}</div>
             <div className="kpi-card__sub">
-              <button type="button" className="stat-link" onClick={() => onOpenJobs("queue")}>
+              <button type="button" className="stat-link" onClick={() => onOpenJobs("queue", "queued")}>
                 Queued <strong className="num">{formatNumber(overview?.queue.queued ?? 0)}</strong>
               </button>
-              <button type="button" className="stat-link" onClick={() => onOpenJobs("queue")}>
+              <button type="button" className="stat-link" onClick={() => onOpenJobs("queue", "running")}>
                 Running <strong className="num">{formatNumber(overview?.queue.running ?? 0)}</strong>
               </button>
             </div>
@@ -87,13 +87,13 @@ export function OverviewPane({
             </div>
             <div className="kpi-card__value num">{formatNumber(overview?.history.total ?? 0)}</div>
             <div className="kpi-card__sub">
-              <button type="button" className="stat-link tone-ok" onClick={() => onOpenJobs("history")}>
+              <button type="button" className="stat-link tone-ok" onClick={() => onOpenJobs("history", "succeeded")}>
                 Succeeded <strong className="num">{formatNumber(overview?.history.succeeded ?? 0)}</strong>
               </button>
-              <button type="button" className="stat-link tone-danger" onClick={() => onOpenJobs("history")}>
+              <button type="button" className="stat-link tone-danger" onClick={() => onOpenJobs("history", "failed")}>
                 Failed <strong className="num">{formatNumber(overview?.history.failed ?? 0)}</strong>
               </button>
-              <button type="button" className="stat-link" onClick={() => onOpenJobs("history")}>
+              <button type="button" className="stat-link" onClick={() => onOpenJobs("history", "cancelled")}>
                 Cancelled <strong className="num">{formatNumber(overview?.history.cancelled ?? 0)}</strong>
               </button>
             </div>
