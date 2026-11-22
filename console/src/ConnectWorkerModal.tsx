@@ -20,7 +20,9 @@ const TABS: Array<{ id: OnboardingTab; label: string }> = [
   { id: "linux", label: "Linux Install" },
 ];
 
-function deriveEndpoint(controlPlane?: ControlPlaneSummary): string {
+export function deriveEndpoint(controlPlane?: ControlPlaneSummary): string {
+  const explicit = controlPlane?.public_endpoint?.trim() || import.meta.env.VITE_PUBLIC_ENDPOINT?.trim();
+  if (explicit) return explicit;
   const listen = controlPlane?.grpc_listen ?? "127.0.0.1:50052";
   const host = typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "127.0.0.1";
   const resolved = listen.startsWith("0.0.0.0:")
@@ -58,6 +60,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
   if (!open) return null;
 
   const endpoint = deriveEndpoint(controlPlane);
+  const isWebSocket = endpoint.startsWith("wss://") || endpoint.startsWith("ws://");
   const authEnabled = Boolean(controlPlane?.auth_enabled);
   const tokenLine = authEnabled ? 'export ANYSERVE_TOKEN="<worker-token>"\n' : "";
 
@@ -74,7 +77,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
           <div>
             <h2 id="connect-worker-title">Connect Worker</h2>
             <p className="modal__sub">
-              Workers open outbound gRPC streams to <code className="mono">{endpoint}</code> (no inbound port required).
+              Workers open outbound {isWebSocket ? "WebSocket" : "gRPC"} streams to <code className="mono">{endpoint}</code> (no inbound port required).
             </p>
           </div>
           <button type="button" className="icon-btn" aria-label="Close modal" onClick={onClose}>

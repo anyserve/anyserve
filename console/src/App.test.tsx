@@ -262,6 +262,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 it("keeps the selected job's detail and cancel target when an older response arrives late", async () => {
@@ -939,4 +940,47 @@ it("filters by job status via select or KPI cards and preserves filters & select
   fireEvent.click(screen.getByRole("button", { name: /^Succeeded\b/i }));
   await waitFor(() => expect((screen.getByLabelText("Status") as HTMLSelectElement).value).toBe("succeeded"));
   expect(await screen.findByRole("heading", { name: "job-ok-1" })).toBeTruthy();
+});
+
+it("renders memory_plus_cloudflare mode badge, wss:// public_endpoint, and WebSocket modal subtitle", async () => {
+  window.history.replaceState(null, "", "/workers");
+  const cloudflareOverview: OverviewResponse = {
+    ...richOverview(),
+    runtime: { code: "memory_plus_cloudflare", label: "Memory + Cloudflare journal", journal: "cloudflare" },
+    control_plane: {
+      ...richOverview().control_plane!,
+      public_endpoint: "  wss://anyserve.example.com  ",
+    },
+  };
+  vi.mocked(getOverview).mockResolvedValue(cloudflareOverview);
+  vi.mocked(getWorkers).mockResolvedValue(richWorkers());
+
+  const view = render(<App />);
+  expect(await screen.findByText("Memory + Cloudflare journal")).toBeTruthy();
+
+  fireEvent.click(await screen.findByRole("button", { name: "Connect Worker" }));
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  expect(document.querySelector(".modal__sub")?.textContent).toBe(
+    "Workers open outbound WebSocket streams to wss://anyserve.example.com (no inbound port required).",
+  );
+  expect(screen.getByText("Endpoint: wss://anyserve.example.com")).toBeTruthy();
+  expect(screen.getByText(/serve\(echo, endpoint="wss:\/\/anyserve\.example\.com"\)/)).toBeTruthy();
+
+  // Falls back to VITE_PUBLIC_ENDPOINT (including ws://) when control_plane.public_endpoint is empty/unset.
+  view.unmount();
+  vi.stubEnv("VITE_PUBLIC_ENDPOINT", "  ws://127.0.0.1:3001  ");
+  vi.mocked(getOverview).mockResolvedValue({
+    ...cloudflareOverview,
+    control_plane: {
+      ...cloudflareOverview.control_plane!,
+      public_endpoint: "   ",
+    },
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Connect Worker" }));
+  expect(document.querySelector(".modal__sub")?.textContent).toBe(
+    "Workers open outbound WebSocket streams to ws://127.0.0.1:3001 (no inbound port required).",
+  );
+  expect(screen.getByText("Endpoint: ws://127.0.0.1:3001")).toBeTruthy();
 });

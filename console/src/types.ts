@@ -6,9 +6,9 @@ export type MetadataMap = Record<string, string>;
 export type AnalyticsSource = "archive" | "retained";
 
 export interface RuntimeModeSummary {
-  code: "memory" | "memory_plus_sqlite" | "memory_plus_postgres";
+  code: "memory" | "memory_plus_sqlite" | "memory_plus_postgres" | "memory_plus_cloudflare";
   label: string;
-  journal: "disabled" | "sqlite" | "postgres";
+  journal: "disabled" | "sqlite" | "postgres" | "cloudflare";
 }
 
 export interface QueueSummary { queued: number; running: number; active: number; }
@@ -34,6 +34,7 @@ export interface InterfaceSummary {
 
 export interface ControlPlaneSummary {
   grpc_listen: string; grpc_tls_enabled: boolean; console_listen: string; auth_enabled: boolean;
+  public_endpoint?: string | null;
   generation: number; retained_jobs: number; sessions: number; max_sessions: number;
   priority_levels: number; default_max_attempts: number;
   heartbeat_interval_ms: number; heartbeat_timeout_ms: number; reconnect_grace_ms: number | null;
