@@ -35,6 +35,7 @@ export interface InterfaceSummary {
 export interface ControlPlaneSummary {
   grpc_listen: string; grpc_tls_enabled: boolean; console_listen: string; auth_enabled: boolean;
   public_endpoint?: string | null;
+  recommended_poll_ms?: number | null;
   generation: number; retained_jobs: number; sessions: number; max_sessions: number;
   priority_levels: number; default_max_attempts: number;
   heartbeat_interval_ms: number; heartbeat_timeout_ms: number; reconnect_grace_ms: number | null;

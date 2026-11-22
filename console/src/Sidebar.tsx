@@ -22,6 +22,7 @@ interface SidebarProps {
   overview: OverviewResponse | null;
   theme: Theme;
   onToggleTheme: () => void;
+  onRefresh?: () => void;
   authenticated: boolean;
   onDisconnect: () => void;
 }
@@ -66,6 +67,7 @@ export const Sidebar = memo(function Sidebar({
   overview,
   theme,
   onToggleTheme,
+  onRefresh,
   authenticated,
   onDisconnect,
 }: SidebarProps) {
@@ -126,6 +128,12 @@ export const Sidebar = memo(function Sidebar({
         </div>
 
         <div className="sidebar__controls">
+          {onRefresh ? (
+            <button type="button" className="ctrl-pill" title="Refresh" aria-label="Refresh" onClick={onRefresh}>
+              <span>Refresh</span>
+            </button>
+          ) : null}
+
           <button type="button" className="ctrl-pill" title="Switch theme" aria-label="Switch theme" onClick={onToggleTheme}>
             {theme === "dark" ? <IconSun /> : <IconMoon />}
             <span>{theme === "dark" ? "Light" : "Dark"}</span>

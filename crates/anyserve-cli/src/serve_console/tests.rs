@@ -17,7 +17,7 @@ use anyserve_core::runtime::{
 use reqwest::{Client, Method, Response};
 use serde_json::{Value, json};
 
-use super::api::{AppState, ControlPlaneStatic, runtime_mode_summary};
+use super::api::{AppState, ControlPlaneStatic, ControlPlaneSummary, runtime_mode_summary};
 use super::handlers::{parse_states, router};
 use super::{ControlPlaneMetadata, format_host_port, run_server};
 
@@ -1622,4 +1622,45 @@ fn runtime_mode_summary_covers_cloudflare_journal() {
     assert_eq!(summary.code, "memory_plus_cloudflare");
     assert_eq!(summary.label, "Memory + Cloudflare journal");
     assert_eq!(summary.journal, "cloudflare");
+}
+
+#[tokio::test]
+async fn overview_omits_recommended_poll_ms_when_none_and_serializes_when_some() {
+    let runtime = test_runtime().await;
+    let c = spawn_console(runtime).await;
+    let body = c.json(Method::GET, "/api/overview", None).await;
+    let cp = body["control_plane"].as_object().unwrap();
+    assert!(
+        !cp.contains_key("recommended_poll_ms"),
+        "expected /api/overview control_plane to omit recommended_poll_ms when None: {body}"
+    );
+
+    let make_summary = |recommended_poll_ms: Option<u64>| ControlPlaneSummary {
+        grpc_listen: "127.0.0.1:50052".into(),
+        grpc_tls_enabled: false,
+        console_listen: "127.0.0.1:3001".into(),
+        public_endpoint: None,
+        auth_enabled: false,
+        generation: 1,
+        retained_jobs: 0,
+        sessions: 0,
+        max_sessions: 64,
+        priority_levels: 4,
+        default_max_attempts: 3,
+        heartbeat_interval_ms: 5_000,
+        heartbeat_timeout_ms: 15_000,
+        reconnect_grace_ms: Some(3_000),
+        recommended_poll_ms,
+    };
+
+    let none_val = serde_json::to_value(make_summary(None)).unwrap();
+    assert!(
+        !none_val
+            .as_object()
+            .unwrap()
+            .contains_key("recommended_poll_ms")
+    );
+
+    let some_val = serde_json::to_value(make_summary(Some(10_000))).unwrap();
+    assert_eq!(some_val["recommended_poll_ms"], json!(10_000));
 }

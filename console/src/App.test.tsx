@@ -984,3 +984,165 @@ it("renders memory_plus_cloudflare mode badge, wss:// public_endpoint, and WebSo
   );
   expect(screen.getByText("Endpoint: ws://127.0.0.1:3001")).toBeTruthy();
 });
+
+it("uses fast default poll intervals when recommended_poll_ms is undefined or null", async () => {
+  vi.useFakeTimers();
+  window.history.replaceState(null, "", "/queue");
+  vi.mocked(getOverview).mockResolvedValue(richOverview());
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [summary("job-fast")],
+    next_page_token: null,
+  });
+  vi.mocked(getJob).mockResolvedValue(detail("job-fast"));
+  vi.mocked(getWorkers).mockResolvedValue(richWorkers());
+
+  render(<App />);
+  await act(async () => {});
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getJobs).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledTimes(1);
+
+  await act(() => vi.advanceTimersByTimeAsync(799));
+  expect(getJobs).toHaveBeenCalledTimes(1);
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(getJobs).toHaveBeenCalledTimes(2);
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledTimes(1);
+
+  await act(() => vi.advanceTimersByTimeAsync(200));
+  expect(getOverview).toHaveBeenCalledTimes(2);
+  expect(getJob).toHaveBeenCalledTimes(2);
+
+  fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
+  await act(async () => {});
+  vi.mocked(getWorkers).mockClear();
+  await act(() => vi.advanceTimersByTimeAsync(1_999));
+  expect(getWorkers).not.toHaveBeenCalled();
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(getWorkers).toHaveBeenCalledTimes(1);
+});
+
+it("honours recommended_poll_ms=10000 across overview, jobs, workers, and job-detail polls while pausing when hidden", async () => {
+  vi.useFakeTimers();
+  window.history.replaceState(null, "", "/queue");
+  const slowOverview: OverviewResponse = {
+    ...richOverview(),
+    control_plane: {
+      ...richOverview().control_plane!,
+      recommended_poll_ms: 10_000,
+    },
+  };
+  vi.mocked(getOverview).mockResolvedValue(slowOverview);
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [summary("job-10s")],
+    next_page_token: null,
+  });
+  vi.mocked(getJob).mockResolvedValue(detail("job-10s"));
+  vi.mocked(getWorkers).mockResolvedValue(richWorkers());
+
+  render(<App />);
+  await act(async () => {});
+  // Initial load performs exactly one fetch per active resource (no duplicate fetch when pollMs updates to 10_000).
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getJobs).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledTimes(1);
+
+  await act(() => vi.advanceTimersByTimeAsync(9_999));
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getJobs).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledTimes(1);
+
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(getOverview).toHaveBeenCalledTimes(2);
+  expect(getJobs).toHaveBeenCalledTimes(2);
+  expect(getJob).toHaveBeenCalledTimes(2);
+
+  // Workers tab also honours the 10_000 ms interval.
+  fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
+  await act(async () => {});
+  expect(getWorkers).toHaveBeenCalledTimes(1);
+  await act(() => vi.advanceTimersByTimeAsync(9_999));
+  expect(getWorkers).toHaveBeenCalledTimes(1);
+  await act(() => vi.advanceTimersByTimeAsync(1));
+  expect(getWorkers).toHaveBeenCalledTimes(2);
+
+  // Pausing when tab is hidden still stops timers and refreshes on return.
+  const visibility = vi.spyOn(document, "visibilityState", "get");
+  visibility.mockReturnValue("hidden");
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  vi.mocked(getOverview).mockClear();
+  vi.mocked(getWorkers).mockClear();
+  await act(() => vi.advanceTimersByTimeAsync(30_000));
+  expect(getOverview).not.toHaveBeenCalled();
+  expect(getWorkers).not.toHaveBeenCalled();
+
+  visibility.mockReturnValue("visible");
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getWorkers).toHaveBeenCalledTimes(1);
+  visibility.mockRestore();
+});
+
+it("disables timer polling when recommended_poll_ms=0 and refreshes on manual Refresh button click", async () => {
+  vi.useFakeTimers();
+  window.history.replaceState(null, "", "/queue");
+  const manualOverview: OverviewResponse = {
+    ...richOverview(),
+    control_plane: {
+      ...richOverview().control_plane!,
+      recommended_poll_ms: 0,
+    },
+  };
+  vi.mocked(getOverview).mockResolvedValue(manualOverview);
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [summary("job-manual")],
+    next_page_token: null,
+  });
+  vi.mocked(getJob).mockResolvedValue(detail("job-manual"));
+  vi.mocked(getWorkers).mockResolvedValue(richWorkers());
+
+  render(<App />);
+  await act(async () => {});
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getJobs).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledTimes(1);
+
+  // No timer polls fire after initial load even after a full minute.
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  expect(getJobs).toHaveBeenCalledTimes(1);
+  expect(getJob).toHaveBeenCalledTimes(1);
+
+  // Clicking Sidebar Refresh button fetches overview, jobs, and active job detail once.
+  const refreshBtn = screen.getByRole("button", { name: "Refresh" });
+  expect(refreshBtn.classList.contains("ctrl-pill")).toBe(true);
+  expect(refreshBtn.getAttribute("title")).toBe("Refresh");
+  expect(refreshBtn.closest(".sidebar__controls")).toBeTruthy();
+
+  await act(async () => {
+    fireEvent.click(refreshBtn);
+  });
+  expect(getOverview).toHaveBeenCalledTimes(2);
+  expect(getJobs).toHaveBeenCalledTimes(2);
+  expect(getJob).toHaveBeenCalledTimes(2);
+
+  // Still no timer polls after manual refresh.
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(getOverview).toHaveBeenCalledTimes(2);
+  expect(getJobs).toHaveBeenCalledTimes(2);
+  expect(getJob).toHaveBeenCalledTimes(2);
+
+  // Workers tab also fetches once on navigation, never polls on timer, and refreshes on click.
+  fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
+  await act(async () => {});
+  expect(getWorkers).toHaveBeenCalledTimes(1);
+  await act(() => vi.advanceTimersByTimeAsync(60_000));
+  expect(getWorkers).toHaveBeenCalledTimes(1);
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+  });
+  expect(getWorkers).toHaveBeenCalledTimes(2);
+});

@@ -87,6 +87,7 @@ export default function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(hasConsoleToken);
   const [token, setToken] = useState("");
+  const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
   const loadMoreAbort = useRef<AbortController | null>(null);
   const navSeedSeq = useRef(0);
 
@@ -192,12 +193,16 @@ export default function App() {
   );
   const jobsQueryKey = `${jobScope}|${filters.status}|${filters.iface}|${filters.ns}|${filters.worker}|${serverSearch}|${timeKey}`;
 
+  const recommendedPollMs = overview?.control_plane?.recommended_poll_ms;
+  const resolvePollMs = (defaultMs: number): number =>
+    recommendedPollMs == null ? defaultMs : recommendedPollMs <= 0 ? 0 : recommendedPollMs;
+
   usePollingEffect(
     getOverview,
     (next) => { setOverview(next); setError(null); },
     handleError,
-    activeTab === "overview" || (activeTab === "jobs" && jobScope !== "history") ? OVERVIEW_POLL_MS : 2_000,
-    [activeTab, jobScope],
+    resolvePollMs(activeTab === "overview" || (activeTab === "jobs" && jobScope !== "history") ? OVERVIEW_POLL_MS : 2_000),
+    [activeTab, jobScope, manualRefreshSeq],
     polling,
   );
 
@@ -227,8 +232,8 @@ export default function App() {
       setError(null);
     },
     handleError,
-    jobScope === "history" ? JOBS_HISTORY_POLL_MS : JOBS_ACTIVE_POLL_MS,
-    [jobScope, filters.status, filters.iface, filters.ns, filters.worker, serverSearch, timeKey],
+    resolvePollMs(jobScope === "history" ? JOBS_HISTORY_POLL_MS : JOBS_ACTIVE_POLL_MS),
+    [jobScope, filters.status, filters.iface, filters.ns, filters.worker, serverSearch, timeKey, manualRefreshSeq],
     polling && activeTab === "jobs",
   );
 
@@ -246,8 +251,8 @@ export default function App() {
       setError(null);
     },
     handleError,
-    WORKERS_POLL_MS,
-    [],
+    resolvePollMs(WORKERS_POLL_MS),
+    [manualRefreshSeq],
     polling && (activeTab === "workers" || activeTab === "interfaces" || activeTab === "pools"),
   );
 
@@ -302,8 +307,8 @@ export default function App() {
     (signal) => getJob(activeSelectedJobId!, signal, activeSelectedNs),
     (next) => { setJobDetail(next); setError(null); },
     (err) => { setJobDetail(null); handleError(err); },
-    jobScope === "queue" ? DETAIL_POLL_MS : 2_000,
-    [activeTab, jobScope, activeJobKey],
+    resolvePollMs(jobScope === "queue" ? DETAIL_POLL_MS : 2_000),
+    [activeTab, jobScope, activeJobKey, manualRefreshSeq],
     polling && activeTab === "jobs" && activeSelectedJobId !== null && Boolean(selectedJob) && !(selectedJobDetail && HISTORY_STATES.includes(selectedJobDetail.job.state)),
   );
 
@@ -446,6 +451,7 @@ export default function App() {
   }, []);
 
   const handleToggleTheme = useCallback(() => setTheme((c) => (c === "light" ? "dark" : "light")), []);
+  const handleRefresh = useCallback(() => setManualRefreshSeq((s) => s + 1), []);
   const handleSelectTab = useCallback((tab: ConsoleTab) => navigateTo(tab), [navigateTo]);
 
   if (authRequired) {
@@ -472,6 +478,7 @@ export default function App() {
         overview={overview}
         theme={theme}
         onToggleTheme={handleToggleTheme}
+        onRefresh={handleRefresh}
         authenticated={authenticated}
         onDisconnect={handleDisconnect}
       />

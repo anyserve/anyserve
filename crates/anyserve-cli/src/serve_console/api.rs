@@ -103,6 +103,8 @@ pub(crate) struct ControlPlaneSummary {
     pub(crate) heartbeat_interval_ms: u64,
     pub(crate) heartbeat_timeout_ms: u64,
     pub(crate) reconnect_grace_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recommended_poll_ms: Option<u64>,
 }
 
 #[derive(Serialize)]

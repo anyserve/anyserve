@@ -162,6 +162,7 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
             heartbeat_interval_ms: duration_ms(config.heartbeat_interval),
             heartbeat_timeout_ms: duration_ms(config.heartbeat_timeout),
             reconnect_grace_ms: config.reconnect_grace.map(duration_ms),
+            recommended_poll_ms: None,
         },
         budgets: BudgetsSummary {
             input_bytes: stats.input_bytes,
