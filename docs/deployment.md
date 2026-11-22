@@ -250,3 +250,121 @@ at the deployment's ingress or proxy.
 Metrics cover Runtime jobs, interfaces, workers, byte budgets and journal.
 Job-state gauges count retained jobs, not cumulative completions. Per-request
 latency histograms and distributed trace export require application instrumentation.
+
+## Cloudflare Containers + DO SQLite + R2
+
+`deploy/cloudflare` packages AnyServe for fully managed deployment on Cloudflare
+Workers Static Assets, Cloudflare Containers, Durable Object SQLite, and
+Cloudflare R2 with a single public `https://` / `wss://` endpoint:
+
+- **Static frontend (`env.ASSETS`)**: serves the React Console from
+  `console/dist` with SPA fallback.
+- **Control plane (`AnyserveControlPlaneDO`)**: runs `anyserve serve` inside a
+  `lite` container (`256 MiB` memory) with `[server].grpc_enabled = false` on
+  port `3001`, exposing `/api/*`, `/rpc/v2/*`, `/ws/v2/*`, `/healthz`,
+  `/readyz`, and `/metrics`. Active WebSocket connections (`activeWsCount`)
+  prevent premature container sleep while workers are connected; once all
+  workers disconnect and traffic goes idle, the container sleeps automatically.
+- **Durable journal (`JournalStorage` + `JournalGateway`)**: `AnyserveControlPlaneDO`
+  intercepts outbound HTTP to `http://journal.internal` via `JournalGateway`
+  and persists metadata and inline payloads (`<= 1 MiB`) in DO SQLite while
+  spilling payloads `> 1 MiB` to R2 (`jobs/<job_id>/<role>/<idx>`) outside
+  `transactionSync`.
+
+### Prerequisites
+
+- A Cloudflare account with **Workers Paid** (required for Containers,
+  Durable Object SQLite, and R2).
+- Node.js 24+ and Docker running locally (Wrangler builds
+  [the container Dockerfile](../deploy/cloudflare/Dockerfile) during deploy).
+- Wrangler authenticated (`npx wrangler login` or `CLOUDFLARE_API_TOKEN`).
+
+### 1. Create the R2 bucket and install deploy dependencies
+
+```bash
+npm --prefix deploy/cloudflare ci
+npx --prefix deploy/cloudflare wrangler r2 bucket create anyserve-journal
+```
+
+Verify the bucket name (`anyserve-journal` by default) in
+[wrangler.jsonc](../deploy/cloudflare/wrangler.jsonc).
+
+### 2. Configure endpoints and secrets
+
+Update `public_endpoint` in [server.toml](../deploy/cloudflare/server.toml) to
+your Worker URL or custom domain (for example `wss://anyserve.example.com`),
+or set `ANYSERVE_PUBLIC_ENDPOINT` as a Worker variable/secret.
+
+Set client and worker bearer tokens before exposing the deployment:
+
+```bash
+npx --prefix deploy/cloudflare wrangler secret put ANYSERVE_CLIENT_TOKENS \
+  --config deploy/cloudflare/wrangler.jsonc
+npx --prefix deploy/cloudflare wrangler secret put ANYSERVE_WORKER_TOKENS \
+  --config deploy/cloudflare/wrangler.jsonc
+```
+
+Optionally set `JOURNAL_INTERNAL_SECRET` to authenticate internal
+`http://journal.internal` requests between the container and `JournalGateway`:
+
+```bash
+npx --prefix deploy/cloudflare wrangler secret put JOURNAL_INTERNAL_SECRET \
+  --config deploy/cloudflare/wrangler.jsonc
+```
+
+`AnyserveControlPlaneDO` forwards `ANYSERVE_CLIENT_TOKENS`,
+`ANYSERVE_WORKER_TOKENS`, `ANYSERVE_PUBLIC_ENDPOINT`, and
+`JOURNAL_INTERNAL_SECRET` (as `ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN`) into the
+container environment at startup.
+
+### 3. Build Console assets (`.wasm.bin`)
+
+Cloudflare Workers Static Assets enforces a `25 MiB` per-file limit, while
+the uncompressed DuckDB-WASM exception-handling binary is `~34 MiB`. Building
+`console` compresses `duckdb-eh-*.wasm` to `.wasm.bin` (`~7.7 MiB`) and removes
+the raw `.wasm` file; the browser decompresses it on demand in Explore via
+`DecompressionStream("gzip")`:
+
+```bash
+npm --prefix console ci
+npm --prefix console run build
+```
+
+To host the DuckDB-WASM binary externally (for example on an R2 custom domain)
+and bypass client-side decompression, set `VITE_DUCKDB_WASM_URL` when building:
+
+```bash
+VITE_DUCKDB_WASM_URL="https://assets.example.com/duckdb-eh.wasm" \
+  npm --prefix console run build
+```
+
+Keep `duckdb-browser-eh.worker.js` served from the same Worker origin (default)
+so browsers permit `new Worker(...)`.
+
+### 4. Deploy to Cloudflare
+
+```bash
+npx --prefix deploy/cloudflare wrangler deploy \
+  --config deploy/cloudflare/wrangler.jsonc
+```
+
+After deployment, connect remote workers and clients using the `wss://`
+endpoint and role-specific tokens:
+
+```bash
+export ANYSERVE_ENDPOINT="wss://anyserve.example.com"
+export ANYSERVE_TOKEN="<worker-or-client-token>"
+```
+
+### Local Node 24 journal gateway testing
+
+For local development or E2E verification without Wrangler/Docker,
+[node-dev-gateway.ts](../deploy/cloudflare/src/node-dev-gateway.ts) runs the
+Contract C `/v1/*` HTTP gateway backed by Node 24 `node:sqlite` and an
+in-memory R2 store:
+
+```bash
+npm --prefix deploy/cloudflare test
+npm --prefix deploy/cloudflare run typecheck
+node --experimental-strip-types deploy/cloudflare/src/node-dev-gateway.ts
+```
