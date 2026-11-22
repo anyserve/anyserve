@@ -107,6 +107,13 @@ export class AnyserveControlPlaneDO extends Container<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     if (!this.ctx.container?.running) {
+      if (!this.env.ANYSERVE_PUBLIC_ENDPOINT) {
+        // No explicit endpoint configured: advertise the host this Worker is served from.
+        this.envVars = {
+          ...this.envVars,
+          ANYSERVE_PUBLIC_ENDPOINT: `wss://${new URL(request.url).host}`,
+        };
+      }
       await this.restoreContainerBindings();
     }
     if (isWebSocketUpgrade(request)) {

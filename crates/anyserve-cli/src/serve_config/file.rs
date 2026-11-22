@@ -143,8 +143,10 @@ impl ServeConsoleConfigFile {
         if !self.enabled.unwrap_or(true) {
             return None;
         }
-        let public_endpoint = nonempty_trimmed(self.public_endpoint)
-            .or_else(|| nonempty_trimmed(env("ANYSERVE_PUBLIC_ENDPOINT")));
+        // A non-empty env var overrides the TOML value (like the journal URL), so
+        // one baked-in image can advertise the endpoint of each deployment.
+        let public_endpoint = nonempty_trimmed(env("ANYSERVE_PUBLIC_ENDPOINT"))
+            .or_else(|| nonempty_trimmed(self.public_endpoint));
 
         Some(ServeConsoleConfig {
             listen: self
@@ -311,7 +313,7 @@ mod postgres_tests {
     }
 
     #[test]
-    fn console_public_endpoint_falls_back_to_env_when_unset_or_empty() {
+    fn console_public_endpoint_env_overrides_toml_and_falls_back_when_unset_or_empty() {
         let empty: ServeConsoleConfigFile = toml::from_str("public_endpoint='   '").unwrap();
         let resolved = empty
             .resolve_with_env(|name| {
@@ -324,15 +326,24 @@ mod postgres_tests {
             Some("wss://edge.example.com")
         );
 
-        let explicit: ServeConsoleConfigFile =
-            toml::from_str("public_endpoint='wss://toml.example.com'").unwrap();
-        let resolved = explicit
-            .resolve_with_env(|_| panic!("env should not override explicit public_endpoint"))
+        let explicit = || -> ServeConsoleConfigFile {
+            toml::from_str("public_endpoint='wss://toml.example.com'").unwrap()
+        };
+        let resolved = explicit()
+            .resolve_with_env(|_| Some(" wss://env.example.com ".into()))
             .unwrap();
         assert_eq!(
             resolved.public_endpoint.as_deref(),
-            Some("wss://toml.example.com")
+            Some("wss://env.example.com")
         );
+
+        for env_value in [None, Some("   ".to_string())] {
+            let resolved = explicit().resolve_with_env(|_| env_value.clone()).unwrap();
+            assert_eq!(
+                resolved.public_endpoint.as_deref(),
+                Some("wss://toml.example.com")
+            );
+        }
     }
 }
 

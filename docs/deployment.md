@@ -291,9 +291,18 @@ Verify the bucket name (`anyserve-journal` by default) in
 
 ### 2. Configure endpoints and secrets
 
-Update `public_endpoint` in [server.toml](../deploy/cloudflare/server.toml) to
-your Worker URL or custom domain (for example `wss://anyserve.example.com`),
-or set `ANYSERVE_PUBLIC_ENDPOINT` as a Worker variable/secret.
+The endpoint advertised to workers (`/api/overview` and the Console's
+"Connect worker" dialog) is resolved in this order:
+
+1. A non-empty `ANYSERVE_PUBLIC_ENDPOINT` environment variable (set it as a
+   Worker variable/secret for your Worker URL or custom domain, for example
+   `wss://anyserve.example.com`); it **overrides** the TOML value.
+2. `public_endpoint` in [server.toml](../deploy/cloudflare/server.toml), which
+   ships as the placeholder `wss://anyserve.example.com`.
+3. If `ANYSERVE_PUBLIC_ENDPOINT` is not set on the Worker, the Worker passes
+   `wss://<request host>` of the request that starts the container, so a fresh
+   deployment advertises its own `*.workers.dev` host without extra
+   configuration.
 
 Set client and worker bearer tokens before exposing the deployment:
 

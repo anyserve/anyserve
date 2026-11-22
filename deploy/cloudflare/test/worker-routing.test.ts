@@ -381,6 +381,86 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
     db.close();
   });
 
+  it("falls back to the request host for ANYSERVE_PUBLIC_ENDPOINT only when unset and the container is stopped", async () => {
+    const { AnyserveControlPlaneDO } = await import("../src/index");
+    const db = new DatabaseSync(":memory:");
+    const { storage: sqlStorage } = createNodeSqliteStorage(db, {
+      enforceCloudflareLimits: true,
+    });
+    const kv = new Map<string, unknown>();
+    const build = (running: boolean, extraEnv: Record<string, string>) => {
+      const ctx = {
+        id: { toString: () => "do-host-fallback" },
+        container: {
+          running,
+          start: () => {},
+          monitor: () => new Promise<void>(() => {}),
+          destroy: async () => {},
+          signal: () => {},
+          getTcpPort: () => ({}),
+          setInactivityTimeout: async () => {},
+          interceptOutboundHttp: async () => {},
+        },
+        exports: { ContainerProxy: () => ({ fetch: async () => new Response("ok") }) },
+        blockConcurrencyWhile: <T>(fn: () => Promise<T>) => fn(),
+        storage: {
+          sql: sqlStorage.sql,
+          transactionSync: sqlStorage.transactionSync,
+          kv: {
+            get: (k: string) => kv.get(k),
+            put: (k: string, v: unknown) => kv.set(k, v),
+          },
+          get: async (k: string) => kv.get(k),
+          put: async (k: string, v: unknown) => {
+            kv.set(k, v);
+          },
+          setAlarm: async () => {},
+          deleteAlarm: async () => {},
+          sync: async () => {},
+        },
+      };
+      const env = {
+        ANYSERVE_R2: new InMemoryR2Bucket(),
+        ANYSERVE_CLIENT_TOKENS: "c",
+        ANYSERVE_WORKER_TOKENS: "w",
+        ...extraEnv,
+      };
+      const instance = new AnyserveControlPlaneDO(
+        ctx as unknown as ConstructorParameters<typeof AnyserveControlPlaneDO>[0],
+        env as unknown as ConstructorParameters<typeof AnyserveControlPlaneDO>[1],
+      );
+      // Stop before actually starting a container: we only inspect envVars.
+      (instance as unknown as { proxyWebSocket: () => Promise<Response> }).proxyWebSocket =
+        async () => new Response("ws-stub");
+      return instance;
+    };
+    const wsRequest = () =>
+      new Request("https://edge.example.workers.dev/ws/v2/worker/session", {
+        headers: { upgrade: "websocket" },
+      });
+
+    const unset = build(false, {});
+    expect(unset.envVars.ANYSERVE_PUBLIC_ENDPOINT).toBeUndefined();
+    await unset.fetch(wsRequest());
+    expect(unset.envVars.ANYSERVE_PUBLIC_ENDPOINT).toBe(
+      "wss://edge.example.workers.dev",
+    );
+    expect(unset.envVars.ANYSERVE_CLIENT_TOKENS).toBe("c");
+
+    const configured = build(false, {
+      ANYSERVE_PUBLIC_ENDPOINT: "wss://configured.example.com",
+    });
+    await configured.fetch(wsRequest());
+    expect(configured.envVars.ANYSERVE_PUBLIC_ENDPOINT).toBe(
+      "wss://configured.example.com",
+    );
+
+    const running = build(true, {});
+    await running.fetch(wsRequest());
+    expect(running.envVars.ANYSERVE_PUBLIC_ENDPOINT).toBeUndefined();
+    db.close();
+  });
+
   it("keeps Dockerfile embedded /etc/anyserve/server.toml in sync with server.toml", () => {
     const testDir = dirname(fileURLToPath(import.meta.url));
     const cfDir = resolve(testDir, "..");
