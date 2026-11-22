@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod client_service;
+pub mod cloudflare_journal;
 pub mod error;
 pub mod http_ws_service;
 pub mod journal;

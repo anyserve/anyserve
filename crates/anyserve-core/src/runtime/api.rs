@@ -703,10 +703,10 @@ impl Default for RuntimeConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalConfig {
+    /// When set, use the Cloudflare Durable Object SQLite + R2 journal backend.
+    pub cloudflare: Option<CloudflareJournalConfig>,
     /// When set, use the shared PostgreSQL scheduler instead of SQLite.
     pub postgres: Option<PostgresConfig>,
-    /// When set, use the Cloudflare Durable Object + R2 journal instead of SQLite.
-    pub cloudflare: Option<CloudflareJournalConfig>,
     /// SQLite only; ignored when `postgres` or `cloudflare` is set.
     pub path: PathBuf,
     /// `synchronous=FULL` when true (default), `NORMAL` otherwise.
@@ -723,8 +723,8 @@ pub struct JournalConfig {
 impl JournalConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
-            postgres: None,
             cloudflare: None,
+            postgres: None,
             path: path.into(),
             full_sync: true,
             queue_capacity: 4_096,

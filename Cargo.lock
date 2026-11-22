@@ -175,6 +175,7 @@ dependencies = [
  "anyserve-proto",
  "async-stream",
  "axum",
+ "base64",
  "bytes",
  "fs2",
  "futures",
