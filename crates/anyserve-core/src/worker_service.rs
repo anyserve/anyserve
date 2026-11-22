@@ -52,18 +52,22 @@ fn require_worker<T>(request: &Request<T>) -> Result<(), Status> {
     }
 }
 
-fn down(msg: pb::attempt_down::Msg) -> pb::AttemptDown {
+pub(crate) fn down(msg: pb::attempt_down::Msg) -> pb::AttemptDown {
     pb::AttemptDown { msg: Some(msg) }
 }
 
-fn finished(status: pb::attempt_finished::Status, reason: impl Into<String>) -> pb::AttemptDown {
+pub(crate) fn finished(
+    status: pb::attempt_finished::Status,
+    reason: impl Into<String>,
+) -> pb::AttemptDown {
     down(pb::attempt_down::Msg::Finished(pb::AttemptFinished {
         status: status as i32,
         reason: reason.into(),
     }))
 }
 
-fn finish_to_proto(status: FinishStatus) -> pb::AttemptDown {
+#[allow(dead_code)]
+pub(crate) fn finish_to_proto(status: FinishStatus) -> pb::AttemptDown {
     match status {
         FinishStatus::Committed => finished(pb::attempt_finished::Status::Committed, ""),
         FinishStatus::Fenced(reason) => finished(pb::attempt_finished::Status::Fenced, reason),
@@ -222,6 +226,7 @@ impl Worker for WorkerGrpcService {
             tx,
             limits,
             timeout,
+            true,
         ));
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
@@ -233,9 +238,12 @@ impl Worker for WorkerGrpcService {
 /// forgotten: each counts against h2's limit of 1024 locally reset streams
 /// per connection, past which the server sends GOAWAY and every attempt on
 /// the worker's connection breaks. Bounded by `limit`.
-async fn drain(mut inbound: Streaming<pb::AttemptUp>, limit: Duration) {
+async fn drain<S: Stream<Item = Result<pb::AttemptUp, Status>> + Unpin>(
+    mut inbound: S,
+    limit: Duration,
+) {
     let _ = tokio::time::timeout(limit, async {
-        while let Ok(Some(_)) = inbound.message().await {}
+        while let Some(Ok(_)) = inbound.next().await {}
     })
     .await;
 }
@@ -282,7 +290,7 @@ async fn send_object_pieces(
     }
 }
 
-async fn send_inputs(
+pub(crate) async fn send_inputs(
     plan: InputPlan,
     tx: mpsc::Sender<Result<pb::AttemptDown, Status>>,
     chunk: usize,
@@ -538,14 +546,17 @@ impl ResultAssembler {
     }
 }
 
-async fn receive_uploads(
+pub(crate) async fn receive_uploads<S>(
     runtime: Runtime,
     link: AttemptLink,
-    mut inbound: Streaming<pb::AttemptUp>,
+    mut inbound: S,
     tx: mpsc::Sender<Result<pb::AttemptDown, Status>>,
     limits: Limits,
     idle: Duration,
-) {
+    drain_on_exit: bool,
+) where
+    S: Stream<Item = Result<pb::AttemptUp, Status>> + Unpin,
+{
     let budget = runtime.result_budget();
     let mut results = ResultAssembler::new(limits, Arc::clone(&budget), runtime.clone());
     let mut last_frame = match &link {
@@ -554,10 +565,10 @@ async fn receive_uploads(
     };
     let mut pending_finish = None;
     loop {
-        let message = match inbound.message().await {
-            Ok(Some(pb::AttemptUp { msg: Some(msg) })) => msg,
-            Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => return,
+        let message = match inbound.next().await {
+            Some(Ok(pb::AttemptUp { msg: Some(msg) })) => msg,
+            Some(Ok(_)) => continue,
+            None | Some(Err(_)) => return,
         };
         let reply = match message {
             pb::attempt_up::Msg::Open(_) => {
@@ -624,5 +635,7 @@ async fn receive_uploads(
         drop(results);
     }
     drop(tx);
-    drain(inbound, idle).await;
+    if drain_on_exit {
+        drain(inbound, idle).await;
+    }
 }

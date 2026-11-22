@@ -231,14 +231,27 @@ impl AuthPolicy {
     }
 
     pub fn verify_client_headers(&self, headers: &HeaderMap) -> Result<Principal, Status> {
+        self.verify_role_headers(headers, Role::Client)
+    }
+
+    pub fn verify_worker_headers(&self, headers: &HeaderMap) -> Result<Principal, Status> {
+        self.verify_role_headers(headers, Role::Worker)
+    }
+
+    fn verify_role_headers(
+        &self,
+        headers: &HeaderMap,
+        expected: Role,
+    ) -> Result<Principal, Status> {
         if !self.is_enabled() {
-            return Self::unauthenticated_principal(Role::Client, headers);
+            return Self::unauthenticated_principal(expected, headers);
         }
         match bearer_token(headers).and_then(|token| self.principal_for_token(token)) {
-            Some(principal) if principal.role == Role::Client => Ok(principal),
-            Some(_) => Err(Status::permission_denied(
-                "worker token cannot be used for client requests",
-            )),
+            Some(principal) if principal.role == expected => Ok(principal),
+            Some(_) => Err(Status::permission_denied(match expected {
+                Role::Client => "worker token cannot be used for client requests",
+                Role::Worker => "client token cannot be used for worker requests",
+            })),
             None => Err(Status::unauthenticated("missing or invalid bearer token")),
         }
     }
@@ -479,6 +492,76 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn verify_worker_headers_enforces_roles_and_namespaces() {
+        let disabled = AuthPolicy::default();
+        let p = disabled.verify_worker_headers(&HeaderMap::new()).unwrap();
+        assert_eq!(p.role, Role::Worker);
+        assert_eq!(p.namespace, DEFAULT_NAMESPACE);
+
+        let mut ns_headers = HeaderMap::new();
+        ns_headers.insert(NAMESPACE_HEADER, "edge-team".parse().unwrap());
+        let p = disabled.verify_worker_headers(&ns_headers).unwrap();
+        assert_eq!(p.namespace, "edge-team");
+
+        let mut bad_ns_headers = HeaderMap::new();
+        bad_ns_headers.insert(NAMESPACE_HEADER, "bad/ns".parse().unwrap());
+        assert_eq!(
+            disabled
+                .verify_worker_headers(&bad_ns_headers)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let policy = AuthPolicy::new(["client-secret".into()], ["worker-secret".into()])
+            .with_scoped_tokens([ScopedToken {
+                token: "scoped-worker".into(),
+                role: Role::Worker,
+                namespace: "factory-a".into(),
+                subject: "jetson-1".into(),
+                forced_pool: Some("jetson-local".into()),
+            }]);
+
+        assert_eq!(
+            policy
+                .verify_worker_headers(&HeaderMap::new())
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            policy
+                .verify_worker_headers(&headers("unknown-token"))
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            policy
+                .verify_worker_headers(&headers("client-secret"))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let worker_principal = policy
+            .verify_worker_headers(&headers("worker-secret"))
+            .unwrap();
+        assert_eq!(worker_principal.role, Role::Worker);
+        assert_eq!(worker_principal.namespace, DEFAULT_NAMESPACE);
+
+        let mut scoped_headers = headers("scoped-worker");
+        scoped_headers.insert(NAMESPACE_HEADER, "spoofed".parse().unwrap());
+        let scoped_principal = policy.verify_worker_headers(&scoped_headers).unwrap();
+        assert_eq!(scoped_principal.role, Role::Worker);
+        assert_eq!(scoped_principal.namespace, "factory-a");
+        assert_eq!(
+            scoped_principal.forced_pool.as_deref(),
+            Some("jetson-local")
         );
     }
 }

@@ -49,31 +49,9 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<pb::SubmitResponse>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
-        let request = request.into_inner();
-        let conflict = match pb::ConflictPolicy::try_from(request.conflict_policy) {
-            Ok(pb::ConflictPolicy::Fail) => api::ConflictPolicy::Fail,
-            Ok(pb::ConflictPolicy::UseExisting | pb::ConflictPolicy::Unspecified) => {
-                api::ConflictPolicy::UseExisting
-            }
-            Err(_) => return Err(Status::invalid_argument("unknown conflict policy")),
-        };
-        let result = self
-            .runtime
-            .submit(api::SubmitRequest {
-                job_id: nonempty(request.job_id),
-                namespace: Some(namespace),
-                conflict,
-                spec: spec_from_proto(
-                    request
-                        .spec
-                        .ok_or_else(|| Status::invalid_argument("spec is required"))?,
-                )?,
-            })
-            .await?;
-        Ok(Response::new(pb::SubmitResponse {
-            job: Some(job_to_proto(result.job)),
-            created: result.created,
-        }))
+        submit_request(&self.runtime, namespace, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     type InvokeStream = EventStream;
@@ -92,22 +70,7 @@ impl Client for ClientGrpcService {
                 ));
             }
         };
-        let mut execution = self
-            .runtime
-            .invoke(api::InvokeRequest {
-                namespace: Some(namespace),
-                spec: spec_from_proto(
-                    start
-                        .spec
-                        .ok_or_else(|| Status::invalid_argument("spec is required"))?,
-                )?,
-                input: if start.streaming_input {
-                    api::InputMode::Streaming
-                } else {
-                    api::InputMode::Complete
-                },
-            })
-            .await?;
+        let mut execution = start_invoke(&self.runtime, namespace, start).await?;
         let input = execution.take_input();
         let stream = async_stream::try_stream! {
             // Execution owns the cancellation guard. Its Drop runs even if the
@@ -160,12 +123,9 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<pb::Job>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
-        let request = request.into_inner();
-        Ok(Response::new(job_to_proto(
-            self.runtime
-                .get_job_in(&namespace, &request.job_id, request.include_outputs)
-                .await?,
-        )))
+        get_job_request(&self.runtime, &namespace, request.into_inner())
+            .await
+            .map(Response::new)
     }
     async fn cancel(
         &self,
@@ -173,12 +133,9 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<pb::Job>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
-        let request = request.into_inner();
-        Ok(Response::new(job_to_proto(
-            self.runtime
-                .cancel_in(&namespace, &request.job_id, request.reason)
-                .await?,
-        )))
+        cancel_request(&self.runtime, &namespace, request.into_inner())
+            .await
+            .map(Response::new)
     }
     async fn list_jobs(
         &self,
@@ -186,26 +143,133 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<pb::ListJobsResponse>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
-        let request = request.into_inner();
-        let states = request
-            .states
-            .into_iter()
-            .map(state_from_proto)
-            .collect::<Result<_, _>>()?;
-        let page = self
-            .runtime
-            .list_jobs(api::JobFilter {
-                states,
-                limit: request.limit as usize,
-                page_token: nonempty(request.page_token),
-                interface: None,
-                namespace: Some(namespace),
-            })
-            .await?;
-        Ok(Response::new(pb::ListJobsResponse {
-            jobs: page.jobs.into_iter().map(job_to_proto).collect(),
-            next_page_token: page.next_page_token.unwrap_or_default(),
-        }))
+        list_jobs_request(&self.runtime, namespace, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+}
+
+pub(crate) async fn submit_request(
+    runtime: &Runtime,
+    namespace: String,
+    request: pb::SubmitRequest,
+) -> Result<pb::SubmitResponse, Status> {
+    let conflict = match pb::ConflictPolicy::try_from(request.conflict_policy) {
+        Ok(pb::ConflictPolicy::Fail) => api::ConflictPolicy::Fail,
+        Ok(pb::ConflictPolicy::UseExisting | pb::ConflictPolicy::Unspecified) => {
+            api::ConflictPolicy::UseExisting
+        }
+        Err(_) => return Err(Status::invalid_argument("unknown conflict policy")),
+    };
+    let result = runtime
+        .submit(api::SubmitRequest {
+            job_id: nonempty(request.job_id),
+            namespace: Some(namespace),
+            conflict,
+            spec: spec_from_proto(
+                request
+                    .spec
+                    .ok_or_else(|| Status::invalid_argument("spec is required"))?,
+            )?,
+        })
+        .await?;
+    Ok(pb::SubmitResponse {
+        job: Some(job_to_proto(result.job)),
+        created: result.created,
+    })
+}
+
+pub(crate) async fn start_invoke(
+    runtime: &Runtime,
+    namespace: String,
+    start: pb::InvokeStart,
+) -> Result<api::Execution, Status> {
+    Ok(runtime
+        .invoke(api::InvokeRequest {
+            namespace: Some(namespace),
+            spec: spec_from_proto(
+                start
+                    .spec
+                    .ok_or_else(|| Status::invalid_argument("spec is required"))?,
+            )?,
+            input: if start.streaming_input {
+                api::InputMode::Streaming
+            } else {
+                api::InputMode::Complete
+            },
+        })
+        .await?)
+}
+
+pub(crate) async fn get_job_request(
+    runtime: &Runtime,
+    namespace: &str,
+    request: pb::GetJobRequest,
+) -> Result<pb::Job, Status> {
+    Ok(job_to_proto(
+        runtime
+            .get_job_in(namespace, &request.job_id, request.include_outputs)
+            .await?,
+    ))
+}
+
+pub(crate) async fn cancel_request(
+    runtime: &Runtime,
+    namespace: &str,
+    request: pb::CancelRequest,
+) -> Result<pb::Job, Status> {
+    Ok(job_to_proto(
+        runtime
+            .cancel_in(namespace, &request.job_id, request.reason)
+            .await?,
+    ))
+}
+
+pub(crate) async fn list_jobs_request(
+    runtime: &Runtime,
+    namespace: String,
+    request: pb::ListJobsRequest,
+) -> Result<pb::ListJobsResponse, Status> {
+    let states = request
+        .states
+        .into_iter()
+        .map(state_from_proto)
+        .collect::<Result<_, _>>()?;
+    let page = runtime
+        .list_jobs(api::JobFilter {
+            states,
+            limit: request.limit as usize,
+            page_token: nonempty(request.page_token),
+            interface: None,
+            namespace: Some(namespace),
+        })
+        .await?;
+    Ok(pb::ListJobsResponse {
+        jobs: page.jobs.into_iter().map(job_to_proto).collect(),
+        next_page_token: page.next_page_token.unwrap_or_default(),
+    })
+}
+
+pub(crate) async fn handle_invoke_message(
+    message: pb::InvokeRequest,
+    input: &Option<api::InputSink>,
+    ended: &mut bool,
+) -> Result<(), Status> {
+    match (message.msg, input, *ended) {
+        (Some(pb::invoke_request::Msg::Input(chunk)), Some(input), false) => {
+            input
+                .send(chunk.data, chunk.metadata.into_iter().collect())
+                .await?;
+            Ok(())
+        }
+        (Some(pb::invoke_request::Msg::InputEnd(_)), Some(input), false) => {
+            input.finish().await?;
+            *ended = true;
+            Ok(())
+        }
+        _ => Err(Status::invalid_argument(
+            "unexpected invocation input message",
+        )),
     }
 }
 
@@ -215,22 +279,7 @@ async fn pump_input(
 ) -> Result<(), Status> {
     let mut ended = input.is_none();
     while let Some(message) = incoming.message().await? {
-        match (message.msg, &input, ended) {
-            (Some(pb::invoke_request::Msg::Input(chunk)), Some(input), false) => {
-                input
-                    .send(chunk.data, chunk.metadata.into_iter().collect())
-                    .await?;
-            }
-            (Some(pb::invoke_request::Msg::InputEnd(_)), Some(input), false) => {
-                input.finish().await?;
-                ended = true;
-            }
-            _ => {
-                return Err(Status::invalid_argument(
-                    "unexpected invocation input message",
-                ));
-            }
-        }
+        handle_invoke_message(message, &input, &mut ended).await?;
     }
     if !ended {
         return Err(Status::invalid_argument(

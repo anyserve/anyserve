@@ -25,6 +25,7 @@ pub(crate) struct ControlPlaneStatic {
     pub(crate) grpc_listen: String,
     pub(crate) grpc_tls_enabled: bool,
     pub(crate) console_listen: String,
+    pub(crate) public_endpoint: Option<String>,
     pub(crate) auth_enabled: bool,
 }
 
@@ -91,6 +92,7 @@ pub(crate) struct ControlPlaneSummary {
     pub(crate) grpc_listen: String,
     pub(crate) grpc_tls_enabled: bool,
     pub(crate) console_listen: String,
+    pub(crate) public_endpoint: Option<String>,
     pub(crate) auth_enabled: bool,
     pub(crate) generation: u64,
     pub(crate) retained_jobs: usize,
@@ -375,6 +377,7 @@ pub(crate) fn runtime_mode_summary(mode: RuntimeMode) -> RuntimeModeSummary {
             RuntimeMode::Memory => "disabled",
             RuntimeMode::MemoryPlusSqlite => "sqlite",
             RuntimeMode::MemoryPlusPostgres => "postgres",
+            RuntimeMode::MemoryPlusCloudflare => "cloudflare",
         },
     }
 }

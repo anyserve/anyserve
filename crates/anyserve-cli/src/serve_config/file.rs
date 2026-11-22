@@ -108,6 +108,7 @@ impl AnyserveConfigFile {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ServerConfigFile {
+    pub(super) grpc_enabled: Option<bool>,
     pub(super) grpc_host: Option<String>,
     pub(super) grpc_port: Option<u16>,
     pub(super) tls: Option<TlsConfigFile>,
@@ -120,19 +121,37 @@ pub(super) struct ServeConsoleConfigFile {
     listen: Option<String>,
     #[serde(default)]
     allowed_origins: Vec<String>,
+    public_endpoint: Option<String>,
+}
+
+fn nonempty_trimmed(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    })
 }
 
 impl ServeConsoleConfigFile {
     pub(super) fn resolve(self) -> Option<ServeConsoleConfig> {
+        self.resolve_with_env(|name| std::env::var(name).ok())
+    }
+
+    fn resolve_with_env(
+        self,
+        mut env: impl FnMut(&str) -> Option<String>,
+    ) -> Option<ServeConsoleConfig> {
         if !self.enabled.unwrap_or(true) {
             return None;
         }
+        let public_endpoint = nonempty_trimmed(self.public_endpoint)
+            .or_else(|| nonempty_trimmed(env("ANYSERVE_PUBLIC_ENDPOINT")));
 
         Some(ServeConsoleConfig {
             listen: self
                 .listen
                 .unwrap_or_else(|| DEFAULT_CONSOLE_LISTEN.to_string()),
             allowed_origins: self.allowed_origins,
+            public_endpoint,
         })
     }
 }
@@ -150,11 +169,14 @@ pub(super) struct TlsConfigFile {
 pub(super) struct JournalConfigFile {
     enabled: Option<bool>,
     backend: Option<JournalBackend>,
+    endpoint: Option<String>,
     url_env: Option<String>,
+    token_env: Option<String>,
     schema: Option<String>,
     lease_duration_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
     max_connections: Option<u32>,
+    r2_spill_threshold_bytes: Option<usize>,
     path: Option<PathBuf>,
     full_sync: Option<bool>,
     queue_capacity: Option<usize>,
@@ -167,6 +189,7 @@ pub(super) struct JournalConfigFile {
 enum JournalBackend {
     Sqlite,
     Postgres,
+    Cloudflare,
 }
 
 #[cfg(test)]
@@ -220,6 +243,97 @@ mod postgres_tests {
         );
         assert!(toml::from_str::<JournalConfigFile>("backend='unknown'").is_err());
     }
+
+    #[test]
+    fn cloudflare_journal_resolves_endpoint_token_and_rejects_sqlite_flags() {
+        let file: JournalConfigFile = toml::from_str(
+            "backend='cloudflare'\nendpoint='http://custom.internal'\nlease_duration_ms=9000\npoll_interval_ms=350\nr2_spill_threshold_bytes=2048",
+        )
+        .unwrap();
+        let cfg = file
+            .clone()
+            .resolve_with_env(None, |_| None)
+            .unwrap()
+            .unwrap();
+        let cf = cfg.cloudflare.as_ref().unwrap();
+        assert_eq!(cf.endpoint, "http://custom.internal");
+        assert_eq!(cf.auth_token, None);
+        assert_eq!(cf.lease_duration, Duration::from_secs(9));
+        assert_eq!(cf.poll_interval, Duration::from_millis(350));
+        assert_eq!(cf.r2_spill_threshold_bytes, 2048);
+
+        // Env var ANYSERVE_CLOUDFLARE_JOURNAL_URL overrides TOML endpoint and
+        // ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN provides optional auth_token.
+        let cfg = file
+            .resolve_with_env(None, |name| match name {
+                "ANYSERVE_CLOUDFLARE_JOURNAL_URL" => Some("https://cf-override.test".into()),
+                "ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN" => Some("secret-token".into()),
+                _ => None,
+            })
+            .unwrap()
+            .unwrap();
+        let cf = cfg.cloudflare.as_ref().unwrap();
+        assert_eq!(cf.endpoint, "https://cf-override.test");
+        assert_eq!(cf.auth_token.as_deref(), Some("secret-token"));
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("secret-token"));
+        assert!(debug.contains("[redacted]"));
+
+        // Explicit token_env fails clearly when missing/empty; defaults endpoint to http://journal.internal.
+        let file: JournalConfigFile =
+            toml::from_str("backend='cloudflare'\ntoken_env='CF_SECRET'").unwrap();
+        assert!(
+            file.clone()
+                .resolve_with_env(None, |_| None)
+                .unwrap_err()
+                .to_string()
+                .contains("CF_SECRET")
+        );
+        let cfg = file
+            .resolve_with_env(None, |name| {
+                (name == "CF_SECRET").then(|| "tok-123".to_string())
+            })
+            .unwrap()
+            .unwrap();
+        let cf = cfg.cloudflare.as_ref().unwrap();
+        assert_eq!(cf.endpoint, "http://journal.internal");
+        assert_eq!(cf.auth_token.as_deref(), Some("tok-123"));
+
+        // Reject path or full_sync=false on cloudflare.
+        for bad in [
+            "backend='cloudflare'\npath='a.sqlite'",
+            "backend='cloudflare'\nfull_sync=false",
+            "backend='cloudflare'\ntoken_env=''",
+        ] {
+            let file: JournalConfigFile = toml::from_str(bad).unwrap();
+            assert!(file.resolve_with_env(None, |_| None).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn console_public_endpoint_falls_back_to_env_when_unset_or_empty() {
+        let empty: ServeConsoleConfigFile = toml::from_str("public_endpoint='   '").unwrap();
+        let resolved = empty
+            .resolve_with_env(|name| {
+                assert_eq!(name, "ANYSERVE_PUBLIC_ENDPOINT");
+                Some("  wss://edge.example.com  ".into())
+            })
+            .unwrap();
+        assert_eq!(
+            resolved.public_endpoint.as_deref(),
+            Some("wss://edge.example.com")
+        );
+
+        let explicit: ServeConsoleConfigFile =
+            toml::from_str("public_endpoint='wss://toml.example.com'").unwrap();
+        let resolved = explicit
+            .resolve_with_env(|_| panic!("env should not override explicit public_endpoint"))
+            .unwrap();
+        assert_eq!(
+            resolved.public_endpoint.as_deref(),
+            Some("wss://toml.example.com")
+        );
+    }
 }
 
 impl JournalConfigFile {
@@ -230,12 +344,14 @@ impl JournalConfigFile {
     fn resolve_with_env(
         self,
         path_override: Option<PathBuf>,
-        env: impl FnOnce(&str) -> Option<String>,
+        mut env: impl FnMut(&str) -> Option<String>,
     ) -> Result<Option<JournalConfig>> {
         if !self.enabled.unwrap_or(true) && path_override.is_none() {
             return Ok(None);
         }
         let postgres = path_override.is_none() && self.backend == Some(JournalBackend::Postgres);
+        let cloudflare =
+            path_override.is_none() && self.backend == Some(JournalBackend::Cloudflare);
         let mut config = if postgres {
             if self.path.is_some() || self.full_sync == Some(false) {
                 anyhow::bail!("journal.path and full_sync=false cannot be used with PostgreSQL");
@@ -259,6 +375,45 @@ impl JournalConfigFile {
                 pg.max_connections = value;
             }
             config
+        } else if cloudflare {
+            if self.path.is_some() || self.full_sync == Some(false) {
+                anyhow::bail!("journal.path and full_sync=false cannot be used with Cloudflare");
+            }
+            let url_env = self
+                .url_env
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("ANYSERVE_CLOUDFLARE_JOURNAL_URL");
+            let endpoint = nonempty_trimmed(env(url_env))
+                .or_else(|| nonempty_trimmed(self.endpoint))
+                .unwrap_or_else(|| "http://journal.internal".to_string());
+            let auth_token = match self.token_env {
+                Some(token_env) => {
+                    let name = token_env.trim();
+                    if name.is_empty() {
+                        anyhow::bail!("journal.token_env must not be empty");
+                    }
+                    let token = nonempty_trimmed(env(name)).with_context(|| {
+                        format!("Cloudflare journal token_env var {name} is missing or empty")
+                    })?;
+                    Some(token)
+                }
+                None => nonempty_trimmed(env("ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN")),
+            };
+            let mut config = JournalConfig::cloudflare(endpoint);
+            let cf = config.cloudflare.as_mut().expect("Cloudflare config");
+            cf.auth_token = auth_token;
+            if let Some(value) = self.lease_duration_ms {
+                cf.lease_duration = Duration::from_millis(value);
+            }
+            if let Some(value) = self.poll_interval_ms {
+                cf.poll_interval = Duration::from_millis(value);
+            }
+            if let Some(value) = self.r2_spill_threshold_bytes {
+                cf.r2_spill_threshold_bytes = value;
+            }
+            config
         } else {
             JournalConfig::new(
                 path_override
@@ -278,7 +433,7 @@ impl JournalConfigFile {
         if let Some(value) = self.retention_secs {
             config.retention = Duration::from_secs(value);
         }
-        if (!postgres && config.path.as_os_str().is_empty())
+        if (!postgres && !cloudflare && config.path.as_os_str().is_empty())
             || config.queue_capacity == 0
             || config.max_batch == 0
         {
@@ -301,6 +456,8 @@ pub(super) struct RuntimeConfigFile {
     max_pending_jobs: Option<usize>,
     max_event_bytes: Option<u64>,
     max_result_bytes: Option<u64>,
+    max_inline_object_bytes: Option<u64>,
+    max_inline_total_bytes: Option<u64>,
     max_sessions: Option<usize>,
     consumer_stall_timeout_ms: Option<u64>,
     cancel_grace_ms: Option<u64>,
@@ -361,6 +518,12 @@ impl RuntimeConfigFile {
         }
         if let Some(value) = self.max_result_bytes {
             config.max_result_bytes = value;
+        }
+        if let Some(value) = self.max_inline_object_bytes {
+            config.limits.max_inline_object_bytes = value;
+        }
+        if let Some(value) = self.max_inline_total_bytes {
+            config.limits.max_inline_total_bytes = value;
         }
         if let Some(value) = self.max_sessions {
             config.max_sessions = value;

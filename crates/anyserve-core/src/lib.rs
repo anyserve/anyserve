@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client_service;
 pub mod error;
+pub mod http_ws_service;
 pub mod journal;
 mod postgres;
 pub mod runtime;

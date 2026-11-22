@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
-use super::{ResolvedServeConfig, ServeOverrides};
+use super::{ResolvedServeConfig, RuntimeMode, ServeOverrides};
 
 fn config(raw: &str, mut overrides: ServeOverrides) -> anyhow::Result<ResolvedServeConfig> {
     let path = crate::test_support::temporary_path("config").with_extension("toml");
@@ -25,6 +25,7 @@ fn defaults_enable_a_local_full_sync_journal() {
     ] {
         assert_eq!(resolved.grpc.host, "127.0.0.1");
         assert_eq!(resolved.grpc.port, 50_052);
+        assert!(resolved.grpc.enabled);
         assert!(!resolved.grpc.tls_enabled);
         let journal = resolved.runtime.journal.unwrap();
         assert_eq!(
@@ -208,4 +209,60 @@ fn all_repository_example_and_benchmark_toml_files_parse() -> anyhow::Result<()>
     }
     assert!(servers > 0);
     Ok(())
+}
+
+#[test]
+fn cloudflare_profile_parses_grpc_disabled_public_endpoint_limits_and_mode() {
+    let resolved = config(
+        r#"
+[server]
+grpc_enabled = false
+
+[console]
+enabled = true
+listen = "0.0.0.0:3001"
+public_endpoint = "wss://anyserve.example.com"
+
+[journal]
+enabled = true
+backend = "cloudflare"
+endpoint = "http://journal.internal"
+queue_capacity = 1024
+max_batch = 64
+retention_secs = 604800
+
+[runtime]
+max_inline_object_bytes = 8388608
+max_inline_total_bytes = 25165824
+"#,
+        ServeOverrides::default(),
+    )
+    .unwrap();
+
+    assert!(!resolved.grpc.enabled);
+    assert_eq!(resolved.runtime_mode(), RuntimeMode::MemoryPlusCloudflare);
+    assert_eq!(
+        RuntimeMode::MemoryPlusCloudflare.code(),
+        "memory_plus_cloudflare"
+    );
+    assert_eq!(
+        RuntimeMode::MemoryPlusCloudflare.label(),
+        "Memory + Cloudflare journal"
+    );
+
+    let console = resolved.console.unwrap();
+    assert_eq!(console.listen, "0.0.0.0:3001");
+    assert_eq!(
+        console.public_endpoint.as_deref(),
+        Some("wss://anyserve.example.com")
+    );
+
+    assert_eq!(resolved.runtime.limits.max_inline_object_bytes, 8_388_608);
+    assert_eq!(resolved.runtime.limits.max_inline_total_bytes, 25_165_824);
+
+    let journal = resolved.runtime.journal.unwrap();
+    let cf = journal.cloudflare.unwrap();
+    assert_eq!(cf.endpoint, "http://journal.internal");
+    assert_eq!(journal.queue_capacity, 1024);
+    assert_eq!(journal.max_batch, 64);
 }

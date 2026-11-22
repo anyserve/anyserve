@@ -47,6 +47,13 @@ pub(crate) struct ServeArgs {
     journal_path: Option<PathBuf>,
 }
 
+pub(crate) fn validate_listeners(config: &ResolvedServeConfig) -> Result<()> {
+    if !config.grpc.enabled && config.console.is_none() {
+        anyhow::bail!("cannot disable gRPC server when console server is also disabled");
+    }
+    Ok(())
+}
+
 pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     let config = ResolvedServeConfig::load(ServeOverrides {
         config: args.config,
@@ -58,6 +65,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         ephemeral: args.ephemeral,
         journal_path: args.journal_path,
     })?;
+    validate_listeners(&config)?;
     let runtime = Runtime::start(config.runtime.clone())
         .await
         .context("start execution runtime")?;
@@ -68,7 +76,11 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         );
     }
 
-    let grpc_addr = socket_addr(&config.grpc.host, config.grpc.port)?;
+    let grpc_addr = config
+        .grpc
+        .enabled
+        .then(|| socket_addr(&config.grpc.host, config.grpc.port))
+        .transpose()?;
     let console_addr = config
         .console
         .as_ref()
@@ -79,6 +91,10 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     let console_meta = ControlPlaneMetadata {
         grpc_listen: format_host_port(&config.grpc.host, config.grpc.port),
         grpc_tls_enabled: tls,
+        public_endpoint: config
+            .console
+            .as_ref()
+            .and_then(|c| c.public_endpoint.clone()),
     };
     let runtime_mode = config.runtime_mode();
     let config_path = config.config_path;
@@ -86,13 +102,17 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut servers = tokio::task::JoinSet::new();
-    servers.spawn(run_grpc_server(
-        grpc_addr,
-        runtime.clone(),
-        config.grpc,
-        AuthPolicy::clone(&auth),
-        shutdown_rx,
-    ));
+    if let Some(grpc_addr) = grpc_addr {
+        servers.spawn(run_grpc_server(
+            grpc_addr,
+            runtime.clone(),
+            config.grpc,
+            AuthPolicy::clone(&auth),
+            shutdown_rx,
+        ));
+    } else {
+        drop(shutdown_rx);
+    }
     if let (Some(adapter), Some(addr)) = (console_config, console_addr) {
         servers.spawn(run_console_server(
             addr,
@@ -105,11 +125,18 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         ));
     }
 
-    if let Some(config_path) = config_path.as_ref() {
+    if let Some(grpc_addr) = grpc_addr {
+        if let Some(config_path) = config_path.as_ref() {
+            let config_path = config_path.display().to_string();
+            info!(grpc = %grpc_addr, tls, config = %config_path, "control plane started");
+        } else {
+            info!(grpc = %grpc_addr, tls, "control plane started");
+        }
+    } else if let Some(config_path) = config_path.as_ref() {
         let config_path = config_path.display().to_string();
-        info!(grpc = %grpc_addr, tls, config = %config_path, "control plane started");
+        info!(grpc_enabled = false, config = %config_path, "control plane started");
     } else {
-        info!(grpc = %grpc_addr, tls, "control plane started");
+        info!(grpc_enabled = false, "control plane started");
     }
     if let Some(console_addr) = console_addr {
         info!(console = %console_addr, "console api started");
@@ -276,4 +303,27 @@ fn socket_addr_from_bind(value: &str) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no socket addresses resolved for {value}"))
+}
+
+#[cfg(test)]
+mod grpc_toggle_tests {
+    use super::*;
+    use crate::serve_config::ServeConsoleConfig;
+
+    #[test]
+    fn disabling_grpc_requires_console_server() {
+        let mut cfg = ResolvedServeConfig::load(ServeOverrides::default()).unwrap();
+        assert!(validate_listeners(&cfg).is_ok());
+
+        cfg.grpc.enabled = false;
+        cfg.console = None;
+        assert!(validate_listeners(&cfg).is_err());
+
+        cfg.console = Some(ServeConsoleConfig {
+            listen: "127.0.0.1:3001".into(),
+            allowed_origins: Vec::new(),
+            public_endpoint: Some("wss://anyserve.example.com".into()),
+        });
+        assert!(validate_listeners(&cfg).is_ok());
+    }
 }

@@ -30,6 +30,7 @@ use super::snapshot::{
 
 pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
     let allowed_origins = Arc::clone(&state.allowed_origins);
+    let http_ws = anyserve_core::http_ws_service::router(state.runtime.clone(), Arc::clone(&auth));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -45,6 +46,7 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
             auth,
             crate::serve_auth::require_client_token,
         ))
+        .merge(http_ws)
         .layer(middleware::from_fn_with_state(
             allowed_origins,
             cors_middleware,
@@ -149,6 +151,7 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
             grpc_listen: state.control_plane.grpc_listen.clone(),
             grpc_tls_enabled: state.control_plane.grpc_tls_enabled,
             console_listen: state.control_plane.console_listen.clone(),
+            public_endpoint: state.control_plane.public_endpoint.clone(),
             auth_enabled: state.control_plane.auth_enabled,
             generation: stats.generation,
             retained_jobs: stats.retained_jobs,
@@ -336,7 +339,7 @@ async fn cors_middleware(
     );
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Accept, Content-Type, Authorization"),
+        HeaderValue::from_static("Accept, Content-Type, Authorization, x-anyserve-namespace"),
     );
 
     if let Some(origin) = allowed_origin {
