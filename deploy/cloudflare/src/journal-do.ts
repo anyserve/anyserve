@@ -107,7 +107,7 @@ export class AnyserveControlPlaneDO extends Container<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     if (!this.ctx.container?.running) {
-      if (!this.env.ANYSERVE_PUBLIC_ENDPOINT) {
+      if (!this.env.ANYSERVE_PUBLIC_ENDPOINT?.trim()) {
         // No explicit endpoint configured: advertise the host this Worker is served from.
         this.envVars = {
           ...this.envVars,

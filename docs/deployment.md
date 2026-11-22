@@ -273,8 +273,8 @@ Cloudflare R2 with a single public `https://` / `wss://` endpoint:
 
 ### Prerequisites
 
-- A Cloudflare account with **Workers Paid** (required for Containers,
-  Durable Object SQLite, and R2).
+- A Cloudflare account with **Workers Paid**. Only Cloudflare Containers
+  requires it; Durable Object SQLite and R2 also have free tiers.
 - Node.js 24+ and Docker running locally (Wrangler builds
   [the container Dockerfile](../deploy/cloudflare/Dockerfile) during deploy).
 - Wrangler authenticated (`npx wrangler login` or `CLOUDFLARE_API_TOKEN`).
@@ -294,15 +294,15 @@ Verify the bucket name (`anyserve-journal` by default) in
 The endpoint advertised to workers (`/api/overview` and the Console's
 "Connect worker" dialog) is resolved in this order:
 
-1. A non-empty `ANYSERVE_PUBLIC_ENDPOINT` environment variable (set it as a
-   Worker variable/secret for your Worker URL or custom domain, for example
-   `wss://anyserve.example.com`); it **overrides** the TOML value.
-2. `public_endpoint` in [server.toml](../deploy/cloudflare/server.toml), which
-   ships as the placeholder `wss://anyserve.example.com`.
-3. If `ANYSERVE_PUBLIC_ENDPOINT` is not set on the Worker, the Worker passes
-   `wss://<request host>` of the request that starts the container, so a fresh
-   deployment advertises its own `*.workers.dev` host without extra
-   configuration.
+1. A non-empty `ANYSERVE_PUBLIC_ENDPOINT` Worker variable/secret (for example
+   `wss://anyserve.example.com` for a custom domain). It is passed to the
+   container as an environment variable, which **overrides** the TOML value.
+2. Otherwise, the Worker passes `wss://<request host>` of the request that
+   starts the container, so a fresh deployment advertises its own
+   `*.workers.dev` host without extra configuration.
+3. `public_endpoint` in [server.toml](../deploy/cloudflare/server.toml) (the
+   placeholder `wss://anyserve.example.com`) only applies when the container
+   runs without either of the above, for example outside the Worker.
 
 Set client and worker bearer tokens before exposing the deployment:
 

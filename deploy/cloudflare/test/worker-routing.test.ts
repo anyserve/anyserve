@@ -447,6 +447,12 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
     );
     expect(unset.envVars.ANYSERVE_CLIENT_TOKENS).toBe("c");
 
+    const blank = build(false, { ANYSERVE_PUBLIC_ENDPOINT: "   " });
+    await blank.fetch(wsRequest());
+    expect(blank.envVars.ANYSERVE_PUBLIC_ENDPOINT).toBe(
+      "wss://edge.example.workers.dev",
+    );
+
     const configured = build(false, {
       ANYSERVE_PUBLIC_ENDPOINT: "wss://configured.example.com",
     });
