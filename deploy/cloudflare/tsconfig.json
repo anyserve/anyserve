@@ -13,5 +13,12 @@
     "resolveJsonModule": true,
     "isolatedModules": true
   },
-  "include": ["src/index.ts", "src/journal-do.ts", "src/storage.ts", "src/env.ts"]
+  "include": [
+    "src/index.ts",
+    "src/journal-do.ts",
+    "src/storage.ts",
+    "src/env.ts",
+    "src/native-do.ts",
+    "src/native/**/*.ts"
+  ]
 }
