@@ -408,7 +408,7 @@ it("renders Pools and Workers with slot occupancy meters, reported load, and nav
   fireEvent.click(screen.getByRole("button", { name: "Disconnected" }));
   expect(screen.queryByRole("heading", { name: "worker-gpu-01" })).toBeNull();
   expect(screen.getByRole("heading", { name: "worker-lost-03" })).toBeTruthy();
-  expect(screen.getByText("default · default")).toBeTruthy();
+  expect(screen.getByText((_, node) => node?.className === "inspector__subtitle-row" && node.textContent === "default·default")).toBeTruthy();
   expect(screen.getByText("Session disconnected; active leases survive until reconnect grace expires.")).toBeTruthy();
 
   fireEvent.click(screen.getByRole("button", { name: "View Worker Jobs" }));
@@ -569,4 +569,114 @@ it("toggles Light/Dark theme and disconnects token cleanly", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
   expect(hasConsoleToken()).toBe(false);
   expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
+});
+
+it("uses AnyServe branding and navigates directly from JobInspector links to Worker, Interface, and Pools", async () => {
+  window.history.replaceState(null, "", "/jobs");
+  vi.mocked(getOverview).mockResolvedValue(richOverview());
+  vi.mocked(getWorkers).mockResolvedValue(richWorkers());
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [
+      summary("job-jump-1", {
+        state: "succeeded",
+        namespace: "tenant-a",
+        interface_name: "llm.generate",
+        latest_worker_id: "worker-gpu-01",
+      }),
+    ],
+    next_page_token: null,
+  });
+  vi.mocked(getJob).mockResolvedValue({
+    ...detail("job-jump-1", {
+      state: "succeeded",
+      namespace: "tenant-a",
+      interface_name: "llm.generate",
+    }),
+    attempts: [
+      {
+        attempt_id: "att-1",
+        state: "succeeded",
+        worker_id: "worker-gpu-01",
+        created_at_ms: 10,
+        finished_at_ms: 25,
+        duration_ms: 15,
+        last_error: null,
+      },
+    ],
+  });
+
+  render(<App />);
+  expect(screen.getByText("AnyServe")).toBeTruthy();
+  await screen.findByRole("button", { name: "worker-gpu-01", hidden: false });
+
+  // Clicking Namespace filters Jobs to tenant-a; clicking it again jumps to Pools filtered by tenant-a.
+  fireEvent.click(screen.getAllByRole("button", { name: "tenant-a" })[0]);
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenLastCalledWith([], 100, 0, expect.any(AbortSignal), {
+      interface: "all",
+      namespace: "tenant-a",
+    }),
+  );
+
+  // Clicking Interface in JobInspector subtitle jumps directly to /interfaces and selects llm.generate.
+  fireEvent.click(screen.getAllByRole("button", { name: "llm.generate" })[0]);
+  expect(await screen.findByText("Pool Tiers Spillover Chain")).toBeTruthy();
+  expect(window.location.pathname).toBe("/interfaces");
+
+  // Jump back to Jobs and click Worker in JobInspector to jump to /workers with worker-gpu-01 selected.
+  fireEvent.click(screen.getByRole("button", { name: "View Jobs" }));
+  await screen.findByText("Scheduling & Policy");
+  const workerButtons = await screen.findAllByRole("button", { name: "worker-gpu-01" });
+  fireEvent.click(workerButtons[workerButtons.length - 1]);
+  expect(await screen.findByText("Outbound Session")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "worker-gpu-01" })).toBeTruthy();
+  expect(window.location.pathname).toBe("/workers");
+});
+
+it("collapses large payloads by default and opens Connect Worker onboarding modal with live endpoint", async () => {
+  window.history.replaceState(null, "", "/jobs");
+  vi.mocked(getOverview).mockResolvedValue(richOverview());
+  vi.mocked(getWorkers).mockResolvedValue(richWorkers());
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [summary("job-big", { state: "succeeded", interface_name: "llm.generate", latest_worker_id: "worker-gpu-01" })],
+    next_page_token: null,
+  });
+  vi.mocked(getJob).mockResolvedValue(
+    detail("job-big", {
+      state: "succeeded",
+      interface_name: "llm.generate",
+      output_preview: {
+        size_bytes: 16_384,
+        content_type: "application/json",
+        preview: JSON.stringify({ model: "bge-m3", vector_marker: "UNIQUE_VECTOR_MARKER", vals: Array.from({ length: 60 }, (_, i) => i) }),
+        truncated: true,
+      },
+    }),
+  );
+
+  render(<App />);
+  expect(await screen.findByText(/Large payload \(16\.0 KiB · truncated preview\) hidden by default/)).toBeTruthy();
+  expect(screen.queryByText(/UNIQUE_VECTOR_MARKER/)).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Show preview" }));
+  expect(await screen.findByText(/UNIQUE_VECTOR_MARKER/)).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Hide preview" }));
+  expect(screen.queryByText(/UNIQUE_VECTOR_MARKER/)).toBeNull();
+
+  // Navigate to Workers and open Connect Worker onboarding modal.
+  fireEvent.click(screen.getByRole("button", { name: /Workers/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "Connect Worker" }));
+  expect(screen.getByRole("dialog")).toBeTruthy();
+  expect(screen.getAllByText(/https:\/\/127\.0\.0\.1:50052/).length).toBeGreaterThan(0);
+  expect(screen.getByText(/Worker token required/)).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("tab", { name: "AI Connectors" }));
+  expect(screen.getByText(/anyserve\.universe\.git/)).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("tab", { name: "Linux Install" }));
+  expect(screen.getByText(/\/usr\/local\/bin\/anyserve/)).toBeTruthy();
+
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(screen.queryByRole("dialog")).toBeNull();
 });

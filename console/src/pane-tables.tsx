@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 
 import type { PaneStat } from "./app-constants";
 import { formatDuration, formatNumber, formatPool, formatShortTime, formatTimestamp } from "./format";
@@ -36,10 +36,11 @@ export function SelectField(props: {
   options: Array<{ value: string; label: string }>;
   onChange: (value: string) => void;
 }) {
+  const currentLabel = props.options.find((opt) => opt.value === props.value)?.label ?? props.value;
   return (
     <label className="field">
       <span className="field__label">{props.label}</span>
-      <select className="field__control" value={props.value} onChange={(e) => props.onChange(e.target.value)}>
+      <select className="field__control" value={props.value} title={currentLabel} onChange={(e) => props.onChange(e.target.value)}>
         {props.options.map((opt) => (
           <option key={opt.value} value={opt.value}>{opt.label}</option>
         ))}
@@ -97,14 +98,22 @@ export function ProgressMeter({ percent, tone }: { percent: number; tone?: "acce
   );
 }
 
-export function TierChain({ tiers, highlightPool }: { tiers: PoolTierPolicy[]; highlightPool?: string }) {
+export function TierChain({
+  tiers,
+  highlightPool,
+  onSelectPool,
+}: {
+  tiers: PoolTierPolicy[];
+  highlightPool?: string;
+  onSelectPool?: (poolName: string) => void;
+}) {
   return (
     <div className="tier-chain">
       {tiers.map((tier, idx) => {
         const poolName = formatPool(tier.pool);
         const isCurrent = highlightPool != null && formatPool(highlightPool) === poolName;
-        return (
-          <div key={`${tier.pool}-${idx}`} className={`tier-node${isCurrent ? " is-current" : ""}`}>
+        const body = (
+          <>
             <span className="tier-node__rank">#{idx + 1}</span>
             <div className="tier-node__body">
               <strong className="mono">{poolName}</strong>
@@ -113,6 +122,20 @@ export function TierChain({ tiers, highlightPool }: { tiers: PoolTierPolicy[]; h
                 {tier.reconnect_grace_ms != null ? ` · Reconnect grace ${formatDuration(tier.reconnect_grace_ms)}` : ""}
               </span>
             </div>
+          </>
+        );
+        return onSelectPool ? (
+          <button
+            key={`${tier.pool}-${idx}`}
+            type="button"
+            className={`tier-node tier-node--interactive${isCurrent ? " is-current" : ""}`}
+            onClick={() => onSelectPool(tier.pool)}
+          >
+            {body}
+          </button>
+        ) : (
+          <div key={`${tier.pool}-${idx}`} className={`tier-node${isCurrent ? " is-current" : ""}`}>
+            {body}
           </div>
         );
       })}
@@ -143,11 +166,14 @@ export function WorkerMiniList(props: {
   );
 }
 
-export function JobsTable(props: {
+export const JobsTable = memo(function JobsTable(props: {
   jobs: JobSummary[];
   selectedJobId: string | null;
   emptyMessage: string;
   onSelect: (jobId: string) => void;
+  onOpenInterface?: (iface: string) => void;
+  onOpenWorker?: (workerId: string) => void;
+  onFilterNamespace?: (namespace: string) => void;
 }) {
   if (props.jobs.length === 0) return <EmptyState message={props.emptyMessage} />;
   return (
@@ -182,13 +208,60 @@ export function JobsTable(props: {
                   <div className="table__primary mono ellipsis" title={job.job_id}>{job.job_id}</div>
                   <div className="table__secondary">
                     <span className="ellipsis">{job.source ?? job.metadata.request_id ?? "direct"}</span>
-                    {ns ? <span className="tag">{ns}</span> : null}
+                    {ns ? (
+                      props.onFilterNamespace ? (
+                        <button
+                          type="button"
+                          className="tag tag--link"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            props.onFilterNamespace!(ns);
+                          }}
+                        >
+                          {ns}
+                        </button>
+                      ) : (
+                        <span className="tag">{ns}</span>
+                      )
+                    ) : null}
                     {job.durability ? <span className="tag">{job.durability}</span> : null}
                   </div>
                 </td>
-                <td className="mono ellipsis" title={job.interface_name}>{job.interface_name}</td>
-                <td className="mono ellipsis" title={job.latest_worker_id ?? "Unassigned"}>
-                  {job.latest_worker_id ?? "Unassigned"}
+                <td>
+                  {props.onOpenInterface ? (
+                    <button
+                      type="button"
+                      className="cell-link mono ellipsis"
+                      title={`Open interface ${job.interface_name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        props.onOpenInterface!(job.interface_name);
+                      }}
+                    >
+                      {job.interface_name}
+                    </button>
+                  ) : (
+                    <span className="mono ellipsis" title={job.interface_name}>{job.interface_name}</span>
+                  )}
+                </td>
+                <td>
+                  {job.latest_worker_id && props.onOpenWorker ? (
+                    <button
+                      type="button"
+                      className="cell-link mono ellipsis"
+                      title={`Open worker ${job.latest_worker_id}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        props.onOpenWorker!(job.latest_worker_id!);
+                      }}
+                    >
+                      {job.latest_worker_id}
+                    </button>
+                  ) : (
+                    <span className="mono ellipsis" title={job.latest_worker_id ?? "Unassigned"}>
+                      {job.latest_worker_id ?? "Unassigned"}
+                    </span>
+                  )}
                 </td>
                 <td className="num">{job.attempt_count}</td>
                 <td>
@@ -204,15 +277,16 @@ export function JobsTable(props: {
       </table>
     </div>
   );
-}
+});
 
-export function InterfacesTable(props: {
+export const InterfacesTable = memo(function InterfacesTable(props: {
   interfaces: InterfaceSummary[];
   selectedName?: string | null;
   onSelect?: (name: string) => void;
+  onOpenPool?: (interfaceName: string, poolName: string) => void;
   compact?: boolean;
 }) {
-  const { interfaces, selectedName, onSelect, compact = false } = props;
+  const { interfaces, selectedName, onSelect, onOpenPool, compact = false } = props;
   if (interfaces.length === 0) return <EmptyState message="No interfaces match the filter" inline={compact} />;
   return (
     <div className="table-wrap">
@@ -247,13 +321,24 @@ export function InterfacesTable(props: {
                 <td>
                   {tiers.length > 0 ? (
                     <div className="tier-chain-inline" title={tip}>
-                      {tiers.map((tier, idx) => (
-                        <span key={`${tier.pool}-${idx}`} className="tag ellipsis">
-                          {idx > 0 ? "→ " : ""}
-                          {formatPool(tier.pool)}
-                          {!compact && tier.spillover_after_ms > 0 ? ` (${formatDuration(tier.spillover_after_ms)})` : ""}
-                        </span>
-                      ))}
+                      {tiers.map((tier, idx) => {
+                        const label = `${idx > 0 ? "→ " : ""}${formatPool(tier.pool)}${!compact && tier.spillover_after_ms > 0 ? ` (${formatDuration(tier.spillover_after_ms)})` : ""}`;
+                        return onOpenPool ? (
+                          <button
+                            key={`${tier.pool}-${idx}`}
+                            type="button"
+                            className="tag tag--link ellipsis"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onOpenPool(item.name, tier.pool);
+                            }}
+                          >
+                            {label}
+                          </button>
+                        ) : (
+                          <span key={`${tier.pool}-${idx}`} className="tag ellipsis">{label}</span>
+                        );
+                      })}
                     </div>
                   ) : (
                     <span className="muted">
@@ -268,4 +353,4 @@ export function InterfacesTable(props: {
       </table>
     </div>
   );
-}
+});

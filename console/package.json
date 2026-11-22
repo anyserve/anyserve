@@ -8,7 +8,8 @@
     "build": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "bench:analytics": "node --experimental-strip-types bench/analytics.ts"
+    "bench:analytics": "node --experimental-strip-types bench/analytics.ts",
+    "bench:ui": "node bench/ui-perf.mjs"
   },
   "dependencies": {
     "@duckdb/duckdb-wasm": "1.33.1-dev57.0",

@@ -1,20 +1,21 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
 import { AuthenticationError, cancelJob, clearConsoleToken, getJob, getJobs, getOverview, getWorkers, hasConsoleToken, setConsoleToken } from "./api";
 import {
   ALL_JOB_STATES, DETAIL_POLL_MS, HISTORY_STATES, JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, JOB_SCOPE_PATHS,
   OVERVIEW_POLL_MS, QUEUE_STATES, TAB_PATHS, WORKERS_POLL_MS, routeFromPathname, type ConsoleTab, type JobScope, type Theme,
 } from "./app-constants";
-import { asErrorMessage, sortJobs, sortWorkers } from "./format";
+import { ConnectWorkerModal } from "./ConnectWorkerModal";
+import { asErrorMessage, formatPool, sortJobs, sortWorkers } from "./format";
 import { InterfacesPane } from "./InterfacesPane";
 import { JobsPane } from "./JobsPane";
 import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
-import { PoolsPane, poolKey } from "./PoolsPane";
+import { PoolsPane, poolKey, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
 import type { JobDetailResponse, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
-import { WorkersPane } from "./WorkersPane";
+import { WorkersPane, type HealthFilter, type WorkerFilterSeed } from "./WorkersPane";
 
 const ExplorePane = lazy(() => import("./ExplorePane"));
 const THEME_KEY = "anyserve.console.theme";
@@ -31,6 +32,40 @@ const toOptions = (values: Iterable<string>, allLabel: string) => [
   ...Array.from(new Set(values)).sort().map((v) => ({ value: v, label: v })),
 ];
 
+function sameJobs(a: JobSummary[], b: JobSummary[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (
+      a[i].job_id !== b[i].job_id ||
+      a[i].state !== b[i].state ||
+      a[i].updated_at_ms !== b[i].updated_at_ms ||
+      a[i].attempt_count !== b[i].attempt_count ||
+      a[i].latest_worker_id !== b[i].latest_worker_id
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sameWorkers(a: WorkerSummary[], b: WorkerSummary[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (
+      a[i].worker_id !== b[i].worker_id ||
+      a[i].session_id !== b[i].session_id ||
+      a[i].healthy !== b[i].healthy ||
+      a[i].draining !== b[i].draining ||
+      a[i].connected !== b[i].connected ||
+      a[i].active_leases !== b[i].active_leases ||
+      a[i].last_seen_at_ms !== b[i].last_seen_at_ms
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export default function App() {
   const init = useMemo(() => routeFromPathname(window.location.pathname), []);
   const [activeTab, setActiveTab] = useState<ConsoleTab>(init.tab);
@@ -43,10 +78,14 @@ export default function App() {
   const [jobsPage, setJobsPage] = useState<JobsPageState>(EMPTY_JOBS);
 
   const [filters, setFilters] = useState({ iface: "all", ns: "all", worker: "all", q: "" });
+  const deferredSearch = useDeferredValue(filters.q);
   const [selectedJobByScope, setSelectedJobByScope] = useState<Record<JobScope, string | null>>({ all: null, queue: null, history: null });
   const [selectedInterface, setSelectedInterface] = useState<string | null>(null);
   const [selectedPoolKey, setSelectedPoolKey] = useState<string | null>(null);
+  const [poolFilterSeed, setPoolFilterSeed] = useState<PoolFilterSeed | null>(null);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
+  const [workerFilterSeed, setWorkerFilterSeed] = useState<WorkerFilterSeed | null>(null);
+  const [connectOpen, setConnectOpen] = useState(false);
 
   const [jobDetail, setJobDetail] = useState<JobDetailResponse | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
@@ -55,6 +94,7 @@ export default function App() {
   const [authenticated, setAuthenticated] = useState(hasConsoleToken);
   const [token, setToken] = useState("");
   const loadMoreAbort = useRef<AbortController | null>(null);
+  const navSeedSeq = useRef(0);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -76,15 +116,15 @@ export default function App() {
 
   useEffect(() => () => loadMoreAbort.current?.abort(), []);
 
-  function handleError(err: unknown) {
+  const handleError = useCallback((err: unknown) => {
     setError(asErrorMessage(err));
     if (err instanceof AuthenticationError) setAuthRequired(true);
-  }
+  }, []);
 
   function resetExtraJobs() {
     loadMoreAbort.current?.abort();
     loadMoreAbort.current = null;
-    setJobsPage((p) => ({ ...p, extra: [], extraNext: null, loadingMore: false }));
+    setJobsPage((p) => (p.extra.length === 0 && !p.extraNext && !p.loadingMore ? p : { ...p, extra: [], extraNext: null, loadingMore: false }));
   }
 
   const polling = !authRequired;
@@ -103,7 +143,15 @@ export default function App() {
 
   usePollingEffect(
     (signal) => getJobs(jobStates, 100, 0, signal, { interface: filters.iface, namespace: filters.ns }),
-    (res) => { setJobsPage((p) => ({ ...p, loadedKey: jobsQueryKey, page1: sortJobs(res.jobs), page1Next: res.next_page_token })); setError(null); },
+    (res) => {
+      const sorted = sortJobs(res.jobs);
+      setJobsPage((p) =>
+        p.loadedKey === jobsQueryKey && p.page1Next === res.next_page_token && sameJobs(p.page1, sorted)
+          ? p
+          : { ...p, loadedKey: jobsQueryKey, page1: sorted, page1Next: res.next_page_token },
+      );
+      setError(null);
+    },
     handleError,
     jobScope === "history" ? JOBS_HISTORY_POLL_MS : JOBS_ACTIVE_POLL_MS,
     [jobScope, filters.iface, filters.ns],
@@ -112,7 +160,16 @@ export default function App() {
 
   usePollingEffect(
     getWorkers,
-    (res) => { setWorkersResponse(res); setWorkers(sortWorkers(res.workers)); setError(null); },
+    (res) => {
+      const sorted = sortWorkers(res.workers);
+      setWorkersResponse((cur) =>
+        cur && cur.total === res.total && cur.healthy === res.healthy && cur.draining === res.draining && cur.disconnected === res.disconnected && sameWorkers(cur.workers, sorted)
+          ? cur
+          : res,
+      );
+      setWorkers((cur) => (sameWorkers(cur, sorted) ? cur : sorted));
+      setError(null);
+    },
     handleError,
     WORKERS_POLL_MS,
     [],
@@ -139,26 +196,32 @@ export default function App() {
   }), [overview, workers, loadedJobs, filters.iface, filters.ns, filters.worker]);
 
   const visibleJobs = useMemo(() => {
-    const q = filters.q.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     return loadedJobs.filter((j) => {
       if (filters.worker !== "all" && j.latest_worker_id !== filters.worker) return false;
       return !q || [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id].some((f) => (f ?? "").toLowerCase().includes(q));
     });
-  }, [loadedJobs, filters.worker, filters.q]);
+  }, [loadedJobs, filters.worker, deferredSearch]);
 
   const selectedJob = useMemo(() => visibleJobs.find((j) => j.job_id === activeSelectedJobId) ?? null, [visibleJobs, activeSelectedJobId]);
   const activeSelectedNs = selectedJob?.namespace && selectedJob.namespace !== "default" ? selectedJob.namespace : undefined;
+  const activeJobKey = selectedJob ? `${selectedJob.namespace ?? "default"}::${selectedJob.job_id}` : activeSelectedJobId;
 
-  useEffect(() => setJobDetail(null), [activeSelectedJobId, activeSelectedNs]);
-  const selectedJobDetail = jobDetail?.job.job_id === activeSelectedJobId ? jobDetail : null;
+  useEffect(() => setJobDetail(null), [activeSelectedJobId]);
+  const selectedJobDetail =
+    jobDetail &&
+    jobDetail.job.job_id === activeSelectedJobId &&
+    (!selectedJob || (jobDetail.job.namespace ?? "default") === (selectedJob.namespace ?? "default"))
+      ? jobDetail
+      : null;
 
   usePollingEffect(
     (signal) => getJob(activeSelectedJobId!, signal, activeSelectedNs),
     (next) => { setJobDetail(next); setError(null); },
     (err) => { setJobDetail(null); handleError(err); },
     jobScope === "queue" ? DETAIL_POLL_MS : 2_000,
-    [activeTab, jobScope, activeSelectedJobId, activeSelectedNs],
-    polling && activeTab === "jobs" && activeSelectedJobId !== null && !(selectedJobDetail && HISTORY_STATES.includes(selectedJobDetail.job.state)),
+    [activeTab, jobScope, activeJobKey],
+    polling && activeTab === "jobs" && activeSelectedJobId !== null && Boolean(selectedJob) && !(selectedJobDetail && HISTORY_STATES.includes(selectedJobDetail.job.state)),
   );
 
   useEffect(() => {
@@ -189,7 +252,7 @@ export default function App() {
     }
   }
 
-  async function handleCancel(jobId: string, namespace?: string) {
+  const handleCancel = useCallback(async (jobId: string, namespace?: string) => {
     try {
       setIsCancelling(true);
       const ns = namespace && namespace !== "default" ? namespace : undefined;
@@ -202,9 +265,9 @@ export default function App() {
           : cur,
       );
     } catch (err) { handleError(err); } finally { setIsCancelling(false); }
-  }
+  }, [handleError]);
 
-  function navigateTo(nextTab: ConsoleTab, nextScope?: JobScope) {
+  const navigateTo = useCallback((nextTab: ConsoleTab, nextScope?: JobScope) => {
     const scope = nextScope ?? jobScope;
     if (nextScope) {
       if (nextScope !== jobScope) resetExtraJobs();
@@ -213,25 +276,77 @@ export default function App() {
     setActiveTab(nextTab);
     const p = routePath(nextTab, scope);
     if (window.location.pathname !== p) window.history.pushState(null, "", p);
-  }
+  }, [jobScope]);
 
-  function jumpToJobs(opts: { iface?: string; ns?: string; worker?: string }) {
+  const jumpToJobs = useCallback((opts: { scope?: JobScope; iface?: string; ns?: string; worker?: string; jobId?: string }) => {
+    const scope = opts.scope ?? "all";
     resetExtraJobs();
-    setFilters((f) => ({ ...f, iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all" }));
-    navigateTo("jobs", "all");
-  }
+    setFilters({ iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: "" });
+    if (opts.jobId) setSelectedJobByScope((c) => ({ ...c, [scope]: opts.jobId! }));
+    navigateTo("jobs", scope);
+  }, [navigateTo]);
 
-  function handleDisconnect() {
+  const openInterface = useCallback((name: string) => {
+    setSelectedInterface(name);
+    navigateTo("interfaces");
+  }, [navigateTo]);
+
+  const openWorker = useCallback((workerId: string) => {
+    setSelectedWorkerId(workerId);
+    navigateTo("workers");
+  }, [navigateTo]);
+
+  const openWorkersHealth = useCallback((health: HealthFilter) => {
+    navSeedSeq.current += 1;
+    setWorkerFilterSeed({ health, seq: navSeedSeq.current });
+    navigateTo("workers");
+  }, [navigateTo]);
+
+  const openPoolKey = useCallback((key: string) => {
+    setSelectedPoolKey(key);
+    navigateTo("pools");
+  }, [navigateTo]);
+
+  const openPoolsByTarget = useCallback((opts: { ns?: string; iface?: string; pool?: string }) => {
+    const match = (overview?.pools ?? []).find(
+      (p) =>
+        (!opts.ns || p.namespace === opts.ns) &&
+        (!opts.iface || p.interface === opts.iface) &&
+        (opts.pool == null || formatPool(p.pool) === formatPool(opts.pool)),
+    );
+    if (match) {
+      setSelectedPoolKey(poolKey(match));
+      navSeedSeq.current += 1;
+      setPoolFilterSeed({ ns: match.namespace, iface: match.interface, seq: navSeedSeq.current });
+    } else {
+      navSeedSeq.current += 1;
+      setPoolFilterSeed({ ns: opts.ns, iface: opts.iface, seq: navSeedSeq.current });
+    }
+    navigateTo("pools");
+  }, [overview?.pools, navigateTo]);
+
+  const filterJobNamespace = useCallback((ns: string) => {
+    if (activeTab === "jobs" && filters.ns === ns) {
+      openPoolsByTarget({ ns });
+    } else {
+      jumpToJobs({ ns, scope: activeTab === "jobs" ? jobScope : "all" });
+    }
+  }, [activeTab, filters.ns, jobScope, jumpToJobs, openPoolsByTarget]);
+
+  const handleDisconnect = useCallback(() => {
     clearConsoleToken();
     setAuthenticated(false); setOverview(null); setWorkers([]); setWorkersResponse(null);
     setJobsPage(EMPTY_JOBS); setJobDetail(null); setError(null); setAuthRequired(true);
-  }
+  }, []);
+
+  const handleToggleTheme = useCallback(() => setTheme((c) => (c === "light" ? "dark" : "light")), []);
+  const handleSelectTab = useCallback((tab: ConsoleTab) => navigateTo(tab), [navigateTo]);
 
   if (authRequired) {
     return (
       <main className="auth">
         <form className="auth__form" onSubmit={(e) => { e.preventDefault(); setConsoleToken(token); setToken(""); setAuthenticated(true); setError(null); setAuthRequired(false); }}>
-          <div className="auth__head"><h1>Anyserve Console</h1><p className="auth__sub">Authenticate with a client token to inspect the control plane.</p></div>
+          <div className="auth__head"><h1>AnyServe Console</h1><p className="auth__sub">Authenticate with a client token to inspect the control plane.</p></div>
           <label htmlFor="client-token">Client token</label>
           <input id="client-token" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} required />
           {error ? <p className="auth__error" role="alert">{error}</p> : null}
@@ -258,41 +373,92 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar activeTab={activeTab} onSelectTab={(tab) => navigateTo(tab)} overview={overview} theme={theme} onToggleTheme={() => setTheme((c) => (c === "light" ? "dark" : "light"))} authenticated={authenticated} onDisconnect={handleDisconnect} />
+      <Sidebar
+        activeTab={activeTab}
+        onSelectTab={handleSelectTab}
+        overview={overview}
+        theme={theme}
+        onToggleTheme={handleToggleTheme}
+        authenticated={authenticated}
+        onDisconnect={handleDisconnect}
+      />
       <div className="workspace">
         {error ? <div className="banner" role="alert">{error}</div> : null}
         <main className="layout">
           {activeTab === "overview" ? (
-            <OverviewPane overview={overview} onNavigate={(tab) => navigateTo(tab)} onOpenInterface={(name) => { setSelectedInterface(name); navigateTo("interfaces"); }} onOpenPool={(key) => { setSelectedPoolKey(key); navigateTo("pools"); }} />
+            <OverviewPane
+              overview={overview}
+              onNavigate={handleSelectTab}
+              onOpenJobs={(scope) => navigateTo("jobs", scope)}
+              onOpenWorkersHealth={openWorkersHealth}
+              onOpenInterface={openInterface}
+              onOpenPool={openPoolKey}
+              onOpenPoolByTier={(iface, pool) => openPoolsByTarget({ iface, pool })}
+            />
           ) : null}
           {activeTab === "jobs" ? (
             <JobsPane
               scope={jobScope} onScopeChange={(next) => navigateTo("jobs", next)} stats={jobStats} jobs={visibleJobs} totalLoaded={loadedJobs.length}
               selectedJobId={selectedJob?.job_id ?? null} onSelect={(id) => setSelectedJobByScope((c) => ({ ...c, [jobScope]: id }))}
+              onOpenInterface={openInterface} onOpenWorker={openWorker} onFilterNamespace={filterJobNamespace}
               interfaceFilter={filters.iface} interfaceOptions={filterOptions.iface} onInterfaceFilterChange={(iface) => { resetExtraJobs(); setFilters((f) => ({ ...f, iface })); }}
               namespaceFilter={filters.ns} namespaceOptions={filterOptions.ns} onNamespaceFilterChange={(ns) => { resetExtraJobs(); setFilters((f) => ({ ...f, ns })); }}
               workerFilter={filters.worker} workerOptions={filterOptions.worker} onWorkerFilterChange={(worker) => setFilters((f) => ({ ...f, worker }))}
               searchQuery={filters.q} onSearchQueryChange={(q) => setFilters((f) => ({ ...f, q }))}
               hasMore={(jobsPage.extra.length > 0 ? jobsPage.extraNext : jobsPage.page1Next) != null} loadingMore={jobsPage.loadingMore} onLoadMore={() => void handleLoadMoreJobs()}
-              inspector={<JobInspector detail={selectedJob ? selectedJobDetail : null} isCancelling={isCancelling} onCancel={handleCancel} />}
+              inspector={
+                <JobInspector
+                  detail={selectedJob ? selectedJobDetail : null}
+                  isCancelling={isCancelling}
+                  onCancel={handleCancel}
+                  onOpenWorker={openWorker}
+                  onOpenInterface={openInterface}
+                  onFilterNamespace={filterJobNamespace}
+                />
+              }
             />
           ) : null}
           {activeTab === "interfaces" ? (
-            <InterfacesPane interfaces={overview?.interfaces ?? []} pools={overview?.pools ?? []} workers={workers} selectedInterface={selectedInterface} onSelectInterface={setSelectedInterface} onViewJobs={(iface) => jumpToJobs({ iface })} onOpenPool={(key) => { setSelectedPoolKey(key); navigateTo("pools"); }} onOpenWorker={(id) => { setSelectedWorkerId(id); navigateTo("workers"); }} />
+            <InterfacesPane
+              interfaces={overview?.interfaces ?? []} pools={overview?.pools ?? []} workers={workers}
+              selectedInterface={selectedInterface} onSelectInterface={setSelectedInterface}
+              onViewJobs={(iface) => jumpToJobs({ iface })} onOpenPool={openPoolKey}
+              onOpenPoolByTier={(iface, pool) => openPoolsByTarget({ iface, pool })} onOpenWorker={openWorker}
+            />
           ) : null}
           {activeTab === "pools" ? (
-            <PoolsPane pools={overview?.pools ?? []} interfaces={overview?.interfaces ?? []} workers={workers} selectedPoolKey={selectedPoolKey} onSelectPool={setSelectedPoolKey} onViewJobs={(iface, ns) => jumpToJobs({ iface, ns })} onOpenWorker={(id) => { setSelectedWorkerId(id); navigateTo("workers"); }} />
+            <PoolsPane
+              pools={overview?.pools ?? []} interfaces={overview?.interfaces ?? []} workers={workers}
+              selectedPoolKey={selectedPoolKey} poolFilterSeed={poolFilterSeed} onSelectPool={setSelectedPoolKey}
+              onViewJobs={(iface, ns) => jumpToJobs({ iface, ns })} onOpenInterface={openInterface} onOpenWorker={openWorker}
+            />
           ) : null}
           {activeTab === "workers" ? (
-            <WorkersPane overview={overview} workersResponse={workersResponse} workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId} onViewJobsForWorker={(worker) => jumpToJobs({ worker })} onOpenInterface={(iface) => { setSelectedInterface(iface); navigateTo("interfaces"); }} />
+            <WorkersPane
+              overview={overview} workersResponse={workersResponse} workers={workers}
+              selectedWorkerId={selectedWorkerId} workerFilterSeed={workerFilterSeed} onSelectWorker={setSelectedWorkerId}
+              onViewJobsForWorker={(worker) => jumpToJobs({ worker })}
+              onViewJobsForNamespace={(ns) => jumpToJobs({ ns })}
+              onOpenInterface={openInterface}
+              onOpenPool={(ns, iface, pool) => openPoolsByTarget({ ns, iface, pool })}
+              onOpenConnect={() => setConnectOpen(true)}
+            />
           ) : null}
           {activeTab === "explore" ? (
             <Suspense fallback={<section className="panel panel--full"><div className="empty">Loading…</div></section>}>
-              <ExplorePane journalEnabled={overview ? overview.runtime.journal !== "disabled" : null} onAuthenticationError={handleError} />
+              <ExplorePane
+                journalEnabled={overview ? overview.runtime.journal !== "disabled" : null}
+                onAuthenticationError={handleError}
+                onOpenWorker={openWorker}
+                onOpenInterface={openInterface}
+                onFilterNamespace={(ns) => jumpToJobs({ ns })}
+                onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
+              />
             </Suspense>
           ) : null}
         </main>
       </div>
+      <ConnectWorkerModal open={connectOpen} controlPlane={overview?.control_plane} onClose={() => setConnectOpen(false)} />
     </div>
   );
 }

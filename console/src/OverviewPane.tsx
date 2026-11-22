@@ -1,4 +1,4 @@
-import type { ConsoleTab } from "./app-constants";
+import type { ConsoleTab, JobScope } from "./app-constants";
 import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMicros, formatNumber, formatPool } from "./format";
 import { IconArrowRight } from "./icons";
 import { EmptyState, InterfacesTable, PanelHeader, ProgressMeter } from "./pane-tables";
@@ -7,11 +7,22 @@ import type { OverviewResponse } from "./types";
 interface OverviewPaneProps {
   overview: OverviewResponse | null;
   onNavigate: (tab: ConsoleTab) => void;
+  onOpenJobs: (scope: JobScope) => void;
+  onOpenWorkersHealth: (health: "all" | "draining") => void;
   onOpenInterface: (interfaceName: string) => void;
   onOpenPool: (poolKey: string) => void;
+  onOpenPoolByTier: (interfaceName: string, poolName: string) => void;
 }
 
-export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool }: OverviewPaneProps) {
+export function OverviewPane({
+  overview,
+  onNavigate,
+  onOpenJobs,
+  onOpenWorkersHealth,
+  onOpenInterface,
+  onOpenPool,
+  onOpenPoolByTier,
+}: OverviewPaneProps) {
   const cp = overview?.control_plane;
   const health = overview?.health;
   const budgets = overview?.budgets;
@@ -49,38 +60,63 @@ export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool
           <div className="kpi-card">
             <div className="kpi-card__head">
               <span>Queue</span>
-              <button type="button" className="link-inline" onClick={() => onNavigate("jobs")}>View all <IconArrowRight /></button>
+              <button type="button" className="link-inline" onClick={() => onOpenJobs("queue")}>View all <IconArrowRight /></button>
             </div>
             <div className="kpi-card__value num">{formatNumber(overview?.queue.active ?? 0)}</div>
             <div className="kpi-card__sub">
-              <span>Queued <strong className="num">{formatNumber(overview?.queue.queued ?? 0)}</strong></span>
-              <span>Running <strong className="num">{formatNumber(overview?.queue.running ?? 0)}</strong></span>
+              <button type="button" className="stat-link" onClick={() => onOpenJobs("queue")}>
+                Queued <strong className="num">{formatNumber(overview?.queue.queued ?? 0)}</strong>
+              </button>
+              <button type="button" className="stat-link" onClick={() => onOpenJobs("queue")}>
+                Running <strong className="num">{formatNumber(overview?.queue.running ?? 0)}</strong>
+              </button>
             </div>
           </div>
 
           <div className="kpi-card">
             <div className="kpi-card__head">
               <span>Outcomes</span>
-              {cp ? <span className="tag num">Retained {formatNumber(cp.retained_jobs)}</span> : null}
+              <div className="kpi-card__head-right">
+                {cp ? (
+                  <button type="button" className="tag tag--link num" title="Query retained jobs in Explore" onClick={() => onNavigate("explore")}>
+                    Retained {formatNumber(cp.retained_jobs)}
+                  </button>
+                ) : null}
+                <button type="button" className="link-inline" onClick={() => onOpenJobs("history")}>History <IconArrowRight /></button>
+              </div>
             </div>
             <div className="kpi-card__value num">{formatNumber(overview?.history.total ?? 0)}</div>
             <div className="kpi-card__sub">
-              <span className="tone-ok">Succeeded <strong className="num">{formatNumber(overview?.history.succeeded ?? 0)}</strong></span>
-              <span className="tone-danger">Failed <strong className="num">{formatNumber(overview?.history.failed ?? 0)}</strong></span>
-              <span>Cancelled <strong className="num">{formatNumber(overview?.history.cancelled ?? 0)}</strong></span>
+              <button type="button" className="stat-link tone-ok" onClick={() => onOpenJobs("history")}>
+                Succeeded <strong className="num">{formatNumber(overview?.history.succeeded ?? 0)}</strong>
+              </button>
+              <button type="button" className="stat-link tone-danger" onClick={() => onOpenJobs("history")}>
+                Failed <strong className="num">{formatNumber(overview?.history.failed ?? 0)}</strong>
+              </button>
+              <button type="button" className="stat-link" onClick={() => onOpenJobs("history")}>
+                Cancelled <strong className="num">{formatNumber(overview?.history.cancelled ?? 0)}</strong>
+              </button>
             </div>
           </div>
 
           <div className="kpi-card">
             <div className="kpi-card__head">
               <span>Workers &amp; Sessions</span>
-              <button type="button" className="link-inline" onClick={() => onNavigate("workers")}>View all <IconArrowRight /></button>
+              <button type="button" className="link-inline" onClick={() => onOpenWorkersHealth("all")}>View all <IconArrowRight /></button>
             </div>
             <div className="kpi-card__value num">{overview ? `${formatNumber(overview.workers.healthy)} / ${formatNumber(overview.workers.total)}` : "0 / 0"}</div>
             <div className="kpi-card__sub">
               {cp ? <span>Sessions <strong className="num">{formatNumber(cp.sessions)}/{formatNumber(cp.max_sessions)}</strong></span> : null}
               <span>Active leases <strong className="num">{formatNumber(overview?.workers.active_leases ?? 0)}</strong></span>
-              {draining != null ? <span className={draining > 0 ? "tone-warn" : undefined}>Draining <strong className="num">{formatNumber(draining)}</strong></span> : null}
+              {draining != null ? (
+                draining > 0 ? (
+                  <button type="button" className="stat-link tone-warn" onClick={() => onOpenWorkersHealth("draining")}>
+                    Draining <strong className="num">{formatNumber(draining)}</strong>
+                  </button>
+                ) : (
+                  <span>Draining <strong className="num">0</strong></span>
+                )
+              ) : null}
             </div>
             {overview && Object.keys(overview.workers.total_capacity).length > 0 ? (
               <div className="kpi-card__extra">Capacity: <code>{formatCapacityMap(overview.workers.total_capacity)}</code></div>
@@ -164,7 +200,7 @@ export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool
           />
           {interfaces.length === 0 ? (
             <div className="panel__body"><EmptyState message="No active or configured interfaces" inline /></div>
-          ) : <InterfacesTable interfaces={interfaces.slice(0, 8)} onSelect={onOpenInterface} compact />}
+          ) : <InterfacesTable interfaces={interfaces.slice(0, 8)} onSelect={onOpenInterface} onOpenPool={onOpenPoolByTier} compact />}
         </section>
 
         <section className="panel">
@@ -197,7 +233,16 @@ export function OverviewPane({ overview, onNavigate, onOpenInterface, onOpenPool
                         <td>
                           <div className="cell-inline" title={`${pool.namespace} / ${pool.interface}`}>
                             {pool.namespace !== "default" ? <span className="tag">{pool.namespace}</span> : null}
-                            <span className="mono ellipsis">{pool.interface}</span>
+                            <button
+                              type="button"
+                              className="cell-link mono ellipsis"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenInterface(pool.interface);
+                              }}
+                            >
+                              {pool.interface}
+                            </button>
                           </div>
                         </td>
                         <td className="num">{formatNumber(pool.sessions)}</td>

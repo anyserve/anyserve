@@ -13,11 +13,12 @@ interface InterfacesPaneProps {
   onSelectInterface: (name: string) => void;
   onViewJobs: (interfaceName: string) => void;
   onOpenPool: (poolKey: string) => void;
+  onOpenPoolByTier: (interfaceName: string, poolName: string) => void;
   onOpenWorker: (workerId: string) => void;
 }
 
 export function InterfacesPane(props: InterfacesPaneProps) {
-  const { interfaces, pools, workers, selectedInterface, onSelectInterface, onViewJobs, onOpenPool, onOpenWorker } = props;
+  const { interfaces, pools, workers, selectedInterface, onSelectInterface, onViewJobs, onOpenPool, onOpenPoolByTier, onOpenWorker } = props;
   const [search, setSearch] = useState("");
 
   const filtered = useMemo(() => {
@@ -39,7 +40,12 @@ export function InterfacesPane(props: InterfacesPaneProps) {
         <div className="panel__toolbar">
           <SearchInput value={search} placeholder="Search interface or pool…" onChange={setSearch} />
         </div>
-        <InterfacesTable interfaces={filtered} selectedName={activeItem?.name ?? null} onSelect={onSelectInterface} />
+        <InterfacesTable
+          interfaces={filtered}
+          selectedName={activeItem?.name ?? null}
+          onSelect={onSelectInterface}
+          onOpenPool={onOpenPoolByTier}
+        />
       </section>
 
       <InspectorShell
@@ -88,7 +94,7 @@ export function InterfacesPane(props: InterfacesPaneProps) {
                     {activeItem.policy.pool_tiers.length === 0 ? (
                       <EmptyState message="No pool tier spillover configured; dispatches to any matching worker." inline />
                     ) : (
-                      <TierChain tiers={activeItem.policy.pool_tiers} />
+                      <TierChain tiers={activeItem.policy.pool_tiers} onSelectPool={(poolName) => onOpenPoolByTier(activeItem.name, poolName)} />
                     )}
                   </InspectorSection>
                 </>

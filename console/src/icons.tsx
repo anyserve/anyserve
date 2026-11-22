@@ -21,11 +21,11 @@ function IconFrame({ children, ...rest }: IconProps) {
   );
 }
 
-export function AnyserveLogo() {
+export function AnyServeLogo() {
   return (
-    <svg viewBox="0 0 24 24" width={18} height={18} aria-hidden="true">
+    <svg viewBox="0 0 24 24" width={19} height={19} aria-hidden="true">
       <rect x={2} y={2} width={20} height={20} rx={5.5} fill="currentColor" opacity={0.12} />
-      <path d="M7 16.5V7.5h2.6l2.4 6.2 2.4-6.2H17v9h-1.8V10.1l-2.4 6.4h-1.6l-2.4-6.4v6.4H7Z" fill="currentColor" />
+      <path d="M12 5.75 6.4 18h2.65l1.15-2.65h3.6L14.95 18h2.65L12 5.75Zm-1.05 7.65L12 10.7l1.05 2.7h-2.1Z" fill="currentColor" />
     </svg>
   );
 }
@@ -106,5 +106,30 @@ export const IconSearch = (p: IconProps) => (
 export const IconArrowRight = (p: IconProps) => (
   <IconFrame {...p}>
     <path d="M3.5 8h9M9 4.5 12.5 8 9 11.5" />
+  </IconFrame>
+);
+
+export const IconPlus = (p: IconProps) => (
+  <IconFrame {...p}>
+    <path d="M8 3.25v9.5M3.25 8h9.5" />
+  </IconFrame>
+);
+
+export const IconCopy = (p: IconProps) => (
+  <IconFrame {...p}>
+    <rect x={5.5} y={5.5} width={7.75} height={7.75} rx={1.4} />
+    <path d="M10.5 5.5V4a1.25 1.25 0 0 0-1.25-1.25H4A1.25 1.25 0 0 0 2.75 4v5.25A1.25 1.25 0 0 0 4 10.5h1.5" />
+  </IconFrame>
+);
+
+export const IconCheck = (p: IconProps) => (
+  <IconFrame {...p}>
+    <path d="m3.5 8.5 3 3 6-6.5" />
+  </IconFrame>
+);
+
+export const IconClose = (p: IconProps) => (
+  <IconFrame {...p}>
+    <path d="m4 4 8 8M12 4l-8 8" />
   </IconFrame>
 );

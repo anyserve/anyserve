@@ -10,7 +10,23 @@ import type { AnalyticsSource, JobDetailResponse } from "./types";
 interface Dataset { count: number; bytes: number; limited: boolean; from: number; to: number; source: AnalyticsSource; }
 const localDate = (v: number) => new Date(v - new Date(v).getTimezoneOffset() * 60_000).toISOString().slice(0, 19);
 
-export default function ExplorePane({ journalEnabled, onAuthenticationError }: { journalEnabled: boolean | null; onAuthenticationError: (error: unknown) => void }) {
+interface ExplorePaneProps {
+  journalEnabled: boolean | null;
+  onAuthenticationError: (error: unknown) => void;
+  onOpenWorker?: (workerId: string) => void;
+  onOpenInterface?: (interfaceName: string) => void;
+  onFilterNamespace?: (namespace: string) => void;
+  onOpenJobInJobs?: (jobId: string, namespace?: string) => void;
+}
+
+export default function ExplorePane({
+  journalEnabled,
+  onAuthenticationError,
+  onOpenWorker,
+  onOpenInterface,
+  onFilterNamespace,
+  onOpenJobInJobs,
+}: ExplorePaneProps) {
   const [chosenSource, setSource] = useState<AnalyticsSource | null>(null);
   const source = chosenSource ?? (journalEnabled ? "archive" : "retained");
   const [windowMinutes, setWindowMinutes] = useState("15");
@@ -127,6 +143,8 @@ export default function ExplorePane({ journalEnabled, onAuthenticationError }: {
   const pageCount = Math.max(1, Math.ceil(filtered.length / 50));
   const jobCol = result?.columns.indexOf("job_id") ?? -1;
   const nsCol = result?.columns.indexOf("namespace") ?? -1;
+  const ifaceCol = result?.columns.indexOf("interface_name") ?? -1;
+  const workerCol = result?.columns.indexOf("latest_worker_id") ?? -1;
 
   function exportCsv() {
     if (!result) return;
@@ -222,7 +240,24 @@ export default function ExplorePane({ journalEnabled, onAuthenticationError }: {
                             {row[jobCol] ? <button className="button" onClick={() => setSelectedJob({ jobId: row[jobCol]!, namespace: nsCol >= 0 ? (row[nsCol] ?? undefined) : undefined })}>Inspect</button> : null}
                           </td>
                         ) : null}
-                        {row.map((val, col) => <td key={col} title={val ?? undefined}>{val === null ? <span className="explore__null">NULL</span> : val}</td>)}
+                        {row.map((val, col) => {
+                          if (val === null) return <td key={col}><span className="explore__null">NULL</span></td>;
+                          if (col === ifaceCol && onOpenInterface) {
+                            return (
+                              <td key={col} title={val}>
+                                <button type="button" className="cell-link mono" onClick={() => onOpenInterface(val)}>{val}</button>
+                              </td>
+                            );
+                          }
+                          if (col === workerCol && onOpenWorker) {
+                            return (
+                              <td key={col} title={val}>
+                                <button type="button" className="cell-link mono" onClick={() => onOpenWorker(val)}>{val}</button>
+                              </td>
+                            );
+                          }
+                          return <td key={col} title={val}>{val}</td>;
+                        })}
                       </tr>
                     ))}
                   </tbody>
@@ -240,8 +275,20 @@ export default function ExplorePane({ journalEnabled, onAuthenticationError }: {
       </section>
       {selectedJob ? (
         <div className="explore__inspector">
-          <button className="button explore__close" onClick={() => setSelectedJob(null)}>Close details</button>
-          <JobInspector detail={detail} />
+          <div className="explore__inspector-bar">
+            {onOpenJobInJobs ? (
+              <button type="button" className="button" onClick={() => onOpenJobInJobs(selectedJob.jobId, selectedJob.namespace)}>
+                Open in Jobs
+              </button>
+            ) : null}
+            <button type="button" className="button explore__close" onClick={() => setSelectedJob(null)}>Close details</button>
+          </div>
+          <JobInspector
+            detail={detail}
+            onOpenWorker={onOpenWorker}
+            onOpenInterface={onOpenInterface}
+            onFilterNamespace={onFilterNamespace}
+          />
         </div>
       ) : null}
     </div>

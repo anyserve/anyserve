@@ -15,6 +15,8 @@ const shortTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour12: false,
 });
 
+const numberFormatter = new Intl.NumberFormat();
+
 export function sortJobs(jobs: JobSummary[]): JobSummary[] {
   return [...jobs].sort((a, b) => b.updated_at_ms - a.updated_at_ms);
 }
@@ -80,7 +82,7 @@ export function budgetPercent(used: number, max: number): number {
 }
 
 export function formatNumber(value: number): string {
-  return new Intl.NumberFormat().format(value);
+  return numberFormatter.format(value);
 }
 
 export function formatCapacityMap(value: Record<string, string | number>): string {
@@ -113,11 +115,11 @@ export function asErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
-/** Compact primitive JSON arrays inline so KServe tensor payloads remain scannable. */
+/** Compact primitive JSON arrays inline with spaces so long vectors wrap cleanly at commas. */
 function formatJsonValue(value: unknown, indent = 0): string {
   if (Array.isArray(value)) {
     const isPrimitiveArray = value.every((v) => v === null || typeof v !== "object");
-    if (isPrimitiveArray && value.length <= 16) return JSON.stringify(value);
+    if (isPrimitiveArray && value.length <= 16) return `[${value.map((v) => JSON.stringify(v)).join(", ")}]`;
     if (value.length === 0) return "[]";
     const pad = "  ".repeat(indent + 1);
     if (isPrimitiveArray) {

@@ -1,7 +1,9 @@
+import { memo } from "react";
+
 import type { ConsoleTab, Theme } from "./app-constants";
 import { formatNumber, formatShortTime, formatTimestamp } from "./format";
 import {
-  AnyserveLogo,
+  AnyServeLogo,
   IconDisconnect,
   IconExplore,
   IconInterfaces,
@@ -58,7 +60,15 @@ function badgeForTab(tab: ConsoleTab, overview: OverviewResponse | null): string
   return null;
 }
 
-export function Sidebar({ activeTab, onSelectTab, overview, theme, onToggleTheme, authenticated, onDisconnect }: SidebarProps) {
+export const Sidebar = memo(function Sidebar({
+  activeTab,
+  onSelectTab,
+  overview,
+  theme,
+  onToggleTheme,
+  authenticated,
+  onDisconnect,
+}: SidebarProps) {
   const health = overview?.health;
   const tone = !overview ? "offline" : health && !health.live ? "bad" : health && (!health.ready || health.journal.status === "unavailable") ? "warn" : "ok";
 
@@ -67,10 +77,10 @@ export function Sidebar({ activeTab, onSelectTab, overview, theme, onToggleTheme
       <div className="sidebar__top">
         <div className="sidebar__brand">
           <span className="sidebar__logo">
-            <AnyserveLogo />
+            <AnyServeLogo />
           </span>
           <div className="sidebar__title-group">
-            <span className="sidebar__title">Anyserve</span>
+            <span className="sidebar__title">AnyServe</span>
             <span className="sidebar__subtitle">Control Plane</span>
           </div>
         </div>
@@ -131,4 +141,4 @@ export function Sidebar({ activeTab, onSelectTab, overview, theme, onToggleTheme
       </div>
     </aside>
   );
-}
+});

@@ -14,6 +14,9 @@ interface JobsPaneProps {
   totalLoaded: number;
   selectedJobId: string | null;
   onSelect: (jobId: string) => void;
+  onOpenInterface: (interfaceName: string) => void;
+  onOpenWorker: (workerId: string) => void;
+  onFilterNamespace: (namespace: string) => void;
   interfaceFilter: string;
   interfaceOptions: FilterOption[];
   onInterfaceFilterChange: (value: string) => void;
@@ -61,7 +64,15 @@ export function JobsPane(props: JobsPaneProps) {
           </div>
         </div>
 
-        <JobsTable jobs={props.jobs} selectedJobId={props.selectedJobId} emptyMessage={EMPTY_MESSAGES[props.scope]} onSelect={props.onSelect} />
+        <JobsTable
+          jobs={props.jobs}
+          selectedJobId={props.selectedJobId}
+          emptyMessage={EMPTY_MESSAGES[props.scope]}
+          onSelect={props.onSelect}
+          onOpenInterface={props.onOpenInterface}
+          onOpenWorker={props.onOpenWorker}
+          onFilterNamespace={props.onFilterNamespace}
+        />
 
         {props.hasMore ? (
           <div className="panel__footer">
