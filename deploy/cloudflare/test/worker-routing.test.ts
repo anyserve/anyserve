@@ -183,9 +183,14 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
   });
 
   it("restores inactivity timeout & outbound interception, forwards JournalGateway RPC, and tracks active WebSockets", async () => {
-    const { AnyserveControlPlaneDO, ContainerProxy, JournalGateway } =
-      await import("../src/index");
+    const {
+      AnyserveControlPlaneDO,
+      AnyserveNativeDO,
+      ContainerProxy,
+      JournalGateway,
+    } = await import("../src/index");
     expect(ContainerProxy).toBeDefined();
+    expect(AnyserveNativeDO).toBeDefined();
 
     const db = new DatabaseSync(":memory:");
     const { storage: sqlStorage } = createNodeSqliteStorage(db, {
@@ -478,5 +483,169 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
       );
     expect(match).not.toBeNull();
     expect(`${match![1]!}\n`).toBe(serverToml);
+  });
+
+  it("validates dual wrangler.jsonc (Native Free default) and wrangler.containers.jsonc (Paid Containers) configs", () => {
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const cfDir = resolve(testDir, "..");
+
+    const nativeCfg = JSON.parse(
+      readFileSync(resolve(cfDir, "wrangler.jsonc"), "utf8"),
+    );
+    expect(nativeCfg.name).toBe("anyserve-cloudflare-native");
+    expect(nativeCfg.main).toBe("src/index.ts");
+    expect(nativeCfg.compatibility_date).toBe("2025-11-17");
+    expect(nativeCfg.build?.command).toContain("npm --prefix");
+    expect(nativeCfg.build?.command).toContain("../../console run build");
+    expect(nativeCfg.containers).toBeUndefined();
+    expect(nativeCfg.durable_objects).toEqual({
+      bindings: [{ name: "ANYSERVE_DO", class_name: "AnyserveNativeDO" }],
+    });
+    expect(nativeCfg.migrations).toEqual([
+      { tag: "native-v1", new_sqlite_classes: ["AnyserveNativeDO"] },
+    ]);
+    expect(nativeCfg.assets).toMatchObject({
+      directory: "../../console/dist",
+      binding: "ASSETS",
+      not_found_handling: "single-page-application",
+      run_worker_first: [
+        "/api/*",
+        "/rpc/*",
+        "/ws/*",
+        "/healthz",
+        "/readyz",
+        "/metrics",
+      ],
+    });
+    expect(nativeCfg.r2_buckets).toEqual([
+      { binding: "ANYSERVE_R2", bucket_name: "anyserve-journal" },
+    ]);
+
+    const containersCfg = JSON.parse(
+      readFileSync(resolve(cfDir, "wrangler.containers.jsonc"), "utf8"),
+    );
+    expect(containersCfg.name).toBe("anyserve-cloudflare");
+    expect(containersCfg.main).toBe("src/index.ts");
+    expect(containersCfg.containers).toEqual([
+      {
+        class_name: "AnyserveControlPlaneDO",
+        image: "./Dockerfile",
+        image_build_context: "../..",
+        instance_type: "lite",
+        max_instances: 1,
+      },
+    ]);
+    expect(containersCfg.durable_objects).toEqual({
+      bindings: [{ name: "ANYSERVE_DO", class_name: "AnyserveControlPlaneDO" }],
+    });
+    expect(containersCfg.migrations).toEqual([
+      { tag: "v1", new_sqlite_classes: ["AnyserveControlPlaneDO"] },
+    ]);
+    expect(containersCfg.r2_buckets).toEqual([
+      { binding: "ANYSERVE_R2", bucket_name: "anyserve-journal" },
+    ]);
+  });
+
+  it("routes Worker fetch requests into AnyserveNativeDO singleton-leader and ASSETS", async () => {
+    const workerModule = await import("../src/index");
+    const { AnyserveNativeDO } = workerModule;
+    const worker = workerModule.default;
+
+    const db = new DatabaseSync(":memory:");
+    const { storage: sqlStorage } = createNodeSqliteStorage(db, {
+      enforceCloudflareLimits: true,
+    });
+    const acceptedSockets: MockWebSocket[] = [];
+    const doCtx = {
+      id: { toString: () => "native-singleton-id" },
+      acceptWebSocket: (ws: MockWebSocket) => {
+        ws.accept();
+        acceptedSockets.push(ws);
+      },
+      getWebSockets: () => acceptedSockets,
+      storage: {
+        sql: sqlStorage.sql,
+        transactionSync: sqlStorage.transactionSync,
+        setAlarm: async () => {},
+        getAlarm: async () => null,
+        deleteAlarm: async () => {},
+      },
+    };
+
+    const r2 = new InMemoryR2Bucket();
+    const idFromNameCalls: string[] = [];
+    let nativeDoInstance: InstanceType<typeof AnyserveNativeDO> | null = null;
+
+    const env = {
+      ANYSERVE_R2: r2,
+      ANYSERVE_CLIENT_TOKENS: "native-client-tok",
+      ANYSERVE_WORKER_TOKENS: "native-worker-tok",
+      ASSETS: {
+        fetch: async (req: Request) =>
+          new Response(`asset:${new URL(req.url).pathname}`, { status: 200 }),
+      },
+      ANYSERVE_DO: {
+        idFromName: (name: string) => {
+          idFromNameCalls.push(name);
+          return { toString: () => `id:${name}` };
+        },
+        get: () => {
+          if (!nativeDoInstance) {
+            nativeDoInstance = new AnyserveNativeDO(
+              doCtx as unknown as ConstructorParameters<
+                typeof AnyserveNativeDO
+              >[0],
+              env as unknown as ConstructorParameters<
+                typeof AnyserveNativeDO
+              >[1],
+            );
+          }
+          return nativeDoInstance;
+        },
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+
+    const readyRes = await worker.fetch(
+      new Request("https://native.example.workers.dev/readyz"),
+      env,
+    );
+    expect(readyRes.status).toBe(204);
+
+    const overviewRes = await worker.fetch(
+      new Request("https://native.example.workers.dev/api/overview", {
+        headers: { authorization: "Bearer native-client-tok" },
+      }),
+      env,
+    );
+    expect(overviewRes.status).toBe(200);
+    const overview = (await overviewRes.json()) as Record<string, any>;
+    expect(overview.runtime.code).toBe("memory_plus_cloudflare");
+    expect(overview.control_plane.recommended_poll_ms).toBe(10_000);
+    expect(overview.control_plane.public_endpoint).toBe(
+      "wss://native.example.workers.dev",
+    );
+
+    const unauthWs = await worker.fetch(
+      new Request("https://native.example.workers.dev/ws/v2/worker/session", {
+        headers: { upgrade: "websocket" },
+      }),
+      env,
+    );
+    expect(unauthWs.status).toBe(401);
+    expect(unauthWs.headers.get("x-anyserve-grpc-code")).toBe("16");
+
+    const assetRes = await worker.fetch(
+      new Request("https://native.example.workers.dev/explore"),
+      env,
+    );
+    expect(assetRes.status).toBe(200);
+    expect(await assetRes.text()).toBe("asset:/explore");
+    expect(idFromNameCalls).toEqual([
+      "singleton-leader",
+      "singleton-leader",
+      "singleton-leader",
+    ]);
+
+    db.close();
   });
 });

@@ -2,8 +2,9 @@ import { ContainerProxy } from "@cloudflare/containers";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./env";
 import { AnyserveControlPlaneDO } from "./journal-do";
+import { AnyserveNativeDO } from "./native-do";
 
-export { AnyserveControlPlaneDO, ContainerProxy };
+export { AnyserveControlPlaneDO, AnyserveNativeDO, ContainerProxy };
 
 export const SINGLETON_LEADER_NAME = "singleton-leader";
 
@@ -32,9 +33,9 @@ export class JournalGateway extends WorkerEntrypoint<Env, JournalGatewayProps> {
         { status: 500 },
       );
     }
-    const stub = this.env.ANYSERVE_DO.get(
-      this.env.ANYSERVE_DO.idFromString(doId),
-    );
+    const containerDo = this.env
+      .ANYSERVE_DO as unknown as DurableObjectNamespace<AnyserveControlPlaneDO>;
+    const stub = containerDo.get(containerDo.idFromString(doId));
     return await stub.handleJournalRequest(request);
   }
 }

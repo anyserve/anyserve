@@ -1,0 +1,41 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "anyserve-cloudflare",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-17",
+  "assets": {
+    "directory": "../../console/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/rpc/*", "/ws/*", "/healthz", "/readyz", "/metrics"]
+  },
+  "containers": [
+    {
+      "class_name": "AnyserveControlPlaneDO",
+      "image": "./Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "lite",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ANYSERVE_DO",
+        "class_name": "AnyserveControlPlaneDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["AnyserveControlPlaneDO"]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ANYSERVE_R2",
+      "bucket_name": "anyserve-journal"
+    }
+  ]
+}
