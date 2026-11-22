@@ -796,6 +796,9 @@ impl Runtime {
     /// configured journal backend is acquired.
     pub async fn start(config: RuntimeConfig) -> anyhow::Result<Runtime> {
         let journal: Option<Arc<dyn JournalBackend>> = match &config.journal {
+            Some(c) if c.cloudflare.is_some() => {
+                Some(crate::cloudflare_journal::CloudflareJournal::open(c).await?)
+            }
             Some(c) if c.postgres.is_some() => Some(crate::postgres::PgJournal::open(c).await?),
             Some(c) => Some(SqliteJournal::open(c).await?),
             None => None,
