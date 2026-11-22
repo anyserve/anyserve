@@ -8,7 +8,15 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 anyserve-proto = { path = "../anyserve-proto" }
-tokio-stream.workspace = true
-tokio.workspace = true
 bytes.workspace = true
+futures.workspace = true
+http.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
+tokio.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+axum.workspace = true

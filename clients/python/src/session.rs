@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyserve_client::execution::{Attempt, AttemptClient, WorkerSession, v2};
+use anyserve_client::execution::{Attempt, AttemptClient, RpcStream, WorkerSession, v2};
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use tokio::sync::{mpsc, watch};
-use tonic::Streaming;
 
 use crate::execution::{error, field, objects_from_py, objects_to_py};
 use crate::{
@@ -18,7 +17,7 @@ use crate::{
 pub struct WorkerConnection {
     runtime: SharedRuntime,
     control: mpsc::Sender<v2::WorkerMessage>,
-    messages: Mutex<Option<Streaming<v2::ServerMessage>>>,
+    messages: Mutex<Option<RpcStream<v2::ServerMessage>>>,
     data: AttemptClient,
     limits: v2::Limits,
     heartbeat_timeout: Duration,
