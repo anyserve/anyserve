@@ -38,6 +38,7 @@ impl ConsoleClient {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mode = match runtime.config().journal.as_ref() {
+            Some(j) if j.cloudflare.is_some() => RuntimeMode::MemoryPlusCloudflare,
             Some(j) if j.postgres.is_some() => RuntimeMode::MemoryPlusPostgres,
             Some(_) => RuntimeMode::MemoryPlusSqlite,
             None => RuntimeMode::Memory,
@@ -50,6 +51,7 @@ impl ConsoleClient {
                 grpc_listen: meta.grpc_listen,
                 grpc_tls_enabled: meta.grpc_tls_enabled,
                 console_listen: addr.to_string(),
+                public_endpoint: meta.public_endpoint,
                 auth_enabled: auth.is_enabled(),
             }),
         };
@@ -99,6 +101,7 @@ async fn spawn_console_auth(runtime: Runtime, auth: AuthPolicy) -> ConsoleClient
     let meta = ControlPlaneMetadata {
         grpc_listen: "127.0.0.1:50052".into(),
         grpc_tls_enabled: false,
+        public_endpoint: None,
     };
     ConsoleClient::spawn(runtime, auth, meta).await
 }
@@ -1036,6 +1039,7 @@ async fn overview_exposes_health_control_plane_budgets_journal_policies_and_pool
         ControlPlaneMetadata {
             grpc_listen: "0.0.0.0:50062".into(),
             grpc_tls_enabled: true,
+            public_endpoint: Some("wss://anyserve.example.com".into()),
         },
     )
     .await;
@@ -1053,6 +1057,7 @@ async fn overview_exposes_health_control_plane_budgets_journal_policies_and_pool
     let cp = &body["control_plane"];
     assert_eq!(cp["grpc_listen"], "0.0.0.0:50062");
     assert_eq!(cp["grpc_tls_enabled"], true);
+    assert_eq!(cp["public_endpoint"], "wss://anyserve.example.com");
     assert!(
         cp["console_listen"]
             .as_str()
@@ -1152,10 +1157,12 @@ async fn run_server_serves_control_plane_metadata_and_shuts_down_cleanly() {
     let cfg = ServeConsoleConfig {
         listen: "127.0.0.1:0".into(),
         allowed_origins: vec![" http://console.test ".into(), "".into()],
+        public_endpoint: None,
     };
     let meta = ControlPlaneMetadata {
         grpc_listen: "127.0.0.1:50099".into(),
         grpc_tls_enabled: true,
+        public_endpoint: None,
     };
     let task = tokio::spawn(run_server(
         addr,
@@ -1482,4 +1489,137 @@ async fn cors_middleware_allows_only_configured_origins() {
             .get("access-control-allow-origin")
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn console_mounts_http_ws_outside_operator_middleware_and_allows_namespace_cors() {
+    let runtime = test_runtime().await;
+    let policy = AuthPolicy::new(["op-client".into()], ["op-worker".into()]).with_scoped_tokens([
+        ScopedToken {
+            token: "tenant-client".into(),
+            role: Role::Client,
+            namespace: "tenant-a".into(),
+            subject: "tenant-a".into(),
+            forced_pool: None,
+        },
+        ScopedToken {
+            token: "tenant-worker".into(),
+            role: Role::Worker,
+            namespace: "tenant-a".into(),
+            subject: "worker-a".into(),
+            forced_pool: None,
+        },
+    ]);
+    let c = spawn_console_auth(runtime, policy).await;
+
+    // CORS preflight advertises x-anyserve-namespace.
+    let preflight = c
+        .http
+        .request(
+            Method::OPTIONS,
+            format!("{}/rpc/v2/client/list_jobs", c.base),
+        )
+        .header("origin", "http://console.test")
+        .header(
+            "access-control-request-headers",
+            "authorization,x-anyserve-namespace",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight.status().as_u16(), 204);
+    assert!(
+        preflight.headers()["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .contains("x-anyserve-namespace")
+    );
+
+    // Operator-only management API still rejects scoped tenant & worker tokens with 403.
+    assert_eq!(
+        c.status(Method::GET, "/api/overview", Some("tenant-client"))
+            .await,
+        403
+    );
+    assert_eq!(
+        c.status(Method::GET, "/api/overview", Some("tenant-worker"))
+            .await,
+        403
+    );
+
+    // Scoped client token succeeds on mounted /rpc/v2/client/list_jobs (empty protobuf ListJobsRequest).
+    let rpc_ok = c
+        .http
+        .post(format!("{}/rpc/v2/client/list_jobs", c.base))
+        .bearer_auth("tenant-client")
+        .header("content-type", "application/x-protobuf")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rpc_ok.status().as_u16(), 200);
+    assert_eq!(rpc_ok.headers()["content-type"], "application/x-protobuf");
+
+    // Worker token is rejected on /rpc/v2/client/list_jobs with 403 + x-anyserve-grpc-code: 7.
+    let rpc_denied = c
+        .http
+        .post(format!("{}/rpc/v2/client/list_jobs", c.base))
+        .bearer_auth("tenant-worker")
+        .header("content-type", "application/x-protobuf")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rpc_denied.status().as_u16(), 403);
+    assert_eq!(rpc_denied.headers()["x-anyserve-grpc-code"], "7");
+
+    // Mounted WS route upgrades cleanly for worker token and rejects client token pre-upgrade.
+    let ws_denied = c
+        .http
+        .get(format!("{}/ws/v2/worker/session", c.base))
+        .bearer_auth("tenant-client")
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ws_denied.status().as_u16(), 403);
+    assert_eq!(ws_denied.headers()["x-anyserve-grpc-code"], "7");
+
+    // Use HTTP/1.1 raw socket to verify 101 Switching Protocols on /ws/v2/worker/session.
+    let addr = c.base.strip_prefix("http://").unwrap();
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let req = format!(
+        "GET /ws/v2/worker/session HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer tenant-worker\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    tcp.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 512];
+    let n = tcp.read(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    // Mounted unary route preserves > 2 MiB DefaultBodyLimit (invalid protobuf > 2 MiB returns 400, not 413).
+    let large_invalid = vec![0xFFu8; 3 * 1024 * 1024];
+    let large_resp = c
+        .http
+        .post(format!("{}/rpc/v2/client/submit", c.base))
+        .bearer_auth("tenant-client")
+        .header("content-type", "application/x-protobuf")
+        .body(large_invalid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(large_resp.status().as_u16(), 400);
+    assert_eq!(large_resp.headers()["x-anyserve-grpc-code"], "3");
+}
+
+#[test]
+fn runtime_mode_summary_covers_cloudflare_journal() {
+    let summary = runtime_mode_summary(RuntimeMode::MemoryPlusCloudflare);
+    assert_eq!(summary.code, "memory_plus_cloudflare");
+    assert_eq!(summary.label, "Memory + Cloudflare journal");
+    assert_eq!(summary.journal, "cloudflare");
 }

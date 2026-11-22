@@ -14,6 +14,7 @@ const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:3001";
 
 #[derive(Clone, Debug)]
 pub struct GrpcConfig {
+    pub enabled: bool,
     pub host: String,
     pub port: u16,
     pub tls_enabled: bool,
@@ -24,6 +25,7 @@ pub struct GrpcConfig {
 impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host: "127.0.0.1".to_string(),
             port: 50_052,
             tls_enabled: false,
@@ -59,6 +61,7 @@ pub enum RuntimeMode {
     Memory,
     MemoryPlusSqlite,
     MemoryPlusPostgres,
+    MemoryPlusCloudflare,
 }
 impl RuntimeMode {
     pub fn code(self) -> &'static str {
@@ -66,6 +69,7 @@ impl RuntimeMode {
             Self::Memory => "memory",
             Self::MemoryPlusSqlite => "memory_plus_sqlite",
             Self::MemoryPlusPostgres => "memory_plus_postgres",
+            Self::MemoryPlusCloudflare => "memory_plus_cloudflare",
         }
     }
     pub fn label(self) -> &'static str {
@@ -73,6 +77,7 @@ impl RuntimeMode {
             Self::Memory => "Memory",
             Self::MemoryPlusSqlite => "Memory + SQLite journal",
             Self::MemoryPlusPostgres => "Memory + PostgreSQL journal",
+            Self::MemoryPlusCloudflare => "Memory + Cloudflare journal",
         }
     }
 }
@@ -81,6 +86,7 @@ impl RuntimeMode {
 pub struct ServeConsoleConfig {
     pub listen: String,
     pub allowed_origins: Vec<String>,
+    pub public_endpoint: Option<String>,
 }
 
 impl ResolvedServeConfig {
@@ -107,6 +113,7 @@ impl ResolvedServeConfig {
         let auth = file_config.auth.unwrap_or_default().resolve()?;
         let console = file_config.console.and_then(|config| config.resolve());
         let grpc = GrpcConfig {
+            enabled: server.grpc_enabled.unwrap_or(defaults.enabled),
             host: overrides
                 .grpc_host
                 .or(server.grpc_host)
@@ -133,17 +140,11 @@ impl ResolvedServeConfig {
     }
 
     pub fn runtime_mode(&self) -> RuntimeMode {
-        if self
-            .runtime
-            .journal
-            .as_ref()
-            .is_some_and(|j| j.postgres.is_some())
-        {
-            RuntimeMode::MemoryPlusPostgres
-        } else if self.runtime.journal.is_some() {
-            RuntimeMode::MemoryPlusSqlite
-        } else {
-            RuntimeMode::Memory
+        match self.runtime.journal.as_ref() {
+            Some(j) if j.cloudflare.is_some() => RuntimeMode::MemoryPlusCloudflare,
+            Some(j) if j.postgres.is_some() => RuntimeMode::MemoryPlusPostgres,
+            Some(_) => RuntimeMode::MemoryPlusSqlite,
+            None => RuntimeMode::Memory,
         }
     }
 }

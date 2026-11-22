@@ -24,6 +24,7 @@ use handlers::router;
 pub struct ControlPlaneMetadata {
     pub grpc_listen: String,
     pub grpc_tls_enabled: bool,
+    pub public_endpoint: Option<String>,
 }
 
 pub(crate) fn format_host_port(host: &str, port: u16) -> String {
@@ -71,6 +72,7 @@ pub async fn run_server(
             grpc_listen: control_plane.grpc_listen,
             grpc_tls_enabled: control_plane.grpc_tls_enabled,
             console_listen,
+            public_endpoint: control_plane.public_endpoint,
             auth_enabled: auth.is_enabled(),
         }),
     };

@@ -705,7 +705,9 @@ impl Default for RuntimeConfig {
 pub struct JournalConfig {
     /// When set, use the shared PostgreSQL scheduler instead of SQLite.
     pub postgres: Option<PostgresConfig>,
-    /// SQLite only; ignored when `postgres` is set.
+    /// When set, use the Cloudflare Durable Object + R2 journal instead of SQLite.
+    pub cloudflare: Option<CloudflareJournalConfig>,
+    /// SQLite only; ignored when `postgres` or `cloudflare` is set.
     pub path: PathBuf,
     /// `synchronous=FULL` when true (default), `NORMAL` otherwise.
     pub full_sync: bool,
@@ -722,6 +724,7 @@ impl JournalConfig {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             postgres: None,
+            cloudflare: None,
             path: path.into(),
             full_sync: true,
             queue_capacity: 4_096,
@@ -736,6 +739,50 @@ impl JournalConfig {
             postgres: Some(PostgresConfig::new(url)),
             ..Self::new(PathBuf::new())
         }
+    }
+
+    pub fn cloudflare(endpoint: impl Into<String>) -> Self {
+        Self {
+            cloudflare: Some(CloudflareJournalConfig::new(endpoint)),
+            ..Self::new(PathBuf::new())
+        }
+    }
+}
+
+/// Shared Cloudflare Durable Object SQLite + R2 journal configuration.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CloudflareJournalConfig {
+    pub endpoint: String,
+    pub auth_token: Option<String>,
+    pub lease_duration: Duration,
+    pub poll_interval: Duration,
+    pub r2_spill_threshold_bytes: usize,
+}
+
+impl CloudflareJournalConfig {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            auth_token: None,
+            lease_duration: Duration::from_secs(15),
+            poll_interval: Duration::from_millis(200),
+            r2_spill_threshold_bytes: 1024 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Debug for CloudflareJournalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudflareJournalConfig")
+            .field("endpoint", &self.endpoint)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("lease_duration", &self.lease_duration)
+            .field("poll_interval", &self.poll_interval)
+            .field("r2_spill_threshold_bytes", &self.r2_spill_threshold_bytes)
+            .finish()
     }
 }
 
