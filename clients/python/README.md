@@ -4,7 +4,7 @@
 transport. Python 3.12+ is required; use the SDK and server from the same release.
 Install from the repository root with `pip install ./clients/python`.
 
-- [Start a server and worker](https://github.com/anyserve/anyserve#run-from-this-checkout).
+- [Start a server and worker](https://github.com/anyserve/anyserve#quick-start).
 - [Client, streaming and worker API reference](https://github.com/anyserve/anyserve/blob/main/docs/python-sdk.md).
 - [Build and test commands](https://github.com/anyserve/anyserve/blob/main/docs/contributing.md).
 - [Echo worker](https://github.com/anyserve/anyserve/blob/main/examples/python/worker.py) and

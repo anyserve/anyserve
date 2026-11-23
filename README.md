@@ -1,117 +1,70 @@
 # Anyserve
 
-Anyserve is a backend-independent execution and scheduling system. Clients send
-opaque inputs through the native execution protocol. The control plane
-matches jobs to outbound workers by capability and available capacity, and owns
-admission, flow control, cancellation, retries and optional durable recovery.
-
-Workers own their application code and backends. An ONNX engine, a remote
-inference service or an ordinary function can implement a worker without adding
-backend-specific semantics to the control plane.
-
-## Core contract
-
-- **Invoke** is ephemeral and supports complete or live duplex input/output.
-  Dropping the invocation cancels unfinished work.
-- **Submit** accepts complete input and defaults to durable execution. The
-  optional SQLite or PostgreSQL backend commits input before acceptance and terminal results
-  before completion acknowledgement. External side effects need application
-  idempotency because unfinished work can execute again after a restart.
-- **Placement** matches interfaces, `namespace` isolation, worker `pool` tiers with spillover, `affinity_key` sticky routing, two-level Priority + round-robin `fairness_key`, `concurrency_key` serialization, required/preferred attributes, resource quantities, and worker credits. Workers establish outbound Session/Attempt connections and need no inbound endpoint.
-- **Workers** are application code on the Python or Rust SDK: sync or `async` handlers, generators for streamed output, and several interfaces per `serve(...)`. Connectors for inference servers live outside this repository, in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
-- **Bounded delivery** provides output events, per-attempt byte windows, replay cursors and three memory budgets. Exposed streamed output cannot silently switch attempts. `max_attempts` includes the first attempt.
-- **Operations** provides client/worker/scoped-tenant token roles, TLS for gRPC, a management API, console, health probes, pool autoscaling Prometheus metrics, and logs.
+Backend-independent execution and scheduling control plane. Clients send opaque payloads over gRPC or WebSocket; the control plane matches jobs to outbound workers by capability and capacity, handling admission, flow control, cancellation, retries, and optional durable recovery—while workers own all application and backend logic.
 
 ```text
-Clients -- Client gRPC --> active leader (standby replicas wait on lease) <-- Worker gRPC -- workers
-                                              |                                                      |
-                                SQLite (one process) or                                 application backend
-                                PostgreSQL (shared journal + lease)
+Clients ── gRPC / WSS ──▶ Control plane (leader or Cloudflare DO) ◀── gRPC / WSS ── Outbound workers
+                                │                                                         │
+                  SQLite · PostgreSQL · DO SQLite + R2                           application backend
 ```
 
-PostgreSQL provides high availability through a single active scheduler and one
-or more standby control-plane replicas sharing a three-table durable journal
-(`scheduler_lease`, `jobs`, `objects`). One leader holds the database-clock
-lease and runs the in-memory scheduler; standbys stay live (`/healthz` 204,
-`/readyz` 503, gRPC `UNAVAILABLE`) and take over automatically when the lease
-is relinquished or expires. SQLite uses the same runtime and journal interface
-in a single process. See
-[deployment](docs/deployment.md#postgresql-high-availability) for failover,
-load balancing and edge-site patterns.
+## Capabilities
 
-## Run from this checkout
+- **Execution**: `Invoke` (ephemeral, optional full-duplex streaming; drop cancels) and `Submit` (durable by default, crash recovery, `job_id` idempotency, bounded at-least-once retries; exposed streamed output never silently switches attempts).
+- **Placement & backpressure**: Interface matching, `namespace` isolation, `pool` tiers with spillover, `affinity_key` sticky routing, priority + `fairness_key` queueing, `concurrency_key` serialization, required/preferred attributes, resource capacity, worker credits, and bounded memory budgets.
+- **Outbound SDKs**: Python 3.12+ and Rust SDKs over gRPC (`http(s)://`) or WebSocket (`ws(s)://`)—workers dial out and need no inbound port. Ready-made inference connectors (vLLM, Ollama, Triton, YOLO, VLA) live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
+- **Operations**: Client/worker/scoped-tenant bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job ls|inspect|cancel`), and a React Console with DuckDB-WASM Explore.
 
-Rust and `protoc` are required to build the binary. Run from the repository root:
+## Quick start
+
+Requires Rust ([rust-toolchain.toml](rust-toolchain.toml)), `protoc`, and Python 3.12+. From the repository root:
 
 ```bash
+# Terminal 1 — control plane (gRPC :50052, HTTP API :3001, SQLite .anyserve/journal.sqlite)
 cargo build --locked -p anyserve
 ./target/debug/anyserve serve --config examples/server.toml
 ```
 
-The example enables native gRPC on `127.0.0.1:50052` and the optional management
-API on `127.0.0.1:3001`. Its journal is `.anyserve/journal.sqlite` relative to the
-server's working directory. `serve --ephemeral` disables durable execution;
-`serve --journal /persistent/journal.sqlite` selects a persistent path.
-
-In another terminal, install the SDK with Python 3.12+ and start a native worker:
-
 ```bash
-python -m venv .venv
-. .venv/bin/activate
+# Terminal 2 — outbound Python echo worker
+python -m venv .venv && . .venv/bin/activate
 pip install ./clients/python
 python examples/python/worker.py
 ```
 
-From a terminal with the same Python environment:
-
 ```bash
+# Terminal 3 — submit a durable job (same venv)
 python examples/python/submit.py
 ```
 
-The Python examples are an [echo worker](examples/python/worker.py) and a
-[submitter](examples/python/submit.py); connectors for OpenAI-compatible
-servers such as vLLM and Ollama, Triton Inference Server, YOLO and VLA policies
-live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
-The [Rust example](examples/rust) uses the same protocol. Applications supply
-backend-specific worker code; the CLI starts the control plane and
-inspects/cancels jobs. Python clients and workers use `ANYSERVE_ENDPOINT`,
-defaulting to `http://127.0.0.1:50052`.
+- Pass `--ephemeral` to disable persistence, or `--journal PATH` for a custom SQLite path.
+- Set `ANYSERVE_ENDPOINT` (default `http://127.0.0.1:50052`; supports `http(s)://`, `ws(s)://`, or comma-separated leader lists) and role-specific `ANYSERVE_TOKEN` for remote access.
+- Rust equivalent: [examples/rust](examples/rust). Browser Console (proxies `/api` to `:3001`): `npm --prefix console ci && npm --prefix console run dev`.
 
-Configure separate client and worker tokens before remote access. The job CLI
-and native clients read `ANYSERVE_TOKEN`; application workers use a worker-role
-token. `job ls`, `job inspect <id>` and `job cancel <id>` use the native API.
+## Deployment modes
 
-## Management
+| Mode | Storage & HA | Entry point |
+|---|---|---|
+| Single node / Edge | Local SQLite journal (single process) | `anyserve serve`, Docker, [Helm](deploy/helm/anyserve) |
+| HA cluster | Shared PostgreSQL journal + single-leader lease with automatic standby failover | `backend = "postgres"`, [Helm](deploy/helm/anyserve) |
+| Cloudflare Workers Free | Native Hibernatable DO + DO SQLite + R2 (`wss://`, no Docker/Containers) | [wrangler.jsonc](deploy/cloudflare/wrangler.jsonc) |
+| Cloudflare Containers | Rust binary in Cloudflare Containers + DO SQLite + R2 (`wss://`, Workers Paid) | [wrangler.containers.jsonc](deploy/cloudflare/wrangler.containers.jsonc) |
 
-When `[console]` is enabled, its listener exposes the console API plus
-`/healthz`, `/readyz` and `/metrics`. Metrics describe the shared Runtime,
-interfaces, workers, byte budgets and journal. Job state gauges count entries
-currently retained in memory, not cumulative completions. With authentication
-enabled, `/metrics` and console reads require an operator token from
-`[auth].client_tokens`; health probes remain accessible without one.
+## Repository
 
-For the browser console, run `npm --prefix console ci` and
-`npm --prefix console run dev`, then open the URL printed by Vite. The dev server
-proxies `/api` to `127.0.0.1:3001`. The management listener serves the API;
-browser assets are built and hosted separately. See
-[Console deployment](docs/deployment.md#browser-console) for production hosting.
-The console keeps its client token in the current browser tab's session storage.
+- `crates/anyserve-core` — scheduler state machine, journal backends, auth, gRPC and HTTP/WS services
+- `crates/anyserve-proto` — native Client/Worker protobuf protocol
+- `crates/anyserve-client` — Rust clients and bounded worker transport
+- `crates/anyserve-cli` — `anyserve` binary (`serve`, `job` CLI, management API)
+- `clients/python` — Python SDK (`anyserve-runtime`)
+- `console` — React Console and DuckDB-WASM Explore
+- `deploy/helm/anyserve` — Kubernetes Helm chart (SQLite or PostgreSQL HA + optional workers)
+- `deploy/cloudflare` — Cloudflare Workers Free native DO and Containers deployments
+- `bench/load` — load benchmarks and console profiling
 
-Explore uses DuckDB-WASM to query a bounded, manually loaded metadata dataset.
-It excludes request/result bodies and media. Use matching binary, SDK and protocol
-versions; see [configuration](docs/configuration.md#console-explore) for query limits.
+## Documentation
 
-## Repository and documentation
-
-- `crates/anyserve-core`: execution state machine, journal, authentication and gRPC services.
-- `crates/anyserve-proto`: the native Client and Worker protocol.
-- `crates/anyserve-client`: native clients and bounded worker transport.
-- `crates/anyserve-cli`: control-plane startup, job CLI and management API.
-- `clients/python`: Python bindings and the application worker API.
-- `console`: views of interfaces, jobs, workers and retained execution events.
-- `bench/load`: native execution workloads and separate CPU profiling.
-- `deploy/helm/anyserve`: Helm chart for a PostgreSQL leader-standby or single SQLite control plane, and an optional worker fleet.
-
-References cover [configuration](docs/configuration.md), the
-[Python SDK](docs/python-sdk.md), [deployment and recovery](docs/deployment.md)
-and [development checks and benchmarks](docs/contributing.md).
+- [Configuration & CLI](docs/configuration.md) — server TOML, auth/TLS, limits, Explore, CLI flags
+- [Python SDK](docs/python-sdk.md) — sync/async clients, duplex streaming, `ExecutionOptions`, `@worker`
+- [Deployment & Recovery](docs/deployment.md) — PostgreSQL HA, Docker, Helm, Console hosting, Cloudflare
+- [Contributing & Benchmarks](docs/contributing.md) — local checks, PostgreSQL tests, load benchmarks, releases
