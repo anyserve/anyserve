@@ -31,7 +31,7 @@ use super::snapshot::{
 pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
     let allowed_origins = Arc::clone(&state.allowed_origins);
     let http_ws = anyserve_core::http_ws_service::router(state.runtime.clone(), Arc::clone(&auth));
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
@@ -46,11 +46,15 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
             auth,
             crate::serve_auth::require_client_token,
         ))
-        .merge(http_ws)
-        .layer(middleware::from_fn_with_state(
-            allowed_origins,
-            cors_middleware,
-        ))
+        .merge(http_ws);
+
+    #[cfg(feature = "embed-console")]
+    let app = app.fallback(super::embedded_ui::fallback_handler);
+
+    app.layer(middleware::from_fn_with_state(
+        allowed_origins,
+        cors_middleware,
+    ))
 }
 
 async fn analytics_jobs(
@@ -350,7 +354,9 @@ async fn cors_middleware(
     );
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Accept, Content-Type, Authorization, x-anyserve-namespace"),
+        HeaderValue::from_static(
+            "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
+        ),
     );
 
     if let Some(origin) = allowed_origin {

@@ -45,6 +45,9 @@ pub(crate) struct ServeArgs {
     /// SQLite recovery journal (default: .anyserve/journal.sqlite).
     #[arg(long = "journal", value_name = "PATH")]
     journal_path: Option<PathBuf>,
+    /// Enable and bind the HTTP console / management API listener (e.g. 127.0.0.1:3001).
+    #[arg(long = "console-listen", value_name = "ADDR")]
+    console_listen: Option<String>,
 }
 
 pub(crate) fn validate_listeners(config: &ResolvedServeConfig) -> Result<()> {
@@ -64,6 +67,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         grpc_key_file: args.grpc_key_file,
         ephemeral: args.ephemeral,
         journal_path: args.journal_path,
+        console_listen: args.console_listen,
     })?;
     validate_listeners(&config)?;
     let runtime = Runtime::start(config.runtime.clone())
@@ -139,7 +143,11 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         info!(grpc_enabled = false, "control plane started");
     }
     if let Some(console_addr) = console_addr {
-        info!(console = %console_addr, "console api started");
+        info!(
+            console = %console_addr,
+            embedded_ui = cfg!(feature = "embed-console"),
+            "console api started"
+        );
     }
 
     let mut lease_lost = false;

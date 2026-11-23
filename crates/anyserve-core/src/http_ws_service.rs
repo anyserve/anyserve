@@ -173,10 +173,40 @@ where
     }
 }
 
+fn extract_http_trace_headers(headers: &HeaderMap) -> Vec<(&'static str, String)> {
+    crate::runtime::api::IDENTITY_EXCLUDED_METADATA_KEYS
+        .iter()
+        .filter_map(|&key| {
+            let val = headers.get(key)?.to_str().ok()?.trim();
+            (!val.is_empty() && val.len() <= crate::trace::MAX_TRACE_HEADER_BYTES)
+                .then(|| (key, val.to_owned()))
+        })
+        .collect()
+}
+
+fn merge_trace_header_pairs(spec: Option<&mut pb::JobSpec>, pairs: &[(&'static str, String)]) {
+    if let Some(spec) = spec
+        && !pairs.is_empty()
+    {
+        crate::trace::merge_trace_headers_into_proto(&mut spec.metadata, |key| {
+            pairs
+                .iter()
+                .find_map(|(k, v)| (*k == key).then_some(v.as_str()))
+        });
+    }
+}
+
 async fn rpc_submit(State(state): State<HttpWsState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle_unary_client(state, headers, body, |runtime, namespace, req| async move {
-        submit_request(&runtime, namespace, req).await
-    })
+    let trace_headers = extract_http_trace_headers(&headers);
+    handle_unary_client(
+        state,
+        headers,
+        body,
+        |runtime, namespace, mut req: pb::SubmitRequest| async move {
+            merge_trace_header_pairs(req.spec.as_mut(), &trace_headers);
+            submit_request(&runtime, namespace, req).await
+        },
+    )
     .await
 }
 
@@ -262,10 +292,17 @@ async fn ws_client_invoke(
         Ok(principal) => principal,
         Err(response) => return response,
     };
+    let trace_headers = extract_http_trace_headers(&headers);
     ws.max_frame_size(WS_MAX_FRAME_SIZE)
         .max_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
-            handle_client_invoke(state.runtime, principal, socket, state.ping_interval)
+            handle_client_invoke(
+                state.runtime,
+                principal,
+                socket,
+                state.ping_interval,
+                trace_headers,
+            )
         })
 }
 
@@ -710,6 +747,7 @@ async fn handle_client_invoke(
     principal: Principal,
     socket: WebSocket,
     ping_period: Duration,
+    trace_headers: Vec<(&'static str, String)>,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut ping_interval = new_ping_interval(ping_period);
@@ -729,7 +767,7 @@ async fn handle_client_invoke(
         }
         Err(None) => return,
     };
-    let start = match first.msg {
+    let mut start = match first.msg {
         Some(pb::invoke_request::Msg::Start(start)) => start,
         _ => {
             send_error_and_close(
@@ -740,6 +778,7 @@ async fn handle_client_invoke(
             return;
         }
     };
+    merge_trace_header_pairs(start.spec.as_mut(), &trace_headers);
     let mut execution = match start_invoke(&runtime, principal.namespace, start).await {
         Ok(execution) => execution,
         Err(status) => {

@@ -45,6 +45,7 @@ pub struct ServeOverrides {
     pub grpc_key_file: Option<String>,
     pub ephemeral: bool,
     pub journal_path: Option<PathBuf>,
+    pub console_listen: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +112,28 @@ impl ResolvedServeConfig {
                 .resolve(overrides.journal_path)?
         };
         let auth = file_config.auth.unwrap_or_default().resolve()?;
-        let console = file_config.console.and_then(|config| config.resolve());
+        let mut console = file_config.console.and_then(|config| config.resolve());
+        if let Some(listen) = overrides
+            .console_listen
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match console.as_mut() {
+                Some(cfg) => cfg.listen = listen.to_owned(),
+                None => {
+                    let public_endpoint = std::env::var("ANYSERVE_PUBLIC_ENDPOINT")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    console = Some(ServeConsoleConfig {
+                        listen: listen.to_owned(),
+                        allowed_origins: Vec::new(),
+                        public_endpoint,
+                    });
+                }
+            }
+        }
         let grpc = GrpcConfig {
             enabled: server.grpc_enabled.unwrap_or(defaults.enabled),
             host: overrides

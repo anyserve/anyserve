@@ -27,6 +27,39 @@ export const IDENTITY_EXCLUDED_METADATA_KEYS = [
   "x-request-id",
 ] as const;
 
+export const MAX_TRACE_HEADER_BYTES = 512;
+
+export function extractTraceHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of IDENTITY_EXCLUDED_METADATA_KEYS) {
+    const raw = headers.get(key);
+    if (!raw) continue;
+    const trimmed = raw.trim();
+    if (trimmed.length > 0 && utf8ByteLen(trimmed) <= MAX_TRACE_HEADER_BYTES) {
+      out[key] = trimmed;
+    }
+  }
+  return out;
+}
+
+export function mergeTraceHeaders(
+  metadata: Record<string, string>,
+  headers: Record<string, string>,
+): void {
+  for (const key of IDENTITY_EXCLUDED_METADATA_KEYS) {
+    const existing = metadata[key];
+    if (existing !== undefined && existing.trim().length > 0) {
+      continue;
+    }
+    const incoming = headers[key];
+    if (!incoming) continue;
+    const trimmed = incoming.trim();
+    if (trimmed.length > 0 && utf8ByteLen(trimmed) <= MAX_TRACE_HEADER_BYTES) {
+      metadata[key] = trimmed;
+    }
+  }
+}
+
 const EXCLUDED_METADATA_SET: ReadonlySet<string> = new Set(
   IDENTITY_EXCLUDED_METADATA_KEYS,
 );

@@ -44,7 +44,14 @@ import {
   type SocketAttachment,
   type SocketKind,
 } from "./host";
-import { DEFAULT_NAMESPACE, decodeScopedId, encodeScopedId, specHash } from "./identity";
+import {
+  DEFAULT_NAMESPACE,
+  decodeScopedId,
+  encodeScopedId,
+  extractTraceHeaders,
+  mergeTraceHeaders,
+  specHash,
+} from "./identity";
 import {
   NativeStore,
   decodeInlineAssignBundle,
@@ -134,6 +141,7 @@ export class NativeEngine implements ConsoleBackend {
   readonly socketsByConnId = new Map<number, NativeWebSocket>();
   readonly socketChains = new Map<number, Promise<void>>();
   readonly pumpingAttempts = new Set<string>();
+  readonly pendingInvokeTraceHeaders = new Map<number, Record<string, string>>();
 
   // Shared runtime byte trackers (for /metrics and /api/overview parity)
   totalInputBytesHeld = 0;
@@ -796,6 +804,12 @@ export class NativeEngine implements ConsoleBackend {
     writeSocketAttachment(pair.server, att);
     this.host.acceptWebSocket(pair.server, [kind]);
     this.socketsByConnId.set(connId, pair.server);
+    if (kind === "invoke") {
+      const traceHeaders = extractTraceHeaders(request.headers);
+      if (Object.keys(traceHeaders).length > 0) {
+        this.pendingInvokeTraceHeaders.set(connId, traceHeaders);
+      }
+    }
 
     // Worker session/attempt handshakes expire at heartbeatTimeoutMs if Hello/Open never arrives!
     if (kind === "session" || kind === "attempt") {
@@ -866,6 +880,9 @@ export class NativeEngine implements ConsoleBackend {
       switch (path) {
         case "/rpc/v2/client/submit": {
           const req = pb.decodeSubmitRequest(rawBody);
+          if (req.spec) {
+            mergeTraceHeaders(req.spec.metadata, extractTraceHeaders(request.headers));
+          }
           const resp = await this.handleSubmitRpc(principal.namespace, req, nowMs);
           return this.protoOkResponse(pb.encodeSubmitResponse(resp));
         }
@@ -1063,6 +1080,7 @@ export class NativeEngine implements ConsoleBackend {
     if (att) {
       this.socketsByConnId.delete(att.connId);
       this.replayStates.delete(att.connId);
+      this.pendingInvokeTraceHeaders.delete(att.connId);
     }
 
     // Complete close handshake cleanly for peer 1005 (plain close without reserved status code)
@@ -2481,6 +2499,14 @@ export class NativeEngine implements ConsoleBackend {
     resultDigest: string | null,
     nowMs: number,
   ): void {
+    if (job.currentLeaseId) {
+      const lease = this.leases.get(job.currentLeaseId);
+      if (lease && lease.concurrencyCounted && job.concurrencyKey.length > 0) {
+        lease.concurrencyCounted = false;
+        this.decConcurrencyKey(job.namespace, job.concurrencyKey);
+      }
+      job.currentLeaseId = null;
+    }
     this.dequeueJobInMemory(job);
     this.totalInputBytesHeld = Math.max(0, this.totalInputBytesHeld - job.totalInputBytes);
 
@@ -2856,6 +2882,16 @@ export class NativeEngine implements ConsoleBackend {
   releaseLeaseInTxn(leaseId: string, _nowMs: number): void {
     const lease = this.leases.get(leaseId);
     if (!lease) return;
+    const job = this.jobs.get(lease.scopedJobId);
+    if (lease.concurrencyCounted) {
+      lease.concurrencyCounted = false;
+      if (job && job.concurrencyKey.length > 0) {
+        this.decConcurrencyKey(job.namespace, job.concurrencyKey);
+      }
+    }
+    if (job && job.currentLeaseId === leaseId) {
+      job.currentLeaseId = null;
+    }
     this.leases.delete(leaseId);
     this.totalResultBytesHeld = Math.max(
       0,

@@ -318,3 +318,37 @@ fn runtime_interface_keys_are_bounded_to_64_non_whitespace_bytes() {
         assert!(err.to_string().contains("1..=64 bytes"), "{err:#}");
     }
 }
+
+#[test]
+fn cli_console_listen_enables_console_or_overrides_config_file() {
+    let without_file = ResolvedServeConfig::load(ServeOverrides {
+        console_listen: Some("0.0.0.0:4010".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let console = without_file.console.unwrap();
+    assert_eq!(console.listen, "0.0.0.0:4010");
+    assert!(console.allowed_origins.is_empty());
+
+    let over_disabled = config(
+        "[console]\nenabled = false\nlisten = '127.0.0.1:3001'\n",
+        ServeOverrides {
+            console_listen: Some("127.0.0.1:3999".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(over_disabled.console.unwrap().listen, "127.0.0.1:3999");
+
+    let over_enabled = config(
+        "[console]\nlisten = '127.0.0.1:3001'\nallowed_origins = ['http://localhost:5173']\n",
+        ServeOverrides {
+            console_listen: Some("127.0.0.1:3888".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let overridden = over_enabled.console.unwrap();
+    assert_eq!(overridden.listen, "127.0.0.1:3888");
+    assert_eq!(overridden.allowed_origins, vec!["http://localhost:5173"]);
+}

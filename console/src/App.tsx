@@ -382,12 +382,13 @@ export default function App() {
     setFilters((f) => ({ ...f, status: nextStatus }));
   }, [jobScope]);
 
-  const jumpToJobs = useCallback((opts: { scope?: JobScope; status?: JobStatusFilter; iface?: string; ns?: string; worker?: string; jobId?: string }) => {
+  const jumpToJobs = useCallback((opts: { scope?: JobScope; status?: JobStatusFilter; iface?: string; ns?: string; worker?: string; jobId?: string; q?: string }) => {
     const scope = opts.scope ?? "all";
     resetExtraJobs();
     if (opts.worker && opts.worker !== "all") rememberWorkers([opts.worker]);
-    setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: "" });
-    setServerSearch("");
+    const nextQ = opts.q ?? "";
+    setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: nextQ });
+    setServerSearch(nextQ.trim());
     setTimeFilter(DEFAULT_TIME_FILTER);
     setPinnedJobByScope((c) => ({ ...c, [scope]: opts.jobId ?? null }));
     if (opts.jobId) setSelectedJobByScope((c) => ({ ...c, [scope]: opts.jobId! }));
@@ -531,6 +532,7 @@ export default function App() {
                   onOpenWorker={openWorker}
                   onOpenInterface={openInterface}
                   onFilterNamespace={filterJobNamespace}
+                  onFilterTrace={(traceId) => jumpToJobs({ scope: "all", q: traceId })}
                 />
               }
             />

@@ -14,7 +14,7 @@ import {
   type NativeWebSocket,
   type SocketAttachment,
 } from "./host";
-import { encodeScopedId, specHash } from "./identity";
+import { encodeScopedId, mergeTraceHeaders, specHash } from "./identity";
 import {
   decodeInlineAssignBundle,
   serializeSpecJson,
@@ -148,6 +148,11 @@ export const clientHandlers = {
   ): Promise<void> {
     if (!start.spec) {
       throw GrpcStatusError.invalidArgument("spec is required");
+    }
+    const pendingTrace = this.pendingInvokeTraceHeaders.get(att.connId);
+    if (pendingTrace) {
+      this.pendingInvokeTraceHeaders.delete(att.connId);
+      mergeTraceHeaders(start.spec.metadata, pendingTrace);
     }
     const normalized = this.normalizeJobSpec(start.spec, "ephemeral");
     const usesLarge = this.specUsesMultiChunkOrR2(normalized.inputs, normalized.params, start.streamingInput);

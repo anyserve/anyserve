@@ -17,3 +17,4 @@ mod generated {
 
 /// Execution protocol: a client API and separate worker control/data streams.
 pub use generated::anyserve::v2;
+pub use prost;

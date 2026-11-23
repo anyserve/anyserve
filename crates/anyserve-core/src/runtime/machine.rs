@@ -358,6 +358,22 @@ impl Inner {
                 );
             }
             job.log.append(None, EventKind::Accepted, now);
+            if let Some(tc) = job
+                .spec
+                .metadata
+                .get("traceparent")
+                .and_then(|v| crate::trace::parse_traceparent(v))
+            {
+                tracing::debug!(
+                    job_id = %job.raw_id,
+                    namespace = %job.namespace,
+                    interface = %job.spec.demand.interface,
+                    trace_id = %tc.trace_id,
+                    parent_span_id = %tc.parent_id,
+                    sampled = tc.sampled,
+                    "job accepted"
+                );
+            }
             if let Some(total) = job.spec.policy.total_timeout {
                 let timer = self.timers.schedule(
                     job.created_at_ms.saturating_add(ms(total)),
@@ -827,6 +843,23 @@ impl Inner {
             finished_leases: Vec::new(),
         };
         let assign = build_assign(st.generation, &job);
+        if let Some(tc) = job
+            .spec
+            .metadata
+            .get("traceparent")
+            .and_then(|v| crate::trace::parse_traceparent(v))
+        {
+            tracing::debug!(
+                job_id = %job.raw_id,
+                namespace = %job.namespace,
+                attempt_id = %assign.attempt_id,
+                worker_id = %job.last_worker_id.as_deref().unwrap_or(""),
+                trace_id = %tc.trace_id,
+                parent_span_id = %tc.parent_id,
+                sampled = tc.sampled,
+                "ephemeral invoke dispatched"
+            );
+        }
         st.leases.insert(
             lease_id,
             Lease {
@@ -1022,6 +1055,24 @@ impl Inner {
             },
             now,
         );
+        if let Some(tc) = job
+            .spec
+            .metadata
+            .get("traceparent")
+            .and_then(|v| crate::trace::parse_traceparent(v))
+        {
+            tracing::debug!(
+                job_id = %job.raw_id,
+                namespace = %job.namespace,
+                attempt_id = %attempt_id,
+                worker_id = %attempt.worker_id,
+                attempt_number = attempt.number,
+                trace_id = %tc.trace_id,
+                parent_span_id = %tc.parent_id,
+                sampled = tc.sampled,
+                "attempt assigned"
+            );
+        }
         if let Some(timeout) = job.spec.policy.execution_timeout {
             let timer = self.timers.schedule(
                 now.saturating_add(ms(timeout)),
@@ -1488,6 +1539,23 @@ impl Inner {
             },
             now,
         );
+        if let Some(tc) = job
+            .spec
+            .metadata
+            .get("traceparent")
+            .and_then(|v| crate::trace::parse_traceparent(v))
+        {
+            tracing::debug!(
+                job_id = %job.raw_id,
+                namespace = %job.namespace,
+                state = ?plan.state,
+                attempt_count = job.attempt_count,
+                trace_id = %tc.trace_id,
+                parent_span_id = %tc.parent_id,
+                sampled = tc.sampled,
+                "job terminal committed"
+            );
+        }
         // A finished ephemeral job keeps only its outcome, as a durable job read
         // back from the journal does, once its current readers are done.
         let mut compacted = if job.durability == Durability::Ephemeral {

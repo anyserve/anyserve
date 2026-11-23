@@ -288,6 +288,8 @@ pub(crate) struct JobEventSummary {
     pub(crate) kind: &'static str,
     pub(crate) created_at_ms: u64,
     pub(crate) payload_size_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) attempt_id: Option<String>,
 }
 #[derive(Serialize)]
 pub(crate) struct WorkerLoadSummary {

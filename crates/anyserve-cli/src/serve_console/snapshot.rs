@@ -282,6 +282,7 @@ pub(crate) fn event_summary(event: &ExecutionEvent) -> JobEventSummary {
         kind,
         created_at_ms: event.at_ms,
         payload_size_bytes,
+        attempt_id: event.attempt_id.clone(),
     }
 }
 

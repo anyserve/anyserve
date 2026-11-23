@@ -13,6 +13,7 @@ import {
   latestAttemptWorker,
 } from "./format";
 import { CopyButton, EmptyState, PanelHeader, StateBadge } from "./pane-tables";
+import { ExecutionWaterfall } from "./trace-waterfall";
 import type { JobDetailResponse, ObjectRefSummary } from "./types";
 
 const LARGE_PAYLOAD_BYTES = 1024;
@@ -262,6 +263,7 @@ export const JobInspector = memo(function JobInspector({
   onOpenWorker,
   onOpenInterface,
   onFilterNamespace,
+  onFilterTrace,
 }: {
   detail: JobDetailResponse | null;
   isCancelling?: boolean;
@@ -269,6 +271,7 @@ export const JobInspector = memo(function JobInspector({
   onOpenWorker?: (workerId: string) => void;
   onOpenInterface?: (interfaceName: string) => void;
   onFilterNamespace?: (namespace: string) => void;
+  onFilterTrace?: (traceId: string) => void;
 }) {
   if (!detail) {
     return <InspectorShell isEmpty emptyTitle="Inspector" emptyHint="Select a job" emptyMessage="Job details appear here." title="" />;
@@ -429,6 +432,9 @@ export const JobInspector = memo(function JobInspector({
       </InspectorGroup>
 
       <InspectorGroup title="Execution">
+        <InspectorSection title="Trace & Waterfall">
+          <ExecutionWaterfall detail={detail} onOpenWorker={onOpenWorker} onFilterTrace={onFilterTrace} />
+        </InspectorSection>
         <InspectorSection title="Attempts">
           {detail.history_incomplete ? <p className="inline-notice" role="status">Incomplete history: earlier execution events are no longer retained.</p> : null}
           <Timeline

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+embed-console = []
+
 [dependencies]
 anyhow.workspace = true
 anyserve-client = { path = "../anyserve-client" }

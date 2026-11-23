@@ -131,7 +131,7 @@ export interface AttemptSummary {
 }
 
 export interface JobEventSummary {
-  sequence: number; kind: EventKind; created_at_ms: number; payload_size_bytes: number;
+  sequence: number; kind: EventKind; created_at_ms: number; payload_size_bytes: number; attempt_id?: string | null;
 }
 
 export interface WorkerLoadSummary {

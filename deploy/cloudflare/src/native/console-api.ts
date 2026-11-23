@@ -271,7 +271,7 @@ export function withCorsHeaders(
   headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   headers.set(
     "Access-Control-Allow-Headers",
-    "Accept, Content-Type, Authorization, x-anyserve-namespace",
+    "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
   );
   const reqOrigin = request.headers.get("Origin");
   if (reqOrigin && allowed.size > 0 && allowed.has(reqOrigin)) {
@@ -1183,6 +1183,7 @@ function formatJobDetailResponse(detail: ConsoleJobDetailResult) {
       kind: ev.kind,
       created_at_ms: ev.atMs,
       payload_size_bytes: ev.payloadSizeBytes,
+      ...(ev.attemptId ? { attempt_id: ev.attemptId } : {}),
     })),
     history_incomplete: historyIncomplete,
     latest_worker: detail.latestWorker,

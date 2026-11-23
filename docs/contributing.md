@@ -9,6 +9,7 @@ Python 3.12+ and Node.js 24+. Run commands from the repository root.
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo test --locked -p anyserve --test rust_ts_differential
 cargo build --locked -p anyserve
 python3 -m venv .venv
 . .venv/bin/activate
@@ -18,6 +19,7 @@ python clients/python/tests/sdk_e2e.py -v
 npm --prefix console ci
 npm --prefix console test
 npm --prefix console run build
+npm --prefix deploy/cloudflare test
 python scripts/check-doc-links.py
 python scripts/check-release-version.py
 ```

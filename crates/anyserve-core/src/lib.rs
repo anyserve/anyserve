@@ -6,6 +6,7 @@ pub mod http_ws_service;
 pub mod journal;
 mod postgres;
 pub mod runtime;
+pub mod trace;
 pub mod worker_service;
 
 /// Milliseconds since the Unix epoch for persisted record timestamps.

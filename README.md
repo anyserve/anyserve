@@ -13,7 +13,7 @@ Clients ── gRPC / WSS ──▶ Control plane (leader or Cloudflare DO) ◀�
 - **Execution**: `Invoke` (ephemeral, optional full-duplex streaming; drop cancels) and `Submit` (durable by default, crash recovery, `job_id` idempotency, bounded at-least-once retries; exposed streamed output never silently switches attempts).
 - **Placement & backpressure**: Interface matching, `namespace` isolation, `pool` tiers with spillover, `affinity_key` sticky routing, priority + `fairness_key` queueing, `concurrency_key` serialization, required/preferred attributes, resource capacity, worker credits, and bounded memory budgets.
 - **Outbound SDKs**: Python 3.12+ and Rust SDKs over gRPC (`http(s)://`) or WebSocket (`ws(s)://`)—workers dial out and need no inbound port. Ready-made inference connectors (vLLM, Ollama, Triton, YOLO, VLA) live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
-- **Operations**: Client/worker/scoped-tenant bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job ls|inspect|cancel`), and a React Console with DuckDB-WASM Explore.
+- **Operations**: Client/worker/scoped-tenant bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job ls|inspect|cancel`), and a React Console with W3C Trace Waterfall and DuckDB-WASM Explore (optional single-binary embedding via `--features embed-console`).
 
 ## Quick start
 
@@ -39,7 +39,7 @@ python examples/python/submit.py
 
 - Pass `--ephemeral` to disable persistence, or `--journal PATH` for a custom SQLite path.
 - Set `ANYSERVE_ENDPOINT` (default `http://127.0.0.1:50052`; supports `http(s)://`, `ws(s)://`, or comma-separated leader lists) and role-specific `ANYSERVE_TOKEN` for remote access.
-- Rust equivalent: [examples/rust](examples/rust). Browser Console (proxies `/api` to `:3001`): `npm --prefix console ci && npm --prefix console run dev`.
+- Rust equivalent: [examples/rust](examples/rust). Browser Console (proxies `/api` to `:3001`): `npm --prefix console ci && npm --prefix console run dev` (or build with `--features embed-console` and `--console-listen 127.0.0.1:3001` to serve it from the binary).
 
 ## Deployment modes
 

@@ -1,4 +1,6 @@
 mod api;
+#[cfg(any(feature = "embed-console", test))]
+mod embedded_ui;
 mod handlers;
 mod metrics;
 mod snapshot;

@@ -413,6 +413,51 @@ td.ellipsis, th.ellipsis { display: table-cell; }
 .timeline__subtitle, .timeline__meta { margin-top: 2px; color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
 .timeline__error { margin-top: 5px; padding: 5px 8px; border-radius: 6px; background: var(--red-soft); color: var(--red); font-size: 11.5px; font-family: var(--mono); word-break: break-word; }
 
+/* ---- Trace & Execution Waterfall ---- */
+.waterfall-block { display: flex; flex-direction: column; gap: 9px; }
+.trace-banner { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-2); }
+.trace-banner__row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.trace-banner__label { color: var(--muted); font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.trace-banner__id { font-size: 11.5px; max-width: 100%; overflow-wrap: anywhere; text-align: left; }
+.tag--ok { background: var(--green-soft); color: var(--green); }
+
+.waterfall { display: flex; flex-direction: column; gap: 7px; }
+.waterfall__summary { display: flex; flex-wrap: wrap; gap: 6px; }
+.waterfall__metric {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--card-2);
+  color: var(--muted); font-size: 11px;
+}
+.waterfall__metric strong { color: var(--fg); font-family: var(--mono); font-weight: 600; }
+
+.waterfall__rows { display: flex; flex-direction: column; gap: 5px; }
+.waterfall__row { display: grid; grid-template-columns: minmax(96px, 128px) minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.waterfall__label { display: flex; flex-direction: column; min-width: 0; font-size: 11.5px; line-height: 1.25; }
+.waterfall__span-name { color: var(--fg-2); font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.waterfall__worker { font-size: 10.5px; color: var(--muted); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.waterfall__track {
+  position: relative; height: 14px; border-radius: 4px;
+  background: var(--pill); border: 1px solid var(--line-2); overflow: hidden;
+}
+.waterfall__bar { position: absolute; top: 2px; bottom: 2px; border-radius: 3px; min-width: 3px; }
+.waterfall__bar--job { background: var(--accent); opacity: 0.88; }
+.waterfall__bar--queue { background: var(--faint); opacity: 0.75; }
+.waterfall__bar--running { background: var(--accent); }
+.waterfall__bar--succeeded { background: var(--green); }
+.waterfall__bar--failed { background: var(--red); }
+.waterfall__bar--cancelled { background: var(--red); opacity: 0.72; }
+.waterfall__bar--restarted { background: var(--amber); }
+
+.waterfall__marker {
+  position: absolute; top: 1px; bottom: 1px; width: 2px; transform: translateX(-1px);
+  border-radius: 1px; pointer-events: none;
+}
+.waterfall__marker--progress { background: var(--fg-2); opacity: 0.55; }
+.waterfall__marker--output { background: var(--fg); opacity: 0.85; }
+.waterfall__marker--ttfo { width: 3px; background: var(--amber); opacity: 1; }
+.waterfall__dur { color: var(--muted); font-size: 11px; font-family: var(--mono); white-space: nowrap; }
+
 .empty { display: flex; align-items: center; justify-content: center; min-height: 180px; padding: 20px; color: var(--muted); font-size: 12.5px; text-align: center; }
 .empty--stack { flex-direction: column; gap: 10px; }
 .empty--stack p { margin: 0; }

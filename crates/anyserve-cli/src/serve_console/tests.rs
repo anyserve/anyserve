@@ -1664,3 +1664,62 @@ async fn overview_omits_recommended_poll_ms_when_none_and_serializes_when_some()
     let some_val = serde_json::to_value(make_summary(Some(10_000))).unwrap();
     assert_eq!(some_val["recommended_poll_ms"], json!(10_000));
 }
+
+#[cfg(feature = "embed-console")]
+#[tokio::test]
+async fn embedded_console_serves_ui_and_assets_while_preserving_auth_and_api_404s() {
+    let runtime = test_runtime().await;
+    let auth = AuthPolicy::new(vec!["op-token".into()], vec!["wk-token".into()]);
+    let c = spawn_console_auth(runtime, auth).await;
+
+    // Public UI entry points serve index.html without requiring an auth token.
+    for path in ["/", "/jobs", "/explore"] {
+        let resp = c.send(Method::GET, path, None).await;
+        assert_eq!(resp.status().as_u16(), 200, "GET {path}");
+        assert_eq!(
+            resp.headers()["content-type"],
+            "text/html; charset=utf-8",
+            "GET {path}"
+        );
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
+        assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+        let html = resp.text().await.unwrap();
+        assert!(html.contains("<div id=\"root\">"), "GET {path}: {html}");
+    }
+
+    // Embedded DuckDB-WASM .wasm.bin asset must NOT carry Content-Encoding: gzip.
+    let wasm_asset = super::embedded_ui::EMBEDDED_CONSOLE_ASSETS
+        .iter()
+        .find(|asset| asset.path.ends_with(".wasm.bin"))
+        .expect("embedded .wasm.bin asset");
+    let wasm_resp = c.send(Method::GET, wasm_asset.path, None).await;
+    assert_eq!(wasm_resp.status().as_u16(), 200);
+    assert_eq!(
+        wasm_resp.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        wasm_resp.headers()["cache-control"],
+        "public, max-age=31536000, immutable"
+    );
+    assert!(
+        wasm_resp
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .is_none(),
+        ".wasm.bin must not send Content-Encoding: gzip"
+    );
+
+    // Control-plane API remains protected and unknown /api/* paths return 404 (not HTML).
+    assert_eq!(c.status(Method::GET, "/api/overview", None).await, 401);
+    assert_eq!(
+        c.status(Method::GET, "/api/overview", Some("op-token"))
+            .await,
+        200
+    );
+    assert_eq!(
+        c.status(Method::GET, "/api/unknown", Some("op-token"))
+            .await,
+        404
+    );
+}

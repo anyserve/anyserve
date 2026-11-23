@@ -30,6 +30,17 @@ fn request_namespace<T>(request: &Request<T>) -> Result<String, Status> {
     }
 }
 
+fn merge_grpc_trace_headers(
+    spec: Option<&mut pb::JobSpec>,
+    headers: &tonic::metadata::MetadataMap,
+) {
+    if let Some(spec) = spec {
+        crate::trace::merge_trace_headers_into_proto(&mut spec.metadata, |key| {
+            headers.get(key).and_then(|value| value.to_str().ok())
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct ClientGrpcService {
     runtime: Runtime,
@@ -49,7 +60,9 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<pb::SubmitResponse>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
-        submit_request(&self.runtime, namespace, request.into_inner())
+        let (headers, _, mut inner) = request.into_parts();
+        merge_grpc_trace_headers(inner.spec.as_mut(), &headers);
+        submit_request(&self.runtime, namespace, inner)
             .await
             .map(Response::new)
     }
@@ -61,8 +74,8 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<Self::InvokeStream>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
-        let mut incoming = request.into_inner();
-        let start = match incoming.message().await?.and_then(|message| message.msg) {
+        let (headers, _, mut incoming) = request.into_parts();
+        let mut start = match incoming.message().await?.and_then(|message| message.msg) {
             Some(pb::invoke_request::Msg::Start(start)) => start,
             _ => {
                 return Err(Status::invalid_argument(
@@ -70,6 +83,7 @@ impl Client for ClientGrpcService {
                 ));
             }
         };
+        merge_grpc_trace_headers(start.spec.as_mut(), &headers);
         let mut execution = start_invoke(&self.runtime, namespace, start).await?;
         let input = execution.take_input();
         let stream = async_stream::try_stream! {

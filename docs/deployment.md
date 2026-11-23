@@ -164,7 +164,10 @@ npm --prefix console run build
 Serve `console/dist` from a static web server with an `index.html` fallback for
 `/queue`, `/workers`, `/history` and `/explore`. Reverse-proxy `/api` to the
 management listener on port 3001; this keeps browser API requests on the same
-origin. For a separate API origin, set `VITE_CONSOLE_API_BASE_URL` at build time
+origin. For single-binary deployments without a separate web server, build with
+`cargo build --locked -p anyserve --features embed-console` (after building
+`console/dist`) and start `anyserve serve --console-listen 127.0.0.1:3001`.
+For a separate API origin, set `VITE_CONSOLE_API_BASE_URL` at build time
 and include the frontend origin in `[console].allowed_origins`.
 
 Use an operator token from `[auth].client_tokens` at the Console sign-in prompt
