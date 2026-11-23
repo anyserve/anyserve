@@ -22,6 +22,7 @@ import {
   type NativeR2Bucket,
   type NativeRuntimeOverrides,
 } from "./host";
+import { utf8ByteLen } from "./utf8";
 
 const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
@@ -152,6 +153,62 @@ export function joinU64(hi: number | null | undefined, lo: number | null | undef
     return 0n;
   }
   return ((BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0));
+}
+
+export interface InlineAssignInput {
+  body: { case: "uri"; value: string } | { case: "inline"; value: Uint8Array };
+  metadata: Record<string, string>;
+}
+
+export interface InlineAssignBundle {
+  inputs: InlineAssignInput[];
+  params: Uint8Array;
+  /** Payload bytes the Assign message would carry (inline data + URIs + metadata + params). */
+  bytes: number;
+}
+
+/**
+ * Decodes `static_in` bundle rows into the inline `Assign` payload. Returns `null` when any entry
+ * references R2 (`r2`/`pr2`/`segs`), i.e. the inputs cannot ride inline in the Assign message.
+ */
+export function decodeInlineAssignBundle(
+  rows: Iterable<{ manifest: string; pack_blob?: unknown; packBlob?: Uint8Array | null }>,
+): InlineAssignBundle | null {
+  let bytes = 0;
+  const inputs: InlineAssignInput[] = [];
+  let params: Uint8Array = new Uint8Array(0);
+  for (const r of rows) {
+    const entries = JSON.parse(r.manifest) as BundleManifestEntry[];
+    const raw = r.packBlob ?? r.pack_blob;
+    const blob = raw ? normalizeBlob(raw) : new Uint8Array(0);
+    for (const e of entries) {
+      if (e.t === "r2" || e.t === "pr2" || e.t === "segs") {
+        return null;
+      }
+      if (e.t === "u") {
+        const meta = e.m ?? {};
+        bytes += utf8ByteLen(e.u) + metadataBytes(meta);
+        inputs.push({ body: { case: "uri", value: e.u }, metadata: meta });
+      } else if (e.t === "i") {
+        const meta = e.m ?? {};
+        const slice = blob.slice(e.o, e.o + e.l);
+        bytes += slice.byteLength + metadataBytes(meta);
+        inputs.push({ body: { case: "inline", value: slice }, metadata: meta });
+      } else if (e.t === "p") {
+        params = blob.slice(e.o, e.o + e.l);
+        bytes += params.byteLength;
+      }
+    }
+  }
+  return { inputs, params, bytes };
+}
+
+function metadataBytes(m: Record<string, string>): number {
+  let sum = 0;
+  for (const k in m) {
+    sum += utf8ByteLen(k) + utf8ByteLen(m[k]!);
+  }
+  return sum;
 }
 
 export function normalizeBlob(val: unknown): Uint8Array {
@@ -1327,7 +1384,7 @@ export class NativeStore {
         offset += params.byteLength;
       }
       const manifest = JSON.stringify(entries);
-      const manifestByteLen = utf8Encoder.encode(manifest).byteLength;
+      const manifestByteLen = utf8ByteLen(manifest);
       if (
         manifestByteLen <= BUNDLE_MANIFEST_MAX_BYTES &&
         manifestByteLen + packBlob.byteLength <= BUNDLE_INLINE_MAX_BYTES
@@ -1476,7 +1533,7 @@ export class NativeStore {
             await flushPendingPackToR2();
           } else {
             // Check whether keeping trailing pack inline fits alongside manifest; if not, flush to R2.
-            const estManifest = utf8Encoder.encode(JSON.stringify(allEntries)).byteLength + 64 * pendingPackParts.length;
+            const estManifest = utf8ByteLen(JSON.stringify(allEntries)) + 64 * pendingPackParts.length;
             if (
               estManifest <= BUNDLE_MANIFEST_MAX_BYTES &&
               estManifest + pendingPackBytes <= BUNDLE_INLINE_MAX_BYTES
@@ -1616,7 +1673,7 @@ export class NativeStore {
           ...(meta ? { m: meta } : {}),
         });
         const newManifest = JSON.stringify(entries);
-        const newManifestBytes = utf8Encoder.encode(newManifest).byteLength;
+        const newManifestBytes = utf8ByteLen(newManifest);
         const newBlobBytes = prevBlob.byteLength + data.byteLength;
         if (
           newManifestBytes <= BUNDLE_MANIFEST_MAX_BYTES &&
@@ -1992,7 +2049,7 @@ function splitManifestRows(
   trailingInlineBlob: Uint8Array | null,
 ): PreparedBundleRow[] {
   const fullManifest = JSON.stringify(allEntries);
-  const fullBytes = utf8Encoder.encode(fullManifest).byteLength;
+  const fullBytes = utf8ByteLen(fullManifest);
   const blobLen = trailingInlineBlob?.byteLength ?? 0;
   if (
     fullBytes <= BUNDLE_MANIFEST_MAX_BYTES &&
@@ -2015,7 +2072,7 @@ function splitManifestRows(
 
   for (let i = 0; i < allEntries.length; i++) {
     const entry = allEntries[i]!;
-    const itemBytes = utf8Encoder.encode(JSON.stringify(entry)).byteLength + 1;
+    const itemBytes = utf8ByteLen(JSON.stringify(entry)) + 1;
     const isInlineEntry = entry.t === "i" || entry.t === "p";
     // Keep all inline entries pointing into trailingInlineBlob together on the last row.
     if (
@@ -2082,7 +2139,7 @@ function packInlineMultiRows(
         u: obj.uri ?? "",
         ...(meta ? { m: meta } : {}),
       };
-      const entryLen = utf8Encoder.encode(JSON.stringify(entry)).byteLength + 1;
+      const entryLen = utf8ByteLen(JSON.stringify(entry)) + 1;
       if (
         curEntries.length > 0 &&
         (curManifestBytes + entryLen > BUNDLE_MANIFEST_MAX_BYTES ||
@@ -2101,7 +2158,7 @@ function packInlineMultiRows(
       l: data.byteLength,
       ...(meta ? { m: meta } : {}),
     };
-    const entryLen = utf8Encoder.encode(JSON.stringify(entry)).byteLength + 1;
+    const entryLen = utf8ByteLen(JSON.stringify(entry)) + 1;
     if (
       curEntries.length > 0 &&
       (curManifestBytes + entryLen > BUNDLE_MANIFEST_MAX_BYTES ||
@@ -2125,7 +2182,7 @@ function packInlineMultiRows(
       o: curBlobBytes,
       l: params.byteLength,
     };
-    const entryLen = utf8Encoder.encode(JSON.stringify(entry)).byteLength + 1;
+    const entryLen = utf8ByteLen(JSON.stringify(entry)) + 1;
     if (
       curEntries.length > 0 &&
       (curManifestBytes + entryLen > BUNDLE_MANIFEST_MAX_BYTES ||
