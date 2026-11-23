@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { GrpcCode } from "../src/native/auth";
-import { NativeEngine, RUNTIME_CODES, rendezvousHash64 } from "../src/native/engine";
+import { CONN_SEQ_BLOCK, NativeEngine, RUNTIME_CODES, rendezvousHash64 } from "../src/native/engine";
+import { utf8ByteLen } from "../src/native/utf8";
 import { parseSpecJson, serializeSpecJson } from "../src/native/store";
 import {
   ATTACHMENT_MAX_BYTES,
@@ -9,6 +10,9 @@ import {
   LARGE_SEND_CAP_BYTES,
   UPLOAD_SEGMENT_BYTES,
   WELCOME_MAX_CHUNK_BYTES,
+  readSocketAttachment,
+  writeSocketAttachment,
+  type SocketAttachment,
   WS_MAX_ENCODED_BYTES,
   WS_READY_STATE_CLOSED,
   WS_READY_STATE_OPEN,
@@ -31,6 +35,19 @@ import {
   specHash,
 } from "../src/native/identity";
 import * as pb from "../src/native/proto";
+
+// Counts WorkerMessage decodes so tests can assert the engine decodes each inbound control frame ONCE.
+const decodeCounters = vi.hoisted(() => ({ workerMessage: 0 }));
+vi.mock("../src/native/proto", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/native/proto")>();
+  return {
+    ...actual,
+    decodeWorkerMessage: (bytes: Uint8Array) => {
+      decodeCounters.workerMessage += 1;
+      return actual.decodeWorkerMessage(bytes);
+    },
+  };
+});
 
 // Mock `cloudflare:workers` so `src/native-do.ts` (`AnyserveNativeDO`) can be exercised directly in Node 24 Vitest.
 vi.mock("cloudflare:workers", () => {
@@ -2329,23 +2346,15 @@ describe("Reference-job per-step row accounting & cold-wake zero-write Heartbeat
 
     // Reference job full lifecycle (incl. secondary index maintenance & alarms & purge) stays in ~22-30 rows!
     expect(submitAndAssignWrites).toBeGreaterThanOrEqual(8);
-    expect(openWrites).toBeLessThanOrEqual(3);
+    // conn_seq is block-allocated (one meta write per CONN_SEQ_BLOCK ids), so the attempt upgrade writes
+    // only the lease row (previously 2 = lease + standalone conn_seq upsert).
+    expect(openWrites).toBeLessThanOrEqual(1);
     expect(resultAndFinishWrites).toBeLessThanOrEqual(9);
     expect(purgeWrites).toBeLessThanOrEqual(10);
     expect(totalLifecycleWrites).toBeGreaterThanOrEqual(20);
-    expect(totalLifecycleWrites).toBeLessThanOrEqual(30);
+    expect(totalLifecycleWrites).toBeLessThanOrEqual(29); // baseline before optimisation: 30
+    expect(platform.storage.totalRowsRead - readsStart).toBeLessThanOrEqual(30); // baseline: 32
     expect(platform.r2!.putCount).toBe(0);
-    console.info(
-      "REFJOB_METRICS " +
-        JSON.stringify({
-          submitAndAssignWrites,
-          openWrites,
-          resultAndFinishWrites,
-          purgeWrites,
-          totalLifecycleWrites,
-          totalRowsReadSinceStart: platform.storage.totalRowsRead - readsStart,
-        }),
-    );
   });
 });
 
@@ -4177,5 +4186,364 @@ describe("Size boundaries (2 MiB Invoke, 8 MiB object, 32 MiB WS boundary), admi
     expect(metricsTxt).toContain("anyserve_native_database_size_bytes ");
     expect(metricsTxt).toContain("anyserve_native_quota_r2_class_a ");
     expect(metricsTxt).toContain("anyserve_native_quota_r2_class_b ");
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Hot-path optimisations (attachment cache, conn_seq blocks, single decode, inline-assign cache,
+// static_in manifest cache, zero-alloc UTF-8 length)
+// ---------------------------------------------------------------------------
+
+function sqlStatementLog(platform: SimulatedNativePlatform): Array<{ query: string; bindings: unknown[] }> {
+  const log: Array<{ query: string; bindings: unknown[] }> = [];
+  const sql = platform.storage.sql as unknown as {
+    exec: (query: string, ...bindings: unknown[]) => unknown;
+  };
+  const orig = sql.exec.bind(sql);
+  sql.exec = (query: string, ...bindings: unknown[]) => {
+    log.push({ query, bindings });
+    return orig(query, ...bindings);
+  };
+  return log;
+}
+
+function metaConnSeq(platform: SimulatedNativePlatform): number {
+  return Number(
+    platform.storage.sql
+      .exec<{ value: string }>(`SELECT value FROM native_runtime_meta WHERE key = 'conn_seq'`)
+      .toArray()[0]!.value,
+  );
+}
+
+describe("zero-allocation utf8ByteLen", () => {
+  it("matches TextEncoder byte length for ASCII, 2/3/4-byte code points and lone surrogates", () => {
+    const samples = ["", "abc", "héllo", "日本語", "😀 emoji", "a\ud800b", "\udc00", "x\ud83d", "\ud83d\ude00\ud83d", "k".repeat(1000)];
+    for (const str of samples) {
+      expect(utf8ByteLen(str), JSON.stringify(str)).toBe(utf8Encoder.encode(str).byteLength);
+    }
+  });
+});
+
+describe("SocketAttachment cache (host.ts)", () => {
+  function makeWrapper(shared: { json: string | null }) {
+    const counters = { serialize: 0, deserialize: 0 };
+    const ws = {
+      serializeAttachment(a: unknown) {
+        counters.serialize += 1;
+        shared.json = JSON.stringify(a);
+      },
+      deserializeAttachment() {
+        counters.deserialize += 1;
+        return shared.json === null ? null : JSON.parse(shared.json);
+      },
+      readyState: WS_READY_STATE_OPEN,
+      bufferedAmount: 0,
+      send() {},
+      close() {},
+    };
+    return { ws: ws as unknown as NativeWebSocket, counters };
+  }
+  const att: SocketAttachment = {
+    kind: "session",
+    connId: 7,
+    id: "s-1",
+    namespace: "default",
+    forcedPool: null,
+    handshakeDone: 1,
+    openedAtMs: 10,
+    lastSeenAtMs: 20,
+    queued: 1,
+    running: 2,
+    utilization: 0.1234567891,
+    replay: 0,
+  };
+
+  it("serves reads from the cache after a write and equals the deserialized round-trip", () => {
+    const shared = { json: null as string | null };
+    const { ws, counters } = makeWrapper(shared);
+    writeSocketAttachment(ws, att);
+    const first = readSocketAttachment(ws)!;
+    for (let i = 0; i < 50; i++) {
+      expect(readSocketAttachment(ws)).toBe(first);
+    }
+    expect(counters.deserialize).toBe(0);
+    // canonical form: identical to what a cold deserialize would produce (utilization rounded to 6 dp)
+    const cold = makeWrapper(shared);
+    expect(readSocketAttachment(cold.ws)).toEqual(first);
+    expect(first.utilization).toBe(0.123457);
+    expect(Object.isFrozen(first)).toBe(true);
+  });
+
+  it("falls back to deserialize on a recreated wrapper (post-hibernation), fills once, and follows later writes", () => {
+    const shared = { json: null as string | null };
+    const a = makeWrapper(shared);
+    writeSocketAttachment(a.ws, att);
+
+    const b = makeWrapper(shared); // wrapper object recreated after hibernation: cache miss
+    const viaB = readSocketAttachment(b.ws)!;
+    expect(b.counters.deserialize).toBe(1);
+    expect(viaB.connId).toBe(7);
+    expect(readSocketAttachment(b.ws)).toBe(viaB);
+    expect(b.counters.deserialize).toBe(1);
+
+    writeSocketAttachment(b.ws, { ...att, lastSeenAtMs: 99, running: 0 });
+    expect(readSocketAttachment(b.ws)!.lastSeenAtMs).toBe(99);
+    expect(readSocketAttachment(b.ws)!.running).toBe(0);
+    expect(b.counters.deserialize).toBe(1);
+
+    const c = makeWrapper({ json: null });
+    expect(readSocketAttachment(c.ws)).toBeNull();
+  });
+
+  it("still enforces the 256-byte attachment cap and never caches a rejected write", () => {
+    const shared = { json: null as string | null };
+    const { ws } = makeWrapper(shared);
+    writeSocketAttachment(ws, att);
+    expect(() => writeSocketAttachment(ws, { ...att, id: "x".repeat(300) })).toThrow(/exceeds/);
+    expect(readSocketAttachment(ws)!.id).toBe("s-1");
+  });
+
+  it("Heartbeats and console reads never call deserializeAttachment once the socket attachment is cached", async () => {
+    const platform = new SimulatedNativePlatform();
+    const { ws: sessionWs } = await connectWorkerSession(platform, { workerId: "w-cache", interfaces: ["c.v1"] });
+    const deserialize = vi.spyOn(sessionWs.server, "deserializeAttachment");
+    for (let i = 0; i < 5; i++) {
+      await sessionWs.sendBinary(
+        pb.encodeWorkerMessage({
+          msg: { case: "heartbeat", value: { load: { queued: i, running: 1, utilization: 0.5, custom: {} } } },
+        }),
+      );
+    }
+    const ov = await platform.engine.fetch(new Request("https://anyserve.example.com/api/overview"));
+    expect(ov.status).toBe(200);
+    await platform.engine.fetch(new Request("https://anyserve.example.com/api/workers"));
+    expect(deserialize).not.toHaveBeenCalled();
+    // attachment reflects the latest heartbeat
+    expect(readSocketAttachment(sessionWs.server)!.queued).toBe(4);
+  });
+});
+
+describe("conn_seq block allocation", () => {
+  it("persists conn_seq once per CONN_SEQ_BLOCK ids and never reuses ids across hibernation", async () => {
+    expect(CONN_SEQ_BLOCK).toBe(64);
+    const platform = new SimulatedNativePlatform();
+    expect(metaConnSeq(platform)).toBe(0);
+    const writesBefore = platform.storage.totalRowsWritten;
+    const ids: number[] = [];
+    for (let i = 0; i < CONN_SEQ_BLOCK + 1; i++) {
+      const up = await platform.openWs("/ws/v2/client/watch");
+      expect(up.status).toBe(101);
+      ids.push(readSocketAttachment(up.client!.server)!.connId);
+      await up.client!.closeClean();
+      if (i === 0) {
+        expect(metaConnSeq(platform)).toBe(CONN_SEQ_BLOCK);
+      }
+    }
+    expect(ids).toEqual(Array.from({ length: CONN_SEQ_BLOCK + 1 }, (_, i) => i + 1));
+    // 65 upgrades => exactly 2 meta writes (ids 1 and 65 cross the ceiling), not 65
+    expect(platform.storage.totalRowsWritten - writesBefore).toBe(2);
+    expect(metaConnSeq(platform)).toBe(2 * CONN_SEQ_BLOCK);
+
+    // Wake: ids resume strictly above the persisted ceiling (all earlier ids may have been issued).
+    platform.simulateHibernation();
+    const up = await platform.openWs("/ws/v2/client/watch");
+    const idAfterWake = readSocketAttachment(up.client!.server)!.connId;
+    expect(idAfterWake).toBeGreaterThan(2 * CONN_SEQ_BLOCK);
+    expect(metaConnSeq(platform)).toBeGreaterThanOrEqual(idAfterWake);
+    const up2 = await platform.openWs("/ws/v2/client/watch");
+    expect(readSocketAttachment(up2.client!.server)!.connId).toBe(idAfterWake + 1);
+  });
+
+  it("resumes above the highest live attachment/session/lease connection id even if the meta ceiling is stale", async () => {
+    const platform = new SimulatedNativePlatform();
+    const { ws: sessionWs } = await connectWorkerSession(platform, { interfaces: ["cs.v1"] });
+    const live = readSocketAttachment(sessionWs.server)!.connId;
+    // Simulate a lost meta write: force the persisted ceiling below a live id.
+    platform.storage.sql.exec(`UPDATE native_runtime_meta SET value = '0' WHERE key = 'conn_seq'`);
+    platform.simulateHibernation();
+    const up = await platform.openWs("/ws/v2/client/watch");
+    expect(readSocketAttachment(up.client!.server)!.connId).toBeGreaterThan(live);
+  });
+});
+
+describe("single WorkerMessage decode per inbound session frame", () => {
+  it("decodes Hello, Heartbeat and non-heartbeat control messages exactly once", async () => {
+    const platform = new SimulatedNativePlatform();
+    const before = decodeCounters.workerMessage;
+    const { ws } = await connectWorkerSession(platform, { workerId: "w-once", interfaces: ["once.v1"] });
+    expect(decodeCounters.workerMessage - before).toBe(1); // Hello
+
+    const hb = decodeCounters.workerMessage;
+    await ws.sendBinary(
+      pb.encodeWorkerMessage({ msg: { case: "heartbeat", value: { load: { queued: 0, running: 0, utilization: 0, custom: {} } } } }),
+    );
+    expect(decodeCounters.workerMessage - hb).toBe(1);
+
+    const credit = decodeCounters.workerMessage;
+    await ws.sendBinary(pb.encodeWorkerMessage({ msg: { case: "credit", value: { freeSlots: 3 } } }));
+    expect(decodeCounters.workerMessage - credit).toBe(1);
+    const sessionRow = platform.storage.sql
+      .exec<{ reported_free: number }>(`SELECT reported_free FROM native_sessions`)
+      .toArray()[0]!;
+    expect(sessionRow.reported_free).toBe(3); // the single decode was still delivered to the handler
+  });
+});
+
+describe("protoOkResponse body handling", () => {
+  it("returns exact bytes for buffer-spanning arrays and for subarray views", async () => {
+    const platform = new SimulatedNativePlatform();
+    const respond = (bytes: Uint8Array) =>
+      (platform.engine as unknown as { protoOkResponse(b: Uint8Array): Response }).protoOkResponse(bytes);
+    const spanning = Uint8Array.from([1, 2, 3, 4, 5]);
+    const r1 = respond(spanning);
+    expect(r1.status).toBe(200);
+    expect(r1.headers.get("content-type")).toBe("application/x-protobuf");
+    expect(Array.from(new Uint8Array(await r1.arrayBuffer()))).toEqual([1, 2, 3, 4, 5]);
+
+    const backing = Uint8Array.from([9, 9, 1, 2, 3, 9, 9]);
+    const view = backing.subarray(2, 5);
+    const r2 = respond(view);
+    expect(Array.from(new Uint8Array(await r2.arrayBuffer()))).toEqual([1, 2, 3]);
+
+    const big = makeDeterministicBytes(3 * 1024 * 1024, 5);
+    const r3 = respond(big);
+    expect(buffersEqual(new Uint8Array(await r3.arrayBuffer()), big)).toBe(true);
+  });
+});
+
+describe("transient small-inline-input cache on queued jobs", () => {
+  const inputs24: pb.ProtoObjectInput[] = Array.from({ length: 24 }, (_, i) => ({
+    body: { case: "inline" as const, value: Uint8Array.of(65 + (i % 26)) },
+    metadata: { i: String(i) },
+  }));
+  const submit24 = (platform: SimulatedNativePlatform, jobId: string) =>
+    platform.unaryPost(
+      "/rpc/v2/client/submit",
+      pb.encodeSubmitRequest({
+        jobId,
+        spec: {
+          demand: { interface: "inl.v1" },
+          inputs: inputs24,
+          params: utf8Encoder.encode("{\"p\":1}"),
+          metadata: {},
+        },
+        conflictPolicy: pb.ConflictPolicy.FAIL,
+      }),
+    );
+  const expectAssignInputs = (assign: pb.Assign) => {
+    expect(assign.inputsViaAttempt).toBe(false);
+    expect(assign.inlineInputs).toHaveLength(24);
+    assign.inlineInputs.forEach((inp, i) => {
+      expect(inp.body.case).toBe("inline");
+      expect(Array.from((inp.body as { value: Uint8Array }).value)).toEqual([65 + (i % 26)]);
+      expect(inp.metadata).toEqual({ i: String(i) });
+    });
+    expect(utf8Decoder.decode(assign.params)).toBe("{\"p\":1}");
+  };
+  const bundleSelects = (log: Array<{ query: string }>) =>
+    log.filter((e) => /native_object_bundles/.test(e.query) && /^\s*SELECT/i.test(e.query));
+
+  it("dispatches a freshly accepted small job without re-reading its bundle, then drops the cache", async () => {
+    const platform = new SimulatedNativePlatform();
+    const { ws: sessionWs } = await connectWorkerSession(platform, { interfaces: ["inl.v1"] });
+    const log = sqlStatementLog(platform);
+    const res = await submit24(platform, "inl-hot");
+    expect(res.status).toBe(200);
+    expect(bundleSelects(log)).toHaveLength(0);
+    expectAssignInputs(extractAssigns(sessionWs)[0]!);
+    expect(platform.engine.inlineAssignCacheBytes).toBe(0);
+  });
+
+  it("holds the payload only while queued, loses it on hibernation, and falls back to SQLite identically", async () => {
+    const platform = new SimulatedNativePlatform();
+    expect((await submit24(platform, "inl-queued")).status).toBe(200); // no worker => stays queued
+    expect(platform.engine.inlineAssignCacheBytes).toBeGreaterThan(0);
+
+    platform.simulateHibernation(); // cache is memory-only
+    expect(platform.engine.inlineAssignCacheBytes).toBe(0);
+    const log = sqlStatementLog(platform);
+    const { ws: sessionWs } = await connectWorkerSession(platform, { interfaces: ["inl.v1"] });
+    expect(bundleSelects(log).length).toBeGreaterThan(0); // SQLite fallback read
+    expectAssignInputs(extractAssigns(sessionWs)[0]!);
+  });
+
+  it("releases the cached bytes when a queued job is cancelled and bounds total cached bytes", async () => {
+    const platform = new SimulatedNativePlatform();
+    expect((await submit24(platform, "inl-cancel")).status).toBe(200);
+    const held = platform.engine.inlineAssignCacheBytes;
+    expect(held).toBeGreaterThan(0);
+    const cancel = await platform.unaryPost(
+      "/rpc/v2/client/cancel",
+      pb.encodeCancelRequest({ jobId: "inl-cancel", reason: "test" }),
+    );
+    expect(pb.decodeJob(cancel.bytes).state).toBe(pb.JobState.CANCELLED);
+    expect(platform.engine.inlineAssignCacheBytes).toBe(0);
+
+    // many queued 60 KiB jobs cannot grow the transient cache beyond INLINE_ASSIGN_CACHE_MAX_BYTES
+    const blob = makeDeterministicBytes(60 * 1024, 9);
+    for (let i = 0; i < 100; i++) {
+      const r = await platform.unaryPost(
+        "/rpc/v2/client/submit",
+        pb.encodeSubmitRequest({
+          jobId: `inl-big-${i}`,
+          spec: {
+            demand: { interface: "inl.v1" },
+            inputs: [{ body: { case: "inline" as const, value: blob }, metadata: {} }],
+            params: new Uint8Array(0),
+            metadata: {},
+          },
+          conflictPolicy: pb.ConflictPolicy.FAIL,
+        }),
+      );
+      expect(r.status).toBe(200);
+    }
+    expect(platform.engine.inlineAssignCacheBytes).toBeLessThanOrEqual(4 * 1024 * 1024);
+    expect(platform.engine.inlineAssignCacheBytes).toBeGreaterThan(0);
+  });
+});
+
+describe("static_in manifests are read once per input pump run", () => {
+  it("reads static_in manifests a single time across multiple <=1 MiB InputData batches", async () => {
+    const platform = new SimulatedNativePlatform();
+    const { ws: sessionWs } = await connectWorkerSession(platform, { interfaces: ["pump.v1"] });
+    const CHUNK = WELCOME_MAX_CHUNK_BYTES;
+    const objs = [0, 1, 2].map((i) => makeDeterministicBytes(8 * CHUNK, 70 + i)); // 3 x 512 KiB = 24 chunks
+    const sub = await platform.unaryPost(
+      "/rpc/v2/client/submit",
+      pb.encodeSubmitRequest({
+        jobId: "pump-once",
+        spec: {
+          demand: { interface: "pump.v1" },
+          inputs: objs.map((o) => ({ body: { case: "inline" as const, value: o }, metadata: {} })),
+          params: new Uint8Array(0),
+          metadata: {},
+        },
+        conflictPolicy: pb.ConflictPolicy.FAIL,
+      }),
+    );
+    expect(sub.status).toBe(200);
+    const assign = extractAssigns(sessionWs)[0]!;
+    expect(assign.inputsViaAttempt).toBe(true);
+
+    const attWs = (await platform.openWs("/ws/v2/worker/attempt")).client!;
+    const log = sqlStatementLog(platform);
+    await attWs.sendBinary(
+      pb.encodeAttemptUp({
+        msg: { case: "open", value: { leaseId: assign.leaseId, generation: assign.generation } },
+      }),
+    );
+    for (let i = 0; i < 50 && platform.engine.leases.get(assign.leaseId)?.inputStage !== 4; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(decodeAttemptDownMessages(attWs).length).toBeGreaterThanOrEqual(25);
+    const lease = platform.engine.leases.get(assign.leaseId)!;
+    expect(lease.inputStage).toBe(4);
+    expect(lease.inputSeq).toBe(25n); // 24 data chunks + trailer => 2 batches (16 + 9 frames)
+    const staticReads = log.filter(
+      (e) =>
+        /FROM native_object_bundles/.test(e.query) && e.bindings.includes("static_in"),
+    );
+    expect(staticReads).toHaveLength(1);
   });
 });

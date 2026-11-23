@@ -19,6 +19,7 @@
     "src/storage.ts",
     "src/env.ts",
     "src/native-do.ts",
+    "src/native-worker.ts",
     "src/native/**/*.ts"
   ]
 }
