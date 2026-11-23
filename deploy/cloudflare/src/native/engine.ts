@@ -97,6 +97,7 @@ import * as pb from "./proto";
 import {
   NativeStore,
   concatBytes,
+  decodeInlineAssignBundle,
   extractR2KeysFromManifest,
   joinU64,
   normalizeBlob,
@@ -108,6 +109,7 @@ import {
   type BundleManifestEntry,
   type CompletedAttemptObjectRef,
   type DurabilityName,
+  type InlineAssignBundle,
   type JobStateName,
   type SegmentSliceRef,
   type StoredDemand,
@@ -116,6 +118,7 @@ import {
   type StoredObject,
   type StoredSpecMetadata,
 } from "./store";
+import { utf8ByteLen } from "./utf8";
 
 export { DEFAULT_NAMESPACE, decodeScopedId, encodeScopedId };
 
@@ -147,17 +150,17 @@ export const RUNTIME_CODES = {
 const PROTOBUF_CONTENT_TYPE = "application/x-protobuf";
 const DEFAULT_FAIRNESS_KEY = "_default";
 const DISPATCH_SCAN = 256;
+/** `conn_seq` meta is persisted as a ceiling once per block of ids instead of once per upgrade. */
+export const CONN_SEQ_BLOCK = 64;
+/** Upper bound on bytes of decoded inline-Assign payloads cached across all queued jobs. */
+export const INLINE_ASSIGN_CACHE_MAX_BYTES = 4_194_304;
 
 const utf8Encoder = new TextEncoder();
-
-function utf8Len(s: string): number {
-  return utf8Encoder.encode(s).byteLength;
-}
 
 function metadataByteLen(m: Record<string, string>): number {
   let sum = 0;
   for (const [k, v] of Object.entries(m)) {
-    sum += utf8Len(k) + utf8Len(v);
+    sum += utf8ByteLen(k) + utf8ByteLen(v);
   }
   return sum;
 }
@@ -405,6 +408,8 @@ interface JobMem {
   eventLogBytes: number;
   eventLogCount: number;
   stalledSinceMs: number | null;
+  /** Transient decoded small-inline `static_in` payload, kept only while queued (see INLINE_ASSIGN_CACHE_MAX_BYTES). */
+  inlineAssign: InlineAssignBundle | null;
 }
 
 interface WatcherMem {
@@ -628,7 +633,7 @@ function stringMapEncodedSize(
   const sorted = sortMapByUtf8Bytes(map);
   let total = 0;
   for (const e of sorted) {
-    const valBytes = utf8Len(e.value);
+    const valBytes = utf8ByteLen(e.value);
     const entryLen =
       (e.keyBytes.byteLength > 0 ? lenDelimitedSize(1, e.keyBytes.byteLength) : 0) +
       (valBytes > 0 ? lenDelimitedSize(1, valBytes) : 0);
@@ -675,7 +680,7 @@ interface OutputManifestItemRef {
 
 function encodedObjectLenFromManifestEntry(entry: BundleManifestEntry): number {
   if (entry.t === "u") {
-    const uLen = utf8Len(entry.u);
+    const uLen = utf8ByteLen(entry.u);
     return lenDelimitedSize(1, uLen) + stringMapEncodedSize(1, entry.m);
   }
   const meta = "m" in entry ? entry.m : undefined;
@@ -699,6 +704,7 @@ export class NativeEngine implements ConsoleBackend {
   private generation = 1n;
   private disposed = false;
   private connSeq = 0;
+  private connSeqCeiling = 0;
   private queueSeq = 0n;
   private rng = { state: 0x5dee_ce66_d1ce_4e5bn };
   private armedAlarmMs: number | null = null;
@@ -726,6 +732,7 @@ export class NativeEngine implements ConsoleBackend {
   private totalInputBytesHeld = 0;
   private totalResultBytesHeld = 0;
   private totalEventBytesHeld = 0;
+  private inlineAssignCacheBytes = 0;
 
   constructor(host: NativeHost) {
     const t0 = host.nowMs();
@@ -775,7 +782,10 @@ export class NativeEngine implements ConsoleBackend {
   private rehydrateAfterWake(nowMs: number): void {
     const meta = this.store.initOrLoadMeta(nowMs);
     this.generation = meta.generation;
+    // `meta.connSeq` is the persisted ceiling of the last reserved block: every id issued by any
+    // previous incarnation is <= it, so resuming strictly above it never reuses an id.
     this.connSeq = meta.connSeq;
+    this.connSeqCeiling = meta.connSeq;
     this.queueSeq = meta.queueSeq;
     this.rng.state = (this.generation ^ 0x5dee_ce66_d1ce_4e5bn) & MASK_64;
 
@@ -788,9 +798,7 @@ export class NativeEngine implements ConsoleBackend {
       if (!att) {
         continue;
       }
-      if (att.connId > this.connSeq) {
-        this.connSeq = att.connId;
-      }
+      this.noteConnId(att.connId);
       this.socketsByConnId.set(att.connId, ws);
     }
 
@@ -800,6 +808,7 @@ export class NativeEngine implements ConsoleBackend {
     );
     for (const r of sessionRows) {
       const connId = Number(r.current_conn_id);
+      this.noteConnId(connId);
       const liveWs = this.socketsByConnId.get(connId);
       const liveAtt = liveWs ? readSocketAttachment(liveWs) : null;
       const session: SessionMem = {
@@ -844,6 +853,9 @@ export class NativeEngine implements ConsoleBackend {
     for (const r of leaseRows) {
       const attemptConnId =
         r.attempt_conn_id !== null ? Number(r.attempt_conn_id) : null;
+      if (attemptConnId !== null) {
+        this.noteConnId(attemptConnId);
+      }
       const liveAttemptConn =
         attemptConnId !== null && this.socketsByConnId.has(attemptConnId)
           ? attemptConnId
@@ -988,7 +1000,11 @@ export class NativeEngine implements ConsoleBackend {
         eventLogBytes: es.bytes,
         eventLogCount: es.cnt,
         stalledSinceMs: null,
+        inlineAssign: null,
       };
+      if (job.callerConnId !== null) {
+        this.noteConnId(job.callerConnId);
+      }
       this.jobs.set(scopedJobId, job);
       this.store.reservedRetainedBytes += job.retainedBytesEst;
       this.totalEventBytesHeld += es.bytes;
@@ -1028,6 +1044,7 @@ export class NativeEngine implements ConsoleBackend {
     );
     for (const r of watcherRows) {
       const watchConnId = Number(r.watch_conn_id);
+      this.noteConnId(watchConnId);
       const w: WatcherMem = {
         watchConnId,
         scopedJobId: String(r.scoped_job_id),
@@ -1381,12 +1398,26 @@ export class NativeEngine implements ConsoleBackend {
     return pair.toUpgradeResponse();
   }
 
+  private noteConnId(connId: number): void {
+    if (connId > this.connSeq) {
+      this.connSeq = connId;
+    }
+  }
+
+  /**
+   * Monotonic, never-reused connection ids. The `conn_seq` meta row holds a ceiling that is raised
+   * (one write) only when the in-memory counter crosses it, i.e. once per `CONN_SEQ_BLOCK` ids.
+   */
   private allocateConnId(_nowMs: number): number {
     this.connSeq += 1;
     const id = this.connSeq;
-    this.store.transactionSync(() => {
-      this.store.setMeta("conn_seq", String(id));
-    });
+    if (id > this.connSeqCeiling) {
+      const ceiling = id + CONN_SEQ_BLOCK - 1;
+      this.store.transactionSync(() => {
+        this.store.setMeta("conn_seq", String(ceiling));
+      });
+      this.connSeqCeiling = ceiling;
+    }
     return id;
   }
 
@@ -1475,8 +1506,12 @@ export class NativeEngine implements ConsoleBackend {
   }
 
   private protoOkResponse(bytes: Uint8Array): Response {
-    const body = new ArrayBuffer(bytes.byteLength);
-    new Uint8Array(body).set(bytes);
+    // Hand over the array's own buffer when it spans it exactly; otherwise copy once.
+    const buf = bytes.buffer;
+    const body =
+      buf instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === buf.byteLength
+        ? buf
+        : (bytes.slice().buffer as ArrayBuffer);
     return new Response(body, {
       status: 200,
       headers: { "Content-Type": PROTOBUF_CONTENT_TYPE },
@@ -1544,6 +1579,7 @@ export class NativeEngine implements ConsoleBackend {
 
     // Fast path for Worker Heartbeat: pure synchronous attachment-only update,
     // ZERO SQL reads/writes, ZERO setAlarm calls!
+    let decodedControl: pb.WorkerMessage | null = null;
     if (att.kind === "session" && att.handshakeDone === 1) {
       if (bytes.byteLength > this.config.maxControlMessageBytes) {
         this.sendWsErrorAndClose(
@@ -1553,8 +1589,8 @@ export class NativeEngine implements ConsoleBackend {
         );
         return;
       }
-      // Peek if it's a Heartbeat before queuing async work
-      let decodedControl: pb.WorkerMessage | null = null;
+      // Decode ONCE here: Heartbeat is handled inline; any other message hands this decoded value
+      // to the session handler (no second decode).
       try {
         decodedControl = pb.decodeWorkerMessage(bytes);
       } catch (err) {
@@ -1590,7 +1626,7 @@ export class NativeEngine implements ConsoleBackend {
         return;
       }
       const stepNow = this.host.nowMs();
-      await this.dispatchSocketMessage(ws, freshAtt, bytes, stepNow);
+      await this.dispatchSocketMessage(ws, freshAtt, bytes, stepNow, decodedControl);
     });
     const safeChain = currentTask.catch(() => {});
     this.socketChains.set(att.connId, safeChain);
@@ -2036,11 +2072,12 @@ export class NativeEngine implements ConsoleBackend {
     att: SocketAttachment,
     bytes: Uint8Array,
     nowMs: number,
+    decodedControl: pb.WorkerMessage | null = null,
   ): Promise<void> {
     try {
       switch (att.kind) {
         case "session":
-          await this.handleSessionSocketMessage(ws, att, bytes, nowMs);
+          await this.handleSessionSocketMessage(ws, att, bytes, nowMs, decodedControl);
           break;
         case "attempt":
           await this.handleAttemptSocketMessage(ws, att, bytes, nowMs);
@@ -2110,13 +2147,14 @@ export class NativeEngine implements ConsoleBackend {
     att: SocketAttachment,
     bytes: Uint8Array,
     nowMs: number,
+    predecoded: pb.WorkerMessage | null = null,
   ): Promise<void> {
     if (bytes.byteLength > this.config.maxControlMessageBytes) {
       throw GrpcStatusError.invalidArgument(
         `control message of ${bytes.byteLength} bytes exceeds ${this.config.maxControlMessageBytes}`,
       );
     }
-    const decoded = pb.decodeWorkerMessage(bytes);
+    const decoded = predecoded ?? pb.decodeWorkerMessage(bytes);
     if (att.handshakeDone === 0) {
       if (decoded.msg?.case !== "hello") {
         throw GrpcStatusError.invalidArgument("a session must start with Hello");
@@ -2257,10 +2295,10 @@ export class NativeEngine implements ConsoleBackend {
     }
     if (
       hello.interfaces.length > MAX_OBJECTS ||
-      hello.interfaces.some((i) => i.length === 0 || utf8Len(i) > MAX_IDENTIFIER_BYTES) ||
-      utf8Len(hello.workerId) > MAX_IDENTIFIER_BYTES ||
-      utf8Len(hello.resumeSessionId) > MAX_IDENTIFIER_BYTES ||
-      utf8Len(hello.pool) > MAX_IDENTIFIER_BYTES
+      hello.interfaces.some((i) => i.length === 0 || utf8ByteLen(i) > MAX_IDENTIFIER_BYTES) ||
+      utf8ByteLen(hello.workerId) > MAX_IDENTIFIER_BYTES ||
+      utf8ByteLen(hello.resumeSessionId) > MAX_IDENTIFIER_BYTES ||
+      utf8ByteLen(hello.pool) > MAX_IDENTIFIER_BYTES
     ) {
       throw GrpcStatusError.invalidArgument(
         `Hello identifiers must be 1..=${MAX_IDENTIFIER_BYTES} bytes and at most ${MAX_OBJECTS} interfaces`,
@@ -2269,7 +2307,7 @@ export class NativeEngine implements ConsoleBackend {
     if (hello.heldLeaseIds.length > MAX_OBJECTS) {
       throw GrpcStatusError.invalidArgument("too many held leases");
     }
-    const ifaceBytes = hello.interfaces.reduce((s, i) => s + utf8Len(i), 0);
+    const ifaceBytes = hello.interfaces.reduce((s, i) => s + utf8ByteLen(i), 0);
     if (
       metadataByteLen(hello.attributes) + metadataByteLen(hello.metadata) + ifaceBytes >
       MAX_METADATA_BYTES
@@ -2706,6 +2744,12 @@ export class NativeEngine implements ConsoleBackend {
       return;
     }
     this.pumpingAttempts.add(leaseId);
+    let staticCache: {
+      scopedJobId: string;
+      connId: number;
+      staticInputs: Array<{ seq: number; entry: BundleManifestEntry }>;
+      paramsRef: { seq: number; entry: BundleManifestEntry } | null;
+    } | null = null;
     try {
       while (!this.disposed) {
         const lease = this.leases.get(leaseId);
@@ -2741,22 +2785,33 @@ export class NativeEngine implements ConsoleBackend {
         const snapByteOff = lease.inputByteOff;
         const snapInputSeq = lease.inputSeq;
 
-        // Gather manifests (fast sync metadata read)
-        const staticManifests = this.store.readBundleManifestsSync(
-          job.scopedJobId,
-          "static_in",
-        );
-        const staticInputs: Array<{ seq: number; entry: BundleManifestEntry }> = [];
-        let paramsRef: { seq: number; entry: BundleManifestEntry } | null = null;
-        for (const row of staticManifests) {
-          for (const e of row.entries) {
-            if (e.t === "p" || e.t === "pr2") {
-              paramsRef = { seq: row.seq, entry: e };
-            } else {
-              staticInputs.push({ seq: row.seq, entry: e });
+        // `static_in` manifests are immutable once the job is accepted: read them ONCE per pump run and
+        // re-read only if the lease's attempt connection (or job) changed. `stream_in` grows, so it is
+        // re-read every batch below.
+        if (
+          staticCache === null ||
+          staticCache.scopedJobId !== job.scopedJobId ||
+          staticCache.connId !== snapConnId
+        ) {
+          const staticInputsRead: Array<{ seq: number; entry: BundleManifestEntry }> = [];
+          let paramsRefRead: { seq: number; entry: BundleManifestEntry } | null = null;
+          for (const row of this.store.readBundleManifestsSync(job.scopedJobId, "static_in")) {
+            for (const e of row.entries) {
+              if (e.t === "p" || e.t === "pr2") {
+                paramsRefRead = { seq: row.seq, entry: e };
+              } else {
+                staticInputsRead.push({ seq: row.seq, entry: e });
+              }
             }
           }
+          staticCache = {
+            scopedJobId: job.scopedJobId,
+            connId: snapConnId,
+            staticInputs: staticInputsRead,
+            paramsRef: paramsRefRead,
+          };
         }
+        const { staticInputs, paramsRef } = staticCache;
 
         const streamManifests = job.streamingInput
           ? this.store.readBundleManifestsSync(job.scopedJobId, "stream_in")
@@ -3479,7 +3534,7 @@ export class NativeEngine implements ConsoleBackend {
       if (lease.curObjIndex === null) {
         const metaBytes = metadataByteLen(chunk.metadata);
         const headerAccounted =
-          OBJECT_OVERHEAD + metaBytes + utf8Len(chunk.uri);
+          OBJECT_OVERHEAD + metaBytes + utf8ByteLen(chunk.uri);
         lease.totalResultBytes += headerAccounted;
         this.totalResultBytesHeld += headerAccounted;
         lease.curObjIndex = chunk.index;
@@ -4207,7 +4262,7 @@ export class NativeEngine implements ConsoleBackend {
       if (replay.curObjIndex === null) {
         const metaBytes = metadataByteLen(chunk.metadata);
         replay.totalResultBytes += BigInt(
-          OBJECT_OVERHEAD + metaBytes + utf8Len(chunk.uri),
+          OBJECT_OVERHEAD + metaBytes + utf8ByteLen(chunk.uri),
         );
         if (replay.nextObjIndex >= MAX_OBJECTS || metaBytes > MAX_METADATA_BYTES) {
           replay.tooLarge = true;
@@ -4613,7 +4668,7 @@ export class NativeEngine implements ConsoleBackend {
     const normalized = this.normalizeJobSpec(req.spec, durability);
 
     const requestedId = req.jobId.trim();
-    if (requestedId && utf8Len(requestedId) > MAX_IDENTIFIER_BYTES) {
+    if (requestedId && utf8ByteLen(requestedId) > MAX_IDENTIFIER_BYTES) {
       throw GrpcStatusError.invalidArgument("job_id is too long");
     }
 
@@ -4847,7 +4902,7 @@ export class NativeEngine implements ConsoleBackend {
     if (!iface || iface.trim().length === 0) {
       throw GrpcStatusError.invalidArgument("demand.interface is required");
     }
-    if (utf8Len(iface) > MAX_IDENTIFIER_BYTES) {
+    if (utf8ByteLen(iface) > MAX_IDENTIFIER_BYTES) {
       throw GrpcStatusError.invalidArgument(
         `demand.interface exceeds ${MAX_IDENTIFIER_BYTES} bytes`,
       );
@@ -4871,7 +4926,7 @@ export class NativeEngine implements ConsoleBackend {
         if (inp.body.value.length === 0) {
           throw GrpcStatusError.invalidArgument("object URI must not be empty");
         }
-        const uriBytes = utf8Len(inp.body.value);
+        const uriBytes = utf8ByteLen(inp.body.value);
         if (uriBytes > MAX_METADATA_BYTES) {
           throw GrpcStatusError.invalidArgument(
             `object URI of ${uriBytes} bytes exceeds ${MAX_METADATA_BYTES} bytes`,
@@ -4917,11 +4972,11 @@ export class NativeEngine implements ConsoleBackend {
           "required capacity cannot be negative",
         );
       }
-      capKeyBytes += utf8Len(k);
+      capKeyBytes += utf8ByteLen(k);
     }
 
     const totalMeta =
-      utf8Len(iface) +
+      utf8ByteLen(iface) +
       metadataByteLen(protoSpec.metadata) +
       metadataByteLen(protoSpec.demand.requiredAttributes) +
       metadataByteLen(protoSpec.demand.preferredAttributes) +
@@ -5149,6 +5204,7 @@ export class NativeEngine implements ConsoleBackend {
       eventLogBytes: EVENT_OVERHEAD_BYTES,
       eventLogCount: 1,
       stalledSinceMs: null,
+      inlineAssign: null,
     };
 
     const lastSplit = splitU64(job.lastSequence);
@@ -5228,6 +5284,18 @@ export class NativeEngine implements ConsoleBackend {
       EVENT_OVERHEAD_BYTES,
     );
 
+    if (
+      !job.streamingInput &&
+      job.totalInputBytes <= this.config.assignInlineLimit &&
+      params.bundleRows.length > 0 &&
+      this.inlineAssignCacheBytes + job.totalInputBytes <= INLINE_ASSIGN_CACHE_MAX_BYTES
+    ) {
+      const decoded = decodeInlineAssignBundle(params.bundleRows);
+      if (decoded !== null && decoded.bytes <= this.config.assignInlineLimit) {
+        job.inlineAssign = decoded;
+        this.inlineAssignCacheBytes += decoded.bytes;
+      }
+    }
     this.jobs.set(job.scopedJobId, job);
     this.store.reservedRetainedBytes += job.retainedBytesEst;
     this.totalInputBytesHeld += job.totalInputBytes;
@@ -5536,6 +5604,7 @@ export class NativeEngine implements ConsoleBackend {
     sessionId: string,
     nowMs: number,
   ): void {
+    const cachedInline = job.inlineAssign;
     this.dequeueJobInMemory(job);
     const session = this.sessions.get(sessionId)!;
     const leaseId = crypto.randomUUID();
@@ -5549,56 +5618,22 @@ export class NativeEngine implements ConsoleBackend {
       job.streamingInput || job.totalInputBytes > this.config.assignInlineLimit;
 
     if (!inputsViaAttempt && (job.spec.input_count > 0 || job.spec.params_len > 0)) {
-      const rows = this.store.exec<{
-        seq: number;
-        manifest: string;
-        pack_blob: Uint8Array | null;
-      }>(
-        `SELECT seq, manifest, pack_blob FROM native_object_bundles
-         WHERE scoped_job_id = ? AND role = 'static_in'
-         ORDER BY seq ASC`,
-        job.scopedJobId,
-      );
-      let assignInlineBytes = 0;
-      let hasR2Ref = false;
-      const loadedInputs: pb.ProtoObjectInput[] = [];
-      let loadedParams: Uint8Array = new Uint8Array(0);
-
-      for (const r of rows) {
-        const entries = JSON.parse(r.manifest) as BundleManifestEntry[];
-        const blob = r.pack_blob ? normalizeBlob(r.pack_blob) : new Uint8Array(0);
-        for (const e of entries) {
-          if (e.t === "r2" || e.t === "pr2" || e.t === "segs") {
-            hasR2Ref = true;
-            break;
-          }
-          if (e.t === "u") {
-            const meta = e.m ?? {};
-            assignInlineBytes += utf8Len(e.u) + metadataByteLen(meta);
-            loadedInputs.push({
-              body: { case: "uri", value: e.u },
-              metadata: meta,
-            });
-          } else if (e.t === "i") {
-            const meta = e.m ?? {};
-            const slice = blob.slice(e.o, e.o + e.l);
-            assignInlineBytes += slice.byteLength + metadataByteLen(meta);
-            loadedInputs.push({
-              body: { case: "inline", value: slice },
-              metadata: meta,
-            });
-          } else if (e.t === "p") {
-            loadedParams = blob.slice(e.o, e.o + e.l);
-            assignInlineBytes += loadedParams.byteLength;
-          }
-        }
-      }
-
-      if (hasR2Ref || assignInlineBytes > this.config.assignInlineLimit) {
+      // Prefer the transient accept-time cache; fall back to SQLite after hibernation / retry.
+      const decoded =
+        cachedInline ??
+        decodeInlineAssignBundle(
+          this.store.exec<{ manifest: string; pack_blob: Uint8Array | null }>(
+            `SELECT seq, manifest, pack_blob FROM native_object_bundles
+             WHERE scoped_job_id = ? AND role = 'static_in'
+             ORDER BY seq ASC`,
+            job.scopedJobId,
+          ),
+        );
+      if (decoded === null || decoded.bytes > this.config.assignInlineLimit) {
         inputsViaAttempt = true;
       } else {
-        inlineInputs = loadedInputs;
-        inlineParams = loadedParams;
+        inlineInputs = decoded.inputs;
+        inlineParams = decoded.params;
       }
     }
 
@@ -7558,6 +7593,10 @@ export class NativeEngine implements ConsoleBackend {
       q.remove(job.priority, job.fairnessKey, job.scopedJobId);
     }
     job.queueSeq = null;
+    if (job.inlineAssign !== null) {
+      this.inlineAssignCacheBytes = Math.max(0, this.inlineAssignCacheBytes - job.inlineAssign.bytes);
+      job.inlineAssign = null;
+    }
   }
 
   private getConcurrencyKeyCount(namespace: string, key: string): number {

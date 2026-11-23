@@ -2232,6 +2232,7 @@ describe("Reference-job per-step row accounting & cold-wake zero-write Heartbeat
       platform.storage.totalRowsWritten + platform.setAlarmCallCount;
 
     const t0 = snap();
+    const readsStart = platform.storage.totalRowsRead;
     const refInputs: pb.ProtoObjectInput[] = Array.from({ length: 8 }, (_, i) => ({
       body: { case: "inline" as const, value: utf8Encoder.encode(`in-${i}`) },
       metadata: {},
@@ -2334,6 +2335,17 @@ describe("Reference-job per-step row accounting & cold-wake zero-write Heartbeat
     expect(totalLifecycleWrites).toBeGreaterThanOrEqual(20);
     expect(totalLifecycleWrites).toBeLessThanOrEqual(30);
     expect(platform.r2!.putCount).toBe(0);
+    console.info(
+      "REFJOB_METRICS " +
+        JSON.stringify({
+          submitAndAssignWrites,
+          openWrites,
+          resultAndFinishWrites,
+          purgeWrites,
+          totalLifecycleWrites,
+          totalRowsReadSinceStart: platform.storage.totalRowsRead - readsStart,
+        }),
+    );
   });
 });
 

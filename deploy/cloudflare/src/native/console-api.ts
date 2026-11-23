@@ -18,6 +18,7 @@ import {
   type StoredErrorInfo,
   type StoredExecutionPolicy,
 } from "./store";
+import { utf8ByteLen } from "./utf8";
 
 export interface ConsoleJobSummaryData {
   job_id: string;
@@ -243,7 +244,6 @@ export interface ConsoleBackend {
   adminReset(nowMs: number): Promise<AdminResetResult>;
 }
 
-const utf8Encoder = new TextEncoder();
 
 function parseAllowedOrigins(env: NativeEnvConfig): Set<string> {
   const raw = env.ANYSERVE_ALLOWED_ORIGINS;
@@ -756,7 +756,7 @@ async function dispatchAuthorizedConsoleRoute(
       return apiErrorResponse(400, statesOrErr);
     }
     const search = normalizeOptionalFilter(url.searchParams.get("q"));
-    if (search && utf8Encoder.encode(search).byteLength > 256) {
+    if (search && utf8ByteLen(search) > 256) {
       return apiErrorResponse(400, "search query exceeds 256 bytes");
     }
     const rawFrom = parseOptionalUint(url.searchParams.get("from_ms"));

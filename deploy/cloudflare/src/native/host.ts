@@ -102,6 +102,8 @@ interface CompactAttachment {
   rp?: 1;
 }
 
+import { utf8ByteLen } from "./utf8";
+
 const utf8Encoder = new TextEncoder();
 
 export function encodeCompactAttachment(att: SocketAttachment): CompactAttachment {
@@ -175,23 +177,44 @@ export function decodeCompactAttachment(raw: unknown): SocketAttachment | null {
 }
 
 export function attachmentByteLength(att: SocketAttachment): number {
-  const json = JSON.stringify(encodeCompactAttachment(att));
-  return utf8Encoder.encode(json).byteLength;
+  return utf8ByteLen(JSON.stringify(encodeCompactAttachment(att)));
 }
+
+/**
+ * Per-socket-object cache of the decoded attachment. Updated by `writeSocketAttachment` and filled
+ * on the first `readSocketAttachment` miss (e.g. a wrapper object recreated after hibernation), so
+ * hot paths never repeat `deserializeAttachment()` + `JSON.parse`. Cached values are frozen and
+ * always equal `decodeCompactAttachment(encodeCompactAttachment(att))`.
+ */
+const attachmentCache = new WeakMap<object, SocketAttachment>();
 
 export function writeSocketAttachment(ws: NativeWebSocket, att: SocketAttachment): void {
   const compact = encodeCompactAttachment(att);
-  const bytes = utf8Encoder.encode(JSON.stringify(compact)).byteLength;
+  const bytes = utf8ByteLen(JSON.stringify(compact));
   if (bytes > ATTACHMENT_MAX_BYTES) {
     throw new Error(
       `WebSocket attachment exceeds ${ATTACHMENT_MAX_BYTES} bytes (${bytes} bytes)`,
     );
   }
   ws.serializeAttachment(compact);
+  const canonical = decodeCompactAttachment(compact);
+  if (canonical) {
+    attachmentCache.set(ws, Object.freeze(canonical));
+  } else {
+    attachmentCache.delete(ws);
+  }
 }
 
 export function readSocketAttachment(ws: NativeWebSocket): SocketAttachment | null {
-  return decodeCompactAttachment(ws.deserializeAttachment());
+  const cached = attachmentCache.get(ws);
+  if (cached) {
+    return cached;
+  }
+  const decoded = decodeCompactAttachment(ws.deserializeAttachment());
+  if (decoded) {
+    attachmentCache.set(ws, Object.freeze(decoded));
+  }
+  return decoded;
 }
 
 export function boundCustomLoad(
@@ -216,7 +239,7 @@ export function boundCustomLoad(
       dropped += 1;
       continue;
     }
-    const entryBytes = utf8Encoder.encode(key).byteLength + 8;
+    const entryBytes = utf8ByteLen(key) + 8;
     if (kept >= LOAD_CUSTOM_MAX_ENTRIES || usedBytes + entryBytes > LOAD_CUSTOM_MAX_BYTES) {
       dropped += 1;
       continue;
