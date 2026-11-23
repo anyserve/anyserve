@@ -354,13 +354,7 @@ function getHeader(headers: HeaderBag, lowerName: string): string | undefined {
 function extractBearerToken(headers: HeaderBag): string | null {
   const raw = getHeader(headers, "authorization");
   if (raw === undefined) return null;
-  if (raw.startsWith("Bearer ")) {
-    return raw.slice(7).trim();
-  }
-  if (raw.startsWith("bearer ")) {
-    return raw.slice(7).trim();
-  }
-  return null;
+  return raw.startsWith("Bearer ") || raw.startsWith("bearer ") ? raw.slice(7).trim() : null;
 }
 
 function parseCommaTokens(raw: string | undefined): string[] {
@@ -403,9 +397,9 @@ export interface AuthPolicyRedactedJSON {
 }
 
 export class AuthPolicy {
-  readonly #clientTokens: readonly Uint8Array[];
-  readonly #workerTokens: readonly Uint8Array[];
-  readonly #scopedTokens: readonly ScopedToken[];
+  #clientTokens: readonly Uint8Array[];
+  #workerTokens: readonly Uint8Array[];
+  #scopedTokens: readonly ScopedToken[];
 
   constructor(
     clientTokens: Iterable<string> = [],
@@ -505,12 +499,12 @@ export class AuthPolicy {
   withScopedTokens(
     tokens: Iterable<ScopedToken | ScopedTokenInit>,
   ): AuthPolicy {
-    const policy = new AuthPolicy([], [], tokens);
-    return new AuthPolicyFromRaw(
-      this.#clientTokens,
-      this.#workerTokens,
-      policy.#scopedTokens,
-    );
+    const next = new AuthPolicy([], [], tokens);
+    const out = new AuthPolicy();
+    out.#clientTokens = this.#clientTokens;
+    out.#workerTokens = this.#workerTokens;
+    out.#scopedTokens = next.#scopedTokens;
+    return out;
   }
 
   isEnabled(): boolean {
@@ -662,40 +656,5 @@ export class AuthPolicy {
 
   [NODE_INSPECT_CUSTOM](): string {
     return this.toString();
-  }
-
-  /** Protected helper for immutable `withScopedTokens`. */
-  protected static _createRaw(
-    clientTokens: readonly Uint8Array[],
-    workerTokens: readonly Uint8Array[],
-    scopedTokens: readonly ScopedToken[],
-  ): AuthPolicy {
-    const inst = Object.create(AuthPolicy.prototype) as AuthPolicy;
-    // Construct via normal constructor is cleaner; see AuthPolicyFromRaw below.
-    return new AuthPolicyFromRaw(clientTokens, workerTokens, scopedTokens);
-  }
-
-  protected _rawParts(): [
-    readonly Uint8Array[],
-    readonly Uint8Array[],
-    readonly ScopedToken[],
-  ] {
-    return [this.#clientTokens, this.#workerTokens, this.#scopedTokens];
-  }
-}
-
-const utf8Decoder = new TextDecoder();
-
-class AuthPolicyFromRaw extends AuthPolicy {
-  constructor(
-    clientTokens: readonly Uint8Array[],
-    workerTokens: readonly Uint8Array[],
-    scopedTokens: readonly ScopedToken[],
-  ) {
-    super(
-      clientTokens.map((b) => utf8Decoder.decode(b)),
-      workerTokens.map((b) => utf8Decoder.decode(b)),
-      scopedTokens,
-    );
   }
 }

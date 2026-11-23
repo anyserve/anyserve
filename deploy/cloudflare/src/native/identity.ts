@@ -13,6 +13,7 @@ import {
   type ErrorInfoInput,
   type JobSpecInput,
   type ProtoObjectInput,
+  utf8ByteLen,
 } from "./proto";
 
 export const DEFAULT_NAMESPACE = "default";
@@ -86,7 +87,20 @@ export function compareBytes(a: Uint8Array, b: Uint8Array): number {
  */
 export function compareUtf8(a: string, b: string): number {
   if (a === b) return 0;
-  return compareBytes(utf8Encoder.encode(a), utf8Encoder.encode(b));
+  const n = a.length < b.length ? a.length : b.length;
+  // ASCII fast path: the first differing code unit decides when both are ASCII.
+  for (let i = 0; i < n; i++) {
+    const ca = a.charCodeAt(i);
+    const cb = b.charCodeAt(i);
+    if (ca === cb) continue;
+    if (ca < 0x80 && cb < 0x80) return ca - cb;
+    return compareBytes(utf8Encoder.encode(a), utf8Encoder.encode(b));
+  }
+  // A UTF-16 prefix is a UTF-8 prefix unless it ends in a lone high surrogate.
+  if (n > 0 && (a.charCodeAt(n - 1) & 0xfc00) === 0xd800) {
+    return compareBytes(utf8Encoder.encode(a), utf8Encoder.encode(b));
+  }
+  return a.length - b.length;
 }
 
 export interface EncodedMapEntry<V> {
@@ -161,7 +175,7 @@ export class IncrementalSha256 {
   private readonly block = new Uint8Array(64);
   private readonly w = new Uint32Array(64);
   private blockLen = 0;
-  private totalBytes = 0n;
+  private totalBytes = 0;
   private finalized = false;
 
   update(data: Uint8Array): this {
@@ -171,7 +185,7 @@ export class IncrementalSha256 {
     let offset = 0;
     let remaining = data.byteLength;
     if (remaining === 0) return this;
-    this.totalBytes += BigInt(remaining);
+    this.totalBytes += remaining;
 
     if (this.blockLen > 0) {
       const need = 64 - this.blockLen;
@@ -278,7 +292,7 @@ export class IncrementalSha256 {
     }
     this.finalized = true;
 
-    const totalBits = this.totalBytes << 3n;
+    const totalBits = BigInt(this.totalBytes) << 3n;
     this.block[this.blockLen++] = 0x80;
     if (this.blockLen > 56) {
       this.block.fill(0, this.blockLen, 64);
@@ -501,8 +515,7 @@ class SyncCanonical {
     this.sha.update(keyBytes);
   }
 
-  map(record: Record<string, string> | undefined): void {
-    const sorted = sortMapByUtf8Bytes(record);
+  private entries(sorted: EncodedMapEntry<string>[]): void {
     this.u64(sorted.length);
     for (let i = 0; i < sorted.length; i++) {
       const entry = sorted[i]!;
@@ -511,17 +524,15 @@ class SyncCanonical {
     }
   }
 
+  map(record: Record<string, string> | undefined): void {
+    this.entries(sortMapByUtf8Bytes(record));
+  }
+
   filteredMap(
     record: Record<string, string> | undefined,
     include: (key: string) => boolean,
   ): void {
-    const sorted = sortMapByUtf8Bytes(record).filter((e) => include(e.key));
-    this.u64(sorted.length);
-    for (let i = 0; i < sorted.length; i++) {
-      const entry = sorted[i]!;
-      this.strPreEncoded(entry.keyBytes);
-      this.str(entry.value);
-    }
+    this.entries(sortMapByUtf8Bytes(record).filter((e) => include(e.key)));
   }
 
   object(obj: CanonicalObjectInput): void {
@@ -772,8 +783,7 @@ class AsyncCanonical {
     }
   }
 
-  async map(record: Record<string, string> | undefined): Promise<void> {
-    const sorted = sortMapByUtf8Bytes(record);
+  private async entries(sorted: EncodedMapEntry<string>[]): Promise<void> {
     await this.u64(sorted.length);
     for (let i = 0; i < sorted.length; i++) {
       const entry = sorted[i]!;
@@ -782,17 +792,15 @@ class AsyncCanonical {
     }
   }
 
+  async map(record: Record<string, string> | undefined): Promise<void> {
+    await this.entries(sortMapByUtf8Bytes(record));
+  }
+
   async filteredMap(
     record: Record<string, string> | undefined,
     include: (key: string) => boolean,
   ): Promise<void> {
-    const sorted = sortMapByUtf8Bytes(record).filter((e) => include(e.key));
-    await this.u64(sorted.length);
-    for (let i = 0; i < sorted.length; i++) {
-      const entry = sorted[i]!;
-      await this.strPreEncoded(entry.keyBytes);
-      await this.str(entry.value);
-    }
+    await this.entries(sortMapByUtf8Bytes(record).filter((e) => include(e.key)));
   }
 
   async streamBytesWithLength(
@@ -963,14 +971,10 @@ export function resultObjectAccountedBytes(params: {
     for (let i = 0; i < keys.length; i++) {
       const k = keys[i]!;
       const v = params.metadata[k]!;
-      metadataBytes += BigInt(
-        utf8Encoder.encode(k).byteLength + utf8Encoder.encode(v).byteLength,
-      );
+      metadataBytes += BigInt(utf8ByteLen(k) + utf8ByteLen(v));
     }
   }
-  const uriBytes = params.uri
-    ? BigInt(utf8Encoder.encode(params.uri).byteLength)
-    : 0n;
+  const uriBytes = params.uri ? BigInt(utf8ByteLen(params.uri)) : 0n;
   const dataBytes =
     params.dataByteLength !== undefined
       ? typeof params.dataByteLength === "bigint"

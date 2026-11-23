@@ -2105,3 +2105,159 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     expect(policy.toString()).toContain("[redacted]");
   });
 });
+
+import * as pbAll from "../src/native/proto";
+import { compareUtf8 as cmpUtf8, resultObjectAccountedBytes as accountedBytes } from "../src/native/identity";
+
+describe("native/proto.ts — schema-driven codec invariants (added)", () => {
+  const te = new TextEncoder();
+  const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+  const sampleStrings = [
+    "", "a", "abc", "h\u00e9llo", "\u65e5\u672c\u8a9e", "z\u{1F600}", "\u{10000}", "\ue000", "\ud800", "\udc00", "x\ud800y", "tail\ud83d",
+    "\u07ff", "\u0800", "\uffff", "a".repeat(300), "\u00e9".repeat(70),
+  ];
+
+  it("exports zero-allocation utf8ByteLen matching TextEncoder exactly", () => {
+    for (const s of sampleStrings) {
+      expect(pbAll.utf8ByteLen(s)).toBe(te.encode(s).byteLength);
+    }
+    let seed = 7;
+    const next = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff);
+    for (let i = 0; i < 500; i++) {
+      let str = "";
+      for (let j = next() % 12; j > 0; j--) str += String.fromCharCode(next() % 0xffff);
+      expect(pbAll.utf8ByteLen(str)).toBe(te.encode(str).byteLength);
+    }
+    expect(accountedBytes({ metadata: { k: "\u00e9", "\u65e5": "v" }, uri: "z\u{1F600}", dataByteLength: 5 })).toBe(
+      BigInt(OBJECT_OVERHEAD + 1 + 2 + 3 + 1 + 5 + 5),
+    );
+  });
+
+  it("compareUtf8 keeps unsigned UTF-8 byte order across ASCII, multi-byte, prefix and surrogate cases", () => {
+    const byBytes = (a: string, b: string) => {
+      const x = te.encode(a);
+      const y = te.encode(b);
+      const n = Math.min(x.length, y.length);
+      for (let i = 0; i < n; i++) if (x[i] !== y[i]) return x[i]! - y[i]!;
+      return x.length - y.length;
+    };
+    for (const a of sampleStrings) {
+      for (const b of sampleStrings) {
+        expect(Math.sign(cmpUtf8(a, b))).toBe(Math.sign(byBytes(a, b)));
+      }
+    }
+    expect(Math.sign(cmpUtf8("ab", "abc"))).toBe(-1);
+    expect(Math.sign(cmpUtf8("b", "a\u00e9"))).toBe(1);
+    expect(Math.sign(cmpUtf8("\ue000", "\u{10000}"))).toBe(-1);
+  });
+
+  it("map entries are emitted in UTF-8 byte order regardless of insertion order (non-ASCII keys, 0/1 entries)", () => {
+    const keys = ["\ue000", "\u{10000}", "b", "a", "\u00e9", "Z", "\u65e5"];
+    const reference = keys.slice().sort((a, b) => Math.sign(cmpUtf8(a, b)));
+    const build = (order: string[]) => {
+      const metadata: Record<string, string> = {};
+      for (const k of order) metadata[k] = `v-${k}`;
+      return encodeInputChunk({ data: new Uint8Array([1]), metadata });
+    };
+    const expected = hex(build(reference));
+    for (let r = 0; r < 8; r++) {
+      const shuffled = keys.slice();
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = (i * 7 + r * 3) % (i + 1);
+        [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
+      }
+      expect(hex(build(shuffled))).toBe(expected);
+    }
+    expect(hex(encodeInputChunk({ metadata: {} }))).toBe("");
+    expect(hex(encodeInputChunk({ metadata: { k: "v" } }))).toBe("12060a016b120176");
+    expect(decodeInputChunk(build(reference)).metadata).toEqual(Object.fromEntries(reference.map((k) => [k, `v-${k}`])));
+  });
+
+  it("encodedLen* equals encoded byte length for nested, oneof and segmented messages", () => {
+    const job = {
+      jobId: "j-\u00e9", state: JobState.SUCCEEDED, durability: Durability.DURABLE, interface: "echo", attemptCount: 3,
+      createdAtMs: 1_700_000_000_000n, updatedAtMs: 2n ** 63n, error: { code: "c", message: "m", retryable: true },
+      outputs: [{ body: { case: "inline" as const, value: new Uint8Array(200) }, metadata: { a: "b", "\u00e9": "x" } }, { body: { case: "uri" as const, value: "r2://x" } }],
+      metadata: { z: "1", a: "2" }, specHash: "h", namespace: "ns",
+    };
+    expect(pbAll.encodedLenJob(job)).toBe(pbAll.encodeJob(job).byteLength);
+    const ev = {
+      jobId: "j", sequence: 9n, attemptId: "a", atMs: 5n,
+      event: { case: "finished" as const, value: { state: JobState.SUCCEEDED, outputs: [{ body: { case: "inline" as const, value: [new Uint8Array(5).fill(1), new Uint8Array(0), new Uint8Array(7).fill(2)] }, metadata: { m: "n" } }] } },
+    };
+    const frame = pbAll.encodeExecutionEventWsFrame(ev);
+    expect(frame.byteLength).toBe(1 + pbAll.encodedLenExecutionEvent(ev));
+    expect(frame[0]).toBe(0);
+    expect(hex(frame.subarray(1))).toBe(hex(pbAll.encodeExecutionEvent(ev)));
+    const dec = pbAll.decodeExecutionEvent(frame.subarray(1));
+    expect(dec.event?.case === "finished" && dec.event.value.outputs[0]!.body).toEqual({
+      case: "inline",
+      value: new Uint8Array([1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2]),
+    });
+    for (const msg of [
+      { msg: { case: "heartbeat" as const, value: { load: { queued: 1, running: 2, utilization: 0.5, custom: { b: 1, a: 2, z: 0 } } } } },
+      { msg: { case: "draining" as const, value: { preempting: true } } },
+      {},
+    ]) {
+      expect(pbAll.encodedLenWorkerMessage(msg)).toBe(pbAll.encodeWorkerMessage(msg).byteLength);
+    }
+  });
+
+  it("keeps hot-message wire details: optional object_index, AttemptUp oneof numbers, u64/i64 extremes", () => {
+    expect(hex(pbAll.encodeInputData({ objectIndex: 0 }))).toBe("2800");
+    expect(hex(pbAll.encodeInputData({}))).toBe("");
+    expect(pbAll.decodeInputData(pbAll.encodeInputData({ objectIndex: 0 })).objectIndex).toBe(0);
+    expect(pbAll.decodeInputData(new Uint8Array(0)).objectIndex).toBeUndefined();
+    const first = (m: Parameters<typeof pbAll.encodeAttemptUp>[0]) => pbAll.encodeAttemptUp(m)[0];
+    expect(first({ msg: { case: "open", value: { leaseId: "l" } } })).toBe(0x0a);
+    expect(first({ msg: { case: "frame", value: { sequence: 1n } } })).toBe(0x12);
+    expect(first({ msg: { case: "result", value: { index: 1 } } })).toBe(0x1a);
+    expect(first({ msg: { case: "finish", value: { outcome: { case: "cancelled" } } } })).toBe(0x2a);
+    for (const v of [0n, 1n, 127n, 128n, 2n ** 32n, 2n ** 53n - 1n, 2n ** 53n, 2n ** 53n + 1n, 2n ** 63n, 2n ** 64n - 1n]) {
+      expect(pbAll.decodeAck(pbAll.encodeAck({ upToSequence: v, resultBytes: v })).upToSequence).toBe(v);
+      expect(pbAll.encodedLenAck({ upToSequence: v })).toBe(pbAll.encodeAck({ upToSequence: v }).byteLength);
+    }
+    const cap = { a: -(2n ** 63n), b: 2n ** 63n - 1n, c: -1n, d: 0n };
+    expect(pbAll.decodeDemand(pbAll.encodeDemand({ requiredCapacity: cap })).requiredCapacity).toEqual(cap);
+    const dm = { k: 0.1, nan: Number.NaN, neg: -2.5, zero: 0 };
+    const back = pbAll.decodeLoad(pbAll.encodeLoad({ custom: dm })).custom;
+    expect(back.k).toBe(0.1);
+    expect(back.nan).toBeNaN();
+    expect(back.neg).toBe(-2.5);
+    expect(back.zero).toBe(0);
+  });
+
+  it("skips unknown fields, merges repeated sub-messages, and rejects malformed input with ProtoDecodeError", () => {
+    const unknown = new Uint8Array([0xf8, 0x06, 0x01, 0xc1, 0x06, 1, 2, 3, 4, 5, 6, 7, 8, 0xca, 0x06, 0x02, 0xaa, 0xbb, 0xd5, 0x06, 1, 2, 3, 4]);
+    const withUnknown = concatBytes(pbAll.encodeAck({ upToSequence: 5n }), unknown);
+    expect(pbAll.decodeAck(withUnknown).upToSequence).toBe(5n);
+    const twoDemands = concatBytes(
+      pbAll.encodeJobSpec({ demand: { interface: "a" } }),
+      pbAll.encodeJobSpec({ demand: { affinityKey: "b" } }),
+    );
+    expect(pbAll.decodeJobSpec(twoDemands).demand).toMatchObject({ interface: "a", affinityKey: "b" });
+    const bad: Uint8Array[] = [
+      new Uint8Array([0x08]), new Uint8Array([0x08, 0x80]), new Uint8Array([0x0b, 0x00]), new Uint8Array([0x00, 0x01]),
+      new Uint8Array([0x12, 0x05, 0x01]), new Uint8Array([0x0a, 0x01, 0xff]), new Uint8Array([0x08, ...Array(9).fill(0xff), 0x02]),
+      new Uint8Array([0x09, 1, 2]), new Uint8Array([0x80, 0x80, 0x80, 0x80, 0x80, 0x01]),
+    ];
+    for (const b of bad) {
+      expect(() => pbAll.decodeFrame(b), hex(b)).toThrow(pbAll.ProtoDecodeError);
+      expect(() => pbAll.decodeHello(b), hex(b)).toThrow(pbAll.ProtoDecodeError);
+    }
+    expect(Durability.DURABLE).toBe(2);
+    expect(JobState.SUCCEEDED).toBe(3);
+    expect(GrpcCode.ResourceExhausted).toBe(8);
+  });
+
+  it("AuthPolicy.withScopedTokens returns an independent policy that keeps client/worker tokens", () => {
+    const base = new AuthPolicy(["c1"], ["w1"]);
+    const next = base.withScopedTokens([{ token: "s1", role: Role.Client, namespace: "ns-a" }]);
+    expect(base.toJSON().scopedTokens).toHaveLength(0);
+    expect(next.toJSON()).toMatchObject({ clientTokenCount: 1, workerTokenCount: 1 });
+    expect(next.principalForToken("s1")?.namespace).toBe("ns-a");
+    expect(next.principalForToken("c1")?.isOperator).toBe(true);
+    expect(base.principalForToken("s1")).toBeNull();
+    expect(next).toBeInstanceOf(AuthPolicy);
+  });
+});
