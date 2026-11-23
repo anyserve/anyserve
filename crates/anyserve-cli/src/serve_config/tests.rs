@@ -295,3 +295,26 @@ forced_pool = "gpu-pool"
     assert!(dbg.contains("edge-node-1"));
     assert!(dbg.contains("gpu-pool"));
 }
+
+#[test]
+fn runtime_interface_keys_are_bounded_to_64_non_whitespace_bytes() {
+    let ok_name = format!("domain.action.{}.v1", "a".repeat(47));
+    assert_eq!(ok_name.len(), 64);
+    let resolved = config(
+        &format!("[runtime.interfaces.\"{ok_name}\"]\nmax_queue = 5\n"),
+        ServeOverrides::default(),
+    )
+    .unwrap();
+    assert_eq!(resolved.runtime.interfaces[&ok_name].max_queue, Some(5));
+
+    let too_long = format!("domain.action.{}.v1", "a".repeat(48));
+    assert_eq!(too_long.len(), 65);
+    for bad in [
+        format!("[runtime.interfaces.\"{too_long}\"]\nmax_queue = 5\n"),
+        "[runtime.interfaces.\"bad space\"]\nmax_queue = 5\n".to_string(),
+        "[runtime.interfaces.\"\"]\nmax_queue = 5\n".to_string(),
+    ] {
+        let err = config(&bad, ServeOverrides::default()).unwrap_err();
+        assert!(err.to_string().contains("1..=64 bytes"), "{err:#}");
+    }
+}

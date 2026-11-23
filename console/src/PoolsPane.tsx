@@ -188,7 +188,12 @@ export function PoolsPane(props: PoolsPaneProps) {
               <div className="spillover-rules">
                 {configuredSpillovers.map((iface) => (
                   <div key={iface.name} className="spillover-rule-row">
-                    <button type="button" className="entity-link mono spillover-rule-row__iface" onClick={() => onOpenInterface(iface.name)}>
+                    <button
+                      type="button"
+                      className="entity-link mono ellipsis spillover-rule-row__iface"
+                      title={`Open interface ${iface.name}`}
+                      onClick={() => onOpenInterface(iface.name)}
+                    >
                       {iface.name}
                     </button>
                     <div className="tier-chain-inline">
@@ -222,8 +227,8 @@ export function PoolsPane(props: PoolsPaneProps) {
         subtitle={
           activePool ? (
             <SubtitlePair
-              left={{ text: activePool.namespace, onClick: () => setNamespaceFilter(activePool.namespace) }}
-              right={{ text: activePool.interface, onClick: () => onOpenInterface(activePool.interface) }}
+              left={{ text: activePool.namespace, title: `Filter pools by ${activePool.namespace}`, onClick: () => setNamespaceFilter(activePool.namespace) }}
+              right={{ text: activePool.interface, title: `Open interface ${activePool.interface}`, onClick: () => onOpenInterface(activePool.interface) }}
             />
           ) : null
         }

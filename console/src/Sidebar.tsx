@@ -11,6 +11,7 @@ import {
   IconMoon,
   IconOverview,
   IconPools,
+  IconRefresh,
   IconSun,
   IconWorkers,
 } from "./icons";
@@ -129,8 +130,8 @@ export const Sidebar = memo(function Sidebar({
 
         <div className="sidebar__controls">
           {onRefresh ? (
-            <button type="button" className="ctrl-pill" title="Refresh" aria-label="Refresh" onClick={onRefresh}>
-              <span>Refresh</span>
+            <button type="button" className="ctrl-pill ctrl-pill--icon" title="Refresh" aria-label="Refresh" onClick={onRefresh}>
+              <IconRefresh />
             </button>
           ) : null}
 

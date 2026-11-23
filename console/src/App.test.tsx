@@ -1118,7 +1118,10 @@ it("disables timer polling when recommended_poll_ms=0 and refreshes on manual Re
   // Clicking Sidebar Refresh button fetches overview, jobs, and active job detail once.
   const refreshBtn = screen.getByRole("button", { name: "Refresh" });
   expect(refreshBtn.classList.contains("ctrl-pill")).toBe(true);
+  expect(refreshBtn.classList.contains("ctrl-pill--icon")).toBe(true);
   expect(refreshBtn.getAttribute("title")).toBe("Refresh");
+  expect(refreshBtn.querySelector("svg")).toBeTruthy();
+  expect(refreshBtn.textContent).toBe("");
   expect(refreshBtn.closest(".sidebar__controls")).toBeTruthy();
 
   await act(async () => {
@@ -1145,4 +1148,114 @@ it("disables timer polling when recommended_poll_ms=0 and refreshes on manual Re
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
   });
   expect(getWorkers).toHaveBeenCalledTimes(2);
+});
+
+it("renders multi-interface worker rows with primary interface button + +N badge, WebSocket session labels, and 24-hour timestamps", async () => {
+  window.history.replaceState(null, "", "/workers");
+  const multiIfaces = [
+    "policy.evaluate.v1",
+    "stream.transform.v1",
+    "chaos.flaky.v1",
+    "slow.cancel.v1",
+  ];
+  const wsOverview: OverviewResponse = {
+    ...richOverview(),
+    runtime: { code: "memory_plus_cloudflare", label: "Memory + Cloudflare DO", journal: "cloudflare" },
+    control_plane: {
+      ...richOverview().control_plane!,
+      public_endpoint: "wss://anyserve-cloudflare-native.example.workers.dev",
+    },
+    interfaces: [
+      ...richOverview().interfaces,
+      {
+        name: "policy.evaluate.v1",
+        queued: 0,
+        running: 1,
+        oldest_queued_age_ms: 0,
+        sessions: 1,
+        free_slots: 3,
+        policy: null,
+      },
+    ],
+  };
+  const multiWorkers: WorkersResponse = {
+    total: 2,
+    healthy: 1,
+    draining: 0,
+    disconnected: 1,
+    workers: [
+      {
+        worker_id: "bot-py-robot-1",
+        session_id: "sess-multi-01",
+        namespace: "default",
+        pool: "default",
+        healthy: true,
+        interfaces: multiIfaces,
+        attributes: { role: "robot" },
+        total_capacity: { slot: 4, vram_mb: 8192 },
+        max_concurrency: 4,
+        free_slots: 3,
+        utilization: 0.25,
+        connected: true,
+        draining: false,
+        active_leases: 1,
+        connected_at_ms: Date.UTC(2026, 10, 23, 22, 31, 1, 293),
+        last_seen_at_ms: Date.UTC(2026, 10, 23, 22, 31, 1, 293),
+        load: { queued: 0, running: 1, utilization: 0.25, custom: {} },
+      },
+      {
+        worker_id: "bot-none-2",
+        session_id: "sess-none-02",
+        namespace: "default",
+        pool: "default",
+        healthy: false,
+        interfaces: [],
+        attributes: {},
+        total_capacity: {},
+        max_concurrency: 1,
+        free_slots: 0,
+        utilization: 0,
+        connected: false,
+        draining: false,
+        active_leases: 0,
+        connected_at_ms: Date.UTC(2026, 10, 23, 22, 30, 0, 0),
+        last_seen_at_ms: Date.UTC(2026, 10, 23, 22, 30, 5, 0),
+        load: { queued: 0, running: 0, utilization: 0, custom: {} },
+      },
+    ],
+  };
+
+  vi.mocked(getOverview).mockResolvedValue(wsOverview);
+  vi.mocked(getWorkers).mockResolvedValue(multiWorkers);
+
+  render(<App />);
+  expect(await screen.findByRole("heading", { name: "bot-py-robot-1" })).toBeTruthy();
+
+  // Refresh button remains accessible via role + name in Sidebar.
+  expect(screen.getByRole("button", { name: "Refresh" })).toBeTruthy();
+
+  // Multi-interface row renders primary clickable button + "+3" count badge with full list in title.
+  const countBadge = screen.getByText("+3");
+  expect(countBadge.getAttribute("title")).toBe(multiIfaces.join(", "));
+  const rowPrimaryBtn = countBadge.closest(".cell-inline")?.querySelector("button");
+  expect(rowPrimaryBtn?.textContent).toBe("policy.evaluate.v1");
+  expect(rowPrimaryBtn?.getAttribute("title")).toBe("Open interface policy.evaluate.v1");
+
+  // Outbound Session shows WebSocket session active / closed when public_endpoint uses wss://.
+  expect(screen.getByText("WebSocket session active")).toBeTruthy();
+  expect(screen.queryByText("gRPC stream active")).toBeNull();
+
+  // Inspector timestamps use 24-hour format without orphan "AM"/"PM" suffixes.
+  for (const el of document.querySelectorAll(".meta-item__value")) {
+    expect(el.textContent ?? "").not.toMatch(/\b(AM|PM)\b/i);
+  }
+
+  // Selecting the disconnected zero-interface worker renders "None" in table and "WebSocket session closed".
+  fireEvent.click(screen.getByText("bot-none-2"));
+  expect(await screen.findByText("WebSocket session closed")).toBeTruthy();
+
+  // Clicking the primary interface button navigates directly to /interfaces for that interface.
+  fireEvent.click(rowPrimaryBtn!);
+  expect(await screen.findByRole("heading", { name: "policy.evaluate.v1" })).toBeTruthy();
+  expect(window.location.pathname).toBe("/interfaces");
 });

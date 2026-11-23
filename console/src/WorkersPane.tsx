@@ -84,6 +84,8 @@ export function WorkersPane(props: WorkersPaneProps) {
   }, [selectedWorkerId, workers, filtered]);
 
   const activeWorker = filtered.find((w) => w.worker_id === selectedWorkerId) ?? filtered[0] ?? null;
+  const publicEndpoint = overview?.control_plane?.public_endpoint?.trim() ?? "";
+  const isWebSocketTransport = publicEndpoint.startsWith("ws://") || publicEndpoint.startsWith("wss://");
 
   return (
     <div className="content-grid">
@@ -138,12 +140,12 @@ export function WorkersPane(props: WorkersPaneProps) {
             <table className="table table--fixed table--interactive">
               <thead>
                 <tr>
-                  <th style={{ width: "14%" }}>Status</th>
-                  <th style={{ width: "23%" }}>Worker</th>
-                  <th style={{ width: "15%" }}>Pool</th>
-                  <th style={{ width: "21%" }}>Interfaces</th>
+                  <th style={{ width: "13%" }}>Status</th>
+                  <th style={{ width: "22%" }}>Worker</th>
+                  <th style={{ width: "13%" }}>Pool</th>
+                  <th style={{ width: "24%" }}>Interfaces</th>
                   <th style={{ width: "16%" }}>Occupancy</th>
-                  <th style={{ width: "11%" }}>Last seen</th>
+                  <th style={{ width: "12%" }}>Last seen</th>
                 </tr>
               </thead>
               <tbody>
@@ -171,10 +173,12 @@ export function WorkersPane(props: WorkersPaneProps) {
                         >
                           {poolName}
                         </button>
-                        {ns !== "default" ? <div className="table__secondary ellipsis">{ns}</div> : null}
+                        {ns !== "default" ? <div className="table__secondary ellipsis" title={ns}>{ns}</div> : null}
                       </td>
                       <td>
-                        {worker.interfaces.length === 1 ? (
+                        {worker.interfaces.length === 0 ? (
+                          <span className="muted">None</span>
+                        ) : worker.interfaces.length === 1 ? (
                           <button
                             type="button"
                             className="cell-link mono ellipsis"
@@ -187,7 +191,23 @@ export function WorkersPane(props: WorkersPaneProps) {
                             {worker.interfaces[0]}
                           </button>
                         ) : (
-                          <span className="mono ellipsis" title={ifaces}>{ifaces}</span>
+                          <div className="cell-inline">
+                            <button
+                              type="button"
+                              className="cell-link mono ellipsis"
+                              style={{ flex: "0 1 auto", minWidth: 0 }}
+                              title={`Open interface ${worker.interfaces[0]}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenInterface(worker.interfaces[0]);
+                              }}
+                            >
+                              {worker.interfaces[0]}
+                            </button>
+                            <span className="tag num" style={{ flex: "none" }} title={ifaces}>
+                              +{worker.interfaces.length - 1}
+                            </span>
+                          </div>
                         )}
                       </td>
                       <td>
@@ -213,7 +233,7 @@ export function WorkersPane(props: WorkersPaneProps) {
         isEmpty={!activeWorker}
         emptyTitle="Worker & Session Inspector"
         emptyHint="Select a worker"
-        emptyMessage="Select a worker to inspect its outbound gRPC session, load, attributes, and capacity."
+        emptyMessage={`Select a worker to inspect its outbound ${isWebSocketTransport ? "WebSocket" : "gRPC"} session, load, attributes, and capacity.`}
         title={activeWorker?.worker_id ?? ""}
         subtitle={
           activeWorker ? (
@@ -248,7 +268,18 @@ export function WorkersPane(props: WorkersPaneProps) {
               <p className="inline-notice" role="status">Session disconnected; active leases survive until reconnect grace expires.</p>
             ) : null}
 
-            <InspectorGroup title="Outbound Session" meta={activeWorker.connected ? "gRPC stream active" : "gRPC stream closed"}>
+            <InspectorGroup
+              title="Outbound Session"
+              meta={
+                isWebSocketTransport
+                  ? activeWorker.connected
+                    ? "WebSocket session active"
+                    : "WebSocket session closed"
+                  : activeWorker.connected
+                    ? "gRPC stream active"
+                    : "gRPC stream closed"
+              }
+            >
               <MetaGrid
                 items={[
                   { label: "Session ID", value: activeWorker.session_id ?? "N/A", mono: true },
@@ -285,8 +316,8 @@ export function WorkersPane(props: WorkersPaneProps) {
                 ) : (
                   <div className="chip-list">
                     {activeWorker.interfaces.map((iface) => (
-                      <button key={iface} type="button" className="chip-btn" onClick={() => onOpenInterface(iface)}>
-                        <span className="mono">{iface}</span>
+                      <button key={iface} type="button" className="chip-btn" title={`Open interface ${iface}`} onClick={() => onOpenInterface(iface)}>
+                        <span className="mono ellipsis">{iface}</span>
                       </button>
                     ))}
                   </div>

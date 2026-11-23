@@ -179,7 +179,7 @@ export function OverviewPane({
                 {cpItems.map((item) => (
                   <div key={item.label} className="meta-item">
                     <span>{item.label}</span>
-                    <strong className={item.mono ? "meta-item__value mono" : "meta-item__value"}>
+                    <strong className={item.mono ? "meta-item__value mono" : "meta-item__value"} title={item.value}>
                       {item.value}
                       {item.tag ? <> <em className="tag">{item.tag}</em></> : null}
                     </strong>
@@ -232,10 +232,12 @@ export function OverviewPane({
                         <td className="table__primary mono ellipsis" title={poolName}>{poolName}</td>
                         <td>
                           <div className="cell-inline" title={`${pool.namespace} / ${pool.interface}`}>
-                            {pool.namespace !== "default" ? <span className="tag">{pool.namespace}</span> : null}
+                            {pool.namespace !== "default" ? <span className="tag" style={{ flex: "none" }}>{pool.namespace}</span> : null}
                             <button
                               type="button"
                               className="cell-link mono ellipsis"
+                              style={{ flex: "0 1 auto", minWidth: 0 }}
+                              title={`Open interface ${pool.interface}`}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 onOpenInterface(pool.interface);

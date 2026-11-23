@@ -1363,8 +1363,26 @@ async fn cold_job_reads_and_watch_share_the_upload_result_budget() {
 #[tokio::test]
 async fn identifiers_are_bounded() {
     let server = serve(config()).await;
+    let exact_64 = format!("domain.action.{}.v1", "a".repeat(47));
+    assert_eq!(exact_64.len(), 64);
+    let over_65 = format!("domain.action.{}.v1", "a".repeat(48));
+    assert_eq!(over_65.len(), 65);
+
+    let mut ok_job = spec(b"x");
+    ok_job.demand.interface = exact_64.clone();
+    ok_job.policy.durability = Some(Durability::Ephemeral);
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("j".repeat(256)),
+            spec: ok_job,
+            ..SubmitRequest::default()
+        })
+        .await
+        .unwrap();
+
     let mut job = spec(b"x");
-    job.demand.interface = "i".repeat(300);
+    job.demand.interface = over_65.clone();
     let error = server
         .runtime
         .submit(SubmitRequest {
@@ -1377,7 +1395,7 @@ async fn identifiers_are_bounded() {
     let error = server
         .runtime
         .submit(SubmitRequest {
-            job_id: Some("j".repeat(300)),
+            job_id: Some("j".repeat(257)),
             spec: spec(b"x"),
             ..SubmitRequest::default()
         })
@@ -1388,7 +1406,7 @@ async fn identifiers_are_bounded() {
     let (tx, outbound) = mpsc::channel(1);
     tx.send(msg(pb::worker_message::Msg::Hello(pb::Hello {
         worker_id: "w".to_string(),
-        interfaces: vec!["i".repeat(300)],
+        interfaces: vec![over_65],
         ..Default::default()
     })))
     .await

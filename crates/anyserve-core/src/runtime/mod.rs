@@ -930,10 +930,16 @@ impl Runtime {
         if spec.demand.interface.trim().is_empty() {
             return Err(RuntimeError::invalid("demand.interface is required"));
         }
-        if spec.demand.interface.len() > limits.max_identifier_bytes as usize {
+        if spec.demand.interface.len() > api::MAX_INTERFACE_BYTES {
             return Err(RuntimeError::invalid(format!(
                 "demand.interface exceeds {} bytes",
-                limits.max_identifier_bytes
+                api::MAX_INTERFACE_BYTES
+            )));
+        }
+        if !api::is_valid_interface_name(&spec.demand.interface) {
+            return Err(RuntimeError::invalid(format!(
+                "demand.interface must be 1..={} bytes with no ASCII whitespace or control characters",
+                api::MAX_INTERFACE_BYTES
             )));
         }
         if spec.inputs.len() > limits.max_objects as usize {
@@ -1944,6 +1950,93 @@ mod tests {
             })
             .await
             .unwrap();
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interface_names_are_bounded_to_64_bytes_and_reject_whitespace_or_control_chars() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let exact_64 = format!("domain.action.{}.v1", "a".repeat(47));
+        assert_eq!(exact_64.len(), api::MAX_INTERFACE_BYTES);
+        let over_65 = format!("domain.action.{}.v1", "a".repeat(48));
+        assert_eq!(over_65.len(), api::MAX_INTERFACE_BYTES + 1);
+
+        // 64-byte domain.action.v1-style interface succeeds on Hello, Submit, and Invoke.
+        let _session = runtime
+            .open_session(anyserve_proto::v2::Hello {
+                worker_id: "w-64".into(),
+                interfaces: vec![exact_64.clone()],
+                max_concurrency: 1,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut ok_spec = JobSpec::default();
+        ok_spec.demand.interface = exact_64.clone();
+        ok_spec.policy.durability = Some(Durability::Ephemeral);
+        let submitted = runtime
+            .submit(SubmitRequest {
+                spec: ok_spec.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(submitted.job.interface, exact_64);
+
+        let exec = runtime
+            .invoke(InvokeRequest {
+                spec: ok_spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        drop(exec);
+
+        // 65-byte, empty, whitespace, and ASCII control-character interfaces fail with InvalidArgument.
+        for bad in [
+            over_65.as_str(),
+            "",
+            "   ",
+            "domain.action.v1 ",
+            "domain action.v1",
+            "domain\taction.v1",
+            "domain\naction.v1",
+            "domain\x00action.v1",
+            "domain\x7faction.v1",
+        ] {
+            let hello_err = runtime
+                .open_session(anyserve_proto::v2::Hello {
+                    worker_id: "w-bad".into(),
+                    interfaces: vec![bad.to_string()],
+                    ..Default::default()
+                })
+                .err()
+                .expect(bad);
+            assert_eq!(hello_err.kind, crate::error::ErrorKind::InvalidArgument);
+
+            let mut bad_spec = JobSpec::default();
+            bad_spec.demand.interface = bad.to_string();
+            bad_spec.policy.durability = Some(Durability::Ephemeral);
+            let sub_err = runtime
+                .submit(SubmitRequest {
+                    spec: bad_spec.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(sub_err.kind, crate::error::ErrorKind::InvalidArgument);
+
+            let inv_err = runtime
+                .invoke(InvokeRequest {
+                    spec: bad_spec,
+                    ..Default::default()
+                })
+                .await
+                .err()
+                .expect(bad);
+            assert_eq!(inv_err.kind, crate::error::ErrorKind::InvalidArgument);
+        }
+
         runtime.shutdown().await;
     }
 

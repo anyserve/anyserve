@@ -222,11 +222,21 @@ async fn list_jobs(
     };
     let worker_id = normalize_optional_filter(query.worker)
         .filter(|worker| !worker.eq_ignore_ascii_case("all"));
+    let interface = normalize_optional_filter(query.interface)
+        .filter(|iface| !iface.eq_ignore_ascii_case("all"));
+    if let Some(ref iface) = interface
+        && !anyserve_core::runtime::api::is_valid_interface_name(iface)
+    {
+        return Err(ApiError::bad_request(format!(
+            "interface must be 1..={} bytes with no ASCII whitespace or control characters",
+            anyserve_core::runtime::api::MAX_INTERFACE_BYTES
+        )));
+    }
     let result = state
         .runtime
         .query_jobs(JobQuery {
             states: parse_states(query.states.as_deref())?,
-            interface: normalize_optional_filter(query.interface),
+            interface,
             namespace: normalize_optional_filter(query.namespace),
             worker_id,
             search,

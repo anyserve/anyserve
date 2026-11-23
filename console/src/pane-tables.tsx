@@ -264,7 +264,7 @@ export const JobsTable = memo(function JobsTable(props: {
                 <td>
                   <div className="cell-stack">
                     <StateBadge state={job.state} />
-                    {job.error_code ? <span className="tag tag--danger ellipsis">{job.error_code}</span> : null}
+                    {job.error_code ? <span className="tag tag--danger ellipsis" title={job.error_code}>{job.error_code}</span> : null}
                   </div>
                 </td>
                 <td>

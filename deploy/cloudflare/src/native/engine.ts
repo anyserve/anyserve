@@ -29,11 +29,13 @@ import {
   HTTP_MAX_BODY_BYTES,
   IsolateMemoryBudget,
   MAX_IDENTIFIER_BYTES,
+  MAX_INTERFACE_BYTES,
   MAX_METADATA_BYTES,
   MAX_OBJECTS,
   WS_MAX_ENCODED_BYTES,
   WS_READY_STATE_OPEN,
   boundCustomLoad,
+  isValidInterfaceName,
   readSocketAttachment,
   writeSocketAttachment,
   type NativeEnvConfig,
@@ -1700,13 +1702,19 @@ export class NativeEngine implements ConsoleBackend {
     }
     if (
       hello.interfaces.length > MAX_OBJECTS ||
-      hello.interfaces.some((i) => i.length === 0 || utf8ByteLen(i) > MAX_IDENTIFIER_BYTES) ||
+      !hello.interfaces.every((i) => isValidInterfaceName(i))
+    ) {
+      throw GrpcStatusError.invalidArgument(
+        `Hello.interfaces entries must be 1..=${MAX_INTERFACE_BYTES} bytes (no ASCII whitespace or control characters) and at most ${MAX_OBJECTS} interfaces`,
+      );
+    }
+    if (
       utf8ByteLen(hello.workerId) > MAX_IDENTIFIER_BYTES ||
       utf8ByteLen(hello.resumeSessionId) > MAX_IDENTIFIER_BYTES ||
       utf8ByteLen(hello.pool) > MAX_IDENTIFIER_BYTES
     ) {
       throw GrpcStatusError.invalidArgument(
-        `Hello identifiers must be 1..=${MAX_IDENTIFIER_BYTES} bytes and at most ${MAX_OBJECTS} interfaces`,
+        `Hello identifiers must be at most ${MAX_IDENTIFIER_BYTES} bytes`,
       );
     }
     if (hello.heldLeaseIds.length > MAX_OBJECTS) {

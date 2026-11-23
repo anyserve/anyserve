@@ -498,7 +498,7 @@ struct InterfaceConfigFile {
     pool_tiers: Vec<PoolTierFile>,
 }
 impl RuntimeConfigFile {
-    pub(super) fn resolve(self) -> RuntimeConfig {
+    pub(super) fn resolve(self) -> Result<RuntimeConfig> {
         let mut config = RuntimeConfig::default();
         if let Some(value) = self.heartbeat_interval_ms {
             config.heartbeat_interval = Duration::from_millis(value);
@@ -557,6 +557,14 @@ impl RuntimeConfigFile {
         if let Some(value) = self.event_log_max_bytes {
             config.event_log_max_bytes = value;
         }
+        for name in self.interfaces.keys() {
+            if !anyserve_core::runtime::api::is_valid_interface_name(name) {
+                anyhow::bail!(
+                    "runtime.interfaces key '{name}' must be 1..={} bytes with no ASCII whitespace or control characters",
+                    anyserve_core::runtime::api::MAX_INTERFACE_BYTES
+                );
+            }
+        }
         config.interfaces = self
             .interfaces
             .into_iter()
@@ -580,6 +588,6 @@ impl RuntimeConfigFile {
                 )
             })
             .collect();
-        config
+        Ok(config)
     }
 }

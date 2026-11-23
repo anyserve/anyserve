@@ -30,6 +30,20 @@ pub const IDENTITY_EXCLUDED_METADATA_KEYS: &[&str] =
 pub const OBJECT_SHA256_METADATA_KEY: &str = "anyserve.sha256";
 pub const OBJECT_SIZE_METADATA_KEY: &str = "anyserve.size_bytes";
 
+/// Maximum UTF-8 byte length of an interface name (`1..=64` bytes with no ASCII
+/// whitespace or control characters).
+pub const MAX_INTERFACE_BYTES: usize = 64;
+
+/// Returns `true` when `name` is `1..=MAX_INTERFACE_BYTES` UTF-8 bytes and
+/// contains no ASCII control or whitespace characters.
+pub fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_INTERFACE_BYTES
+        && name
+            .bytes()
+            .all(|b| !b.is_ascii_control() && !b.is_ascii_whitespace())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Object {
     Inline { data: Bytes, metadata: Metadata },
@@ -581,7 +595,8 @@ pub struct Limits {
     /// Input objects of a job, result objects of an attempt, and interfaces
     /// of a worker.
     pub max_objects: u32,
-    /// Job ids, interface names and worker ids.
+    /// Job ids, session ids, pool names and worker ids (interface names use
+    /// [`MAX_INTERFACE_BYTES`]).
     pub max_identifier_bytes: u32,
 }
 

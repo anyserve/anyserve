@@ -5,7 +5,9 @@ import { GrpcCode, GrpcStatusError, type AuthPolicy } from "./auth";
 import { DEFAULT_NAMESPACE, encodeScopedId, validateNamespaceSafe } from "./engine";
 import {
   MAX_IDENTIFIER_BYTES,
+  MAX_INTERFACE_BYTES,
   PREVIEW_MAX_BYTES,
+  isValidInterfaceName,
   type InterfacePolicyConfig,
   type NativeEnvConfig,
 } from "./host";
@@ -816,11 +818,20 @@ async function dispatchAuthorizedConsoleRoute(
         "namespace must be 1..=64 ASCII characters in [a-zA-Z0-9._-]",
       );
     }
+    const rawIface = normalizeOptionalFilter(url.searchParams.get("interface"));
+    const ifaceFilter =
+      rawIface && rawIface.toLowerCase() !== "all" ? rawIface : null;
+    if (ifaceFilter !== null && !isValidInterfaceName(ifaceFilter)) {
+      return apiErrorResponse(
+        400,
+        `interface must be 1..=${MAX_INTERFACE_BYTES} bytes with no ASCII whitespace or control characters`,
+      );
+    }
 
     const result = backend.queryJobsForConsole(
       {
         states: statesOrErr,
-        interfaceName: normalizeOptionalFilter(url.searchParams.get("interface")),
+        interfaceName: ifaceFilter,
         namespace: nsFilter,
         workerId,
         search,

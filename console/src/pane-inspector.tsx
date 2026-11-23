@@ -33,9 +33,9 @@ export function MetaGrid({ items }: { items: MetaField[] }) {
       {items.map((item) => (
         <div key={item.label} className="meta-item">
           <span>{item.label}</span>
-          <strong className={item.mono ? "meta-item__value mono" : "meta-item__value"}>
+          <strong className={item.mono ? "meta-item__value mono" : "meta-item__value"} title={item.title ?? item.value}>
             {item.onClick ? (
-              <button type="button" className="entity-link" title={item.title} onClick={item.onClick}>
+              <button type="button" className="entity-link" title={item.title ?? item.value} onClick={item.onClick}>
                 {item.value}
               </button>
             ) : (
@@ -114,9 +114,9 @@ export interface SubtitleItem {
 
 function SubtitleNode({ text, title, onClick }: SubtitleItem) {
   return onClick ? (
-    <button type="button" className="entity-link mono" title={title} onClick={onClick}>{text}</button>
+    <button type="button" className="entity-link mono" title={title ?? text} onClick={onClick}>{text}</button>
   ) : (
-    <span className="mono">{text}</span>
+    <span className="mono" title={title ?? text}>{text}</span>
   );
 }
 

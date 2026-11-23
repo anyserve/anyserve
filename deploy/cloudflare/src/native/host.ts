@@ -8,6 +8,7 @@ export const MAX_INLINE_TOTAL_BYTES = 25_165_824; // 24 MiB
 export const MAX_METADATA_BYTES = 32_768; // 32 KiB
 export const MAX_OBJECTS = 1_024;
 export const MAX_IDENTIFIER_BYTES = 256;
+export const MAX_INTERFACE_BYTES = 64;
 
 export const WELCOME_MAX_CONTROL_BYTES = 262_144; // 256 KiB
 export const WELCOME_MAX_CHUNK_BYTES = 65_536; // 64 KiB
@@ -105,6 +106,19 @@ interface CompactAttachment {
 import { utf8ByteLen } from "./utf8";
 
 const utf8Encoder = new TextEncoder();
+
+export function isValidInterfaceName(name: string): boolean {
+  if (name.length === 0 || utf8ByteLen(name) > MAX_INTERFACE_BYTES) {
+    return false;
+  }
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c <= 0x20 || c === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
 
 export function encodeCompactAttachment(att: SocketAttachment): CompactAttachment {
   const kindMap: Record<SocketKind, CompactAttachment["k"]> = {

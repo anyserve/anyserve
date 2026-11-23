@@ -155,9 +155,10 @@ allow for startup time proportional to retained data.
 
 Compiled protocol limits are 16 MiB per inline object, 32 MiB per job's input or
 attempt result (including associated metadata), 32 KiB metadata, 1,024 objects,
-256-byte identifiers, 64 KiB chunks and a 4 MiB unacknowledged attempt window.
-The gRPC message cap is 64 MiB including protobuf overhead. URI objects are opaque
-references; applications fetch them.
+64-byte interface names (`1..=64` bytes with no ASCII whitespace or control
+characters), 256-byte job/worker/session/pool identifiers, 64 KiB chunks and a
+4 MiB unacknowledged attempt window. The gRPC message cap is 64 MiB including
+protobuf overhead. URI objects are opaque references; applications fetch them.
 
 ## Console Explore
 

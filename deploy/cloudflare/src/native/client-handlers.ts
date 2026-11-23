@@ -5,9 +5,11 @@ import { GrpcStatusError } from "./auth";
 import {
   EVENT_OVERHEAD_BYTES,
   MAX_IDENTIFIER_BYTES,
+  MAX_INTERFACE_BYTES,
   MAX_METADATA_BYTES,
   MAX_OBJECTS,
   WS_READY_STATE_OPEN,
+  isValidInterfaceName,
   writeSocketAttachment,
   type NativeWebSocket,
   type SocketAttachment,
@@ -543,9 +545,14 @@ export const clientHandlers = {
     if (!iface || iface.trim().length === 0) {
       throw GrpcStatusError.invalidArgument("demand.interface is required");
     }
-    if (utf8ByteLen(iface) > MAX_IDENTIFIER_BYTES) {
+    if (utf8ByteLen(iface) > MAX_INTERFACE_BYTES) {
       throw GrpcStatusError.invalidArgument(
-        `demand.interface exceeds ${MAX_IDENTIFIER_BYTES} bytes`,
+        `demand.interface exceeds ${MAX_INTERFACE_BYTES} bytes`,
+      );
+    }
+    if (!isValidInterfaceName(iface)) {
+      throw GrpcStatusError.invalidArgument(
+        `demand.interface must be 1..=${MAX_INTERFACE_BYTES} bytes with no ASCII whitespace or control characters`,
       );
     }
     if (protoSpec.inputs.length > MAX_OBJECTS) {

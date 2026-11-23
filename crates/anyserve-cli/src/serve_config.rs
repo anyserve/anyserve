@@ -101,7 +101,7 @@ impl ResolvedServeConfig {
         let server = file_config.server.unwrap_or_default();
         let tls = server.tls.unwrap_or_default();
         let defaults = GrpcConfig::default();
-        let mut runtime = file_config.runtime.unwrap_or_default().resolve();
+        let mut runtime = file_config.runtime.unwrap_or_default().resolve()?;
         runtime.journal = if overrides.ephemeral {
             None
         } else {

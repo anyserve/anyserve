@@ -10,7 +10,10 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::Runtime;
-use super::api::{ErrorInfo, JobState, Metadata, Object, WorkerLoad, codes};
+use super::api::{
+    ErrorInfo, JobState, MAX_INTERFACE_BYTES, Metadata, Object, WorkerLoad, codes,
+    is_valid_interface_name,
+};
 use super::events::LogFull;
 use super::identity::outcome_digest;
 use super::input::InputLog;
@@ -93,17 +96,19 @@ impl Runtime {
             return Err(RuntimeError::invalid("Hello.interfaces is required"));
         }
         if hello.interfaces.len() > limits.max_objects as usize
-            || hello
-                .interfaces
-                .iter()
-                .any(|i| i.is_empty() || i.len() > identifier)
-            || hello.worker_id.len() > identifier
+            || !hello.interfaces.iter().all(|i| is_valid_interface_name(i))
+        {
+            return Err(RuntimeError::invalid(format!(
+                "Hello.interfaces entries must be 1..={MAX_INTERFACE_BYTES} bytes (no ASCII whitespace or control characters) and at most {} interfaces",
+                limits.max_objects
+            )));
+        }
+        if hello.worker_id.len() > identifier
             || hello.resume_session_id.len() > identifier
             || hello.pool.len() > identifier
         {
             return Err(RuntimeError::invalid(format!(
-                "Hello identifiers must be 1..={identifier} bytes and at most {} interfaces",
-                limits.max_objects
+                "Hello identifiers must be at most {identifier} bytes"
             )));
         }
         if hello.held_lease_ids.len() > limits.max_objects as usize {

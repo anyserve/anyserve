@@ -4547,3 +4547,135 @@ describe("static_in manifests are read once per input pump run", () => {
     expect(staticReads).toHaveLength(1);
   });
 });
+
+describe("interface name 1..=64 byte bound on Hello, Submit, Invoke, and Console query", () => {
+  it("accepts a 64-byte interface and rejects 65-byte, empty, whitespace, and control-char interfaces with GrpcCode.InvalidArgument (3)", async () => {
+    const platform = new SimulatedNativePlatform();
+    const exact64 = `domain.action.${"a".repeat(47)}.v1`;
+    expect(utf8ByteLen(exact64)).toBe(64);
+    const over65 = `domain.action.${"a".repeat(48)}.v1`;
+    expect(utf8ByteLen(over65)).toBe(65);
+
+    // 1. 64-char interface succeeds on Hello, Submit, and Invoke
+    const { ws: sessionWs } = await connectWorkerSession(platform, {
+      workerId: "w-iface-64",
+      interfaces: [exact64],
+    });
+
+    const okSub = await platform.unaryPost(
+      "/rpc/v2/client/submit",
+      pb.encodeSubmitRequest({
+        jobId: `j-${"x".repeat(254)}`,
+        spec: {
+          demand: { interface: exact64 },
+          inputs: [{ body: { case: "inline", value: utf8Encoder.encode("ok") }, metadata: {} }],
+          params: new Uint8Array(0),
+          metadata: {},
+        },
+        conflictPolicy: pb.ConflictPolicy.FAIL,
+      }),
+    );
+    expect(okSub.status).toBe(200);
+    expect(pb.decodeSubmitResponse(okSub.bytes).job?.interface).toBe(exact64);
+
+    const okInv = (await platform.openWs("/ws/v2/client/invoke")).client!;
+    await okInv.sendBinary(
+      pb.encodeInvokeRequest({
+        msg: {
+          case: "start",
+          value: {
+            streamingInput: false,
+            spec: {
+              demand: { interface: exact64 },
+              inputs: [],
+              params: new Uint8Array(0),
+              metadata: {},
+            },
+          },
+        },
+      }),
+    );
+    expect(okInv.serverClosed).toBeNull();
+    expect(decodeExecutionEvents(okInv)[0]!.event?.case).toBe("accepted");
+    expect(extractAssigns(sessionWs).length).toBeGreaterThanOrEqual(1);
+
+    const okConsoleRes = await platform.engine.fetch(
+      new Request(`https://anyserve.example.com/api/jobs?interface=${encodeURIComponent(exact64)}`),
+    );
+    expect(okConsoleRes.status).toBe(200);
+
+    // 2. 65-char, empty, whitespace, and ASCII control interfaces fail with InvalidArgument (3)
+    for (const bad of [
+      over65,
+      "",
+      "   ",
+      "domain action.v1",
+      "domain\taction.v1",
+      "domain\naction.v1",
+      "domain\x00action.v1",
+      "domain\x7faction.v1",
+    ]) {
+      const badHello = (await platform.openWs("/ws/v2/worker/session")).client!;
+      await badHello.sendBinary(
+        pb.encodeWorkerMessage({
+          msg: {
+            case: "hello",
+            value: {
+              workerId: "w-bad",
+              interfaces: [bad],
+              maxConcurrency: 1,
+            },
+          },
+        }),
+      );
+      expect(badHello.popDecodedFrames()[0]).toMatchObject({
+        kind: "error",
+        code: GrpcCode.InvalidArgument,
+      });
+      expect(badHello.readyState).toBe(WS_READY_STATE_CLOSED);
+
+      const badSub = await platform.unaryPost(
+        "/rpc/v2/client/submit",
+        pb.encodeSubmitRequest({
+          jobId: "",
+          spec: {
+            demand: { interface: bad },
+            inputs: [],
+            params: new Uint8Array(0),
+            metadata: {},
+          },
+          conflictPolicy: pb.ConflictPolicy.FAIL,
+        }),
+      );
+      expect(badSub.grpcCode).toBe(GrpcCode.InvalidArgument);
+
+      const badInv = (await platform.openWs("/ws/v2/client/invoke")).client!;
+      await badInv.sendBinary(
+        pb.encodeInvokeRequest({
+          msg: {
+            case: "start",
+            value: {
+              streamingInput: false,
+              spec: {
+                demand: { interface: bad },
+                inputs: [],
+                params: new Uint8Array(0),
+                metadata: {},
+              },
+            },
+          },
+        }),
+      );
+      expect(badInv.popDecodedFrames()[0]).toMatchObject({
+        kind: "error",
+        code: GrpcCode.InvalidArgument,
+      });
+      expect(badInv.readyState).toBe(WS_READY_STATE_CLOSED);
+    }
+
+    const badConsoleRes = await platform.engine.fetch(
+      new Request(`https://anyserve.example.com/api/jobs?interface=${encodeURIComponent(over65)}`),
+    );
+    expect(badConsoleRes.status).toBe(400);
+  });
+});
