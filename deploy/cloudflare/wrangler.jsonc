@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "anyserve-cloudflare-native",
-  "main": "src/index.ts",
+  "main": "src/native-worker.ts",
   "compatibility_date": "2025-11-17",
   "build": {
     "command": "if [ -f console/package.json ]; then npm --prefix console run build; else npm --prefix ../../console run build; fi"

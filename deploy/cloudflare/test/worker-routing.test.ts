@@ -493,7 +493,7 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
       readFileSync(resolve(cfDir, "wrangler.jsonc"), "utf8"),
     );
     expect(nativeCfg.name).toBe("anyserve-cloudflare-native");
-    expect(nativeCfg.main).toBe("src/index.ts");
+    expect(nativeCfg.main).toBe("src/native-worker.ts");
     expect(nativeCfg.compatibility_date).toBe("2025-11-17");
     expect(nativeCfg.build?.command).toContain("npm --prefix");
     expect(nativeCfg.build?.command).toContain("../../console run build");

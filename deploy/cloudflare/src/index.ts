@@ -3,22 +3,11 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./env";
 import { AnyserveControlPlaneDO } from "./journal-do";
 import { AnyserveNativeDO } from "./native-do";
+import { SINGLETON_LEADER_NAME, isControlPlanePath } from "./native-worker";
 
 export { AnyserveControlPlaneDO, AnyserveNativeDO, ContainerProxy };
 
-export const SINGLETON_LEADER_NAME = "singleton-leader";
-
-const CONTROL_PLANE_EXACT_PATHS = new Set(["/healthz", "/readyz", "/metrics"]);
-const CONTROL_PLANE_PREFIXES = ["/api", "/rpc", "/ws"];
-
-export function isControlPlanePath(pathname: string): boolean {
-  if (CONTROL_PLANE_EXACT_PATHS.has(pathname)) {
-    return true;
-  }
-  return CONTROL_PLANE_PREFIXES.some(
-    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
-  );
-}
+export { SINGLETON_LEADER_NAME, isControlPlanePath };
 
 export interface JournalGatewayProps {
   doId: string;

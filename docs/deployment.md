@@ -266,6 +266,8 @@ Separate Worker names and Durable Object migration histories mean the two modes 
 
 [wrangler.jsonc](../deploy/cloudflare/wrangler.jsonc) runs the full AnyServe v2 execution control plane directly inside a single Hibernatable WebSocket Durable Object (`AnyserveNativeDO`) backed by DO SQLite and R2, with **no `containers` stanza** and no Docker dependency. Unmodified Rust and Python SDKs connect over `wss://`.
 
+The Free config's `main` is `src/native-worker.ts`, a dedicated entrypoint that exports only `AnyserveNativeDO` and a thin routing `fetch`, so the bundle excludes `@cloudflare/containers`, `JournalGateway` and the journal Durable Object. [wrangler.containers.jsonc](../deploy/cloudflare/wrangler.containers.jsonc) keeps `src/index.ts`, which re-uses the same routing and additionally exports `AnyserveControlPlaneDO`, `ContainerProxy` and `JournalGateway`.
+
 #### Prerequisites
 
 - A Cloudflare account on **Workers Free** (or Paid) with **R2 enabled** on the account before first deploy.
