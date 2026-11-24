@@ -46,7 +46,7 @@ python examples/python/submit.py
 | Mode | What you get | Entry point |
 |---|---|---|
 | Local / Zero-VPS Quick Tunnel | Local SQLite + `--auto-token`; optional `cloudflared tunnel --url http://127.0.0.1:3001` for instant public `wss://` | `anyserve serve --console-listen 127.0.0.1:3001 --auto-token`, [Quick Tunnel](docs/deployment.md#zero-vps-quick-tunnel) |
-| VPS (Docker Compose + Caddy) | Single-domain auto-HTTPS serving native gRPC (`https://`), `wss://`, and embedded Console | [deploy/vps/README.md](deploy/vps/README.md) |
+| VPS (Docker Compose + Caddy) | Single-domain auto-HTTPS serving native gRPC (`https://`), `wss://`, embedded Console, and optional [GitHub Login token portal](plugins/anyserve-auth-github/README.md) | [deploy/vps/README.md](deploy/vps/README.md) |
 | Fly.io | Single persistent NVMe Machine with native HTTP/2 gRPC (`:50052`), `wss://`, and embedded Console | [deploy/fly/README.md](deploy/fly/README.md) |
 | Cloudflare Workers Free | `$0` serverless Hibernatable DO + DO SQLite + R2 (`wss://` + Console, no Docker) | [wrangler.jsonc](deploy/cloudflare/wrangler.jsonc), [docs/deployment.md](docs/deployment.md#cloudflare-deployment-deploycloudflare) |
 | Cloudflare Containers | Rust binary in Cloudflare Containers + DO SQLite + R2 (`wss://`, Workers Paid) | [wrangler.containers.jsonc](deploy/cloudflare/wrangler.containers.jsonc) |
@@ -61,6 +61,7 @@ python examples/python/submit.py
 - `clients/python` — Python SDK (`anyserve-runtime`)
 - `console` — React Console and DuckDB-WASM Explore
 - `deploy/vps`, `deploy/fly` — 1-minute Docker Compose + Caddy and Fly.io relay templates
+- `plugins/anyserve-auth-github` — optional GitHub Login OAuth portal plugin (HMAC tokens + revocation)
 - `deploy/helm/anyserve` — Kubernetes Helm chart (SQLite or PostgreSQL HA + optional workers)
 - `deploy/cloudflare` — Cloudflare Workers Free native DO and Containers deployments
 - `bench/load` — load benchmarks and console profiling

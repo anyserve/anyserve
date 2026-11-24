@@ -9,6 +9,8 @@ services:
       - ANYSERVE_CLIENT_TOKENS
       - ANYSERVE_WORKER_TOKENS
       - ANYSERVE_PUBLIC_ENDPOINT
+      - ANYSERVE_TOKEN_SIGNING_KEY=${ANYSERVE_TOKEN_SIGNING_KEY:-}
+      - ANYSERVE_AUTH_REVOCATION_URL=${ANYSERVE_AUTH_REVOCATION_URL:-}
     volumes:
       - anyserve_data:/data
       - ./server.toml:/etc/anyserve/server.toml:ro
@@ -25,11 +27,36 @@ services:
     environment:
       - ANYSERVE_DOMAIN
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${ANYSERVE_CADDYFILE:-./Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
 
+  # Optional GitHub Login self-service token plugin:
+  #   ANYSERVE_CADDYFILE=./Caddyfile.auth-github docker compose --profile auth-github up -d
+  auth-github:
+    profiles: ["auth-github"]
+    build:
+      context: ../..
+      dockerfile: plugins/anyserve-auth-github/Dockerfile
+    restart: unless-stopped
+    environment:
+      - ANYSERVE_AUTH_LISTEN=0.0.0.0:3002
+      - ANYSERVE_AUTH_DB=/data/auth-github.sqlite
+      - ANYSERVE_AUTH_PUBLIC_URL=${ANYSERVE_AUTH_PUBLIC_URL:-https://${ANYSERVE_DOMAIN}}
+      - ANYSERVE_AUTH_CONSOLE_URL=${ANYSERVE_AUTH_CONSOLE_URL:-https://${ANYSERVE_DOMAIN}}
+      - ANYSERVE_AUTH_GRPC_ENDPOINT=${ANYSERVE_AUTH_GRPC_ENDPOINT:-https://${ANYSERVE_DOMAIN}}
+      - ANYSERVE_AUTH_WS_ENDPOINT=${ANYSERVE_AUTH_WS_ENDPOINT:-wss://${ANYSERVE_DOMAIN}}
+      - ANYSERVE_TOKEN_SIGNING_KEY
+      - GITHUB_CLIENT_ID
+      - GITHUB_CLIENT_SECRET
+      - ANYSERVE_AUTH_ALLOWED_USERS=${ANYSERVE_AUTH_ALLOWED_USERS:-}
+      - ANYSERVE_AUTH_MIN_ACCOUNT_AGE_DAYS=${ANYSERVE_AUTH_MIN_ACCOUNT_AGE_DAYS:-0}
+      - ANYSERVE_AUTH_TOKEN_TTL_DAYS=${ANYSERVE_AUTH_TOKEN_TTL_DAYS:-30}
+    volumes:
+      - anyserve_auth_data:/data
+
 volumes:
   anyserve_data:
+  anyserve_auth_data:
   caddy_data:
   caddy_config:

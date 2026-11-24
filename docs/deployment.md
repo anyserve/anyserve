@@ -19,7 +19,9 @@ cloudflared tunnel --url http://127.0.0.1:3001
 
 ## Quick VPS Relay (`deploy/vps`)
 
-`deploy/vps` provides a 1-minute single-domain Compose stack with Caddy automatic HTTPS: gRPC (`/anyserve.v2.*`, `/grpc.health.*`, `/grpc.reflection.*`) proxies to `h2c://anyserve:50052`, `/metrics` is blocked (`403`), and Console/WSS proxy to `:3001`. See [deploy/vps/README.md](../deploy/vps/README.md).
+`deploy/vps` provides a 1-minute single-domain Compose stack with Caddy automatic HTTPS: gRPC (`/anyserve.v2.*`, `/grpc.health.*`, `/grpc.reflection.*`) proxies to `h2c://anyserve:50052`, `/metrics` is blocked (`403`), and Console/WSS proxy to `:3001`.
+
+For public multi-user betas where anyone signs in with **GitHub Login** to mint and revoke isolated `client`/`worker` tokens (`gh-<id>` namespace) and inspect their own jobs in the Console, enable the optional [anyserve-auth-github](../plugins/anyserve-auth-github/README.md) Compose profile (`ANYSERVE_CADDYFILE=./Caddyfile.auth-github docker compose --profile auth-github up -d`). See [deploy/vps/README.md](../deploy/vps/README.md).
 
 ## Fly.io (`deploy/fly`)
 

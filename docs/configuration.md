@@ -36,6 +36,10 @@ worker_tokens = []
 # role = "worker"
 # namespace = "robot-fleet-a"
 # forced_pool = "jetson-local"
+# Optional HMAC signing keys for decoupled auth plugins (default env: ANYSERVE_TOKEN_SIGNING_KEY):
+# signing_keys_env = "ANYSERVE_TOKEN_SIGNING_KEY"
+# revocation_url = "http://auth-github:3002/internal/revocations"
+# revocation_poll_interval_ms = 2000
 
 # Omit this section to disable management HTTP.
 [console]
@@ -93,13 +97,15 @@ environment sources are combined. When `[auth].client_tokens_env` or
 automatically reads comma-separated tokens from `ANYSERVE_CLIENT_TOKENS` and
 `ANYSERVE_WORKER_TOKENS` when set. An explicit TOML `*_env` key names the
 variable to read (and requires it to be set); it does not contain the token
-itself. With client/worker/scoped lists all empty (and `--auto-token` not set),
-client/worker authentication is disabled and the `x-anyserve-namespace` header
-is caller-asserted with no tenant isolation. Once enabled, clients need
+itself. With client/worker/scoped/signing-key lists all empty (and `--auto-token` not
+set), client/worker authentication is disabled and the `x-anyserve-namespace`
+header is caller-asserted with no tenant isolation. Once enabled, clients need
 client-role tokens, workers need worker-role tokens, and tenant isolation comes
-from `[[auth.scoped_tokens]]`. The management HTTP API (`/api/*`, `/metrics`)
-requires an operator token from `[auth].client_tokens` (or CLI/env client
-tokens; scoped tenant tokens and worker tokens receive `403 Forbidden`).
+from `[[auth.scoped_tokens]]` or stateless signed tokens (`ANYSERVE_TOKEN_SIGNING_KEY`).
+On the management HTTP server, `/metrics` strictly requires an operator token
+from `[auth].client_tokens` (or CLI/env `ANYSERVE_CLIENT_TOKENS`), while Console
+`/api/*` accepts both operator tokens (global view) and tenant `client` tokens
+(strictly scoped to their own namespace; cross-namespace requests receive `403 Forbidden`).
 
 When a job sets a non-empty `concurrency_key` and neither `runtime.default_max_in_flight_per_key`
 nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, the scheduler defaults to `1`

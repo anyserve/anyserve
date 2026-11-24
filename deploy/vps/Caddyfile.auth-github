@@ -1,0 +1,26 @@
+{$ANYSERVE_DOMAIN} {
+	# Block Prometheus metrics and internal plugin endpoints from the public internet.
+	@blocked path /metrics /metrics/* /internal /internal/*
+	handle @blocked {
+		respond 403
+	}
+
+	# Optional GitHub Login token portal plugin (/tokens, /auth/*).
+	@auth_github path /tokens /auth/*
+	handle @auth_github {
+		reverse_proxy auth-github:3002
+	}
+
+	# Route native HTTP/2 gRPC services (Client, Worker, gRPC health, reflection)
+	# to the control plane's h2c listener.
+	@grpc path /anyserve.v2.* /grpc.health.* /grpc.reflection.*
+	handle @grpc {
+		reverse_proxy h2c://anyserve:50052
+	}
+
+	# Route embedded Console UI, management API (/api/*), HTTP/WS transport
+	# (/rpc/v2/*, /ws/v2/*), and probes (/healthz, /readyz) to the HTTP listener.
+	handle {
+		reverse_proxy anyserve:3001
+	}
+}
