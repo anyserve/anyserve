@@ -48,26 +48,67 @@ pub(super) struct AuthConfigFile {
     scoped_tokens: Vec<ScopedTokenFile>,
 }
 
+pub(super) const DEFAULT_CLIENT_TOKENS_ENV: &str = "ANYSERVE_CLIENT_TOKENS";
+pub(super) const DEFAULT_WORKER_TOKENS_ENV: &str = "ANYSERVE_WORKER_TOKENS";
+pub(super) const PUBLIC_ENDPOINT_ENV: &str = "ANYSERVE_PUBLIC_ENDPOINT";
+
+pub(super) fn split_tokens(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 impl AuthConfigFile {
-    pub(super) fn resolve(self) -> Result<AuthPolicy> {
-        let from_env = |name: Option<&str>| -> Result<Vec<String>> {
-            let Some(name) = name else {
-                return Ok(Vec::new());
-            };
-            let raw = std::env::var(name)
-                .with_context(|| format!("read auth tokens from env var {name}"))?;
-            Ok(raw.split(',').map(str::to_string).collect())
+    pub(super) fn resolve_with_env(
+        self,
+        cli_client_tokens: &[String],
+        cli_worker_tokens: &[String],
+        mut env: impl FnMut(&str) -> Option<String>,
+    ) -> Result<AuthPolicy> {
+        let resolve_env_tokens = |explicit: Option<&str>,
+                                  default_env: &str,
+                                  env: &mut dyn FnMut(&str) -> Option<String>|
+         -> Result<Vec<String>> {
+            match explicit {
+                Some(name) => {
+                    let raw = env(name)
+                        .with_context(|| format!("read auth tokens from env var {name}"))?;
+                    Ok(split_tokens(&raw))
+                }
+                None => Ok(env(default_env)
+                    .map(|raw| split_tokens(&raw))
+                    .unwrap_or_default()),
+            }
         };
+
         let mut client_tokens = self.client_tokens;
-        client_tokens.extend(from_env(self.client_tokens_env.as_deref())?);
+        client_tokens.extend(resolve_env_tokens(
+            self.client_tokens_env.as_deref(),
+            DEFAULT_CLIENT_TOKENS_ENV,
+            &mut env,
+        )?);
+        for raw in cli_client_tokens {
+            client_tokens.extend(split_tokens(raw));
+        }
+
         let mut worker_tokens = self.worker_tokens;
-        worker_tokens.extend(from_env(self.worker_tokens_env.as_deref())?);
+        worker_tokens.extend(resolve_env_tokens(
+            self.worker_tokens_env.as_deref(),
+            DEFAULT_WORKER_TOKENS_ENV,
+            &mut env,
+        )?);
+        for raw in cli_worker_tokens {
+            worker_tokens.extend(split_tokens(raw));
+        }
+
         let mut scoped = Vec::with_capacity(self.scoped_tokens.len());
         for entry in self.scoped_tokens {
             let token = match (entry.token, entry.token_env) {
                 (Some(t), _) => t,
-                (None, Some(env)) => std::env::var(&env)
-                    .with_context(|| format!("read scoped token from env var {env}"))?,
+                (None, Some(env_name)) => env(&env_name)
+                    .with_context(|| format!("read scoped token from env var {env_name}"))?,
                 (None, None) => {
                     anyhow::bail!("auth.scoped_tokens entry requires token or token_env")
                 }
@@ -124,7 +165,7 @@ pub(super) struct ServeConsoleConfigFile {
     public_endpoint: Option<String>,
 }
 
-fn nonempty_trimmed(value: Option<String>) -> Option<String> {
+pub(super) fn nonempty_trimmed(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -132,11 +173,7 @@ fn nonempty_trimmed(value: Option<String>) -> Option<String> {
 }
 
 impl ServeConsoleConfigFile {
-    pub(super) fn resolve(self) -> Option<ServeConsoleConfig> {
-        self.resolve_with_env(|name| std::env::var(name).ok())
-    }
-
-    fn resolve_with_env(
+    pub(super) fn resolve_with_env(
         self,
         mut env: impl FnMut(&str) -> Option<String>,
     ) -> Option<ServeConsoleConfig> {
@@ -145,7 +182,7 @@ impl ServeConsoleConfigFile {
         }
         // A non-empty env var overrides the TOML value (like the journal URL), so
         // one baked-in image can advertise the endpoint of each deployment.
-        let public_endpoint = nonempty_trimmed(env("ANYSERVE_PUBLIC_ENDPOINT"))
+        let public_endpoint = nonempty_trimmed(env(PUBLIC_ENDPOINT_ENV))
             .or_else(|| nonempty_trimmed(self.public_endpoint));
 
         Some(ServeConsoleConfig {
@@ -345,14 +382,72 @@ mod postgres_tests {
             );
         }
     }
+
+    #[test]
+    fn auth_env_fallbacks_explicit_overrides_and_cli_merging() {
+        use anyserve_core::auth::Role;
+
+        let empty = AuthConfigFile::default();
+        let disabled = empty.resolve_with_env(&[], &[], |_| None).unwrap();
+        assert!(!disabled.is_enabled());
+
+        // Automatic fallback to ANYSERVE_CLIENT_TOKENS / ANYSERVE_WORKER_TOKENS when unset in TOML.
+        let env_only = AuthConfigFile::default()
+            .resolve_with_env(&[], &[], |name| match name {
+                "ANYSERVE_CLIENT_TOKENS" => Some(" c1 , c2 ,, ".into()),
+                "ANYSERVE_WORKER_TOKENS" => Some("w1, w2".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(env_only.is_enabled());
+        assert_eq!(env_only.role_for_token("c1"), Some(Role::Client));
+        assert_eq!(env_only.role_for_token("c2"), Some(Role::Client));
+        assert_eq!(env_only.role_for_token("w1"), Some(Role::Worker));
+        assert_eq!(env_only.role_for_token("w2"), Some(Role::Worker));
+        assert_eq!(env_only.role_for_token("other"), None);
+
+        // Explicit TOML client_tokens_env / worker_tokens_env overrides the default env var name.
+        let explicit_toml: AuthConfigFile =
+            toml::from_str("client_tokens_env='CUSTOM_C'\nworker_tokens_env='CUSTOM_W'").unwrap();
+        let err = explicit_toml
+            .resolve_with_env(&[], &[], |name| match name {
+                "ANYSERVE_CLIENT_TOKENS" => Some("ignored-default".into()),
+                "ANYSERVE_WORKER_TOKENS" => Some("ignored-default-w".into()),
+                _ => None,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("CUSTOM_C"), "{err:#}");
+
+        let explicit_toml: AuthConfigFile = toml::from_str(
+            "client_tokens=['toml-c']\nclient_tokens_env='CUSTOM_C'\nworker_tokens_env='CUSTOM_W'",
+        )
+        .unwrap();
+        let merged = explicit_toml
+            .resolve_with_env(
+                &["cli-c1, cli-c2".into()],
+                &["cli-w1".into(), " , cli-w2 ".into()],
+                |name| match name {
+                    "CUSTOM_C" => Some("env-c".into()),
+                    "CUSTOM_W" => Some("env-w".into()),
+                    "ANYSERVE_CLIENT_TOKENS" => Some("must-not-load-c".into()),
+                    "ANYSERVE_WORKER_TOKENS" => Some("must-not-load-w".into()),
+                    _ => None,
+                },
+            )
+            .unwrap();
+        for tok in ["toml-c", "env-c", "cli-c1", "cli-c2"] {
+            assert_eq!(merged.role_for_token(tok), Some(Role::Client), "{tok}");
+        }
+        for tok in ["env-w", "cli-w1", "cli-w2"] {
+            assert_eq!(merged.role_for_token(tok), Some(Role::Worker), "{tok}");
+        }
+        assert_eq!(merged.role_for_token("must-not-load-c"), None);
+        assert_eq!(merged.role_for_token("must-not-load-w"), None);
+    }
 }
 
 impl JournalConfigFile {
-    pub(super) fn resolve(self, path_override: Option<PathBuf>) -> Result<Option<JournalConfig>> {
-        self.resolve_with_env(path_override, |name| std::env::var(name).ok())
-    }
-
-    fn resolve_with_env(
+    pub(super) fn resolve_with_env(
         self,
         path_override: Option<PathBuf>,
         mut env: impl FnMut(&str) -> Option<String>,

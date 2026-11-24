@@ -352,3 +352,361 @@ fn cli_console_listen_enables_console_or_overrides_config_file() {
     assert_eq!(overridden.listen, "127.0.0.1:3888");
     assert_eq!(overridden.allowed_origins, vec!["http://localhost:5173"]);
 }
+
+fn config_with_env(
+    raw: &str,
+    mut overrides: ServeOverrides,
+    env: impl FnMut(&str) -> Option<String>,
+) -> anyhow::Result<ResolvedServeConfig> {
+    let path = crate::test_support::temporary_path("config-env").with_extension("toml");
+    fs::write(&path, raw)?;
+    overrides.config = Some(path.clone());
+    let result = ResolvedServeConfig::load_with_env(overrides, env);
+    fs::remove_file(path)?;
+    result
+}
+
+fn assert_auto_token_shape(token: &str, expected_prefix: &str) {
+    let hex = token
+        .strip_prefix(expected_prefix)
+        .unwrap_or_else(|| panic!("token {token:?} missing prefix {expected_prefix:?}"));
+    assert_eq!(hex.len(), 32, "expected 32 hex chars in {token:?}");
+    assert!(
+        hex.bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')),
+        "expected lowercase hex in {token:?}"
+    );
+}
+
+#[test]
+fn cli_tokens_and_env_fallbacks_configure_auth_without_config_file() {
+    use anyserve_core::auth::Role;
+
+    let from_cli = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            client_tokens: vec!["cli-c1".into(), " cli-c2 , cli-c3 , ".into()],
+            worker_tokens: vec!["cli-w1,cli-w2".into(), "  ".into()],
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(from_cli.auth.is_enabled());
+    assert!(from_cli.auto_tokens.is_none());
+    for tok in ["cli-c1", "cli-c2", "cli-c3"] {
+        assert_eq!(from_cli.auth.role_for_token(tok), Some(Role::Client));
+    }
+    for tok in ["cli-w1", "cli-w2"] {
+        assert_eq!(from_cli.auth.role_for_token(tok), Some(Role::Worker));
+    }
+
+    let from_env =
+        ResolvedServeConfig::load_with_env(ServeOverrides::default(), |name| match name {
+            "ANYSERVE_CLIENT_TOKENS" => Some("env-c1, env-c2".into()),
+            "ANYSERVE_WORKER_TOKENS" => Some("env-w1".into()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(from_env.auth.is_enabled());
+    assert_eq!(from_env.auth.role_for_token("env-c1"), Some(Role::Client));
+    assert_eq!(from_env.auth.role_for_token("env-c2"), Some(Role::Client));
+    assert_eq!(from_env.auth.role_for_token("env-w1"), Some(Role::Worker));
+}
+
+#[test]
+fn cli_public_endpoint_overrides_env_and_toml_and_works_without_console() {
+    let overridden = config_with_env(
+        "[console]\nlisten = '127.0.0.1:3001'\npublic_endpoint = 'wss://toml.example.com'\n",
+        ServeOverrides {
+            public_endpoint: Some("  https://cli.example.com  ".into()),
+            ..Default::default()
+        },
+        |name| match name {
+            "ANYSERVE_PUBLIC_ENDPOINT" => Some("wss://env.example.com".into()),
+            _ => None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        overridden
+            .console
+            .as_ref()
+            .unwrap()
+            .public_endpoint
+            .as_deref(),
+        Some("https://cli.example.com")
+    );
+    assert_eq!(
+        overridden.public_endpoint.as_deref(),
+        Some("https://cli.example.com")
+    );
+
+    // Blank CLI override falls back to env, then TOML.
+    let fallback_env = config_with_env(
+        "[console]\npublic_endpoint = 'wss://toml.example.com'\n",
+        ServeOverrides {
+            public_endpoint: Some("   ".into()),
+            ..Default::default()
+        },
+        |name| match name {
+            "ANYSERVE_PUBLIC_ENDPOINT" => Some("wss://env.example.com".into()),
+            _ => None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fallback_env.public_endpoint.as_deref(),
+        Some("wss://env.example.com")
+    );
+    assert_eq!(
+        fallback_env
+            .console
+            .as_ref()
+            .unwrap()
+            .public_endpoint
+            .as_deref(),
+        Some("wss://env.example.com")
+    );
+
+    // Works even when console is disabled (without enabling console).
+    let grpc_only = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            public_endpoint: Some("https://grpc.example.com".into()),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(grpc_only.console.is_none());
+    assert_eq!(
+        grpc_only.public_endpoint.as_deref(),
+        Some("https://grpc.example.com")
+    );
+}
+
+#[test]
+fn no_grpc_flag_disables_grpc_overriding_default_and_toml() {
+    let default_disabled = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            no_grpc: true,
+            console_listen: Some("127.0.0.1:3001".into()),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(!default_disabled.grpc.enabled);
+    assert!(default_disabled.console.is_some());
+
+    let toml_overridden = config_with_env(
+        "[server]\ngrpc_enabled = true\n[console]\nlisten = '127.0.0.1:3001'\n",
+        ServeOverrides {
+            no_grpc: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(!toml_overridden.grpc.enabled);
+}
+
+#[test]
+fn auto_token_generates_persists_with_0600_reloads_and_redacts_debug() {
+    use anyserve_core::auth::Role;
+
+    let dir = crate::test_support::temporary_path("auto-token-dir");
+    let journal = dir.join("journal.sqlite");
+    let tokens_file = dir.join("tokens.env");
+
+    let first = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(journal.clone()),
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    let auto1 = first.auto_tokens.as_ref().expect("auto_tokens populated");
+    assert!(!auto1.reused_existing);
+    assert_eq!(auto1.persisted_path.as_deref(), Some(tokens_file.as_path()));
+    assert_auto_token_shape(&auto1.client_token, "as_c_");
+    assert_auto_token_shape(&auto1.worker_token, "as_w_");
+    assert_ne!(auto1.client_token, auto1.worker_token);
+    assert!(first.auth.is_enabled());
+    assert_eq!(
+        first.auth.role_for_token(&auto1.client_token),
+        Some(Role::Client)
+    );
+    assert_eq!(
+        first.auth.role_for_token(&auto1.worker_token),
+        Some(Role::Worker)
+    );
+
+    let dbg = format!("{first:?}");
+    assert!(!dbg.contains(&auto1.client_token));
+    assert!(!dbg.contains(&auto1.worker_token));
+    assert!(dbg.contains("[redacted]"));
+
+    let persisted = fs::read_to_string(&tokens_file).unwrap();
+    assert_eq!(
+        persisted,
+        format!(
+            "ANYSERVE_CLIENT_TOKENS={}\nANYSERVE_WORKER_TOKENS={}\n",
+            auto1.client_token, auto1.worker_token
+        )
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&tokens_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "tokens.env must be 0600, got {mode:o}");
+    }
+
+    // Restart with the same journal path reloads existing tokens without rotating.
+    let second = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(journal.clone()),
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    let auto2 = second.auto_tokens.as_ref().expect("auto_tokens reloaded");
+    assert!(auto2.reused_existing);
+    assert_eq!(auto2.client_token, auto1.client_token);
+    assert_eq!(auto2.worker_token, auto1.worker_token);
+    assert_eq!(
+        second.auth.role_for_token(&auto1.client_token),
+        Some(Role::Client)
+    );
+    assert_eq!(
+        second.auth.role_for_token(&auto1.worker_token),
+        Some(Role::Worker)
+    );
+
+    // Corrupt/empty tokens.env regenerates a fresh valid pair.
+    fs::write(&tokens_file, "ANYSERVE_CLIENT_TOKENS=\n").unwrap();
+    let recovered = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(journal),
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    let auto3 = recovered
+        .auto_tokens
+        .as_ref()
+        .expect("auto_tokens regenerated");
+    assert!(!auto3.reused_existing);
+    assert_auto_token_shape(&auto3.client_token, "as_c_");
+    assert_auto_token_shape(&auto3.worker_token, "as_w_");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn auto_token_ephemeral_stays_in_memory_and_noop_when_tokens_exist() {
+    use anyserve_core::auth::Role;
+
+    let ephemeral = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            ephemeral: true,
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    let auto = ephemeral
+        .auto_tokens
+        .as_ref()
+        .expect("ephemeral auto_tokens");
+    assert!(auto.persisted_path.is_none());
+    assert!(!auto.reused_existing);
+    assert_auto_token_shape(&auto.client_token, "as_c_");
+    assert_auto_token_shape(&auto.worker_token, "as_w_");
+    assert_eq!(
+        ephemeral.auth.role_for_token(&auto.client_token),
+        Some(Role::Client)
+    );
+
+    // No-op when user provided tokens via CLI, env, TOML static, or TOML scoped.
+    let dir = crate::test_support::temporary_path("auto-token-noop");
+    let journal = dir.join("journal.sqlite");
+    let tokens_file = dir.join("tokens.env");
+
+    let cli_case = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(journal.clone()),
+            client_tokens: vec!["user-client".into()],
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(cli_case.auto_tokens.is_none());
+    assert!(!tokens_file.exists());
+    assert_eq!(
+        cli_case.auth.role_for_token("user-client"),
+        Some(Role::Client)
+    );
+
+    let env_case = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(journal.clone()),
+            auto_token: true,
+            ..Default::default()
+        },
+        |name| (name == "ANYSERVE_WORKER_TOKENS").then(|| "env-worker".into()),
+    )
+    .unwrap();
+    assert!(env_case.auto_tokens.is_none());
+    assert!(!tokens_file.exists());
+    assert_eq!(
+        env_case.auth.role_for_token("env-worker"),
+        Some(Role::Worker)
+    );
+
+    let scoped_case = config_with_env(
+        r#"
+[[auth.scoped_tokens]]
+token = "scoped-tok"
+role = "worker"
+namespace = "team-a"
+"#,
+        ServeOverrides {
+            journal_path: Some(journal.clone()),
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(scoped_case.auto_tokens.is_none());
+    assert!(!tokens_file.exists());
+    assert_eq!(
+        scoped_case.auth.role_for_token("scoped-tok"),
+        Some(Role::Worker)
+    );
+
+    // Also avoid writing tokens.env if both listeners are disabled (invalid config).
+    let invalid_listeners = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(journal),
+            no_grpc: true,
+            auto_token: true,
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert!(invalid_listeners.auto_tokens.is_none());
+    assert!(!tokens_file.exists());
+
+    let _ = fs::remove_dir_all(&dir);
+}

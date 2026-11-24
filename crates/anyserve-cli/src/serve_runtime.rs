@@ -12,7 +12,7 @@ use clap::Args;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
-use crate::serve_config::{GrpcConfig, ResolvedServeConfig, ServeOverrides};
+use crate::serve_config::{AutoTokens, GrpcConfig, ResolvedServeConfig, ServeOverrides};
 use crate::serve_console::{
     ControlPlaneMetadata, format_host_port, run_server as run_console_server,
 };
@@ -39,6 +39,9 @@ pub(crate) struct ServeArgs {
     grpc_cert_file: Option<String>,
     #[arg(long = "grpc-key-file")]
     grpc_key_file: Option<String>,
+    /// Disable the gRPC listener (requires --console-listen or [console] in config).
+    #[arg(long = "no-grpc")]
+    no_grpc: bool,
     /// Disable durable jobs and keep the runtime entirely in memory.
     #[arg(long, conflicts_with = "journal_path")]
     ephemeral: bool,
@@ -48,6 +51,128 @@ pub(crate) struct ServeArgs {
     /// Enable and bind the HTTP console / management API listener (e.g. 127.0.0.1:3001).
     #[arg(long = "console-listen", value_name = "ADDR")]
     console_listen: Option<String>,
+    /// Public endpoint URL advertised to clients and workers (overrides [console].public_endpoint and ANYSERVE_PUBLIC_ENDPOINT).
+    #[arg(long = "public-endpoint", value_name = "URL")]
+    public_endpoint: Option<String>,
+    /// Static client bearer token (repeatable; comma-separated values are split).
+    #[arg(long = "client-token", value_name = "TOKEN")]
+    client_tokens: Vec<String>,
+    /// Static worker bearer token (repeatable; comma-separated values are split).
+    #[arg(long = "worker-token", value_name = "TOKEN")]
+    worker_tokens: Vec<String>,
+    /// Generate (or reload from <journal_dir>/tokens.env) random client and worker tokens when no auth is configured.
+    #[arg(long = "auto-token")]
+    auto_token: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StartupSummary<'a> {
+    pub grpc_addr: Option<SocketAddr>,
+    pub grpc_tls_enabled: bool,
+    pub console_addr: Option<SocketAddr>,
+    pub embedded_console_ui: bool,
+    pub public_endpoint: Option<&'a str>,
+    pub auth_enabled: bool,
+    pub auto_tokens: Option<&'a AutoTokens>,
+}
+
+fn connectable_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) if v4.ip().is_unspecified() => {
+            SocketAddr::from(([127, 0, 0, 1], v4.port()))
+        }
+        SocketAddr::V6(v6) if v6.ip().is_unspecified() => {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], v6.port()))
+        }
+        other => other,
+    }
+}
+
+pub(crate) fn format_startup_summary(summary: &StartupSummary<'_>) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "AnyServe relay ready");
+
+    match summary.grpc_addr {
+        Some(addr) => {
+            let scheme = if summary.grpc_tls_enabled {
+                "https"
+            } else {
+                "http"
+            };
+            let _ = writeln!(out, "  gRPC:     {scheme}://{addr}");
+        }
+        None => {
+            let _ = writeln!(out, "  gRPC:     disabled");
+        }
+    }
+
+    match summary.console_addr {
+        Some(addr) => {
+            let suffix = if summary.embedded_console_ui {
+                " (embedded UI enabled)"
+            } else {
+                ""
+            };
+            let _ = writeln!(out, "  Console:  http://{addr}{suffix}");
+        }
+        None => {
+            let _ = writeln!(out, "  Console:  disabled");
+        }
+    }
+
+    if let Some(public_endpoint) = summary.public_endpoint {
+        let _ = writeln!(out, "  Public:   {public_endpoint}");
+    }
+
+    if let Some(auto) = summary.auto_tokens {
+        let detail = match (&auto.persisted_path, auto.reused_existing) {
+            (Some(path), true) => format!("auto-token loaded from {}", path.display()),
+            (Some(path), false) => format!("auto-generated, saved to {}", path.display()),
+            (None, _) => "auto-generated, ephemeral".to_string(),
+        };
+        let _ = writeln!(out, "  Auth:     enabled ({detail})");
+        let _ = writeln!(out, "  Client token: {}", auto.client_token);
+        let _ = writeln!(out, "  Worker token: {}", auto.worker_token);
+    } else if summary.auth_enabled {
+        let _ = writeln!(out, "  Auth:     enabled");
+    } else {
+        let _ = writeln!(out, "  Auth:     disabled (anonymous)");
+    }
+
+    let endpoint = summary
+        .public_endpoint
+        .map(str::to_owned)
+        .or_else(|| {
+            summary.grpc_addr.map(|addr| {
+                let scheme = if summary.grpc_tls_enabled {
+                    "https"
+                } else {
+                    "http"
+                };
+                format!("{scheme}://{}", connectable_socket_addr(addr))
+            })
+        })
+        .or_else(|| {
+            summary
+                .console_addr
+                .map(|addr| format!("ws://{}", connectable_socket_addr(addr)))
+        });
+
+    if let Some(endpoint) = endpoint {
+        let _ = writeln!(out, "  Quickstart:");
+        let _ = writeln!(out, "    export ANYSERVE_ENDPOINT={endpoint}");
+        if let Some(auto) = summary.auto_tokens {
+            let _ = writeln!(out, "    export ANYSERVE_TOKEN={}", auto.client_token);
+        } else if summary.auth_enabled {
+            let _ = writeln!(out, "    export ANYSERVE_TOKEN=<client-or-worker-token>");
+        } else {
+            let _ = writeln!(out, "    export ANYSERVE_TOKEN=\"\"");
+        }
+    }
+
+    out.trim_end_matches('\n').to_owned()
 }
 
 pub(crate) fn validate_listeners(config: &ResolvedServeConfig) -> Result<()> {
@@ -65,9 +190,14 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         grpc_tls_enabled: args.grpc_tls_enabled,
         grpc_cert_file: args.grpc_cert_file,
         grpc_key_file: args.grpc_key_file,
+        no_grpc: args.no_grpc,
         ephemeral: args.ephemeral,
         journal_path: args.journal_path,
         console_listen: args.console_listen,
+        public_endpoint: args.public_endpoint,
+        client_tokens: args.client_tokens,
+        worker_tokens: args.worker_tokens,
+        auto_token: args.auto_token,
     })?;
     validate_listeners(&config)?;
     let runtime = Runtime::start(config.runtime.clone())
@@ -103,6 +233,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     let runtime_mode = config.runtime_mode();
     let config_path = config.config_path;
     let console_config = config.console;
+    let public_endpoint = config.public_endpoint;
+    let auto_tokens = config.auto_tokens;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut servers = tokio::task::JoinSet::new();
@@ -149,6 +281,19 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             "console api started"
         );
     }
+
+    eprintln!(
+        "{}",
+        format_startup_summary(&StartupSummary {
+            grpc_addr,
+            grpc_tls_enabled: tls,
+            console_addr,
+            embedded_console_ui: cfg!(feature = "embed-console"),
+            public_endpoint: public_endpoint.as_deref(),
+            auth_enabled: auth.is_enabled(),
+            auto_tokens: auto_tokens.as_ref(),
+        })
+    );
 
     let mut lease_lost = false;
     let failure = tokio::select! {
@@ -317,6 +462,13 @@ fn socket_addr_from_bind(value: &str) -> Result<SocketAddr> {
 mod grpc_toggle_tests {
     use super::*;
     use crate::serve_config::ServeConsoleConfig;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestServeCli {
+        #[command(flatten)]
+        serve: ServeArgs,
+    }
 
     #[test]
     fn disabling_grpc_requires_console_server() {
@@ -333,5 +485,168 @@ mod grpc_toggle_tests {
             public_endpoint: Some("wss://anyserve.example.com".into()),
         });
         assert!(validate_listeners(&cfg).is_ok());
+    }
+
+    #[test]
+    fn no_grpc_override_requires_console_listener() {
+        let without_console = ResolvedServeConfig::load_with_env(
+            ServeOverrides {
+                no_grpc: true,
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert!(!without_console.grpc.enabled);
+        assert!(validate_listeners(&without_console).is_err());
+
+        let with_console = ResolvedServeConfig::load_with_env(
+            ServeOverrides {
+                no_grpc: true,
+                console_listen: Some("127.0.0.1:3001".into()),
+                ..Default::default()
+            },
+            |_| None,
+        )
+        .unwrap();
+        assert!(!with_console.grpc.enabled);
+        assert!(validate_listeners(&with_console).is_ok());
+    }
+
+    #[test]
+    fn serve_args_parse_zero_config_flags() {
+        let parsed = TestServeCli::try_parse_from([
+            "serve",
+            "--client-token",
+            "tok-c1",
+            "--client-token",
+            "tok-c2,tok-c3",
+            "--worker-token",
+            "tok-w1,tok-w2",
+            "--worker-token",
+            "tok-w3",
+            "--public-endpoint",
+            "https://relay.example.com",
+            "--no-grpc",
+            "--auto-token",
+            "--console-listen",
+            "0.0.0.0:3001",
+        ])
+        .unwrap();
+        assert_eq!(parsed.serve.client_tokens, vec!["tok-c1", "tok-c2,tok-c3"]);
+        assert_eq!(parsed.serve.worker_tokens, vec!["tok-w1,tok-w2", "tok-w3"]);
+        assert_eq!(
+            parsed.serve.public_endpoint.as_deref(),
+            Some("https://relay.example.com")
+        );
+        assert!(parsed.serve.no_grpc);
+        assert!(parsed.serve.auto_token);
+        assert_eq!(parsed.serve.console_listen.as_deref(), Some("0.0.0.0:3001"));
+    }
+
+    #[test]
+    fn startup_summary_formats_anonymous_static_auth_and_auto_token_modes() {
+        // 1. Default anonymous mode (gRPC only, console disabled).
+        let anonymous = format_startup_summary(&StartupSummary {
+            grpc_addr: Some("127.0.0.1:50052".parse().unwrap()),
+            grpc_tls_enabled: false,
+            console_addr: None,
+            embedded_console_ui: false,
+            public_endpoint: None,
+            auth_enabled: false,
+            auto_tokens: None,
+        });
+        assert!(anonymous.contains("gRPC:     http://127.0.0.1:50052"));
+        assert!(anonymous.contains("Console:  disabled"));
+        assert!(!anonymous.contains("Public:"));
+        assert!(anonymous.contains("Auth:     disabled (anonymous)"));
+        assert!(anonymous.contains("export ANYSERVE_ENDPOINT=http://127.0.0.1:50052"));
+        assert!(anonymous.contains("export ANYSERVE_TOKEN=\"\""));
+
+        // 2. Static user-configured auth + TLS + embedded UI + public endpoint (never prints static tokens).
+        let static_auth = format_startup_summary(&StartupSummary {
+            grpc_addr: Some("0.0.0.0:50052".parse().unwrap()),
+            grpc_tls_enabled: true,
+            console_addr: Some("0.0.0.0:3001".parse().unwrap()),
+            embedded_console_ui: true,
+            public_endpoint: Some("https://relay.example.com"),
+            auth_enabled: true,
+            auto_tokens: None,
+        });
+        assert!(static_auth.contains("gRPC:     https://0.0.0.0:50052"));
+        assert!(static_auth.contains("Console:  http://0.0.0.0:3001 (embedded UI enabled)"));
+        assert!(static_auth.contains("Public:   https://relay.example.com"));
+        assert!(static_auth.contains("Auth:     enabled\n"));
+        assert!(!static_auth.contains("Client token:"));
+        assert!(!static_auth.contains("Worker token:"));
+        assert!(static_auth.contains("export ANYSERVE_ENDPOINT=https://relay.example.com"));
+        assert!(static_auth.contains("export ANYSERVE_TOKEN=<client-or-worker-token>"));
+
+        // 3. --no-grpc + --auto-token persisted (newly generated).
+        let saved_auto = AutoTokens {
+            client_token: "as_c_0123456789abcdef0123456789abcdef".into(),
+            worker_token: "as_w_fedcba9876543210fedcba9876543210".into(),
+            persisted_path: Some(PathBuf::from(".anyserve/tokens.env")),
+            reused_existing: false,
+        };
+        let auto_saved_banner = format_startup_summary(&StartupSummary {
+            grpc_addr: None,
+            grpc_tls_enabled: false,
+            console_addr: Some("0.0.0.0:3001".parse().unwrap()),
+            embedded_console_ui: false,
+            public_endpoint: None,
+            auth_enabled: true,
+            auto_tokens: Some(&saved_auto),
+        });
+        assert!(auto_saved_banner.contains("gRPC:     disabled"));
+        assert!(auto_saved_banner.contains("Console:  http://0.0.0.0:3001\n"));
+        assert!(!auto_saved_banner.contains("(embedded UI enabled)"));
+        assert!(
+            auto_saved_banner
+                .contains("Auth:     enabled (auto-generated, saved to .anyserve/tokens.env)")
+        );
+        assert!(auto_saved_banner.contains("Client token: as_c_0123456789abcdef0123456789abcdef"));
+        assert!(auto_saved_banner.contains("Worker token: as_w_fedcba9876543210fedcba9876543210"));
+        assert!(auto_saved_banner.contains("export ANYSERVE_ENDPOINT=ws://127.0.0.1:3001"));
+        assert!(
+            auto_saved_banner
+                .contains("export ANYSERVE_TOKEN=as_c_0123456789abcdef0123456789abcdef")
+        );
+
+        // 4. --auto-token reloaded from disk vs ephemeral.
+        let reloaded_auto = AutoTokens {
+            reused_existing: true,
+            ..saved_auto.clone()
+        };
+        let reloaded_banner = format_startup_summary(&StartupSummary {
+            grpc_addr: Some("0.0.0.0:50052".parse().unwrap()),
+            grpc_tls_enabled: false,
+            console_addr: None,
+            embedded_console_ui: false,
+            public_endpoint: None,
+            auth_enabled: true,
+            auto_tokens: Some(&reloaded_auto),
+        });
+        assert!(
+            reloaded_banner
+                .contains("Auth:     enabled (auto-token loaded from .anyserve/tokens.env)")
+        );
+        assert!(reloaded_banner.contains("export ANYSERVE_ENDPOINT=http://127.0.0.1:50052"));
+
+        let ephemeral_auto = AutoTokens {
+            persisted_path: None,
+            reused_existing: false,
+            ..saved_auto
+        };
+        let ephemeral_banner = format_startup_summary(&StartupSummary {
+            grpc_addr: Some("127.0.0.1:50052".parse().unwrap()),
+            grpc_tls_enabled: false,
+            console_addr: None,
+            embedded_console_ui: false,
+            public_endpoint: None,
+            auth_enabled: true,
+            auto_tokens: Some(&ephemeral_auto),
+        });
+        assert!(ephemeral_banner.contains("Auth:     enabled (auto-generated, ephemeral)"));
     }
 }
