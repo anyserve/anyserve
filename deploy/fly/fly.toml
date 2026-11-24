@@ -1,0 +1,57 @@
+# Deploy from the repository root so the Docker build context includes crates/ and console/:
+#   fly deploy -c deploy/fly/fly.toml
+#
+# Customize `app` below, or let `fly launch --no-deploy -c deploy/fly/fly.toml` update it.
+app = "anyserve-relay"
+primary_region = "sin"
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[processes]
+  app = "serve --grpc-host 0.0.0.0 --grpc-port 50052 --console-listen 0.0.0.0:3001 --journal /data/journal.sqlite"
+
+[mounts]
+  source = "anyserve_data"
+  destination = "/data"
+  processes = ["app"]
+
+# HTTPS (:443) -> embedded Console UI, /api/*, /rpc/v2/*, /ws/v2/* (wss://), /healthz, /readyz
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/readyz"
+
+# Native HTTP/2 gRPC over TLS on :50052 -> https://<app>.fly.dev:50052
+[[services]]
+  protocol = "tcp"
+  internal_port = 50052
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[services.ports]]
+    port = 50052
+    handlers = ["tls", "http"]
+
+    [services.ports.http_options]
+      h2_backend = true
+
+    [services.ports.tls_options]
+      alpn = ["h2"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

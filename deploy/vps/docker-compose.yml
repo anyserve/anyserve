@@ -1,0 +1,35 @@
+services:
+  anyserve:
+    image: ghcr.io/anyserve/anyserve:v0.5.0
+    # Uncomment to build locally from a source checkout (embeds the Console UI):
+    # build: ../..
+    restart: unless-stopped
+    command: ["serve", "--config", "/etc/anyserve/server.toml"]
+    environment:
+      - ANYSERVE_CLIENT_TOKENS
+      - ANYSERVE_WORKER_TOKENS
+      - ANYSERVE_PUBLIC_ENDPOINT
+    volumes:
+      - anyserve_data:/data
+      - ./server.toml:/etc/anyserve/server.toml:ro
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - anyserve
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - ANYSERVE_DOMAIN
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  anyserve_data:
+  caddy_data:
+  caddy_config:

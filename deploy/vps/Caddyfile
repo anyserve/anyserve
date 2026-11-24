@@ -1,0 +1,20 @@
+{$ANYSERVE_DOMAIN} {
+	# Block Prometheus metrics from the public internet.
+	@metrics path /metrics /metrics/*
+	handle @metrics {
+		respond 403
+	}
+
+	# Route native HTTP/2 gRPC services (Client, Worker, gRPC health, reflection)
+	# to the control plane's h2c listener.
+	@grpc path /anyserve.v2.* /grpc.health.* /grpc.reflection.*
+	handle @grpc {
+		reverse_proxy h2c://anyserve:50052
+	}
+
+	# Route embedded Console UI, management API (/api/*), HTTP/WS transport
+	# (/rpc/v2/*, /ws/v2/*), and probes (/healthz, /readyz) to the HTTP listener.
+	handle {
+		reverse_proxy anyserve:3001
+	}
+}
