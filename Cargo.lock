@@ -135,6 +135,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyserve-auth-github"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "anyserve-core",
+ "axum",
+ "base64",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "anyserve-bench"
 version = "0.5.0"
 dependencies = [

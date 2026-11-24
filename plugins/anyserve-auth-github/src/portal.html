@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AnyServe · GitHub Token Portal</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b0d12;
+      --card: #131722;
+      --border: #262d3d;
+      --text: #e6ecf5;
+      --muted: #93a1b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --danger: #ef4444;
+      --danger-bg: rgba(239, 68, 68, 0.12);
+      --ok: #22c55e;
+      --ok-bg: rgba(34, 197, 94, 0.14);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f5f7fb;
+        --card: #ffffff;
+        --border: #dfe5ef;
+        --text: #0f172a;
+        --muted: #526077;
+        --danger-bg: rgba(239, 68, 68, 0.08);
+        --ok-bg: rgba(34, 197, 94, 0.1);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px 16px 64px;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 820px; margin: 0 auto; display: grid; gap: 18px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 22px;
+    }
+    h1, h2 { margin: 0 0 8px; font-size: 1.25rem; }
+    h2 { font-size: 1.05rem; }
+    p { margin: 0 0 12px; color: var(--muted); font-size: 0.92rem; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    .user { display: flex; align-items: center; gap: 12px; }
+    .avatar { width: 40px; height: 40px; border-radius: 999px; border: 1px solid var(--border); object-fit: cover; }
+    .pill {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-family: var(--mono);
+      border: 1px solid var(--border);
+    }
+    .pill.ok { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+    .pill.revoked { color: var(--danger); background: var(--danger-bg); border-color: transparent; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 15px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 0.88rem;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .btn.primary:hover { background: var(--accent-hover); }
+    .btn.danger { color: var(--danger); border-color: rgba(239, 68, 68, 0.4); }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .form { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin-top: 12px; }
+    label { display: grid; gap: 5px; font-size: 0.82rem; color: var(--muted); }
+    input, select {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font: inherit;
+      font-size: 0.9rem;
+    }
+    pre {
+      margin: 10px 0 0;
+      padding: 12px;
+      border-radius: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .alert {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      border: 1px solid var(--border);
+      background: var(--danger-bg);
+      color: var(--danger);
+    }
+    .minted {
+      margin-top: 16px;
+      padding: 14px;
+      border-radius: 10px;
+      border: 1px solid rgba(59, 130, 246, 0.45);
+      background: rgba(59, 130, 246, 0.08);
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.86rem; }
+    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .mono { font-family: var(--mono); }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div id="errorBox" class="alert" hidden></div>
+
+    <div id="loggedOutCard" class="card" hidden>
+      <h1>AnyServe Self-Service Tokens</h1>
+      <p>Sign in with GitHub to mint isolated <strong>client</strong> and <strong>worker</strong> bearer tokens for your private namespace (<code>gh-&lt;id&gt;</code>).</p>
+      <a class="btn primary" href="/auth/github">Sign in with GitHub</a>
+    </div>
+
+    <div id="portalRoot" hidden>
+      <div class="card">
+        <div class="row">
+          <div class="user">
+            <img id="userAvatar" class="avatar" alt="" hidden />
+            <div>
+              <h1 id="userLogin" style="margin-bottom:2px"></h1>
+              <span id="userNs" class="pill"></span>
+            </div>
+          </div>
+          <div class="row">
+            <a id="consoleLink" class="btn" href="/" hidden>Open Console</a>
+            <button id="logoutBtn" class="btn" type="button">Sign out</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Mint Bearer Token</h2>
+        <p id="policyHint"></p>
+        <form id="mintForm" class="form">
+          <label>
+            Role
+            <select id="roleSelect">
+              <option value="client">Client (submit, invoke, Console)</option>
+              <option value="worker">Worker (connect worker sessions)</option>
+            </select>
+          </label>
+          <label style="flex:1; min-width:180px">
+            Label
+            <input id="labelInput" type="text" maxlength="48" placeholder="laptop-gpu / ci-runner" />
+          </label>
+          <button id="mintBtn" class="btn primary" type="submit">Generate Token</button>
+        </form>
+
+        <div id="mintedBox" class="minted" hidden>
+          <div class="row">
+            <strong>Copy your new token now (it will not be shown again):</strong>
+            <div class="row">
+              <button id="copyTokenBtn" class="btn" type="button">Copy Token</button>
+              <a id="openInConsoleBtn" class="btn primary" href="#" hidden>Open in Console</a>
+            </div>
+          </div>
+          <pre id="mintedToken"></pre>
+          <pre id="mintedSnippet"></pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <h2>Your Tokens</h2>
+          <button id="revokeAllBtn" class="btn danger" type="button">Revoke All Active</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Role</th>
+              <th>Label</th>
+              <th>Preview</th>
+              <th>Created</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="tokensBody"></tbody>
+        </table>
+        <p id="emptyTokens" style="margin-top:12px" hidden>No tokens issued yet.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = { config: {}, user: null };
+
+    function showError(msg) {
+      const box = document.getElementById("errorBox");
+      if (!msg) { box.hidden = true; box.textContent = ""; return; }
+      box.textContent = msg;
+      box.hidden = false;
+    }
+
+    function fmtTime(sec) {
+      if (!sec) return "—";
+      return new Date(sec * 1000).toLocaleString();
+    }
+
+    async function api(url, options) {
+      const resp = await fetch(url, {
+        ...options,
+        headers: {
+          "Accept": "application/json",
+          "X-Requested-With": "fetch",
+          ...(options && options.headers ? options.headers : {}),
+        },
+      });
+      if (resp.status === 204) return null;
+      const body = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(body.error || `${resp.status} ${resp.statusText}`);
+      return body;
+    }
+
+    function renderTokens(tokens) {
+      const tbody = document.getElementById("tokensBody");
+      const empty = document.getElementById("emptyTokens");
+      tbody.textContent = "";
+      empty.hidden = tokens.length > 0;
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      for (const t of tokens) {
+        const tr = document.createElement("tr");
+        const roleTd = document.createElement("td");
+        roleTd.className = "mono";
+        roleTd.textContent = t.role;
+
+        const labelTd = document.createElement("td");
+        labelTd.textContent = t.label || "default";
+
+        const prevTd = document.createElement("td");
+        prevTd.className = "mono";
+        prevTd.textContent = t.token_preview;
+
+        const createdTd = document.createElement("td");
+        createdTd.textContent = fmtTime(t.created_at);
+
+        const expired = t.expires_at && t.expires_at <= nowSec;
+        const active = !t.revoked_at && !expired;
+        const statusTd = document.createElement("td");
+        const badge = document.createElement("span");
+        badge.className = active ? "pill ok" : "pill revoked";
+        badge.textContent = t.revoked_at ? "Revoked" : expired ? "Expired" : "Active";
+        statusTd.appendChild(badge);
+
+        const actionTd = document.createElement("td");
+        if (!t.revoked_at) {
+          const btn = document.createElement("button");
+          btn.className = "btn danger";
+          btn.type = "button";
+          btn.textContent = "Revoke";
+          btn.onclick = async () => {
+            showError("");
+            try {
+              await api(`/auth/api/tokens/${encodeURIComponent(t.jti)}/revoke`, { method: "POST" });
+              await refresh();
+            } catch (err) {
+              showError(err.message);
+            }
+          };
+          actionTd.appendChild(btn);
+        }
+
+        tr.append(roleTd, labelTd, prevTd, createdTd, statusTd, actionTd);
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function refresh() {
+      const data = await api("/auth/api/me");
+      if (!data.authenticated) {
+        document.getElementById("loggedOutCard").hidden = false;
+        document.getElementById("portalRoot").hidden = true;
+        return;
+      }
+      state.user = data.user;
+      state.config = data.config || {};
+      document.getElementById("loggedOutCard").hidden = true;
+      document.getElementById("portalRoot").hidden = false;
+      document.getElementById("userLogin").textContent = `@${data.user.login}`;
+      document.getElementById("userNs").textContent = `namespace: ${data.user.namespace}`;
+      const avatar = document.getElementById("userAvatar");
+      if (data.user.avatar_url) { avatar.src = data.user.avatar_url; avatar.hidden = false; }
+      const consoleLink = document.getElementById("consoleLink");
+      if (state.config.console_url) {
+        consoleLink.href = state.config.console_url;
+        consoleLink.hidden = false;
+      }
+      const ttl = state.config.token_ttl_days ? `${state.config.token_ttl_days}-day expiry` : "no automatic expiry";
+      document.getElementById("policyHint").textContent =
+        `Up to ${state.config.max_tokens_per_user} active tokens, ${ttl}. Revocations take effect immediately.`;
+      renderTokens(data.tokens || []);
+    }
+
+    document.getElementById("mintForm").onsubmit = async (e) => {
+      e.preventDefault();
+      showError("");
+      const role = document.getElementById("roleSelect").value;
+      const label = document.getElementById("labelInput").value.trim() || "default";
+      try {
+        const res = await api("/auth/api/tokens", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ role, label }),
+        });
+        document.getElementById("mintedToken").textContent = res.token;
+        const lines = [];
+        if (state.config.grpc_endpoint) {
+          lines.push(`# Native gRPC (recommended)\nexport ANYSERVE_ENDPOINT=${state.config.grpc_endpoint}`);
+        }
+        if (state.config.ws_endpoint) {
+          lines.push(`# WebSocket fallback\nexport ANYSERVE_ENDPOINT=${state.config.ws_endpoint}`);
+        }
+        lines.push(`export ANYSERVE_TOKEN=${res.token}`);
+        document.getElementById("mintedSnippet").textContent = lines.join("\n");
+
+        const openConsole = document.getElementById("openInConsoleBtn");
+        if (role === "client" && state.config.console_url) {
+          openConsole.href = `${state.config.console_url.replace(/\/$/, "")}/#token=${encodeURIComponent(res.token)}`;
+          openConsole.hidden = false;
+        } else {
+          openConsole.hidden = true;
+        }
+        document.getElementById("mintedBox").hidden = false;
+        document.getElementById("labelInput").value = "";
+        await refresh();
+      } catch (err) {
+        showError(err.message);
+      }
+    };
+
+    document.getElementById("copyTokenBtn").onclick = async () => {
+      const tok = document.getElementById("mintedToken").textContent;
+      if (tok) await navigator.clipboard.writeText(tok);
+    };
+
+    document.getElementById("revokeAllBtn").onclick = async () => {
+      showError("");
+      try {
+        await api("/auth/api/tokens/revoke-all", { method: "POST" });
+        await refresh();
+      } catch (err) {
+        showError(err.message);
+      }
+    };
+
+    document.getElementById("logoutBtn").onclick = async () => {
+      await api("/auth/logout", { method: "POST" });
+      document.getElementById("mintedBox").hidden = true;
+      await refresh();
+    };
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("error")) showError(params.get("error"));
+    refresh().catch((err) => showError(err.message));
+  </script>
+</body>
+</html>

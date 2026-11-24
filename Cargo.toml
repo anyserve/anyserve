@@ -7,6 +7,7 @@ members = [
   "crates/anyserve-core",
   "crates/anyserve-proto",
   "examples/rust",
+  "plugins/anyserve-auth-github",
 ]
 resolver = "2"
 
