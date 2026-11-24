@@ -70,6 +70,11 @@ pub fn validate_namespace(namespace: &str) -> Result<&str, Status> {
     Ok(namespace)
 }
 
+/// Generates a random `<prefix><32 lowercase hex>` bearer token using OS CSPRNG.
+pub fn generate_token(prefix: &str) -> String {
+    format!("{prefix}{}", uuid::Uuid::new_v4().simple())
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct ScopedToken {
     pub token: String,

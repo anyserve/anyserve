@@ -8,88 +8,22 @@ Redis is not required.
 
 ## Zero-VPS Quick Tunnel
 
-For an instant authenticated relay on your laptop or workstation with zero server,
-domain, or TOML file:
+Run an authenticated local relay with no config file and expose `:3001` publicly via `wss://`:
 
 ```bash
 anyserve serve --console-listen 127.0.0.1:3001 --auto-token
-```
-
-`--auto-token` generates a client token (`as_c_*`) and worker token (`as_w_*`),
-saves them to `<journal_dir>/tokens.env` (`0600` on Unix) across restarts
-(memory-only with `--ephemeral`), and prints a ready-to-copy startup card. Pass
-`--no-grpc` if you only need the HTTP/WS + Console port.
-
-Expose `:3001` publicly over `wss://` using a Cloudflare Quick Tunnel:
-
-```bash
 cloudflared tunnel --url http://127.0.0.1:3001
 ```
 
-Connect remote Rust or Python workers and clients to the printed `trycloudflare.com`
-URL with the matching role token (or open `https://...` in a browser when running
-the official Docker image or a binary built with `--features embed-console`):
-
-```bash
-export ANYSERVE_ENDPOINT="wss://<random>.trycloudflare.com"
-export ANYSERVE_TOKEN="<as_w_... or as_c_...>"
-```
-
-Quick Tunnel URLs rotate whenever `cloudflared` restarts. For a stable private
-mesh with native gRPC instead of a public tunnel, run on **Tailscale**: bind
-`--grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --auto-token` and point
-workers/clients at `http://<tailscale-ip>:50052` (or `wss://<node>.ts.net` when
-proxying `:3001` via `tailscale serve`).
+`--auto-token` generates `as_c_*` / `as_w_*` tokens (`0600` `<journal_dir>/tokens.env` across restarts, memory-only with `--ephemeral`) and prints a copy-paste startup card; point workers/clients at `wss://<random>.trycloudflare.com` (pass `--no-grpc` if only `:3001` is needed). For private native gRPC over Tailscale, bind `--grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --auto-token` and connect to `http://<tailscale-ip>:50052`.
 
 ## Quick VPS Relay (`deploy/vps`)
 
-`deploy/vps` provides a 1-minute single-domain relay for any Linux VPS using
-Docker Compose and Caddy (`caddy:2-alpine`) with automatic Let's Encrypt HTTPS.
-See [deploy/vps/README.md](../deploy/vps/README.md) for the full guide.
-
-- **Single domain for every transport**: Caddy routes native HTTP/2 gRPC paths
-  (`/anyserve.v2.*`, `/grpc.health.*`, `/grpc.reflection.*`) to `h2c://anyserve:50052`
-  and routes everything else (embedded Console UI, `/api/*`, `/rpc/v2/*`,
-  `/ws/v2/*`, `/healthz`, `/readyz`) to `anyserve:3001`.
-- **Safe defaults**: `deploy/vps/Caddyfile` blocks `/metrics` (`403`) from the
-  public internet, and `deploy/vps/server.toml` sets bounded runtime memory
-  budgets for a 2 GiB VPS with a persistent SQLite volume (`/data/journal.sqlite`).
-
-```bash
-cd deploy/vps
-cp .env.example .env   # set ANYSERVE_DOMAIN, ANYSERVE_PUBLIC_ENDPOINT, ANYSERVE_CLIENT_TOKENS, ANYSERVE_WORKER_TOKENS
-docker compose up -d
-```
-
-Clients and workers connect to `https://<your-domain>` (native gRPC) or
-`wss://<your-domain>` (WebSocket fallback); open `https://<your-domain>` in a
-browser for the embedded Console.
+`deploy/vps` provides a 1-minute single-domain Compose stack with Caddy automatic HTTPS: gRPC (`/anyserve.v2.*`, `/grpc.health.*`, `/grpc.reflection.*`) proxies to `h2c://anyserve:50052`, `/metrics` is blocked (`403`), and Console/WSS proxy to `:3001`. See [deploy/vps/README.md](../deploy/vps/README.md).
 
 ## Fly.io (`deploy/fly`)
 
-`deploy/fly` runs a single persistent Fly Machine (`min_machines_running = 1`,
-`auto_stop_machines = "off"`) with an attached NVMe volume (`/data`) and
-automatic TLS. It builds the root `Dockerfile` (with embedded Console UI) and
-starts `anyserve serve` directly via CLI flags and Fly secrets—no TOML file
-required (an optional tuned `deploy/fly/server.toml` is included for custom
-limits). See [deploy/fly/README.md](../deploy/fly/README.md) for details.
-
-- **Native HTTP/2 gRPC**: `https://<app>.fly.dev:50052` (`h2_backend = true`)
-- **Embedded Console & WSS fallback**: `https://<app>.fly.dev` / `wss://<app>.fly.dev`
-
-Deploy from the repository root so the Docker build context resolves `Dockerfile`
-(generate random tokens with `openssl rand -hex 24`):
-
-```bash
-fly launch --no-deploy -c deploy/fly/fly.toml
-fly volumes create anyserve_data --size 1 --region sin -c deploy/fly/fly.toml
-fly secrets set \
-  ANYSERVE_CLIENT_TOKENS="<client-token>" \
-  ANYSERVE_WORKER_TOKENS="<worker-token>" \
-  ANYSERVE_PUBLIC_ENDPOINT="https://<app>.fly.dev:50052" \
-  -c deploy/fly/fly.toml
-fly deploy -c deploy/fly/fly.toml
-```
+`deploy/fly` runs one persistent Fly Machine (`512mb`, NVMe `/data` volume) built from `Dockerfile` with native HTTP/2 gRPC on `https://<app>.fly.dev:50052` and WSS/Console on `https://<app>.fly.dev`, configured purely via Fly secrets (`ANYSERVE_CLIENT_TOKENS`, `ANYSERVE_WORKER_TOKENS`, `ANYSERVE_PUBLIC_ENDPOINT`). See [deploy/fly/README.md](../deploy/fly/README.md).
 
 ## PostgreSQL high availability
 

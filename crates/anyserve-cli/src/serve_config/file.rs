@@ -67,41 +67,38 @@ impl AuthConfigFile {
         cli_worker_tokens: &[String],
         mut env: impl FnMut(&str) -> Option<String>,
     ) -> Result<AuthPolicy> {
-        let resolve_env_tokens = |explicit: Option<&str>,
-                                  default_env: &str,
-                                  env: &mut dyn FnMut(&str) -> Option<String>|
+        let mut collect = |mut tokens: Vec<String>,
+                           explicit: Option<&str>,
+                           default_env: &str,
+                           cli: &[String]|
          -> Result<Vec<String>> {
-            match explicit {
-                Some(name) => {
-                    let raw = env(name)
-                        .with_context(|| format!("read auth tokens from env var {name}"))?;
-                    Ok(split_tokens(&raw))
-                }
-                None => Ok(env(default_env)
-                    .map(|raw| split_tokens(&raw))
-                    .unwrap_or_default()),
+            let env_raw = match explicit {
+                Some(name) => Some(
+                    env(name).with_context(|| format!("read auth tokens from env var {name}"))?,
+                ),
+                None => env(default_env),
+            };
+            if let Some(raw) = env_raw {
+                tokens.extend(split_tokens(&raw));
             }
+            for raw in cli {
+                tokens.extend(split_tokens(raw));
+            }
+            Ok(tokens)
         };
 
-        let mut client_tokens = self.client_tokens;
-        client_tokens.extend(resolve_env_tokens(
+        let client_tokens = collect(
+            self.client_tokens,
             self.client_tokens_env.as_deref(),
             DEFAULT_CLIENT_TOKENS_ENV,
-            &mut env,
-        )?);
-        for raw in cli_client_tokens {
-            client_tokens.extend(split_tokens(raw));
-        }
-
-        let mut worker_tokens = self.worker_tokens;
-        worker_tokens.extend(resolve_env_tokens(
+            cli_client_tokens,
+        )?;
+        let worker_tokens = collect(
+            self.worker_tokens,
             self.worker_tokens_env.as_deref(),
             DEFAULT_WORKER_TOKENS_ENV,
-            &mut env,
-        )?);
-        for raw in cli_worker_tokens {
-            worker_tokens.extend(split_tokens(raw));
-        }
+            cli_worker_tokens,
+        )?;
 
         let mut scoped = Vec::with_capacity(self.scoped_tokens.len());
         for entry in self.scoped_tokens {

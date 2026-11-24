@@ -2,7 +2,6 @@ mod file;
 #[cfg(test)]
 mod tests;
 
-use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -181,13 +180,6 @@ impl ResolvedServeConfig {
         let mut console = file_config
             .console
             .and_then(|config| config.resolve_with_env(&mut env));
-        let mut cached_env_public_endpoint: Option<Option<String>> = None;
-        let mut env_public_endpoint =
-            |env: &mut dyn FnMut(&str) -> Option<String>| -> Option<String> {
-                cached_env_public_endpoint
-                    .get_or_insert_with(|| file::nonempty_trimmed(env(file::PUBLIC_ENDPOINT_ENV)))
-                    .clone()
-            };
         if let Some(listen) = file::nonempty_trimmed(overrides.console_listen) {
             match console.as_mut() {
                 Some(cfg) => cfg.listen = listen,
@@ -195,7 +187,7 @@ impl ResolvedServeConfig {
                     console = Some(ServeConsoleConfig {
                         listen,
                         allowed_origins: Vec::new(),
-                        public_endpoint: env_public_endpoint(&mut env),
+                        public_endpoint: file::nonempty_trimmed(env(file::PUBLIC_ENDPOINT_ENV)),
                     });
                 }
             }
@@ -205,15 +197,10 @@ impl ResolvedServeConfig {
         {
             cfg.public_endpoint = Some(ep.clone());
         }
-        let public_endpoint = cli_public_endpoint
-            .or_else(|| console.as_ref().and_then(|c| c.public_endpoint.clone()))
-            .or_else(|| {
-                if console.is_none() {
-                    env_public_endpoint(&mut env)
-                } else {
-                    None
-                }
-            });
+        let public_endpoint = cli_public_endpoint.or_else(|| match &console {
+            Some(cfg) => cfg.public_endpoint.clone(),
+            None => file::nonempty_trimmed(env(file::PUBLIC_ENDPOINT_ENV)),
+        });
 
         let grpc = GrpcConfig {
             enabled: if overrides.no_grpc {
@@ -269,48 +256,49 @@ impl ResolvedServeConfig {
 }
 
 fn auto_token_file_path(journal: Option<&JournalConfig>) -> Option<PathBuf> {
-    let journal = journal?;
-    if journal.postgres.is_some() || journal.cloudflare.is_some() {
-        return None;
-    }
-    let parent = journal
-        .path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty());
-    Some(match parent {
-        Some(dir) => dir.join(AUTO_TOKEN_FILE_NAME),
-        None => PathBuf::from(AUTO_TOKEN_FILE_NAME),
-    })
+    let journal = journal.filter(|j| j.postgres.is_none() && j.cloudflare.is_none())?;
+    Some(
+        match journal.path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            Some(dir) => dir.join(AUTO_TOKEN_FILE_NAME),
+            None => PathBuf::from(AUTO_TOKEN_FILE_NAME),
+        },
+    )
 }
 
 fn resolve_or_generate_auto_tokens(
     journal: Option<&JournalConfig>,
 ) -> Result<(AutoTokens, Vec<String>, Vec<String>)> {
     let persisted_path = auto_token_file_path(journal);
-    if let Some(path) = persisted_path.as_ref()
-        && let Some((client_tokens, worker_tokens)) = read_auto_tokens_file(path)?
+    if let Some(path) = &persisted_path
+        && let Some((clients, workers)) = read_auto_tokens_file(path)?
     {
-        let auto = AutoTokens {
-            client_token: client_tokens[0].clone(),
-            worker_token: worker_tokens[0].clone(),
-            persisted_path: Some(path.clone()),
-            reused_existing: true,
-        };
-        return Ok((auto, client_tokens, worker_tokens));
+        return Ok((
+            AutoTokens {
+                client_token: clients[0].clone(),
+                worker_token: workers[0].clone(),
+                persisted_path: Some(path.clone()),
+                reused_existing: true,
+            },
+            clients,
+            workers,
+        ));
     }
 
-    let client_token = generate_token(CLIENT_TOKEN_PREFIX)?;
-    let worker_token = generate_token(WORKER_TOKEN_PREFIX)?;
-    if let Some(path) = persisted_path.as_ref() {
+    let client_token = anyserve_core::auth::generate_token(CLIENT_TOKEN_PREFIX);
+    let worker_token = anyserve_core::auth::generate_token(WORKER_TOKEN_PREFIX);
+    if let Some(path) = &persisted_path {
         write_auto_tokens_file(path, &client_token, &worker_token)?;
     }
-    let auto = AutoTokens {
-        client_token: client_token.clone(),
-        worker_token: worker_token.clone(),
-        persisted_path,
-        reused_existing: false,
-    };
-    Ok((auto, vec![client_token], vec![worker_token]))
+    Ok((
+        AutoTokens {
+            client_token: client_token.clone(),
+            worker_token: worker_token.clone(),
+            persisted_path,
+            reused_existing: false,
+        },
+        vec![client_token],
+        vec![worker_token],
+    ))
 }
 
 fn read_auto_tokens_file(path: &Path) -> Result<Option<(Vec<String>, Vec<String>)>> {
@@ -324,57 +312,38 @@ fn read_auto_tokens_file(path: &Path) -> Result<Option<(Vec<String>, Vec<String>
 }
 
 fn parse_tokens_env(raw: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let mut client_tokens = None;
-    let mut worker_tokens = None;
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let trimmed = trimmed
-            .strip_prefix("export ")
-            .map(str::trim)
-            .unwrap_or(trimmed);
-        let Some((key, value)) = trimmed.split_once('=') else {
+    let parse_val = |v: &str| -> Option<Vec<String>> {
+        let v = v.trim();
+        let unquoted = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+            .unwrap_or(v);
+        let tokens = file::split_tokens(unquoted);
+        (!tokens.is_empty()
+            && tokens
+                .iter()
+                .all(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic())))
+        .then_some(tokens)
+    };
+
+    let (mut clients, mut workers) = (None, None);
+    for line in raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let entry = line.strip_prefix("export ").map(str::trim).unwrap_or(line);
+        let Some((key, value)) = entry.split_once('=') else {
             continue;
         };
-        let key = key.trim();
-        let value = strip_matching_quotes(value.trim());
-        match key {
-            file::DEFAULT_CLIENT_TOKENS_ENV => {
-                let parsed = file::split_tokens(value);
-                if !parsed.is_empty() && parsed.iter().all(|token| is_valid_auto_token(token)) {
-                    client_tokens = Some(parsed);
-                }
-            }
-            file::DEFAULT_WORKER_TOKENS_ENV => {
-                let parsed = file::split_tokens(value);
-                if !parsed.is_empty() && parsed.iter().all(|token| is_valid_auto_token(token)) {
-                    worker_tokens = Some(parsed);
-                }
-            }
+        match key.trim() {
+            file::DEFAULT_CLIENT_TOKENS_ENV => clients = parse_val(value),
+            file::DEFAULT_WORKER_TOKENS_ENV => workers = parse_val(value),
             _ => {}
         }
     }
-    match (client_tokens, worker_tokens) {
-        (Some(clients), Some(workers)) => Some((clients, workers)),
-        _ => None,
-    }
-}
-
-fn strip_matching_quotes(value: &str) -> &str {
-    if value.len() >= 2
-        && ((value.starts_with('"') && value.ends_with('"'))
-            || (value.starts_with('\'') && value.ends_with('\'')))
-    {
-        &value[1..value.len() - 1]
-    } else {
-        value
-    }
-}
-
-fn is_valid_auto_token(token: &str) -> bool {
-    !token.is_empty() && token.bytes().all(|b| b.is_ascii_graphic())
+    clients.zip(workers)
 }
 
 fn write_auto_tokens_file(path: &Path, client_token: &str, worker_token: &str) -> Result<()> {
@@ -408,60 +377,4 @@ fn write_auto_tokens_file(path: &Path, client_token: &str, worker_token: &str) -
     file.sync_all()
         .with_context(|| format!("sync auto-token file {}", path.display()))?;
     Ok(())
-}
-
-fn generate_token(prefix: &str) -> Result<String> {
-    let mut bytes = [0u8; 16];
-    fill_os_random(&mut bytes)?;
-    let mut out = String::with_capacity(prefix.len() + bytes.len() * 2);
-    out.push_str(prefix);
-    for byte in bytes {
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    Ok(out)
-}
-
-#[cfg(unix)]
-fn fill_os_random(buf: &mut [u8]) -> Result<()> {
-    use std::io::Read;
-    let mut urandom =
-        fs::File::open("/dev/urandom").context("open /dev/urandom for auto-token generation")?;
-    urandom
-        .read_exact(buf)
-        .context("read random bytes from /dev/urandom")?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn fill_os_random(buf: &mut [u8]) -> Result<()> {
-    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
-    #[link(name = "bcrypt")]
-    unsafe extern "system" {
-        fn BCryptGenRandom(
-            h_algorithm: *mut core::ffi::c_void,
-            pb_buffer: *mut u8,
-            cb_buffer: u32,
-            dw_flags: u32,
-        ) -> i32;
-    }
-    let len = u32::try_from(buf.len()).context("random buffer too large")?;
-    // SAFETY: `buf` points to `len` writable bytes; passing a null handle with
-    // `BCRYPT_USE_SYSTEM_PREFERRED_RNG` uses the OS CSPRNG.
-    let status = unsafe {
-        BCryptGenRandom(
-            core::ptr::null_mut(),
-            buf.as_mut_ptr(),
-            len,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status != 0 {
-        anyhow::bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn fill_os_random(_buf: &mut [u8]) -> Result<()> {
-    anyhow::bail!("--auto-token is not supported on this platform; configure tokens explicitly")
 }
