@@ -1,9 +1,13 @@
 target
 .git
 .github
-console
+console/node_modules
+console/dist
+console/.env.local
+console/*.tsbuildinfo
 docs
 deploy
+deploy/cloudflare/node_modules
 scripts
 clients/python/dist
 clients/python/python/anyserve/*.so

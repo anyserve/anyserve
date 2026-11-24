@@ -164,6 +164,19 @@ jobs:
             anyserve:ci serve --config /etc/anyserve/server.toml
           curl --fail --max-time 5 --retry 15 --retry-delay 1 --retry-max-time 60 \
             --retry-all-errors http://127.0.0.1:3001/readyz
+          ui_headers="$RUNNER_TEMP/anyserve-smoke/ui.headers"
+          ui_body="$RUNNER_TEMP/anyserve-smoke/ui.html"
+          ui_status=$(curl --silent --show-error --max-time 5 \
+            --dump-header "$ui_headers" \
+            --output "$ui_body" \
+            --write-out '%{http_code}' \
+            http://127.0.0.1:3001/)
+          if [[ "$ui_status" != "200" ]]; then
+            echo "Expected HTTP 200 from /, got $ui_status" >&2
+            exit 1
+          fi
+          grep -qi '^content-type:.*text/html' "$ui_headers"
+          grep -Fq '<div id="root">' "$ui_body"
 
   helm:
     runs-on: ubuntu-latest
