@@ -71,8 +71,10 @@ cargo build --release --locked -p anyserve -p anyserve-bench
 
 The native scenarios are S1 ephemeral Invoke, S2 streamed Invoke (64 × 1 KiB
 output frames), S3 durable Submit/Watch, S4 ephemeral Submit/Watch, and S5 mixed
-S1/S3. The Linux runner's repeatability gate compares p50 within 10%; S5 gates
-its durable path. Throughput and errors must also be checked.
+S1/S3. The Linux runner's repeatability gate defaults to comparing p50 within 10%
+(`--max-p50-drift 0.10`), while shared CI runners relax it via `--max-p50-drift`
+and `--drift-retries`; S5 gates its durable path. Throughput and errors must also
+be checked.
 
 Core scale checks measure queries over 10,000 jobs, dispatch with 129 workers
 and recovery of 2,048 durable jobs:

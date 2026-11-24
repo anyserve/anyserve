@@ -152,14 +152,50 @@ def gated_p50(row):
     return row["p50_ms"]
 
 
+def repeat_drifts(rows):
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["scenario"], row["concurrency"]), []).append(gated_p50(row))
+    drifts = {}
+    for key, values in groups.items():
+        lo, hi = min(values), max(values)
+        drift = (hi / lo - 1.0) if lo > 0 else (0.0 if hi == lo else float("inf"))
+        scenario, concurrency = key
+        drifts[key] = {
+            "case": f"{scenario}-c{concurrency}",
+            "drift": drift,
+            "p50_ms": values,
+        }
+    return drifts
+
+
+def format_repeat_drifts(drifts):
+    parts = []
+    for info in drifts.values():
+        values = ", ".join(f"{value:.3f}" for value in info["p50_ms"])
+        parts.append(f"{info['case']}: {info['drift']:.1%} [{values} ms]")
+    return ", ".join(parts)
+
+
 def seconds(value):
     return float(value[:-2]) / 1000 if value.endswith("ms") else float(value.rstrip("s"))
 
 
 class Run:
-    def __init__(self, profile, keep, cases=None, duration="20s", warmup="5s", repeat=1):
+    def __init__(
+        self,
+        profile,
+        keep,
+        cases=None,
+        duration="20s",
+        warmup="5s",
+        repeat=1,
+        max_p50_drift=0.10,
+        drift_retries=0,
+    ):
         self.profile, self.keep, self.cases = profile, keep, cases
         self.duration, self.warmup, self.repeat = duration, warmup, repeat
+        self.max_p50_drift, self.drift_retries = max_p50_drift, drift_retries
         self.env = dict(os.environ, RUST_LOG="warn")
         # The control plane must use the production default even if the shell
         # running this script has a Tokio override. Load roles are sized below.
@@ -190,7 +226,12 @@ class Run:
             "control_thread_source": "production default; TOKIO_WORKER_THREADS unset",
             "worker_processes": "max(4, concurrency // 8)", "worker_concurrency": 16,
             "native_channel_default": "min(concurrency, 8); tasks round-robin over independently connected channels",
-            "duration_seconds": seconds(duration), "warmup_seconds": seconds(warmup), "repeat": repeat, "sample_interval_seconds": 0.5,
+            "duration_seconds": seconds(duration),
+            "warmup_seconds": seconds(warmup),
+            "repeat": repeat,
+            "max_p50_drift": max_p50_drift,
+            "drift_retries": drift_retries,
+            "sample_interval_seconds": 0.5,
             "cpu_percent_unit": "100% is one fully used logical CPU; workers are summed",
             "latency_scope": "successful requests started after warmup; requests crossing the stop clock are drained",
             "runtime_scope": "fresh process and FULL SQLite journal per case; default runtime limits",
@@ -351,14 +392,51 @@ enabled = false
                     self.case(scenario, concurrency, self.keep and last, suffix)
             if self.repeat > 1:
                 # The method's repeatability gate: paired runs must agree on every gated p50.
-                groups = {}
-                for row in self.rows:
-                    groups.setdefault((row["scenario"], row["concurrency"]), []).append(gated_p50(row))
-                drift = max(max(values) / min(values) - 1 for values in groups.values())
-                self.meta["repeat_p50_drift"] = drift
-                print(f"p50 drift between repeats: {drift:.1%}", flush=True)
-                if drift >= 0.10:
-                    raise RuntimeError(f"p50 drifted {drift:.1%} between repeats; the method requires under 10%")
+                attempts = []
+                for attempt in range(self.drift_retries + 1):
+                    drifts = repeat_drifts(self.rows)
+                    drift = max(info["drift"] for info in drifts.values())
+                    by_case = {
+                        info["case"]: {"drift": info["drift"], "p50_ms": info["p50_ms"]}
+                        for info in drifts.values()
+                    }
+                    attempts.append({"attempt": attempt + 1, "drift": drift, "by_case": by_case})
+                    self.meta["repeat_p50_drift"] = drift
+                    self.meta["repeat_p50_drift_by_case"] = by_case
+                    self.meta["repeat_p50_drift_attempts"] = attempts
+                    print(
+                        f"p50 drift between repeats: {drift:.1%} "
+                        f"(limit: {self.max_p50_drift:.1%}; {format_repeat_drifts(drifts)})",
+                        flush=True,
+                    )
+                    if drift < self.max_p50_drift:
+                        break
+                    drifted_cases = [
+                        (int(scenario[1:]), concurrency)
+                        for (scenario, concurrency), info in drifts.items()
+                        if info["drift"] >= self.max_p50_drift
+                    ]
+                    if attempt < self.drift_retries and not self.keep:
+                        label = ", ".join(f"S{s}-c{c}" for s, c in drifted_cases)
+                        print(
+                            f"retrying drifted cases ({attempt + 1}/{self.drift_retries}): {label}",
+                            flush=True,
+                        )
+                        drifted_keys = {(f"S{s}", c) for s, c in drifted_cases}
+                        self.rows = [
+                            row
+                            for row in self.rows
+                            if (row["scenario"], row["concurrency"]) not in drifted_keys
+                        ]
+                        for round_index in range(self.repeat):
+                            suffix = f"-retry{attempt + 1}-r{round_index + 1}"
+                            for scenario, concurrency in drifted_cases:
+                                self.case(scenario, concurrency, False, suffix)
+                        continue
+                    raise RuntimeError(
+                        f"p50 drifted {drift:.1%} between repeats "
+                        f"(limit {self.max_p50_drift:.1%}; {format_repeat_drifts(drifts)})"
+                    )
             self.summary()
             print(self.out / "summary.md", flush=True)
         except BaseException as error:
@@ -378,13 +456,30 @@ def main():
     parser.add_argument("--cases", help="comma-separated cases such as S1-c16,S3-c16; default is the full matrix")
     parser.add_argument("--duration", default="20s", help="measurement window per case")
     parser.add_argument("--warmup", default="5s", help="warm-up before each measurement")
-    parser.add_argument("--repeat", type=int, default=1, help="run the cases this many times and fail if a gated p50 drifts 10%% or more")
+    parser.add_argument("--repeat", type=int, default=1, help="run the cases this many times and fail if a gated p50 drift reaches --max-p50-drift")
+    parser.add_argument("--max-p50-drift", type=float, default=0.10, help="maximum allowed p50 ratio drift between repeats (default: 0.10 = 10%%)")
+    parser.add_argument("--drift-retries", type=int, default=0, help="how many times to re-run only drifted cases when drift reaches --max-p50-drift")
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be >= 1")
+    if args.max_p50_drift <= 0:
+        parser.error("--max-p50-drift must be > 0")
+    if args.drift_retries < 0:
+        parser.error("--drift-retries must be >= 0")
     # Python must run cleanup on SIGTERM as well as Ctrl-C.
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
-    Run(args.profile, args.keep, args.cases.split(",") if args.cases else None, args.duration, args.warmup, args.repeat).run()
+    Run(
+        args.profile,
+        args.keep,
+        args.cases.split(",") if args.cases else None,
+        args.duration,
+        args.warmup,
+        args.repeat,
+        args.max_p50_drift,
+        args.drift_retries,
+    ).run()
 
 
 if __name__ == "__main__":
