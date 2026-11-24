@@ -5,6 +5,7 @@ mod tests;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use anyserve_core::auth::AuthPolicy;
@@ -13,9 +14,28 @@ use anyserve_core::runtime::api::{JournalConfig, RuntimeConfig};
 use file::AnyserveConfigFile;
 
 const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:3001";
+const DEFAULT_REVOCATION_POLL_MS: u64 = 2_000;
+const MIN_REVOCATION_POLL_MS: u64 = 250;
 const AUTO_TOKEN_FILE_NAME: &str = "tokens.env";
 const CLIENT_TOKEN_PREFIX: &str = "as_c_";
 const WORKER_TOKEN_PREFIX: &str = "as_w_";
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AuthRevocationConfig {
+    pub url: String,
+    pub bearer_token: String,
+    pub poll_interval: Duration,
+}
+
+impl std::fmt::Debug for AuthRevocationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRevocationConfig")
+            .field("url", &self.url)
+            .field("bearer_token", &"[redacted]")
+            .field("poll_interval", &self.poll_interval)
+            .finish()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct GrpcConfig {
@@ -106,6 +126,7 @@ pub struct ResolvedServeConfig {
     pub console: Option<ServeConsoleConfig>,
     pub public_endpoint: Option<String>,
     pub auth: AuthPolicy,
+    pub auth_revocation: Option<AuthRevocationConfig>,
     pub auto_tokens: Option<AutoTokens>,
 }
 
@@ -170,7 +191,7 @@ impl ResolvedServeConfig {
                 .unwrap_or_default()
                 .resolve_with_env(overrides.journal_path, &mut env)?
         };
-        let mut auth = file_config.auth.unwrap_or_default().resolve_with_env(
+        let (mut auth, auth_revocation) = file_config.auth.unwrap_or_default().resolve_with_env(
             &overrides.client_tokens,
             &overrides.worker_tokens,
             &mut env,
@@ -241,6 +262,7 @@ impl ResolvedServeConfig {
             console,
             public_endpoint,
             auth,
+            auth_revocation,
             auto_tokens,
         })
     }

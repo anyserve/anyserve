@@ -1382,7 +1382,7 @@ async fn native_do_auth_scoping_namespace_isolation_and_console_apis() {
         Code::PermissionDenied
     );
 
-    // Console auth: missing token -> 401; scoped tenant client token -> 403 Forbidden
+    // Console auth: missing token -> 401; scoped tenant -> 403 on /metrics, 200 scoped on /api/overview
     let ov_unauth = http
         .get(format!("{}/api/overview", gw.http_base))
         .send()
@@ -1390,13 +1390,32 @@ async fn native_do_auth_scoping_namespace_isolation_and_console_apis() {
         .unwrap();
     assert_eq!(ov_unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    let metrics_scoped = http
+        .get(format!("{}/metrics", gw.http_base))
+        .bearer_auth(TENANT_A_CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(metrics_scoped.status(), reqwest::StatusCode::FORBIDDEN);
+
     let ov_scoped = http
         .get(format!("{}/api/overview", gw.http_base))
         .bearer_auth(TENANT_A_CLIENT_TOKEN)
         .send()
         .await
         .unwrap();
-    assert_eq!(ov_scoped.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(ov_scoped.status(), reqwest::StatusCode::OK);
+    let ov_scoped_json: Value = ov_scoped.json().await.unwrap();
+    assert_eq!(ov_scoped_json["scope"]["is_operator"], false);
+    assert_eq!(ov_scoped_json["scope"]["namespace"], "tenant-a");
+
+    let cross_ns = http
+        .get(format!("{}/api/jobs?namespace=tenant-b", gw.http_base))
+        .bearer_auth(TENANT_A_CLIENT_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_ns.status(), reqwest::StatusCode::FORBIDDEN);
 
     // (b) Scoped worker + client isolation: `tenant-a` vs `tenant-b` on the SAME raw `job_id`!
     let spawn_echo_worker = |token: &'static str, wid: &'static str| {

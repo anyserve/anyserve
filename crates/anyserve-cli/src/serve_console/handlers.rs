@@ -1,12 +1,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyserve_core::auth::{AuthPolicy, DEFAULT_NAMESPACE};
+use anyserve_core::auth::{AuthPolicy, DEFAULT_NAMESPACE, Principal};
 use anyserve_core::error::{ErrorKind, RuntimeError};
 use anyserve_core::now_ms;
 use anyserve_core::runtime::api::{JobQuery, JobScan, JobState};
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ORIGIN, VARY,
@@ -19,9 +19,9 @@ use axum::{Json, Router};
 
 use super::api::{
     AnalyticsQuery, AnalyticsResponse, AnalyticsSource, ApiError, AppState, BudgetsSummary,
-    CancelJobResponse, ControlPlaneSummary, HistorySummary, InterfaceSummary, JobDetailResponse,
-    JobsQuery, JobsResponse, NamespaceQuery, OverviewResponse, PoolSummary, QueueSummary,
-    WorkersResponse,
+    CancelJobResponse, ConsoleScopeSummary, ControlPlaneSummary, HistorySummary, InterfaceSummary,
+    JobDetailResponse, JobsQuery, JobsResponse, NamespaceQuery, OverviewResponse, PoolSummary,
+    QueueSummary, WorkersResponse,
 };
 use super::snapshot::{
     duration_ms, health_summary, interface_policy_summary, job_detail_response, job_summary,
@@ -59,8 +59,10 @@ pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
 
 async fn analytics_jobs(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<AnalyticsResponse>, ApiError> {
+    let namespace = enforce_namespace(&principal, query.namespace, false)?;
     let page = state
         .runtime
         .scan_job_metadata(JobScan {
@@ -69,7 +71,7 @@ async fn analytics_jobs(
             to_ms: query.to_ms,
             limit: query.limit.unwrap_or(250),
             cursor: normalize_optional_filter(query.cursor),
-            namespace: normalize_optional_filter(query.namespace),
+            namespace,
         })
         .await
         .map_err(api_error)?;
@@ -105,19 +107,30 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, ApiError> {
+async fn overview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<OverviewResponse>, ApiError> {
     state.runtime.ensure_active_leader().map_err(api_error)?;
-    let snapshot = state.runtime.snapshot();
+    let snapshot = if principal.is_operator {
+        state.runtime.snapshot()
+    } else {
+        state.runtime.snapshot_namespace(&principal.namespace)
+    };
     let health = snapshot.health;
     let stats = snapshot.stats;
     let config = state.runtime.config();
 
-    let interface_names: BTreeSet<&str> = stats
-        .interfaces
-        .keys()
-        .chain(config.interfaces.keys())
-        .map(String::as_str)
-        .collect();
+    let interface_names: BTreeSet<&str> = if principal.is_operator {
+        stats
+            .interfaces
+            .keys()
+            .chain(config.interfaces.keys())
+            .map(String::as_str)
+            .collect()
+    } else {
+        stats.interfaces.keys().map(String::as_str).collect()
+    };
     let interfaces = interface_names
         .into_iter()
         .map(|name| {
@@ -148,6 +161,34 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
         })
         .collect();
 
+    let scope = state
+        .control_plane
+        .auth_enabled
+        .then(|| ConsoleScopeSummary {
+            is_operator: principal.is_operator,
+            namespace: principal.namespace.clone(),
+            subject: principal.subject.clone(),
+        });
+    let budgets = if principal.is_operator {
+        BudgetsSummary {
+            input_bytes: stats.input_bytes,
+            max_pending_bytes: config.max_pending_bytes,
+            result_bytes: stats.result_bytes,
+            max_result_bytes: config.max_result_bytes,
+            event_bytes: stats.event_bytes,
+            max_event_bytes: config.max_event_bytes,
+        }
+    } else {
+        BudgetsSummary {
+            input_bytes: 0,
+            max_pending_bytes: 0,
+            result_bytes: 0,
+            max_result_bytes: 0,
+            event_bytes: 0,
+            max_event_bytes: 0,
+        }
+    };
+
     Ok(Json(OverviewResponse {
         runtime: state.mode,
         health: health_summary(health),
@@ -168,14 +209,8 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
             reconnect_grace_ms: config.reconnect_grace.map(duration_ms),
             recommended_poll_ms: None,
         },
-        budgets: BudgetsSummary {
-            input_bytes: stats.input_bytes,
-            max_pending_bytes: config.max_pending_bytes,
-            result_bytes: stats.result_bytes,
-            max_result_bytes: config.max_result_bytes,
-            event_bytes: stats.event_bytes,
-            max_event_bytes: config.max_event_bytes,
-        },
+        scope,
+        budgets,
         journal_stats: stats.journal.map(journal_stats_summary),
         queue: QueueSummary {
             queued: stats.queued,
@@ -197,8 +232,10 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
 
 async fn list_jobs(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(query): Query<JobsQuery>,
 ) -> Result<Json<JobsResponse>, ApiError> {
+    let namespace = enforce_namespace(&principal, query.namespace, true)?;
     let page_token = normalize_optional_filter(query.page_token).or_else(|| {
         query
             .offset
@@ -241,7 +278,7 @@ async fn list_jobs(
         .query_jobs(JobQuery {
             states: parse_states(query.states.as_deref())?,
             interface,
-            namespace: normalize_optional_filter(query.namespace),
+            namespace,
             worker_id,
             search,
             from_ms,
@@ -261,10 +298,12 @@ async fn list_jobs(
 
 async fn get_job(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(job_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
-    let ns = resolve_namespace(query.namespace);
+    let ns = enforce_namespace(&principal, query.namespace, false)?
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
     let preview = state
         .runtime
         .inspect_job_preview_in(&ns, &job_id)
@@ -277,10 +316,12 @@ async fn get_job(
 
 async fn cancel_job(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Path(job_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<CancelJobResponse>, ApiError> {
-    let ns = resolve_namespace(query.namespace);
+    let ns = enforce_namespace(&principal, query.namespace, false)?
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
     let job = state
         .runtime
         .cancel_in(&ns, &job_id, "cancelled from console".into())
@@ -291,7 +332,10 @@ async fn cancel_job(
     }))
 }
 
-async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkersResponse>, ApiError> {
+async fn list_workers(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<WorkersResponse>, ApiError> {
     state.runtime.ensure_active_leader().map_err(api_error)?;
     let workers_view = state.runtime.list_workers();
     let mut healthy = 0usize;
@@ -299,6 +343,9 @@ async fn list_workers(State(state): State<AppState>) -> Result<Json<WorkersRespo
     let mut disconnected = 0usize;
     let mut workers = Vec::with_capacity(workers_view.len());
     for worker in workers_view {
+        if !principal.is_operator && worker.namespace != principal.namespace {
+            continue;
+        }
         let summary = worker_summary(worker);
         if summary.healthy {
             healthy += 1;
@@ -366,8 +413,22 @@ async fn cors_middleware(
     response
 }
 
-fn resolve_namespace(raw: Option<String>) -> String {
-    normalize_optional_filter(raw).unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned())
+fn enforce_namespace(
+    principal: &Principal,
+    requested: Option<String>,
+    allow_all_keyword: bool,
+) -> Result<Option<String>, ApiError> {
+    let normalized = normalize_optional_filter(requested);
+    if principal.is_operator {
+        return Ok(normalized);
+    }
+    if let Some(ref ns) = normalized
+        && !(allow_all_keyword && ns.eq_ignore_ascii_case("all"))
+        && ns != &principal.namespace
+    {
+        return Err(ApiError::forbidden("token cannot access another namespace"));
+    }
+    Ok(Some(principal.namespace.clone()))
 }
 
 fn normalize_optional_filter(raw: Option<String>) -> Option<String> {

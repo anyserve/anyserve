@@ -12,7 +12,9 @@ use clap::Args;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
-use crate::serve_config::{AutoTokens, GrpcConfig, ResolvedServeConfig, ServeOverrides};
+use crate::serve_config::{
+    AuthRevocationConfig, AutoTokens, GrpcConfig, ResolvedServeConfig, ServeOverrides,
+};
 use crate::serve_console::{
     ControlPlaneMetadata, format_host_port, run_server as run_console_server,
 };
@@ -227,9 +229,17 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     let config_path = config.config_path;
     let console_config = config.console;
     let public_endpoint = config.public_endpoint;
+    let auth_revocation = config.auth_revocation;
     let auto_tokens = config.auto_tokens;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    if let Some(rev_cfg) = auth_revocation {
+        tokio::spawn(run_revocation_poller(
+            rev_cfg,
+            Arc::clone(&auth),
+            shutdown_tx.subscribe(),
+        ));
+    }
     let mut servers = tokio::task::JoinSet::new();
     if let Some(grpc_addr) = grpc_addr {
         servers.spawn(run_grpc_server(
@@ -318,6 +328,66 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+async fn run_revocation_poller(
+    cfg: AuthRevocationConfig,
+    auth: Arc<AuthPolicy>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(error) => {
+            warn!(%error, "build HTTP client for auth revocation poller");
+            return;
+        }
+    };
+    let mut interval = tokio::time::interval(cfg.poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                poll_revocations_once(&client, &cfg, &auth).await;
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn poll_revocations_once(
+    client: &reqwest::Client,
+    cfg: &AuthRevocationConfig,
+    auth: &AuthPolicy,
+) {
+    let since_version = auth.revocation_version();
+    match client
+        .get(&cfg.url)
+        .query(&[("since_version", since_version)])
+        .bearer_auth(&cfg.bearer_token)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {}
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<anyserve_core::auth::RevocationSnapshot>().await {
+                Ok(snapshot) => auth.apply_revocations(snapshot),
+                Err(error) => warn!(%error, url = %cfg.url, "decode auth revocation snapshot"),
+            }
+        }
+        Ok(resp) => {
+            warn!(status = %resp.status(), url = %cfg.url, "auth revocation endpoint error");
+        }
+        Err(error) => {
+            warn!(%error, url = %cfg.url, "poll auth revocation endpoint");
+        }
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {

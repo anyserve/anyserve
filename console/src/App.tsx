@@ -47,6 +47,20 @@ function readTheme(): Theme {
   return "light";
 }
 
+function consumeHashToken(): boolean {
+  try {
+    const hash = window.location.hash;
+    if (!hash.startsWith("#token=")) return false;
+    const raw = decodeURIComponent(hash.slice("#token=".length)).trim();
+    if (!raw) return false;
+    setConsoleToken(raw);
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const init = useMemo(() => parseUrlState(window.location.pathname, window.location.search), []);
   const [activeTab, setActiveTab] = useState<ConsoleTab>(init.tab);
@@ -85,7 +99,7 @@ export default function App() {
   const [isCancelling, setIsCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
-  const [authenticated, setAuthenticated] = useState(hasConsoleToken);
+  const [authenticated, setAuthenticated] = useState(() => consumeHashToken() || hasConsoleToken());
   const [token, setToken] = useState("");
   const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
   const loadMoreAbort = useRef<AbortController | null>(null);
@@ -199,7 +213,14 @@ export default function App() {
 
   usePollingEffect(
     getOverview,
-    (next) => { setOverview(next); setError(null); },
+    (next) => {
+      setOverview(next);
+      if (next.scope && !next.scope.is_operator) {
+        const ns = next.scope.namespace;
+        setFilters((f) => (f.ns === ns ? f : { ...f, ns }));
+      }
+      setError(null);
+    },
     handleError,
     resolvePollMs(activeTab === "overview" || (activeTab === "jobs" && jobScope !== "history") ? OVERVIEW_POLL_MS : 2_000),
     [activeTab, jobScope, manualRefreshSeq],
@@ -382,12 +403,13 @@ export default function App() {
     setFilters((f) => ({ ...f, status: nextStatus }));
   }, [jobScope]);
 
+  const lockedTenantNs = overview?.scope && !overview.scope.is_operator ? overview.scope.namespace : null;
   const jumpToJobs = useCallback((opts: { scope?: JobScope; status?: JobStatusFilter; iface?: string; ns?: string; worker?: string; jobId?: string; q?: string }) => {
     const scope = opts.scope ?? "all";
     resetExtraJobs();
     if (opts.worker && opts.worker !== "all") rememberWorkers([opts.worker]);
     const nextQ = opts.q ?? "";
-    setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: opts.ns ?? "all", worker: opts.worker ?? "all", q: nextQ });
+    setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: lockedTenantNs ?? opts.ns ?? "all", worker: opts.worker ?? "all", q: nextQ });
     setServerSearch(nextQ.trim());
     setTimeFilter(DEFAULT_TIME_FILTER);
     setPinnedJobByScope((c) => ({ ...c, [scope]: opts.jobId ?? null }));

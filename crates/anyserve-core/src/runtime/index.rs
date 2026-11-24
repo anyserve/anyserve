@@ -388,23 +388,47 @@ impl JobIndex {
     pub(crate) fn interfaces(&self, now: u64) -> BTreeMap<String, InterfaceStats> {
         let mut merged: BTreeMap<String, InterfaceStats> = BTreeMap::new();
         for ns in self.namespaces.values() {
-            for (name, index) in &ns.interfaces {
-                let oldest = index
-                    .queued_since
-                    .first()
-                    .map(|(since, _)| now.saturating_sub(*since))
-                    .unwrap_or(0);
-                let entry = if let Some(entry) = merged.get_mut(name.as_str()) {
-                    entry
-                } else {
-                    merged.entry(name.clone()).or_default()
-                };
-                entry.queued += index.jobs[0].len();
-                entry.running += index.jobs[1].len();
-                entry.oldest_queued_age_ms = entry.oldest_queued_age_ms.max(oldest);
-            }
+            Self::merge_namespace_interfaces(ns, now, &mut merged);
         }
         merged
+    }
+
+    pub(crate) fn namespace_snapshot(
+        &self,
+        namespace: &str,
+        now: u64,
+    ) -> ([usize; 5], BTreeMap<String, InterfaceStats>) {
+        let Some(ns) = self.namespaces.get(namespace) else {
+            return ([0; 5], BTreeMap::new());
+        };
+        let counts = [
+            ns.jobs[0].len(),
+            ns.jobs[1].len(),
+            ns.jobs[2].len(),
+            ns.jobs[3].len(),
+            ns.jobs[4].len(),
+        ];
+        let mut interfaces = BTreeMap::new();
+        Self::merge_namespace_interfaces(ns, now, &mut interfaces);
+        (counts, interfaces)
+    }
+
+    fn merge_namespace_interfaces(
+        ns: &NamespaceIndex,
+        now: u64,
+        merged: &mut BTreeMap<String, InterfaceStats>,
+    ) {
+        for (name, index) in &ns.interfaces {
+            let oldest = index
+                .queued_since
+                .first()
+                .map(|(since, _)| now.saturating_sub(*since))
+                .unwrap_or(0);
+            let entry = merged.entry(name.clone()).or_default();
+            entry.queued += index.jobs[0].len();
+            entry.running += index.jobs[1].len();
+            entry.oldest_queued_age_ms = entry.oldest_queued_age_ms.max(oldest);
+        }
     }
 }
 

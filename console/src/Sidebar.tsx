@@ -88,6 +88,12 @@ export const Sidebar = memo(function Sidebar({
           </div>
         </div>
       </div>
+      {overview?.scope && !overview.scope.is_operator ? (
+        <div className="sidebar__scope" title={`Tenant scope: ${overview.scope.subject} (${overview.scope.namespace})`}>
+          <span className="ellipsis">{overview.scope.subject}</span>
+          <span className="mono">{overview.scope.namespace}</span>
+        </div>
+      ) : null}
 
       <div className="sidebar__scroll">
         <nav className="sidebar__nav" aria-label="Console sections">

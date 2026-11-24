@@ -1,7 +1,7 @@
 // Management & Console HTTP API for AnyserveNativeDO (section 6.2, 7 of docs/cloudflare-native-do-plan.md).
 // Matches console/src/types.ts and crates/anyserve-cli/src/serve_console/{api,handlers,snapshot,metrics}.rs.
 
-import { GrpcCode, GrpcStatusError, type AuthPolicy } from "./auth";
+import { GrpcCode, GrpcStatusError, type AuthPolicy, type Principal } from "./auth";
 import { DEFAULT_NAMESPACE, encodeScopedId, validateNamespaceSafe } from "./engine";
 import {
   MAX_IDENTIFIER_BYTES,
@@ -225,7 +225,7 @@ export interface ConsoleBackend {
   readonly auth: AuthPolicy;
   readonly env: NativeEnvConfig;
   getHealth(): { live: boolean; ready: boolean; message: string | null };
-  getOverviewSnapshot(nowMs: number): ConsoleOverviewSnapshot;
+  getOverviewSnapshot(nowMs: number, namespace?: string): ConsoleOverviewSnapshot;
   queryJobsForConsole(query: ConsoleJobsQuery, nowMs: number): ConsoleJobsQueryResult;
   getJobDetailForConsole(
     namespace: string,
@@ -605,15 +605,64 @@ export async function handleConsoleOrHealthRequest(
     );
   }
 
-  // All remaining management routes (/metrics, /api/*) require operator token when auth is enabled.
+  // /metrics and /api/admin/reset remain strictly Operator-only.
+  if (path === "/metrics" || path === "/api/admin/reset") {
+    try {
+      backend.auth.authorizeOperatorHeaders(request.headers);
+    } catch (err) {
+      return withCorsHeaders(request, authMiddlewareErrorResponse(err), backend.env);
+    }
+    const res = await dispatchAuthorizedConsoleRoute(
+      request,
+      url,
+      path,
+      method,
+      backend,
+      null,
+      nowMs,
+    );
+    return withCorsHeaders(request, res, backend.env);
+  }
+
+  // Remaining Console /api/* routes permit both operator and tenant client tokens.
+  let principal: Principal;
   try {
-    backend.auth.authorizeOperatorHeaders(request.headers);
+    principal = backend.auth.authorizeConsoleHeaders(request.headers);
   } catch (err) {
     return withCorsHeaders(request, authMiddlewareErrorResponse(err), backend.env);
   }
 
-  const res = await dispatchAuthorizedConsoleRoute(request, url, path, method, backend, nowMs);
+  const res = await dispatchAuthorizedConsoleRoute(
+    request,
+    url,
+    path,
+    method,
+    backend,
+    principal,
+    nowMs,
+  );
   return withCorsHeaders(request, res, backend.env);
+}
+
+function enforceConsoleNamespace(
+  principal: Principal,
+  requested: string | null,
+  allowAllKeyword: boolean,
+): string | null {
+  if (principal.isOperator) {
+    return requested;
+  }
+  if (
+    requested !== null &&
+    !(allowAllKeyword && requested.toLowerCase() === "all") &&
+    requested !== principal.namespace
+  ) {
+    throw new GrpcStatusError(
+      GrpcCode.PermissionDenied,
+      "token cannot access another namespace",
+    );
+  }
+  return principal.namespace;
 }
 
 async function dispatchAuthorizedConsoleRoute(
@@ -622,6 +671,7 @@ async function dispatchAuthorizedConsoleRoute(
   path: string,
   method: string,
   backend: ConsoleBackend,
+  principal: Principal | null,
   nowMs: number,
 ): Promise<Response> {
   if (path === "/metrics" && method === "GET") {
@@ -633,8 +683,12 @@ async function dispatchAuthorizedConsoleRoute(
   }
 
   if (path === "/api/overview" && method === "GET") {
-    const snap = backend.getOverviewSnapshot(nowMs);
-    const body = {
+    const isOperator = principal?.isOperator ?? true;
+    const snap = backend.getOverviewSnapshot(
+      nowMs,
+      isOperator ? undefined : principal?.namespace,
+    );
+    const body: Record<string, unknown> = {
       runtime: {
         code: "memory_plus_cloudflare",
         label: "Memory + Cloudflare DO",
@@ -667,21 +721,32 @@ async function dispatchAuthorizedConsoleRoute(
         boot_id: snap.bootId,
         constructor_runs: snap.constructorRuns,
       },
-      budgets: {
-        input_bytes: snap.inputBytes,
-        max_pending_bytes: snap.maxPendingBytes,
-        result_bytes: snap.resultBytes,
-        max_result_bytes: snap.maxResultBytes,
-        event_bytes: snap.eventBytes,
-        max_event_bytes: snap.maxEventBytes,
-      },
-      journal_stats: {
-        pending_ops: 0,
-        committed_batches: snap.committedBatches,
-        committed_ops: snap.committedOps,
-        last_batch_size: 1,
-        last_commit_micros: 0,
-      },
+      budgets: isOperator
+        ? {
+            input_bytes: snap.inputBytes,
+            max_pending_bytes: snap.maxPendingBytes,
+            result_bytes: snap.resultBytes,
+            max_result_bytes: snap.maxResultBytes,
+            event_bytes: snap.eventBytes,
+            max_event_bytes: snap.maxEventBytes,
+          }
+        : {
+            input_bytes: 0,
+            max_pending_bytes: 0,
+            result_bytes: 0,
+            max_result_bytes: 0,
+            event_bytes: 0,
+            max_event_bytes: 0,
+          },
+      journal_stats: isOperator
+        ? {
+            pending_ops: 0,
+            committed_batches: snap.committedBatches,
+            committed_ops: snap.committedOps,
+            last_batch_size: 1,
+            last_commit_micros: 0,
+          }
+        : null,
       queue: {
         queued: snap.queued,
         running: snap.running,
@@ -715,7 +780,17 @@ async function dispatchAuthorizedConsoleRoute(
           : null,
       })),
       pools: snap.pools,
-      quota: {
+      refreshed_at_ms: nowMs,
+    };
+    if (backend.auth.isEnabled() && principal) {
+      body.scope = {
+        is_operator: principal.isOperator,
+        namespace: principal.namespace,
+        subject: principal.subject,
+      };
+    }
+    if (isOperator) {
+      body.quota = {
         day_utc: snap.quotaDayUtc,
         month_utc: snap.quotaMonthUtc,
         do_requests: snap.quotaDoRequests,
@@ -727,14 +802,17 @@ async function dispatchAuthorizedConsoleRoute(
         large_jobs: snap.quotaLargeJobs,
         database_size_bytes: snap.databaseSizeBytes,
         reserved_retained_bytes: snap.reservedRetainedBytes,
-      },
-      refreshed_at_ms: nowMs,
-    };
+      };
+    }
     return jsonResponse(body);
   }
 
   if (path === "/api/workers" && method === "GET") {
-    const workers = backend.listWorkersForConsole(nowMs);
+    const allWorkers = backend.listWorkersForConsole(nowMs);
+    const workers =
+      principal && !principal.isOperator
+        ? allWorkers.filter((w) => w.namespace === principal.namespace)
+        : allWorkers;
     let healthy = 0;
     let draining = 0;
     let disconnected = 0;
@@ -811,12 +889,20 @@ async function dispatchAuthorizedConsoleRoute(
     const rawWorker = normalizeOptionalFilter(url.searchParams.get("worker"));
     const workerId =
       rawWorker && rawWorker.toLowerCase() !== "all" ? rawWorker : null;
-    const nsFilter = normalizeOptionalFilter(url.searchParams.get("namespace"));
-    if (nsFilter !== null && !validateNamespaceSafe(nsFilter)) {
+    const requestedNs = normalizeOptionalFilter(url.searchParams.get("namespace"));
+    if (requestedNs !== null && !validateNamespaceSafe(requestedNs)) {
       return apiErrorResponse(
         400,
         "namespace must be 1..=64 ASCII characters in [a-zA-Z0-9._-]",
       );
+    }
+    let nsFilter: string | null = requestedNs;
+    if (principal) {
+      try {
+        nsFilter = enforceConsoleNamespace(principal, requestedNs, true);
+      } catch (err) {
+        return authMiddlewareErrorResponse(err);
+      }
     }
     const rawIface = normalizeOptionalFilter(url.searchParams.get("interface"));
     const ifaceFilter =
@@ -875,12 +961,20 @@ async function dispatchAuthorizedConsoleRoute(
     if (fromMs >= toMs || toMs - fromMs > 31 * 24 * 60 * 60 * 1000) {
       return apiErrorResponse(400, "choose a time range of at most 31 days");
     }
-    const nsFilter = normalizeOptionalFilter(url.searchParams.get("namespace"));
-    if (nsFilter !== null && !validateNamespaceSafe(nsFilter)) {
+    const requestedNs = normalizeOptionalFilter(url.searchParams.get("namespace"));
+    if (requestedNs !== null && !validateNamespaceSafe(requestedNs)) {
       return apiErrorResponse(
         400,
         "namespace must be 1..=64 ASCII characters in [a-zA-Z0-9._-]",
       );
+    }
+    let nsFilter: string | null = requestedNs;
+    if (principal) {
+      try {
+        nsFilter = enforceConsoleNamespace(principal, requestedNs, false);
+      } catch (err) {
+        return authMiddlewareErrorResponse(err);
+      }
     }
     const cursorRaw = normalizeOptionalFilter(url.searchParams.get("cursor"));
     let before: { createdAtMs: number; cursorId: string } | null = null;
@@ -944,13 +1038,20 @@ async function dispatchAuthorizedConsoleRoute(
     } catch {
       return apiErrorResponse(400, "invalid job_id encoding");
     }
-    const ns =
-      normalizeOptionalFilter(url.searchParams.get("namespace")) ?? DEFAULT_NAMESPACE;
-    if (!validateNamespaceSafe(ns)) {
+    const requestedNs = normalizeOptionalFilter(url.searchParams.get("namespace"));
+    if (requestedNs !== null && !validateNamespaceSafe(requestedNs)) {
       return apiErrorResponse(
         400,
         "namespace must be 1..=64 ASCII characters in [a-zA-Z0-9._-]",
       );
+    }
+    let ns = requestedNs ?? DEFAULT_NAMESPACE;
+    if (principal) {
+      try {
+        ns = enforceConsoleNamespace(principal, requestedNs, false) ?? DEFAULT_NAMESPACE;
+      } catch (err) {
+        return authMiddlewareErrorResponse(err);
+      }
     }
     const job = await backend.cancelJobForConsole(
       ns,
@@ -972,13 +1073,20 @@ async function dispatchAuthorizedConsoleRoute(
     } catch {
       return apiErrorResponse(400, "invalid job_id encoding");
     }
-    const ns =
-      normalizeOptionalFilter(url.searchParams.get("namespace")) ?? DEFAULT_NAMESPACE;
-    if (!validateNamespaceSafe(ns)) {
+    const requestedNs = normalizeOptionalFilter(url.searchParams.get("namespace"));
+    if (requestedNs !== null && !validateNamespaceSafe(requestedNs)) {
       return apiErrorResponse(
         400,
         "namespace must be 1..=64 ASCII characters in [a-zA-Z0-9._-]",
       );
+    }
+    let ns = requestedNs ?? DEFAULT_NAMESPACE;
+    if (principal) {
+      try {
+        ns = enforceConsoleNamespace(principal, requestedNs, false) ?? DEFAULT_NAMESPACE;
+      } catch (err) {
+        return authMiddlewareErrorResponse(err);
+      }
     }
     const detail = await backend.getJobDetailForConsole(ns, rawJobId, nowMs);
     if (!detail) {

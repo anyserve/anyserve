@@ -1259,3 +1259,28 @@ it("renders multi-interface worker rows with primary interface button + +N badge
   expect(await screen.findByRole("heading", { name: "policy.evaluate.v1" })).toBeTruthy();
   expect(window.location.pathname).toBe("/interfaces");
 });
+
+it("captures #token= from URL hash, strips the hash, and locks tenant scope UI", async () => {
+  window.history.replaceState(null, "", "/jobs#token=asv1.hash-token.sig");
+  vi.mocked(getOverview).mockResolvedValue({
+    ...minimalOverview(),
+    scope: { is_operator: false, namespace: "gh-9001", subject: "gh:octocat" },
+  });
+  vi.mocked(getJobs).mockResolvedValue({ jobs: [], next_page_token: null, total: 0 });
+
+  render(<App />);
+  expect(hasConsoleToken()).toBe(true);
+  expect(setConsoleToken).toHaveBeenCalledWith("asv1.hash-token.sig");
+  await waitFor(() => expect(window.location.hash).toBe(""));
+  expect(await screen.findByText("gh:octocat")).toBeTruthy();
+  expect(document.querySelector(".sidebar__scope")?.textContent).toContain("gh-9001");
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenCalledWith(
+      expect.any(Array),
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({ namespace: "gh-9001" }),
+    ),
+  );
+});

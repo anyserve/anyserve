@@ -654,3 +654,54 @@ fn auto_token_ephemeral_stays_in_memory_and_noop_when_tokens_exist() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn signing_keys_and_revocation_url_resolve_from_env_and_auto_token_stays_noop() {
+    use anyserve_core::auth::{Role, SignedTokenClaims, sign_token};
+
+    let key = "shared-signing-secret-0123456789";
+    let dir = crate::test_support::temporary_path("signing-key-env");
+    let resolved = ResolvedServeConfig::load_with_env(
+        ServeOverrides {
+            journal_path: Some(dir.join("journal.sqlite")),
+            auto_token: true,
+            ..Default::default()
+        },
+        |name| match name {
+            "ANYSERVE_TOKEN_SIGNING_KEY" => Some(key.into()),
+            "ANYSERVE_AUTH_REVOCATION_URL" => {
+                Some("http://auth-github:3002/internal/revocations".into())
+            }
+            _ => None,
+        },
+    )
+    .unwrap();
+
+    assert!(resolved.auth.is_enabled());
+    assert!(resolved.auto_tokens.is_none());
+    let rev = resolved
+        .auth_revocation
+        .as_ref()
+        .expect("revocation config");
+    assert_eq!(rev.url, "http://auth-github:3002/internal/revocations");
+    assert!(!format!("{resolved:?}").contains(key));
+
+    let tok = sign_token(
+        key.as_bytes(),
+        &SignedTokenClaims {
+            jti: "jti-cfg".into(),
+            ns: "gh-7".into(),
+            role: "client".into(),
+            sub: "gh:dev".into(),
+            iat: 1_700_000_000,
+            exp: None,
+            fp: None,
+        },
+    )
+    .unwrap();
+    let p = resolved.auth.principal_for_token(&tok).unwrap();
+    assert_eq!(p.namespace, "gh-7");
+    assert_eq!(p.role, Role::Client);
+    assert!(!p.is_operator);
+    assert!(!dir.exists());
+}

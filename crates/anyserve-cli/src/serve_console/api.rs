@@ -41,6 +41,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -59,11 +66,20 @@ pub(crate) struct RuntimeModeSummary {
     pub(crate) journal: &'static str,
 }
 
+#[derive(Clone, Serialize)]
+pub(crate) struct ConsoleScopeSummary {
+    pub(crate) is_operator: bool,
+    pub(crate) namespace: String,
+    pub(crate) subject: String,
+}
+
 #[derive(Serialize)]
 pub(crate) struct OverviewResponse {
     pub(crate) runtime: RuntimeModeSummary,
     pub(crate) health: HealthSummary,
     pub(crate) control_plane: ControlPlaneSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<ConsoleScopeSummary>,
     pub(crate) budgets: BudgetsSummary,
     pub(crate) journal_stats: Option<JournalStatsSummary>,
     pub(crate) queue: QueueSummary,

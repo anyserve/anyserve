@@ -4,19 +4,179 @@
 //! credential check before any request reaches the runtime. Tokens are split by
 //! role and resolve into a [`Principal`] carrying the caller's `namespace`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
+use anyhow::Context as _;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::HeaderMap;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use tonic::Status;
 use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
 pub const DEFAULT_NAMESPACE: &str = "default";
 pub const NAMESPACE_HEADER: &str = "x-anyserve-namespace";
+pub const SIGNED_TOKEN_PREFIX: &str = "asv1.";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedTokenClaims {
+    pub jti: String,
+    pub ns: String,
+    pub role: String,
+    pub sub: String,
+    pub iat: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fp: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationSnapshot {
+    pub version: u64,
+    #[serde(default)]
+    pub revoked_jtis: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RevocationState {
+    version: u64,
+    revoked_jtis: HashSet<String>,
+}
+
+fn now_secs() -> u64 {
+    crate::now_ms() / 1000
+}
+
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK_LEN: usize = 64;
+    let mut k0 = [0u8; BLOCK_LEN];
+    if key.len() > BLOCK_LEN {
+        let digest = Sha256::digest(key);
+        k0[..32].copy_from_slice(&digest);
+    } else {
+        k0[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK_LEN];
+    let mut opad = [0x5cu8; BLOCK_LEN];
+    for i in 0..BLOCK_LEN {
+        ipad[i] ^= k0[i];
+        opad[i] ^= k0[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+fn parse_role(raw: &str) -> Option<Role> {
+    match raw {
+        "client" => Some(Role::Client),
+        "worker" => Some(Role::Worker),
+        _ => None,
+    }
+}
+
+/// Signs claims into a stateless `asv1.<b64url-json>.<b64url-hmac>` bearer token.
+pub fn sign_token(key: &[u8], claims: &SignedTokenClaims) -> anyhow::Result<String> {
+    anyhow::ensure!(!key.is_empty(), "signing key must not be empty");
+    anyhow::ensure!(!claims.jti.trim().is_empty(), "token jti must not be empty");
+    validate_namespace(&claims.ns)
+        .map_err(|s| anyhow::anyhow!("invalid token namespace: {}", s.message()))?;
+    anyhow::ensure!(
+        parse_role(&claims.role).is_some(),
+        "token role must be 'client' or 'worker'"
+    );
+    let json = serde_json::to_vec(claims).context("serialize token claims")?;
+    let payload = URL_SAFE_NO_PAD.encode(json);
+    let signing_input = format!("{SIGNED_TOKEN_PREFIX}{payload}");
+    let mac = hmac_sha256(key, signing_input.as_bytes());
+    let sig = URL_SAFE_NO_PAD.encode(mac);
+    Ok(format!("{signing_input}.{sig}"))
+}
+
+/// Verifies a `asv1.` signed token against all configured keys in constant time.
+pub fn verify_signed_token(
+    token: &str,
+    keys: &[Vec<u8>],
+    now_secs: u64,
+) -> Option<SignedTokenClaims> {
+    if keys.is_empty() {
+        return None;
+    }
+    let body = token.strip_prefix(SIGNED_TOKEN_PREFIX)?;
+    let (payload_b64, sig_b64) = body.split_once('.')?;
+    if sig_b64.contains('.') {
+        return None;
+    }
+    let sig = URL_SAFE_NO_PAD.decode(sig_b64).ok()?;
+    if sig.len() != 32 {
+        return None;
+    }
+    let signing_input = format!("{SIGNED_TOKEN_PREFIX}{payload_b64}");
+    let verified = keys.iter().fold(false, |ok, key| {
+        if key.is_empty() {
+            return ok;
+        }
+        let expected = hmac_sha256(key, signing_input.as_bytes());
+        ok | constant_time_bytes_eq(&expected, &sig)
+    });
+    if !verified {
+        return None;
+    }
+    let raw_claims = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let claims: SignedTokenClaims = serde_json::from_slice(&raw_claims).ok()?;
+    if claims.jti.trim().is_empty()
+        || validate_namespace(&claims.ns).is_err()
+        || parse_role(&claims.role).is_none()
+        || claims.exp.is_some_and(|exp| now_secs >= exp)
+    {
+        return None;
+    }
+    Some(claims)
+}
+
+/// Derives the shared bearer secret used by internal plugin endpoints (e.g. `/internal/revocations`)
+/// without sending the raw signing key over the wire.
+pub fn internal_revocation_bearer(signing_key: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"anyserve-internal-revocations:");
+    hasher.update(signing_key);
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    constant_time_bytes_eq(left.as_bytes(), right.as_bytes())
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
 
 const V2_CLIENT_PREFIX: &str = "/anyserve.v2.Client/";
 const V2_WORKER_PREFIX: &str = "/anyserve.v2.Worker/";
@@ -101,6 +261,8 @@ pub struct AuthPolicy {
     client_tokens: BTreeSet<String>,
     worker_tokens: BTreeSet<String>,
     scoped_tokens: Vec<ScopedToken>,
+    signing_keys: Vec<Vec<u8>>,
+    revocations: Arc<RwLock<RevocationState>>,
 }
 
 impl std::fmt::Debug for AuthPolicy {
@@ -109,6 +271,8 @@ impl std::fmt::Debug for AuthPolicy {
             .field("client_token_count", &self.client_tokens.len())
             .field("worker_token_count", &self.worker_tokens.len())
             .field("scoped_tokens", &self.scoped_tokens)
+            .field("signing_key_count", &self.signing_keys.len())
+            .field("revocation_version", &self.revocation_version())
             .finish()
     }
 }
@@ -129,6 +293,8 @@ impl AuthPolicy {
             client_tokens: clean(&mut client_tokens.into_iter()),
             worker_tokens: clean(&mut worker_tokens.into_iter()),
             scoped_tokens: Vec::new(),
+            signing_keys: Vec::new(),
+            revocations: Arc::new(RwLock::new(RevocationState::default())),
         }
     }
 
@@ -143,10 +309,37 @@ impl AuthPolicy {
         self
     }
 
+    pub fn with_signing_keys(mut self, keys: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        self.signing_keys = keys.into_iter().filter(|k| !k.is_empty()).collect();
+        self
+    }
+
+    pub fn revocation_version(&self) -> u64 {
+        self.revocations
+            .read()
+            .expect("revocations lock poisoned")
+            .version
+    }
+
+    pub fn apply_revocations(&self, snapshot: RevocationSnapshot) {
+        let mut guard = self.revocations.write().expect("revocations lock poisoned");
+        guard.version = snapshot.version;
+        guard.revoked_jtis = snapshot.revoked_jtis.into_iter().collect();
+    }
+
+    fn is_jti_revoked(&self, jti: &str) -> bool {
+        self.revocations
+            .read()
+            .expect("revocations lock poisoned")
+            .revoked_jtis
+            .contains(jti)
+    }
+
     pub fn is_enabled(&self) -> bool {
         !self.client_tokens.is_empty()
             || !self.worker_tokens.is_empty()
             || !self.scoped_tokens.is_empty()
+            || !self.signing_keys.is_empty()
     }
 
     /// Returns the role a bearer token grants, if any.
@@ -185,6 +378,20 @@ impl AuthPolicy {
                 is_operator: true,
             });
         }
+        if matched.is_none()
+            && !self.signing_keys.is_empty()
+            && let Some(claims) = verify_signed_token(candidate, &self.signing_keys, now_secs())
+            && !self.is_jti_revoked(&claims.jti)
+            && let Some(role) = parse_role(&claims.role)
+        {
+            matched = Some(Principal {
+                namespace: claims.ns,
+                role,
+                subject: claims.sub,
+                forced_pool: claims.fp,
+                is_operator: false,
+            });
+        }
         matched
     }
 
@@ -192,8 +399,8 @@ impl AuthPolicy {
         self.verify_client_headers(headers).map(|_| ())
     }
 
-    /// Verifies management/operator HTTP access: requires an operator-level
-    /// client token when auth is enabled; tenant-scoped and worker tokens get `PermissionDenied`.
+    /// Verifies management/operator HTTP access (`/metrics`, global queries): requires an
+    /// operator-level client token when auth is enabled; tenant tokens and workers get `PermissionDenied`.
     pub fn authorize_operator_headers(&self, headers: &HeaderMap) -> Result<(), Status> {
         if !self.is_enabled() {
             return Ok(());
@@ -204,6 +411,23 @@ impl AuthPolicy {
             Some(principal) if principal.role == Role::Client && principal.is_operator => Ok(()),
             Some(_) => Err(Status::permission_denied(
                 "management API requires an operator client token",
+            )),
+            None => Err(Status::unauthenticated("missing or invalid bearer token")),
+        }
+    }
+
+    /// Verifies Console `/api/*` access: allows both operator client tokens and tenant-scoped
+    /// client tokens, returning the caller's [`Principal`] for namespace enforcement.
+    pub fn authorize_console_headers(&self, headers: &HeaderMap) -> Result<Principal, Status> {
+        if !self.is_enabled() {
+            return Self::unauthenticated_principal(Role::Client, headers);
+        }
+        let token = bearer_token(headers)
+            .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+        match self.principal_for_token(token) {
+            Some(principal) if principal.role == Role::Client => Ok(principal),
+            Some(_) => Err(Status::permission_denied(
+                "worker token cannot access console API",
             )),
             None => Err(Status::unauthenticated("missing or invalid bearer token")),
         }
@@ -301,17 +525,6 @@ fn contains_token(tokens: &BTreeSet<String>, candidate: &str) -> bool {
     tokens.iter().fold(false, |found, token| {
         found | constant_time_eq(token, candidate)
     })
-}
-
-fn constant_time_eq(left: &str, right: &str) -> bool {
-    let (left, right) = (left.as_bytes(), right.as_bytes());
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
 }
 
 #[derive(Clone)]
@@ -621,5 +834,103 @@ mod tests {
         assert!(policy_dbg.contains("client_token_count: 1"));
         assert!(policy_dbg.contains("worker_token_count: 1"));
         assert!(policy_dbg.contains("factory-a"));
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_vector() {
+        let mac = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn signed_tokens_verify_rotate_expire_revoke_and_never_grant_operator() {
+        let key1 = b"primary-signing-secret-32-bytes!!".to_vec();
+        let key2 = b"rotated-signing-secret-32-bytes!!".to_vec();
+        let claims = SignedTokenClaims {
+            jti: "jti-1".into(),
+            ns: "gh-42".into(),
+            role: "client".into(),
+            sub: "gh:octocat".into(),
+            iat: 1_700_000_000,
+            exp: Some(now_secs() + 3600),
+            fp: Some("gpu-a".into()),
+        };
+        let token = sign_token(&key1, &claims).unwrap();
+        assert!(token.starts_with(SIGNED_TOKEN_PREFIX));
+
+        let policy = AuthPolicy::default().with_signing_keys([key2.clone(), key1.clone()]);
+        assert!(policy.is_enabled());
+        let p = policy.principal_for_token(&token).unwrap();
+        assert_eq!(p.namespace, "gh-42");
+        assert_eq!(p.role, Role::Client);
+        assert_eq!(p.subject, "gh:octocat");
+        assert_eq!(p.forced_pool.as_deref(), Some("gpu-a"));
+        assert!(!p.is_operator);
+
+        // Console API allows tenant client token; operator API (/metrics) rejects it.
+        let ch = headers(&token);
+        let cp = policy.authorize_console_headers(&ch).unwrap();
+        assert_eq!(cp.namespace, "gh-42");
+        assert!(!cp.is_operator);
+        assert_eq!(
+            policy.authorize_operator_headers(&ch).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        // Tamper & wrong key reject cleanly.
+        let mut tampered = token.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(policy.principal_for_token(&tampered).is_none());
+        let wrong_policy = AuthPolicy::default().with_signing_keys([key2]);
+        assert!(wrong_policy.principal_for_token(&token).is_none());
+
+        // Expired token rejected.
+        let expired = sign_token(
+            &key1,
+            &SignedTokenClaims {
+                exp: Some(now_secs().saturating_sub(1)),
+                ..claims.clone()
+            },
+        )
+        .unwrap();
+        assert!(policy.principal_for_token(&expired).is_none());
+
+        // Worker signed token rejects Console API with PermissionDenied.
+        let worker_tok = sign_token(
+            &key1,
+            &SignedTokenClaims {
+                jti: "jti-w".into(),
+                role: "worker".into(),
+                ..claims
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policy
+                .authorize_console_headers(&headers(&worker_tok))
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+
+        // Revocation snapshot blocks revoked JTI immediately and updates version.
+        policy.apply_revocations(RevocationSnapshot {
+            version: 7,
+            revoked_jtis: vec!["jti-1".into()],
+        });
+        assert_eq!(policy.revocation_version(), 7);
+        assert!(policy.principal_for_token(&token).is_none());
+        assert!(policy.principal_for_token(&worker_tok).is_some());
+
+        // Debug never exposes signing key bytes.
+        let dbg = format!("{policy:?}");
+        assert!(!dbg.contains("primary-signing-secret"));
+        assert!(dbg.contains("signing_key_count: 2"));
+        assert!(dbg.contains("revocation_version: 7"));
     }
 }

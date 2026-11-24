@@ -279,11 +279,17 @@ async fn console_requires_client_auth_for_reads_and_cancellation() {
 }
 
 #[tokio::test]
-async fn console_rejects_scoped_tenant_tokens() {
+async fn console_scopes_tenant_tokens_to_own_namespace_and_keeps_metrics_operator_only() {
     let runtime = test_runtime().await;
-    let job_id = submit(
+    let job_a = submit(
         &runtime,
         Some("tenant-a"),
+        spec("demo.auth.v1", Durability::Ephemeral),
+    )
+    .await;
+    let _job_b = submit(
+        &runtime,
+        Some("tenant-b"),
         spec("demo.auth.v1", Durability::Ephemeral),
     )
     .await;
@@ -305,40 +311,120 @@ async fn console_rejects_scoped_tenant_tokens() {
             },
         ]);
     let c = spawn_console_auth(runtime, policy).await;
-    let detail = format!("/api/jobs/{job_id}");
-    let cancel = format!("/api/jobs/{job_id}/cancel");
-    let paths = [
+    let detail_a = format!("/api/jobs/{job_a}");
+    let cancel_a = format!("/api/jobs/{job_a}/cancel");
+
+    // Workers remain forbidden from /metrics and all /api/* routes.
+    for path in [
         "/metrics",
         "/api/overview",
         "/api/jobs",
         "/api/workers",
-        "/api/analytics/jobs?source=retained&from_ms=0&to_ms=1",
-        &detail,
-    ];
-
-    for token in [
-        "scoped-a-client",
-        "scoped-default-client",
-        "operator-worker",
+        &detail_a,
     ] {
-        for path in paths {
-            assert_eq!(
-                c.status(Method::GET, path, Some(token)).await,
-                403,
-                "token {token} on {path}"
-            );
-        }
         assert_eq!(
-            c.status(Method::POST, &cancel, Some(token)).await,
+            c.status(Method::GET, path, Some("operator-worker")).await,
             403,
-            "token {token} cancel"
+            "worker on {path}"
         );
     }
     assert_eq!(
-        c.status(Method::GET, "/api/jobs", Some("operator-client"))
+        c.status(Method::POST, &cancel_a, Some("operator-worker"))
+            .await,
+        403
+    );
+
+    // Tenant client tokens stay 403 on /metrics and explicit cross-namespace queries.
+    for token in ["scoped-a-client", "scoped-default-client"] {
+        assert_eq!(c.status(Method::GET, "/metrics", Some(token)).await, 403);
+        assert_eq!(
+            c.status(Method::GET, "/api/jobs?namespace=tenant-b", Some(token))
+                .await,
+            403
+        );
+        assert_eq!(
+            c.status(
+                Method::GET,
+                "/api/analytics/jobs?source=retained&from_ms=0&to_ms=1&namespace=tenant-b",
+                Some(token)
+            )
+            .await,
+            403
+        );
+        assert_eq!(
+            c.status(
+                Method::GET,
+                &format!("{detail_a}?namespace=tenant-b"),
+                Some(token)
+            )
+            .await,
+            403
+        );
+        assert_eq!(
+            c.status(
+                Method::POST,
+                &format!("{cancel_a}?namespace=tenant-b"),
+                Some(token)
+            )
+            .await,
+            403
+        );
+    }
+
+    // `scoped-default-client` cannot inspect or cancel tenant-a's job (404 in own namespace).
+    assert_eq!(
+        c.status(Method::GET, &detail_a, Some("scoped-default-client"))
+            .await,
+        404
+    );
+    assert_eq!(
+        c.status(Method::POST, &cancel_a, Some("scoped-default-client"))
+            .await,
+        404
+    );
+
+    // `scoped-a-client` sees only tenant-a on /api/overview, /api/jobs, /api/workers, /api/jobs/:id, and can cancel its own job.
+    let ov_a = c
+        .json(Method::GET, "/api/overview", Some("scoped-a-client"))
+        .await;
+    assert_eq!(ov_a["scope"]["is_operator"], false);
+    assert_eq!(ov_a["scope"]["namespace"], "tenant-a");
+    assert_eq!(ov_a["queue"]["queued"], 1);
+    assert_eq!(ov_a["budgets"]["max_pending_bytes"], 0);
+    assert!(ov_a["journal_stats"].is_null());
+
+    let jobs_a = c
+        .json(
+            Method::GET,
+            "/api/jobs?namespace=all",
+            Some("scoped-a-client"),
+        )
+        .await;
+    assert_eq!(jobs_a["total"], 1);
+    assert_eq!(jobs_a["jobs"][0]["job_id"], job_a);
+    assert_eq!(jobs_a["jobs"][0]["namespace"], "tenant-a");
+
+    assert_eq!(
+        c.status(Method::GET, &detail_a, Some("scoped-a-client"))
             .await,
         200
     );
+    assert_eq!(
+        c.status(Method::POST, &cancel_a, Some("scoped-a-client"))
+            .await,
+        200
+    );
+
+    // Operator token keeps global access to /metrics, /api/jobs, and all namespaces.
+    assert_eq!(
+        c.status(Method::GET, "/metrics", Some("operator-client"))
+            .await,
+        200
+    );
+    let jobs_all = c
+        .json(Method::GET, "/api/jobs", Some("operator-client"))
+        .await;
+    assert_eq!(jobs_all["total"], 2);
 }
 
 #[tokio::test]
@@ -1535,11 +1621,16 @@ async fn console_mounts_http_ws_outside_operator_middleware_and_allows_namespace
             .contains("x-anyserve-namespace")
     );
 
-    // Operator-only management API still rejects scoped tenant & worker tokens with 403.
+    // Operator-only /metrics rejects scoped tenant & worker tokens; Console /api/overview allows tenant client (scoped) and rejects worker (403).
+    assert_eq!(
+        c.status(Method::GET, "/metrics", Some("tenant-client"))
+            .await,
+        403
+    );
     assert_eq!(
         c.status(Method::GET, "/api/overview", Some("tenant-client"))
             .await,
-        403
+        200
     );
     assert_eq!(
         c.status(Method::GET, "/api/overview", Some("tenant-worker"))

@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use anyserve_core::auth::AuthPolicy;
 use serde::Deserialize;
 
-use super::{DEFAULT_CONSOLE_LISTEN, ServeConsoleConfig};
+use super::{
+    AuthRevocationConfig, DEFAULT_CONSOLE_LISTEN, DEFAULT_REVOCATION_POLL_MS,
+    MIN_REVOCATION_POLL_MS, ServeConsoleConfig,
+};
 use anyserve_core::runtime::api::{InterfacePolicy, JournalConfig, RuntimeConfig};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -46,10 +49,17 @@ pub(super) struct AuthConfigFile {
     worker_tokens_env: Option<String>,
     #[serde(default)]
     scoped_tokens: Vec<ScopedTokenFile>,
+    /// Env var holding comma-separated HMAC signing keys for stateless plugin tokens.
+    signing_keys_env: Option<String>,
+    /// Optional internal revocation snapshot endpoint exposed by an auth plugin.
+    revocation_url: Option<String>,
+    revocation_poll_interval_ms: Option<u64>,
 }
 
 pub(super) const DEFAULT_CLIENT_TOKENS_ENV: &str = "ANYSERVE_CLIENT_TOKENS";
 pub(super) const DEFAULT_WORKER_TOKENS_ENV: &str = "ANYSERVE_WORKER_TOKENS";
+pub(super) const DEFAULT_SIGNING_KEYS_ENV: &str = "ANYSERVE_TOKEN_SIGNING_KEY";
+pub(super) const DEFAULT_REVOCATION_URL_ENV: &str = "ANYSERVE_AUTH_REVOCATION_URL";
 pub(super) const PUBLIC_ENDPOINT_ENV: &str = "ANYSERVE_PUBLIC_ENDPOINT";
 
 pub(super) fn split_tokens(raw: &str) -> Vec<String> {
@@ -66,7 +76,7 @@ impl AuthConfigFile {
         cli_client_tokens: &[String],
         cli_worker_tokens: &[String],
         mut env: impl FnMut(&str) -> Option<String>,
-    ) -> Result<AuthPolicy> {
+    ) -> Result<(AuthPolicy, Option<AuthRevocationConfig>)> {
         let mut collect = |mut tokens: Vec<String>,
                            explicit: Option<&str>,
                            default_env: &str,
@@ -99,6 +109,28 @@ impl AuthConfigFile {
             DEFAULT_WORKER_TOKENS_ENV,
             cli_worker_tokens,
         )?;
+        let signing_keys: Vec<Vec<u8>> = collect(
+            Vec::new(),
+            self.signing_keys_env.as_deref(),
+            DEFAULT_SIGNING_KEYS_ENV,
+            &[],
+        )?
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+        let revocation_url = nonempty_trimmed(self.revocation_url)
+            .or_else(|| nonempty_trimmed(env(DEFAULT_REVOCATION_URL_ENV)));
+        let auth_revocation = revocation_url
+            .zip(signing_keys.first())
+            .map(|(url, primary_key)| AuthRevocationConfig {
+                url,
+                bearer_token: anyserve_core::auth::internal_revocation_bearer(primary_key),
+                poll_interval: Duration::from_millis(
+                    self.revocation_poll_interval_ms
+                        .unwrap_or(DEFAULT_REVOCATION_POLL_MS)
+                        .max(MIN_REVOCATION_POLL_MS),
+                ),
+            });
 
         let mut scoped = Vec::with_capacity(self.scoped_tokens.len());
         for entry in self.scoped_tokens {
@@ -131,7 +163,12 @@ impl AuthConfigFile {
                 forced_pool: entry.forced_pool.filter(|p| !p.trim().is_empty()),
             });
         }
-        Ok(AuthPolicy::new(client_tokens, worker_tokens).with_scoped_tokens(scoped))
+        Ok((
+            AuthPolicy::new(client_tokens, worker_tokens)
+                .with_scoped_tokens(scoped)
+                .with_signing_keys(signing_keys),
+            auth_revocation,
+        ))
     }
 }
 
@@ -385,17 +422,19 @@ mod postgres_tests {
         use anyserve_core::auth::Role;
 
         let empty = AuthConfigFile::default();
-        let disabled = empty.resolve_with_env(&[], &[], |_| None).unwrap();
+        let (disabled, rev) = empty.resolve_with_env(&[], &[], |_| None).unwrap();
         assert!(!disabled.is_enabled());
+        assert!(rev.is_none());
 
         // Automatic fallback to ANYSERVE_CLIENT_TOKENS / ANYSERVE_WORKER_TOKENS when unset in TOML.
-        let env_only = AuthConfigFile::default()
+        let (env_only, rev) = AuthConfigFile::default()
             .resolve_with_env(&[], &[], |name| match name {
                 "ANYSERVE_CLIENT_TOKENS" => Some(" c1 , c2 ,, ".into()),
                 "ANYSERVE_WORKER_TOKENS" => Some("w1, w2".into()),
                 _ => None,
             })
             .unwrap();
+        assert!(rev.is_none());
         assert!(env_only.is_enabled());
         assert_eq!(env_only.role_for_token("c1"), Some(Role::Client));
         assert_eq!(env_only.role_for_token("c2"), Some(Role::Client));
@@ -416,16 +455,20 @@ mod postgres_tests {
         assert!(err.to_string().contains("CUSTOM_C"), "{err:#}");
 
         let explicit_toml: AuthConfigFile = toml::from_str(
-            "client_tokens=['toml-c']\nclient_tokens_env='CUSTOM_C'\nworker_tokens_env='CUSTOM_W'",
+            "client_tokens=['toml-c']\nclient_tokens_env='CUSTOM_C'\nworker_tokens_env='CUSTOM_W'\nrevocation_poll_interval_ms=50",
         )
         .unwrap();
-        let merged = explicit_toml
+        let (merged, rev) = explicit_toml
             .resolve_with_env(
                 &["cli-c1, cli-c2".into()],
                 &["cli-w1".into(), " , cli-w2 ".into()],
                 |name| match name {
                     "CUSTOM_C" => Some("env-c".into()),
                     "CUSTOM_W" => Some("env-w".into()),
+                    "ANYSERVE_TOKEN_SIGNING_KEY" => Some("sign-key-1,sign-key-old".into()),
+                    "ANYSERVE_AUTH_REVOCATION_URL" => {
+                        Some("http://127.0.0.1:3002/internal/revocations".into())
+                    }
                     "ANYSERVE_CLIENT_TOKENS" => Some("must-not-load-c".into()),
                     "ANYSERVE_WORKER_TOKENS" => Some("must-not-load-w".into()),
                     _ => None,
@@ -440,6 +483,12 @@ mod postgres_tests {
         }
         assert_eq!(merged.role_for_token("must-not-load-c"), None);
         assert_eq!(merged.role_for_token("must-not-load-w"), None);
+        let rev = rev.expect("revocation config");
+        assert_eq!(rev.url, "http://127.0.0.1:3002/internal/revocations");
+        assert_eq!(rev.poll_interval, Duration::from_millis(250));
+        assert!(!format!("{rev:?}").contains(&rev.bearer_token));
+        assert!(!format!("{rev:?}").contains("sign-key-1"));
+        assert!(format!("{rev:?}").contains("[redacted]"));
     }
 }
 

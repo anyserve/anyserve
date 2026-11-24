@@ -752,7 +752,7 @@ async fn diff_auth_namespace_isolation_and_console_parity() {
     assert_eq!(r_w_wrong.code(), Code::PermissionDenied);
     assert_eq!(t_w_wrong.code(), Code::PermissionDenied);
 
-    // Console auth: unauthenticated -> 401; scoped tenant -> 403
+    // Console auth: unauthenticated -> 401; scoped tenant -> 403 on /metrics, 200 (scoped) on /api/overview, 403 on cross-namespace
     assert_eq!(
         console_get(&b.http, &b.rust.http_base, None, "/api/overview")
             .await
@@ -770,7 +770,7 @@ async fn diff_auth_namespace_isolation_and_console_parity() {
             &b.http,
             &b.rust.http_base,
             Some(TENANT_A_CLIENT_TOKEN),
-            "/api/overview"
+            "/metrics"
         )
         .await
         .0,
@@ -781,7 +781,29 @@ async fn diff_auth_namespace_isolation_and_console_parity() {
             &b.http,
             &b.ts.http_base,
             Some(TENANT_A_CLIENT_TOKEN),
-            "/api/overview"
+            "/metrics"
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        console_get(
+            &b.http,
+            &b.rust.http_base,
+            Some(TENANT_A_CLIENT_TOKEN),
+            "/api/jobs?namespace=tenant-b"
+        )
+        .await
+        .0,
+        403
+    );
+    assert_eq!(
+        console_get(
+            &b.http,
+            &b.ts.http_base,
+            Some(TENANT_A_CLIENT_TOKEN),
+            "/api/jobs?namespace=tenant-b"
         )
         .await
         .0,
@@ -888,6 +910,47 @@ async fn diff_auth_namespace_isolation_and_console_parity() {
     assert_eq!((rs, ts), (200, 200));
     assert_eq!(r_jobs_a["total"], 2);
     assert_eq!(t_jobs_a["total"], 2);
+
+    // Tenant A Console isolation parity on /api/overview & /api/jobs
+    let (rs, r_ten_ov) = console_get(
+        &b.http,
+        &b.rust.http_base,
+        Some(TENANT_A_CLIENT_TOKEN),
+        "/api/overview",
+    )
+    .await;
+    let (ts, t_ten_ov) = console_get(
+        &b.http,
+        &b.ts.http_base,
+        Some(TENANT_A_CLIENT_TOKEN),
+        "/api/overview",
+    )
+    .await;
+    assert_eq!((rs, ts), (200, 200));
+    assert_eq!(r_ten_ov["scope"]["namespace"], "tenant-a");
+    assert_eq!(t_ten_ov["scope"]["namespace"], "tenant-a");
+    assert_eq!(r_ten_ov["scope"]["is_operator"], false);
+    assert_eq!(t_ten_ov["scope"]["is_operator"], false);
+    assert_eq!(r_ten_ov["queue"]["queued"], 2);
+    assert_eq!(t_ten_ov["queue"]["queued"], 2);
+
+    let (rs, r_ten_jobs) = console_get(
+        &b.http,
+        &b.rust.http_base,
+        Some(TENANT_A_CLIENT_TOKEN),
+        "/api/jobs",
+    )
+    .await;
+    let (ts, t_ten_jobs) = console_get(
+        &b.http,
+        &b.ts.http_base,
+        Some(TENANT_A_CLIENT_TOKEN),
+        "/api/jobs",
+    )
+    .await;
+    assert_eq!((rs, ts), (200, 200));
+    assert_eq!(r_ten_jobs["total"], 2);
+    assert_eq!(t_ten_jobs["total"], 2);
 
     // Connect one worker per backend and compare /api/workers
     let (_rw, _) = connect_worker(

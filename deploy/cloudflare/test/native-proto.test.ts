@@ -1957,6 +1957,13 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
         httpStatus: 403,
       }),
     );
+    expect(policy.authorizeConsoleHeaders(scopedClientHeaders)).toEqual({
+      namespace: "tenant-a",
+      role: Role.Client,
+      subject: "svc-a",
+      forcedPool: null,
+      isOperator: false,
+    });
 
     // Even a scoped client token in "default" namespace is NOT an operator!
     const scopedDefaultHeaders = {
@@ -2000,6 +2007,14 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     );
     expect(() =>
       policy.authorizeOperatorHeaders(scopedWorkerHeaders),
+    ).toThrowError(
+      expect.objectContaining({
+        code: GrpcCode.PermissionDenied,
+        httpStatus: 403,
+      }),
+    );
+    expect(() =>
+      policy.authorizeConsoleHeaders(scopedWorkerHeaders),
     ).toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,

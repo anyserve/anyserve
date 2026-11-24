@@ -10,25 +10,37 @@ use axum::response::{IntoResponse, Response};
 
 pub(crate) async fn require_client_token(
     State(policy): State<Arc<AuthPolicy>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    if matches!(request.uri().path(), "/healthz" | "/readyz") {
+    let path = request.uri().path();
+    if matches!(path, "/healthz" | "/readyz") {
         return next.run(request).await;
     }
-    match policy.authorize_operator_headers(request.headers()) {
-        Ok(()) => next.run(request).await,
-        Err(status) => {
-            let code = if status.code() == tonic::Code::PermissionDenied {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::UNAUTHORIZED
-            };
-            (
-                code,
-                axum::Json(serde_json::json!({ "error": status.message() })),
-            )
-                .into_response()
-        }
+    if path == "/metrics" {
+        return match policy.authorize_operator_headers(request.headers()) {
+            Ok(()) => next.run(request).await,
+            Err(status) => auth_error_response(status),
+        };
     }
+    match policy.authorize_console_headers(request.headers()) {
+        Ok(principal) => {
+            request.extensions_mut().insert(principal);
+            next.run(request).await
+        }
+        Err(status) => auth_error_response(status),
+    }
+}
+
+fn auth_error_response(status: tonic::Status) -> Response {
+    let code = if status.code() == tonic::Code::PermissionDenied {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::UNAUTHORIZED
+    };
+    (
+        code,
+        axum::Json(serde_json::json!({ "error": status.message() })),
+    )
+        .into_response()
 }

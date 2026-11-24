@@ -24,9 +24,9 @@ use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
-    InputSink, InterfaceStats, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview,
-    JobSpec, JobState, JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeSnapshot,
-    RuntimeStats, SubmitOutcome, SubmitRequest, WorkerStats, WorkerView, codes,
+    InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview, JobSpec, JobState,
+    JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeSnapshot, RuntimeStats, SubmitOutcome,
+    SubmitRequest, WorkerStats, WorkerView, codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
@@ -1688,7 +1688,7 @@ impl Runtime {
     pub fn stats(&self) -> RuntimeStats {
         let now = now_ms();
         let st = self.inner.lock();
-        let (stats, _) = self.stats_locked(&st, now, false);
+        let (stats, _) = self.stats_locked(&st, now, None);
         drop(st);
         RuntimeStats {
             journal: self.inner.journal.as_ref().map(|journal| journal.stats()),
@@ -1703,9 +1703,24 @@ impl Runtime {
         let now = now_ms();
         let st = self.inner.lock();
         let health = self.health_locked(&st, journal);
-        let (mut stats, workers) = self.stats_locked(&st, now, true);
+        let (mut stats, workers) = self.stats_locked(&st, now, None);
         drop(st);
         stats.journal = self.inner.journal.as_ref().map(|journal| journal.stats());
+        RuntimeSnapshot {
+            health,
+            stats,
+            workers,
+        }
+    }
+
+    /// Takes a tenant-isolated runtime snapshot restricted strictly to `namespace`.
+    /// Global journal stats and global memory byte budgets are omitted (`None` / `0`).
+    pub fn snapshot_namespace(&self, namespace: &str) -> RuntimeSnapshot {
+        let journal = self.inner.journal_health();
+        let now = now_ms();
+        let st = self.inner.lock();
+        let health = self.health_locked(&st, journal);
+        let (stats, workers) = self.stats_locked(&st, now, Some(namespace));
         RuntimeSnapshot {
             health,
             stats,
@@ -1717,38 +1732,46 @@ impl Runtime {
         &self,
         st: &State,
         now: u64,
-        with_worker_stats: bool,
+        namespace_filter: Option<&str>,
     ) -> (RuntimeStats, WorkerStats) {
-        let mut interfaces = st.job_index.interfaces(now);
-        let [queued, running, succeeded, failed, cancelled] = st.job_index.counts();
+        let (counts, mut interfaces, retained_jobs) = match namespace_filter {
+            Some(ns) => {
+                let (counts, interfaces) = st.job_index.namespace_snapshot(ns, now);
+                let retained = counts[2] + counts[3] + counts[4];
+                (counts, interfaces, retained)
+            }
+            None => (
+                st.job_index.counts(),
+                st.job_index.interfaces(now),
+                st.terminal_order.len(),
+            ),
+        };
+        let [queued, running, succeeded, failed, cancelled] = counts;
         let generation = st.generation;
-        let retained_jobs = st.terminal_order.len();
-        let sessions = st.sessions.len();
+        let mut sessions_count = 0usize;
         let mut pools_tmp: HashMap<(&str, &str, &str), PoolStats> = HashMap::new();
         let mut session_lease_ifaces: HashMap<&str, usize> = HashMap::new();
         let mut workers = WorkerStats::default();
         for session in st.sessions.values() {
+            if namespace_filter.is_some_and(|ns| session.namespace != ns) {
+                continue;
+            }
+            sessions_count += 1;
             let free = session.free_slots() as u64;
-            if with_worker_stats {
-                workers.total += 1;
-                workers.active_leases += session.active.len() as u64;
-                workers.last_seen_at_ms = Some(
-                    workers
-                        .last_seen_at_ms
-                        .map_or(session.last_seen_ms, |max| max.max(session.last_seen_ms)),
-                );
-                if session.draining {
-                    workers.draining += 1;
-                }
-                if session.tx.is_some() && !session.draining {
-                    workers.healthy += 1;
-                    for (name, value) in &session.total_capacity {
-                        if let Some(total) = workers.total_capacity.get_mut(name.as_str()) {
-                            *total += value;
-                        } else {
-                            workers.total_capacity.insert(name.clone(), *value);
-                        }
-                    }
+            workers.total += 1;
+            workers.active_leases += session.active.len() as u64;
+            workers.last_seen_at_ms = Some(
+                workers
+                    .last_seen_at_ms
+                    .map_or(session.last_seen_ms, |max| max.max(session.last_seen_ms)),
+            );
+            if session.draining {
+                workers.draining += 1;
+            }
+            if session.tx.is_some() && !session.draining {
+                workers.healthy += 1;
+                for (name, value) in &session.total_capacity {
+                    *workers.total_capacity.entry(name.clone()).or_insert(0) += value;
                 }
             }
             if session.interfaces.len() > 1 && !session.active.is_empty() {
@@ -1765,19 +1788,9 @@ impl Runtime {
                 }
             }
             for interface in &session.interfaces {
-                if let Some(entry) = interfaces.get_mut(interface.as_str()) {
-                    entry.sessions += 1;
-                    entry.free_slots += free;
-                } else {
-                    interfaces.insert(
-                        interface.clone(),
-                        InterfaceStats {
-                            sessions: 1,
-                            free_slots: free,
-                            ..Default::default()
-                        },
-                    );
-                }
+                let entry = interfaces.entry(interface.clone()).or_default();
+                entry.sessions += 1;
+                entry.free_slots += free;
 
                 let active_leases = if session.active.is_empty() {
                     0
@@ -1812,6 +1825,9 @@ impl Runtime {
             }
         }
         for (namespace, ifaces) in &st.queues {
+            if namespace_filter.is_some_and(|ns| namespace != ns) {
+                continue;
+            }
             for (interface, queue) in ifaces {
                 if queue.is_empty() {
                     continue;
@@ -1837,6 +1853,15 @@ impl Runtime {
                 ((ns.to_string(), iface.to_string(), pool.to_string()), stats)
             })
             .collect();
+        let (input_bytes, result_bytes, event_bytes) = if namespace_filter.is_some() {
+            (0, 0, 0)
+        } else {
+            (
+                self.inner.input_budget.used(),
+                self.inner.result_budget.used(),
+                self.inner.event_budget.used(),
+            )
+        };
         (
             RuntimeStats {
                 generation,
@@ -1846,13 +1871,13 @@ impl Runtime {
                 failed,
                 cancelled,
                 retained_jobs,
-                sessions,
+                sessions: sessions_count,
                 interfaces,
                 pools,
                 journal: None,
-                input_bytes: self.inner.input_budget.used(),
-                result_bytes: self.inner.result_budget.used(),
-                event_bytes: self.inner.event_budget.used(),
+                input_bytes,
+                result_bytes,
+                event_bytes,
             },
             workers,
         )

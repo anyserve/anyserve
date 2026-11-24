@@ -35,7 +35,11 @@ export const consoleQueries = {
     };
   },
 
-  getOverviewSnapshot(this: NativeEngine, nowMs: number): ConsoleOverviewSnapshot {
+  getOverviewSnapshot(
+    this: NativeEngine,
+    nowMs: number,
+    namespace?: string,
+  ): ConsoleOverviewSnapshot {
     const health = this.getHealth();
     let queued = 0;
     let running = 0;
@@ -68,11 +72,14 @@ export const consoleQueries = {
       return s;
     };
 
-    for (const name of Object.keys(this.config.interfaces)) {
-      ensureIface(name);
+    if (namespace === undefined) {
+      for (const name of Object.keys(this.config.interfaces)) {
+        ensureIface(name);
+      }
     }
 
     for (const j of this.jobs.values()) {
+      if (namespace !== undefined && j.namespace !== namespace) continue;
       const st = ensureIface(j.interfaceName);
       switch (j.state) {
         case "queued":
@@ -134,7 +141,10 @@ export const consoleQueries = {
       }
     >();
 
+    let sessionsCount = 0;
     for (const s of this.sessions.values()) {
+      if (namespace !== undefined && s.namespace !== namespace) continue;
+      sessionsCount += 1;
       const free = sessionFreeSlots(s);
       wActiveLeases += s.activeLeases.size;
       wLastSeen = wLastSeen === null ? s.lastSeenMs : Math.max(wLastSeen, s.lastSeenMs);
@@ -179,6 +189,7 @@ export const consoleQueries = {
     }
 
     for (const [ns, ifaceQueues] of this.queues) {
+      if (namespace !== undefined && ns !== namespace) continue;
       for (const [iface, q] of ifaceQueues) {
         if (q.totalLen === 0) continue;
         const primaryPool =
@@ -234,18 +245,18 @@ export const consoleQueries = {
       constructorRuns: this.constructorRuns,
       droppedCustomLoadEntries: this.droppedCustomLoadEntries,
       retainedJobs: retainedTerminals,
-      sessions: this.sessions.size,
+      sessions: sessionsCount,
       maxSessions: this.config.maxSessionSockets,
       priorityLevels: this.config.priorityLevels,
       defaultMaxAttempts: this.config.defaultMaxAttempts,
       heartbeatIntervalMs: this.config.heartbeatIntervalMs,
       heartbeatTimeoutMs: this.config.heartbeatTimeoutMs,
       reconnectGraceMs: this.config.reconnectGraceMs,
-      inputBytes: this.totalInputBytesHeld,
+      inputBytes: namespace !== undefined ? 0 : this.totalInputBytesHeld,
       maxPendingBytes: this.config.maxPendingBytes,
-      resultBytes: this.totalResultBytesHeld,
+      resultBytes: namespace !== undefined ? 0 : this.totalResultBytesHeld,
       maxResultBytes: this.config.maxResultBytes,
-      eventBytes: this.totalEventBytesHeld,
+      eventBytes: namespace !== undefined ? 0 : this.totalEventBytesHeld,
       maxEventBytes: this.config.maxEventBytes,
       committedBatches: this.committedBatches,
       committedOps: this.committedOps,
@@ -255,10 +266,10 @@ export const consoleQueries = {
       failed,
       cancelled,
       workersRollup: {
-        total: this.sessions.size,
+        total: sessionsCount,
         healthy: wHealthy,
         draining: wDraining,
-        unavailable: Math.max(0, this.sessions.size - wHealthy),
+        unavailable: Math.max(0, sessionsCount - wHealthy),
         active_leases: wActiveLeases,
         total_capacity: wTotalCap,
         last_seen_at_ms: wLastSeen,

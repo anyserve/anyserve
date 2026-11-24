@@ -57,10 +57,16 @@ export interface PoolSummary {
   sessions: number; free_slots: number; active_leases: number; desired_additional_slots: number;
 }
 
+export interface ConsoleScopeSummary {
+  is_operator: boolean;
+  namespace: string;
+  subject: string;
+}
+
 export interface OverviewResponse {
   runtime: RuntimeModeSummary; queue: QueueSummary; history: HistorySummary;
   workers: WorkerRollup; interfaces: InterfaceSummary[]; refreshed_at_ms: number;
-  health?: HealthSummary; control_plane?: ControlPlaneSummary; budgets?: BudgetsSummary;
+  health?: HealthSummary; control_plane?: ControlPlaneSummary; scope?: ConsoleScopeSummary | null; budgets?: BudgetsSummary;
   journal_stats?: JournalStatsSummary | null; pools?: PoolSummary[];
 }
 

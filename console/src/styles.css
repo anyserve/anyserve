@@ -112,6 +112,7 @@ td.ellipsis, th.ellipsis { display: table-cell; }
 .sidebar__title-group { display: flex; flex-direction: column; min-width: 0; }
 .sidebar__title { font-size: 13.5px; font-weight: 650; letter-spacing: -0.01em; line-height: 1.15; }
 .sidebar__subtitle { font-size: 10.5px; color: var(--muted); line-height: 1.2; }
+.sidebar__scope { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin: 0 10px 6px; padding: 4px 8px; border-radius: 7px; border: 1px solid var(--line); background: var(--card-2); color: var(--fg-2); font-size: 11px; }
 
 .sidebar__scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 10px 10px; }
 .sidebar__nav { display: flex; flex-direction: column; gap: 2px; }

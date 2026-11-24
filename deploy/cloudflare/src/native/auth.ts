@@ -641,6 +641,31 @@ export class AuthPolicy {
     );
   }
 
+  /**
+   * Verifies Console `/api/*` access: allows both operator client tokens and
+   * tenant-scoped client tokens, returning `Principal` so handlers enforce
+   * namespace isolation.
+   */
+  authorizeConsoleHeaders(headers: HeaderBag): Principal {
+    if (!this.isEnabled()) {
+      return this.#unauthenticatedPrincipal(Role.Client, headers);
+    }
+    const token = extractBearerToken(headers);
+    if (token === null) {
+      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
+    }
+    const principal = this.principalForToken(token);
+    if (principal === null) {
+      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
+    }
+    if (principal.role === Role.Client) {
+      return principal;
+    }
+    throw GrpcStatusError.permissionDenied(
+      "worker token cannot access console API",
+    );
+  }
+
   toJSON(): AuthPolicyRedactedJSON {
     return {
       clientTokenCount: this.#clientTokens.length,
