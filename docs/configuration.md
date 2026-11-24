@@ -1,8 +1,12 @@
 # Configuration
 
-`anyserve serve --config server.toml` reads TOML. Flags override file settings;
-unknown keys are rejected. With no file, gRPC listens on `127.0.0.1:50052`, the
-journal is enabled and management HTTP is disabled.
+`anyserve serve` runs either from a TOML file (`--config server.toml`) or
+zero-TOML using CLI flags and automatic environment fallbacks
+(`ANYSERVE_CLIENT_TOKENS`, `ANYSERVE_WORKER_TOKENS`,
+`ANYSERVE_PUBLIC_ENDPOINT`). Flags override environment and file settings;
+unknown TOML keys are rejected. With no file or flags, gRPC listens on
+`127.0.0.1:50052`, the SQLite journal is enabled and management HTTP is
+disabled.
 
 ## Server file
 
@@ -83,14 +87,19 @@ event_log_max_bytes = 8388608
 # spillover_after_ms = 200
 ```
 
-Token lists and their environment sources are combined. An environment key names
-the variable to read; it does not contain the token itself. With client/worker/scoped
-lists all empty, client/worker authentication is disabled and the `x-anyserve-namespace`
-header is caller-asserted with no tenant isolation. Once enabled, clients need
-client-role tokens, workers need worker-role tokens, and tenant isolation comes from
-`[[auth.scoped_tokens]]`. The management HTTP API (`/api/*`, `/metrics`) requires an
-operator token from `[auth].client_tokens` (scoped tenant tokens and worker tokens
-receive `403 Forbidden`).
+Token lists from TOML, CLI flags (`--client-token`, `--worker-token`), and
+environment sources are combined. When `[auth].client_tokens_env` or
+`[auth].worker_tokens_env` is omitted (including zero-TOML runs), `anyserve serve`
+automatically reads comma-separated tokens from `ANYSERVE_CLIENT_TOKENS` and
+`ANYSERVE_WORKER_TOKENS` when set. An explicit TOML `*_env` key names the
+variable to read (and requires it to be set); it does not contain the token
+itself. With client/worker/scoped lists all empty (and `--auto-token` not set),
+client/worker authentication is disabled and the `x-anyserve-namespace` header
+is caller-asserted with no tenant isolation. Once enabled, clients need
+client-role tokens, workers need worker-role tokens, and tenant isolation comes
+from `[[auth.scoped_tokens]]`. The management HTTP API (`/api/*`, `/metrics`)
+requires an operator token from `[auth].client_tokens` (or CLI/env client
+tokens; scoped tenant tokens and worker tokens receive `403 Forbidden`).
 
 When a job sets a non-empty `concurrency_key` and neither `runtime.default_max_in_flight_per_key`
 nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, the scheduler defaults to `1`
@@ -198,7 +207,7 @@ flags. `job` commands read `ANYSERVE_TOKEN` and `ANYSERVE_NAMESPACE`.
 
 | Command | Flags / arguments |
 |---|---|
-| `serve` | `--config PATH`, `--grpc-host HOST`, `--grpc-port PORT`, `--grpc-tls-enabled[=true\|false]`, `--grpc-cert-file PATH`, `--grpc-key-file PATH`, `--journal PATH`, `--ephemeral`, `--console-listen ADDR` |
+| `serve` | `--config PATH`, `--grpc-host HOST`, `--grpc-port PORT`, `--no-grpc`, `--grpc-tls-enabled[=true\|false]`, `--grpc-cert-file PATH`, `--grpc-key-file PATH`, `--journal PATH`, `--ephemeral`, `--console-listen ADDR`, `--public-endpoint URL`, `--client-token TOKEN`, `--worker-token TOKEN`, `--auto-token` |
 | `job ls` (alias `list`) | Repeatable `--state queued\|running\|succeeded\|failed\|cancelled`, `--limit N` (100), `--page-token TOKEN` |
 | `job inspect` | `JOB_ID` |
 | `job cancel` | One or more `JOB_ID` arguments, or `--stdin` for IDs from standard input |
@@ -206,6 +215,23 @@ flags. `job` commands read `ANYSERVE_TOKEN` and `ANYSERVE_NAMESPACE`.
 All `job` commands accept `-o/--output text|json` (default `text`) and have no
 `--token` flag (use `ANYSERVE_TOKEN`). `--journal` and `--ephemeral` are
 mutually exclusive. Use each command's `--help` for accepted values.
+
+### Zero-TOML `serve` flags and environment fallbacks
+
+| Flag | Default env fallback | Behavior |
+|---|---|---|
+| `--client-token TOKEN` | `ANYSERVE_CLIENT_TOKENS` | Repeatable; comma-separated values are split and trimmed. Combined with TOML tokens. Env fallback applies automatically whenever `[auth].client_tokens_env` is not set. |
+| `--worker-token TOKEN` | `ANYSERVE_WORKER_TOKENS` | Repeatable; comma-separated values are split and trimmed. Combined with TOML tokens. Env fallback applies automatically whenever `[auth].worker_tokens_env` is not set. |
+| `--console-listen ADDR` | — | Enables the management HTTP, WebSocket (`/ws/v2/*`), and embedded Console listener (e.g. `127.0.0.1:3001` or `0.0.0.0:3001`) without a TOML file; overrides `[console].listen`. |
+| `--public-endpoint URL` | `ANYSERVE_PUBLIC_ENDPOINT` | Advertised endpoint for `/api/overview` and the Console "Connect worker" dialog. Precedence: `--public-endpoint` > `ANYSERVE_PUBLIC_ENDPOINT` > `[console].public_endpoint`. |
+| `--no-grpc` | — | Disables the gRPC listener without a TOML file. Requires management HTTP (`--console-listen` or `[console].enabled = true`). |
+| `--auto-token` | — | If no client, worker, or scoped tokens are configured from TOML, CLI, or env, generates random `as_c_*` (client) and `as_w_*` (worker) tokens and prints a ready-to-copy startup card. Persisted to `<journal_dir>/tokens.env` (`0600` on Unix) and reloaded on restart when durable SQLite is enabled; memory-only with `--ephemeral`. No-op if any tokens are already configured. |
+
+At startup, `anyserve serve` prints a concise summary card showing active
+listeners, embedded Console status, advertised public endpoint, and auth state
+(static user tokens are never printed; generated/reloaded `--auto-token`
+credentials are shown with copy-paste `ANYSERVE_ENDPOINT` / `ANYSERVE_TOKEN`
+commands).
 
 ## Embedded Rust Runtime
 

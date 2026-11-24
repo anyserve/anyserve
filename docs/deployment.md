@@ -6,6 +6,91 @@ automatic failover) or by a local SQLite journal in a single process. Add
 workers for execution capacity. Separate database schemas isolate domains.
 Redis is not required.
 
+## Zero-VPS Quick Tunnel
+
+For an instant authenticated relay on your laptop or workstation with zero server,
+domain, or TOML file:
+
+```bash
+anyserve serve --console-listen 127.0.0.1:3001 --auto-token
+```
+
+`--auto-token` generates a client token (`as_c_*`) and worker token (`as_w_*`),
+saves them to `<journal_dir>/tokens.env` (`0600` on Unix) across restarts
+(memory-only with `--ephemeral`), and prints a ready-to-copy startup card. Pass
+`--no-grpc` if you only need the HTTP/WS + Console port.
+
+Expose `:3001` publicly over `wss://` using a Cloudflare Quick Tunnel:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:3001
+```
+
+Connect remote Rust or Python workers and clients to the printed `trycloudflare.com`
+URL with the matching role token (or open `https://...` in a browser when running
+the official Docker image or a binary built with `--features embed-console`):
+
+```bash
+export ANYSERVE_ENDPOINT="wss://<random>.trycloudflare.com"
+export ANYSERVE_TOKEN="<as_w_... or as_c_...>"
+```
+
+Quick Tunnel URLs rotate whenever `cloudflared` restarts. For a stable private
+mesh with native gRPC instead of a public tunnel, run on **Tailscale**: bind
+`--grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --auto-token` and point
+workers/clients at `http://<tailscale-ip>:50052` (or `wss://<node>.ts.net` when
+proxying `:3001` via `tailscale serve`).
+
+## Quick VPS Relay (`deploy/vps`)
+
+`deploy/vps` provides a 1-minute single-domain relay for any Linux VPS using
+Docker Compose and Caddy (`caddy:2-alpine`) with automatic Let's Encrypt HTTPS.
+See [deploy/vps/README.md](../deploy/vps/README.md) for the full guide.
+
+- **Single domain for every transport**: Caddy routes native HTTP/2 gRPC paths
+  (`/anyserve.v2.*`, `/grpc.health.*`, `/grpc.reflection.*`) to `h2c://anyserve:50052`
+  and routes everything else (embedded Console UI, `/api/*`, `/rpc/v2/*`,
+  `/ws/v2/*`, `/healthz`, `/readyz`) to `anyserve:3001`.
+- **Safe defaults**: `deploy/vps/Caddyfile` blocks `/metrics` (`403`) from the
+  public internet, and `deploy/vps/server.toml` sets bounded runtime memory
+  budgets for a 2 GiB VPS with a persistent SQLite volume (`/data/journal.sqlite`).
+
+```bash
+cd deploy/vps
+cp .env.example .env   # set ANYSERVE_DOMAIN, ANYSERVE_PUBLIC_ENDPOINT, ANYSERVE_CLIENT_TOKENS, ANYSERVE_WORKER_TOKENS
+docker compose up -d
+```
+
+Clients and workers connect to `https://<your-domain>` (native gRPC) or
+`wss://<your-domain>` (WebSocket fallback); open `https://<your-domain>` in a
+browser for the embedded Console.
+
+## Fly.io (`deploy/fly`)
+
+`deploy/fly` runs a single persistent Fly Machine (`min_machines_running = 1`,
+`auto_stop_machines = "off"`) with an attached NVMe volume (`/data`) and
+automatic TLS. It builds the root `Dockerfile` (with embedded Console UI) and
+starts `anyserve serve` directly via CLI flags and Fly secrets—no TOML file
+required (an optional tuned `deploy/fly/server.toml` is included for custom
+limits). See [deploy/fly/README.md](../deploy/fly/README.md) for details.
+
+- **Native HTTP/2 gRPC**: `https://<app>.fly.dev:50052` (`h2_backend = true`)
+- **Embedded Console & WSS fallback**: `https://<app>.fly.dev` / `wss://<app>.fly.dev`
+
+Deploy from the repository root so the Docker build context resolves `Dockerfile`
+(generate random tokens with `openssl rand -hex 24`):
+
+```bash
+fly launch --no-deploy -c deploy/fly/fly.toml
+fly volumes create anyserve_data --size 1 --region sin -c deploy/fly/fly.toml
+fly secrets set \
+  ANYSERVE_CLIENT_TOKENS="<client-token>" \
+  ANYSERVE_WORKER_TOKENS="<worker-token>" \
+  ANYSERVE_PUBLIC_ENDPOINT="https://<app>.fly.dev:50052" \
+  -c deploy/fly/fly.toml
+fly deploy -c deploy/fly/fly.toml
+```
+
 ## PostgreSQL high availability
 
 Replace the SQLite `[journal]` section in the server file with:
@@ -74,16 +159,21 @@ site-rack or cloud worker pool rather than operating multi-node PG HA on the edg
 
 ## Containers
 
-Release images are `ghcr.io/anyserve/anyserve:vVERSION` (Linux amd64).
-To build and run this checkout:
+Release images are `ghcr.io/anyserve/anyserve:vVERSION` (Linux amd64). The
+official `Dockerfile` embeds the React Console UI out of the box
+(`--features embed-console`), so a single container serves gRPC, HTTP/WS, and
+the Web Console.
+
+To build and run a local demo with the embedded Console on `http://127.0.0.1:3001`:
 
 ```bash
 docker build -t anyserve:local .
 docker network create anyserve
 docker volume create anyserve-data
 docker run -d --name anyserve --network anyserve --restart unless-stopped \
-  -p 127.0.0.1:50052:50052 -v anyserve-data:/data anyserve:local \
-  serve --grpc-host 0.0.0.0 --journal /data/journal.sqlite
+  -p 127.0.0.1:50052:50052 -p 127.0.0.1:3001:3001 \
+  -v anyserve-data:/data anyserve:local \
+  serve --grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --journal /data/journal.sqlite
 ```
 
 Run the example echo worker on the same network:
@@ -94,12 +184,27 @@ docker run -d --name anyserve-worker --network anyserve --restart unless-stopped
   -e ANYSERVE_ENDPOINT=http://anyserve:50052 anyserve-worker:local
 ```
 
+For an authenticated container without writing a TOML file, pass token
+environment variables (or `--auto-token`) alongside `--console-listen 0.0.0.0:3001`:
+
+```bash
+docker run -d --name anyserve --restart unless-stopped \
+  -p 127.0.0.1:50052:50052 -p 127.0.0.1:3001:3001 \
+  -v anyserve-data:/data \
+  -e ANYSERVE_CLIENT_TOKENS="<client-token>" \
+  -e ANYSERVE_WORKER_TOKENS="<worker-token>" \
+  -e ANYSERVE_PUBLIC_ENDPOINT="https://relay.example.com" \
+  anyserve:local \
+  serve --grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --journal /data/journal.sqlite
+```
+
 Both builds accept `--build-arg DEBIAN_MIRROR=https://<mirror-host>` when a
 different Debian package mirror is needed. Stop the demo with
 `docker stop anyserve-worker anyserve`; the named volume retains its journal.
 
-For remote access, mount a [server file](configuration.md) with separate client
-and worker credentials and TLS settings. Persist the journal directory,
+For custom runtime limits, scoped tenant tokens, or gRPC TLS, mount a
+[server file](configuration.md) (or use the single-domain Caddy setup in
+[deploy/vps/README.md](../deploy/vps/README.md)). Persist the journal directory,
 including SQLite sidecar files. Use matching server, SDK and protocol releases.
 
 ## Kubernetes
@@ -153,8 +258,11 @@ a client token from the Secret.
 
 ## Browser Console
 
-The binary and container expose the management API, not browser assets. Build
-the frontend separately:
+The official container image embeds the React Console UI out of the box
+(`--features embed-console`) whenever the management listener is enabled
+(`--console-listen` or `[console]`). Default `cargo build` binaries expose only
+the management API; build with `--features embed-console` for a single binary,
+or build and host the frontend separately:
 
 ```bash
 npm --prefix console ci
