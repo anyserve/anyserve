@@ -14,7 +14,7 @@ pub(crate) async fn require_client_token(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if matches!(path, "/healthz" | "/readyz") {
+    if matches!(path, "/healthz" | "/readyz" | "/api/info") {
         return next.run(request).await;
     }
     if path == "/metrics" {

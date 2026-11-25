@@ -1,6 +1,8 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use anyserve_core::auth::{AuthLayer, AuthPolicy};
@@ -9,6 +11,7 @@ use anyserve_core::runtime::Runtime;
 use anyserve_core::worker_service::WorkerGrpcService;
 use anyserve_proto::v2::{client_server::ClientServer, worker_server::WorkerServer};
 use clap::Args;
+use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tracing::{info, warn};
 
@@ -16,13 +19,16 @@ use crate::serve_config::{
     AuthRevocationConfig, AutoTokens, GrpcConfig, ResolvedServeConfig, ServeOverrides,
 };
 use crate::serve_console::{
-    ControlPlaneMetadata, format_host_port, run_server as run_console_server,
+    ControlPlaneMetadata, format_host_port, run_server_with_listener as run_console_server,
 };
 
 #[cfg(test)]
 mod tests;
 
 const MAX_PENDING_RESET_STREAMS: usize = 1024;
+const REVOCATION_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+const REVOCATION_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
 #[derive(Args, Debug)]
 pub(crate) struct ServeArgs {
     #[arg(long = "config", value_name = "PATH")]
@@ -50,6 +56,12 @@ pub(crate) struct ServeArgs {
     /// SQLite recovery journal (default: .anyserve/journal.sqlite).
     #[arg(long = "journal", value_name = "PATH")]
     journal_path: Option<PathBuf>,
+    /// Maximum SQLite journal size in bytes (ANYSERVE_JOURNAL_MAX_BYTES / [journal].max_bytes).
+    #[arg(long = "journal-max-bytes", value_name = "BYTES")]
+    journal_max_bytes: Option<u64>,
+    /// Approximate process memory limit in MiB used to scale byte budgets automatically.
+    #[arg(long = "memory-limit", value_name = "MB")]
+    memory_limit_mb: Option<u64>,
     /// Enable and bind the HTTP console / management API listener (e.g. 127.0.0.1:3001).
     #[arg(long = "console-listen", value_name = "ADDR")]
     console_listen: Option<String>,
@@ -177,7 +189,62 @@ pub(crate) fn validate_listeners(config: &ResolvedServeConfig) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run(args: ServeArgs) -> Result<()> {
+async fn load_grpc_tls_config(config: &GrpcConfig) -> Result<Option<ServerTlsConfig>> {
+    if !config.tls_enabled {
+        return Ok(None);
+    }
+    let cert_file = config
+        .cert_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--grpc-cert-file is required when TLS is enabled"))?;
+    let key_file = config
+        .key_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--grpc-key-file is required when TLS is enabled"))?;
+    let identity = Identity::from_pem(
+        tokio::fs::read(cert_file)
+            .await
+            .context("read tls certificate")?,
+        tokio::fs::read(key_file)
+            .await
+            .context("read tls private key")?,
+    );
+    Ok(Some(ServerTlsConfig::new().identity(identity)))
+}
+
+async fn bind_listeners(
+    grpc_addr: Option<SocketAddr>,
+    console_addr: Option<SocketAddr>,
+) -> Result<(
+    Option<(tokio::net::TcpListener, SocketAddr)>,
+    Option<(tokio::net::TcpListener, SocketAddr)>,
+)> {
+    let grpc = match grpc_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind gRPC listener {addr}"))?;
+            let bound = listener.local_addr().context("read bound gRPC address")?;
+            Some((listener, bound))
+        }
+        None => None,
+    };
+    let console = match console_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind console listener {addr}"))?;
+            let bound = listener
+                .local_addr()
+                .context("read bound console address")?;
+            Some((listener, bound))
+        }
+        None => None,
+    };
+    Ok((grpc, console))
+}
+
+pub(crate) async fn run(args: ServeArgs, json_logs: bool) -> Result<()> {
     let config = ResolvedServeConfig::load(ServeOverrides {
         config: args.config,
         grpc_host: args.grpc_host,
@@ -188,6 +255,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         no_grpc: args.no_grpc,
         ephemeral: args.ephemeral,
         journal_path: args.journal_path,
+        journal_max_bytes: args.journal_max_bytes,
+        memory_limit_mb: args.memory_limit_mb,
         console_listen: args.console_listen,
         public_endpoint: args.public_endpoint,
         client_tokens: args.client_tokens,
@@ -195,15 +264,6 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         auto_token: args.auto_token,
     })?;
     validate_listeners(&config)?;
-    let runtime = Runtime::start(config.runtime.clone())
-        .await
-        .context("start execution runtime")?;
-    let auth = Arc::new(config.auth.clone());
-    if !auth.is_enabled() {
-        warn!(
-            "auth is disabled; any client can reach the control plane (set [auth] tokens before exposing it beyond a trusted network)"
-        );
-    }
 
     let grpc_addr = config
         .grpc
@@ -215,15 +275,36 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         .as_ref()
         .map(|console| socket_addr_from_bind(&console.listen))
         .transpose()?;
+    let grpc_tls = if config.grpc.enabled {
+        load_grpc_tls_config(&config.grpc).await?
+    } else {
+        None
+    };
+
+    let runtime = Runtime::start(config.runtime.clone())
+        .await
+        .context("start execution runtime")?;
+    let auth = Arc::new(config.auth.clone());
+    if !auth.is_enabled() {
+        warn!(
+            "auth is disabled; any client can reach the control plane (set [auth] tokens before exposing it beyond a trusted network)"
+        );
+    }
+
+    let (grpc_bound, console_bound) = match bind_listeners(grpc_addr, console_addr).await {
+        Ok(bound) => bound,
+        Err(err) => {
+            runtime.shutdown().await;
+            return Err(err);
+        }
+    };
+    let grpc_bound_addr = grpc_bound.as_ref().map(|(_, addr)| *addr);
+    let console_bound_addr = console_bound.as_ref().map(|(_, addr)| *addr);
 
     let tls = config.grpc.tls_enabled;
-    let console_meta = ControlPlaneMetadata {
-        grpc_listen: format_host_port(&config.grpc.host, config.grpc.port),
-        grpc_tls_enabled: tls,
-        public_endpoint: config
-            .console
-            .as_ref()
-            .and_then(|c| c.public_endpoint.clone()),
+    let grpc_listen_display = match grpc_bound_addr {
+        Some(bound) if config.grpc.port == 0 => format_host_port(&config.grpc.host, bound.port()),
+        _ => format_host_port(&config.grpc.host, config.grpc.port),
     };
     let runtime_mode = config.runtime_mode();
     let config_path = config.config_path;
@@ -233,28 +314,81 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     let auto_tokens = config.auto_tokens;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Run one bounded startup revocation sync before serving traffic to close
+    // the restart window when the auth service is reachable.
+    let mut revocation_sync_ok: Option<Arc<AtomicBool>> = None;
     if let Some(rev_cfg) = auth_revocation {
-        tokio::spawn(run_revocation_poller(
-            rev_cfg,
-            Arc::clone(&auth),
-            shutdown_tx.subscribe(),
-        ));
+        let sync_ok = Arc::new(AtomicBool::new(false));
+        revocation_sync_ok = Some(Arc::clone(&sync_ok));
+        match build_revocation_http_client() {
+            Ok(client) => {
+                let (initial_failures, initial_error) = match tokio::time::timeout(
+                    REVOCATION_STARTUP_TIMEOUT,
+                    poll_revocations_once(&client, &rev_cfg, &auth, &runtime, &sync_ok),
+                )
+                .await
+                {
+                    Ok(Ok(())) => (0u32, None),
+                    Ok(Err(error)) => {
+                        warn!(
+                            url = %rev_cfg.url,
+                            error = %error,
+                            "initial auth revocation sync failed; continuing with background polling"
+                        );
+                        (1u32, Some(error))
+                    }
+                    Err(_) => {
+                        let msg = "initial auth revocation sync timed out".to_owned();
+                        warn!(url = %rev_cfg.url, "{msg}; continuing with background polling");
+                        (1u32, Some(msg))
+                    }
+                };
+                tokio::spawn(run_revocation_poller(
+                    client,
+                    rev_cfg,
+                    Arc::clone(&auth),
+                    runtime.clone(),
+                    sync_ok,
+                    initial_failures,
+                    initial_error,
+                    shutdown_tx.subscribe(),
+                ));
+            }
+            Err(error) => {
+                warn!(%error, "build HTTP client for auth revocation poller");
+            }
+        }
     }
+
+    let console_meta = ControlPlaneMetadata {
+        grpc_enabled: config.grpc.enabled,
+        grpc_listen: grpc_listen_display,
+        grpc_tls_enabled: tls,
+        public_endpoint: console_config
+            .as_ref()
+            .and_then(|c| c.public_endpoint.clone()),
+        auth_portal_url: console_config
+            .as_ref()
+            .and_then(|c| c.auth_portal_url.clone()),
+        revocation_sync_ok,
+    };
+
     let mut servers = tokio::task::JoinSet::new();
-    if let Some(grpc_addr) = grpc_addr {
+    if let Some((listener, _)) = grpc_bound {
         servers.spawn(run_grpc_server(
-            grpc_addr,
+            listener,
+            grpc_tls,
             runtime.clone(),
-            config.grpc,
             AuthPolicy::clone(&auth),
             shutdown_rx,
         ));
     } else {
         drop(shutdown_rx);
     }
-    if let (Some(adapter), Some(addr)) = (console_config, console_addr) {
+    if let (Some(adapter), Some((listener, _))) = (console_config, console_bound) {
         servers.spawn(run_console_server(
-            addr,
+            listener,
             runtime.clone(),
             adapter,
             console_meta,
@@ -264,32 +398,60 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         ));
     }
 
-    match (grpc_addr, config_path.as_ref().map(|p| p.display())) {
+    match (grpc_bound_addr, config_path.as_ref().map(|p| p.display())) {
         (Some(grpc), Some(cfg)) => info!(%grpc, tls, config = %cfg, "control plane started"),
         (Some(grpc), None) => info!(%grpc, tls, "control plane started"),
         (None, Some(cfg)) => info!(grpc_enabled = false, config = %cfg, "control plane started"),
         (None, None) => info!(grpc_enabled = false, "control plane started"),
     }
-    if let Some(console_addr) = console_addr {
+    if let Some(console) = console_bound_addr {
         info!(
-            console = %console_addr,
+            %console,
             embedded_ui = cfg!(feature = "embed-console"),
             "console api started"
         );
     }
 
-    eprintln!(
-        "{}",
-        format_startup_summary(&StartupSummary {
-            grpc_addr,
-            grpc_tls_enabled: tls,
-            console_addr,
-            embedded_console_ui: cfg!(feature = "embed-console"),
-            public_endpoint: public_endpoint.as_deref(),
-            auth_enabled: auth.is_enabled(),
-            auto_tokens: auto_tokens.as_ref(),
-        })
-    );
+    if json_logs {
+        let grpc_str = grpc_bound_addr.map(|a| a.to_string());
+        let console_str = console_bound_addr.map(|a| a.to_string());
+        let auto_token_source =
+            auto_tokens
+                .as_ref()
+                .map(|auto| match (&auto.persisted_path, auto.reused_existing) {
+                    (Some(_), true) => "reloaded",
+                    (Some(_), false) => "persisted",
+                    (None, _) => "ephemeral",
+                });
+        let auto_token_path = auto_tokens
+            .as_ref()
+            .and_then(|auto| auto.persisted_path.as_ref())
+            .map(|p| p.display().to_string());
+        info!(
+            grpc = grpc_str.as_deref(),
+            grpc_tls = tls,
+            console = console_str.as_deref(),
+            embedded_ui = cfg!(feature = "embed-console"),
+            public_endpoint = public_endpoint.as_deref(),
+            auth_enabled = auth.is_enabled(),
+            auto_token_source,
+            auto_token_path = auto_token_path.as_deref(),
+            "anyserve relay ready"
+        );
+    } else {
+        eprintln!(
+            "{}",
+            format_startup_summary(&StartupSummary {
+                grpc_addr: grpc_bound_addr,
+                grpc_tls_enabled: tls,
+                console_addr: console_bound_addr,
+                embedded_console_ui: cfg!(feature = "embed-console"),
+                public_endpoint: public_endpoint.as_deref(),
+                auth_enabled: auth.is_enabled(),
+                auto_tokens: auto_tokens.as_ref(),
+            })
+        );
+    }
 
     let mut lease_lost = false;
     let failure = tokio::select! {
@@ -309,10 +471,11 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         // Sever active HTTP/2 connections immediately when fenced so clients and
         // workers reconnect to the new leader without waiting for drain grace.
         servers.abort_all();
-    }
-    runtime.shutdown().await;
-    if !lease_lost {
-        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        runtime.shutdown().await;
+    } else {
+        // Stop accepting new connections and let in-flight RPCs (including durable
+        // completions) drain before closing the runtime journal.
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(joined) = servers.join_next().await {
                 if let Ok(Err(error)) = joined {
                     warn!(%error, "server stopped during shutdown");
@@ -323,6 +486,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         if drained.is_err() {
             servers.abort_all();
         }
+        runtime.shutdown().await;
     }
     if let Some(error) = failure {
         return Err(error);
@@ -330,32 +494,62 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+fn build_revocation_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+}
+
+fn next_revocation_delay(base: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return base;
+    }
+    let max_delay = REVOCATION_MAX_BACKOFF.max(base);
+    let factor = 1u32 << consecutive_failures.min(10);
+    base.saturating_mul(factor).min(max_delay)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_revocation_poller(
+    client: reqwest::Client,
     cfg: AuthRevocationConfig,
     auth: Arc<AuthPolicy>,
+    runtime: Runtime,
+    sync_ok: Arc<AtomicBool>,
+    mut consecutive_failures: u32,
+    mut last_error: Option<String>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(error) => {
-            warn!(%error, "build HTTP client for auth revocation poller");
-            return;
-        }
-    };
-    let mut interval = tokio::time::interval(cfg.poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        let delay = next_revocation_delay(cfg.poll_interval, consecutive_failures);
         tokio::select! {
-            _ = interval.tick() => {
-                poll_revocations_once(&client, &cfg, &auth).await;
-            }
+            _ = tokio::time::sleep(delay) => {}
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     break;
                 }
+            }
+        }
+        if *shutdown.borrow() {
+            break;
+        }
+        match poll_revocations_once(&client, &cfg, &auth, &runtime, &sync_ok).await {
+            Ok(()) => {
+                consecutive_failures = 0;
+                last_error = None;
+            }
+            Err(error) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let changed = last_error.as_deref() != Some(error.as_str());
+                if consecutive_failures == 1 || consecutive_failures.is_multiple_of(10) || changed {
+                    warn!(
+                        url = %cfg.url,
+                        consecutive_failures,
+                        error = %error,
+                        "auth revocation sync failed"
+                    );
+                }
+                last_error = Some(error);
             }
         }
     }
@@ -365,29 +559,63 @@ async fn poll_revocations_once(
     client: &reqwest::Client,
     cfg: &AuthRevocationConfig,
     auth: &AuthPolicy,
-) {
+    runtime: &Runtime,
+    sync_ok: &AtomicBool,
+) -> Result<(), String> {
     let since_version = auth.revocation_version();
-    match client
-        .get(&cfg.url)
-        .query(&[("since_version", since_version)])
-        .bearer_auth(&cfg.bearer_token)
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {}
-        Ok(resp) if resp.status().is_success() => {
-            match resp.json::<anyserve_core::auth::RevocationSnapshot>().await {
-                Ok(snapshot) => auth.apply_revocations(snapshot),
-                Err(error) => warn!(%error, url = %cfg.url, "decode auth revocation snapshot"),
-            }
-        }
-        Ok(resp) => {
-            warn!(status = %resp.status(), url = %cfg.url, "auth revocation endpoint error");
-        }
-        Err(error) => {
-            warn!(%error, url = %cfg.url, "poll auth revocation endpoint");
+    let mut bearers = vec![cfg.bearer_token.clone()];
+    for candidate in auth.revocation_bearers() {
+        if !bearers.iter().any(|existing| existing == &candidate) {
+            bearers.push(candidate);
         }
     }
+
+    let mut result = Err("no revocation bearer configured".to_owned());
+    for (idx, bearer) in bearers.iter().enumerate() {
+        match client
+            .get(&cfg.url)
+            .query(&[("since_version", since_version)])
+            .bearer_auth(bearer)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                auth.mark_revocation_synced();
+                result = Ok(());
+                break;
+            }
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<anyserve_core::auth::RevocationSnapshot>().await {
+                    Ok(snapshot) => {
+                        auth.apply_revocations(snapshot);
+                        result = Ok(());
+                    }
+                    Err(error) => {
+                        result = Err(format!("decode auth revocation snapshot: {error}"));
+                    }
+                }
+                break;
+            }
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    && idx + 1 < bearers.len() =>
+            {
+                continue;
+            }
+            Ok(resp) => {
+                result = Err(format!("auth revocation endpoint status {}", resp.status()));
+                break;
+            }
+            Err(error) => {
+                result = Err(format!("poll auth revocation endpoint: {error}"));
+                break;
+            }
+        }
+    }
+
+    sync_ok.store(result.is_ok(), Ordering::Relaxed);
+    runtime.disconnect_revoked_and_expired_sessions(auth);
+    result
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -405,82 +633,64 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
+async fn set_grpc_health(reporter: &mut tonic_health::server::HealthReporter, serving: bool) {
+    let status = if serving {
+        tonic_health::ServingStatus::Serving
+    } else {
+        tonic_health::ServingStatus::NotServing
+    };
+    reporter.set_service_status("", status).await;
+    if serving {
+        reporter
+            .set_serving::<ClientServer<ClientGrpcService>>()
+            .await;
+        reporter
+            .set_serving::<WorkerServer<WorkerGrpcService>>()
+            .await;
+    } else {
+        reporter
+            .set_not_serving::<ClientServer<ClientGrpcService>>()
+            .await;
+        reporter
+            .set_not_serving::<WorkerServer<WorkerGrpcService>>()
+            .await;
+    }
+}
+
 async fn run_grpc_server(
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
+    tls_config: Option<ServerTlsConfig>,
     runtime: Runtime,
-    config: GrpcConfig,
     auth: AuthPolicy,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    let mut builder = Server::builder();
+    if let Some(tls_cfg) = tls_config {
+        builder = builder.tls_config(tls_cfg).context("configure grpc tls")?;
+    }
+    let incoming = TcpIncoming::from_listener(listener, true, None)
+        .map_err(|error| anyhow::anyhow!("configure gRPC TCP listener: {error}"))?;
+
     let client_service = ClientServer::new(ClientGrpcService::new(runtime.clone()))
         .max_decoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .max_encoding_message_size(anyserve_proto::MAX_MESSAGE_SIZE);
     let worker_service = WorkerGrpcService::server(runtime.clone());
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    if runtime.is_leader_active() {
-        health_reporter
-            .set_serving::<ClientServer<ClientGrpcService>>()
-            .await;
-        health_reporter
-            .set_serving::<WorkerServer<WorkerGrpcService>>()
-            .await;
-    } else {
-        health_reporter
-            .set_not_serving::<ClientServer<ClientGrpcService>>()
-            .await;
-        health_reporter
-            .set_not_serving::<WorkerServer<WorkerGrpcService>>()
-            .await;
-    }
+    set_grpc_health(&mut health_reporter, runtime.is_leader_active()).await;
+
     let mut leader_rx = runtime.subscribe_leadership();
     let health_watch = tokio::spawn(async move {
         while leader_rx.changed().await.is_ok() {
-            if *leader_rx.borrow() {
-                health_reporter
-                    .set_serving::<ClientServer<ClientGrpcService>>()
-                    .await;
-                health_reporter
-                    .set_serving::<WorkerServer<WorkerGrpcService>>()
-                    .await;
-            } else {
-                health_reporter
-                    .set_not_serving::<ClientServer<ClientGrpcService>>()
-                    .await;
-                health_reporter
-                    .set_not_serving::<WorkerServer<WorkerGrpcService>>()
-                    .await;
-            }
+            let serving = *leader_rx.borrow();
+            set_grpc_health(&mut health_reporter, serving).await;
         }
     });
-
-    let mut builder = Server::builder();
-    if config.tls_enabled {
-        let cert_file = config
-            .cert_file
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--grpc-cert-file is required when TLS is enabled"))?;
-        let key_file = config
-            .key_file
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("--grpc-key-file is required when TLS is enabled"))?;
-        let identity = Identity::from_pem(
-            tokio::fs::read(cert_file)
-                .await
-                .context("read tls certificate")?,
-            tokio::fs::read(key_file)
-                .await
-                .context("read tls private key")?,
-        );
-        builder = builder
-            .tls_config(ServerTlsConfig::new().identity(identity))
-            .context("configure grpc tls")?;
-    }
 
     builder
         .tcp_nodelay(true)
         .initial_stream_window_size(Some(4 * 1024 * 1024))
         .initial_connection_window_size(Some(32 * 1024 * 1024))
-        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_interval(Some(Duration::from_secs(20)))
         // A draining worker cancels its attempt streams at once; the
         // default rapid-reset guard (20) would drop the whole connection.
         .http2_max_pending_accept_reset_streams(Some(MAX_PENDING_RESET_STREAMS))
@@ -488,7 +698,7 @@ async fn run_grpc_server(
         .add_service(health_service)
         .add_service(client_service)
         .add_service(worker_service)
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(incoming, async move {
             let _ = shutdown.changed().await;
             health_watch.abort();
         })
@@ -518,7 +728,15 @@ fn socket_addr_from_bind(value: &str) -> Result<SocketAddr> {
 mod grpc_toggle_tests {
     use super::*;
     use crate::serve_config::ServeConsoleConfig;
+    use crate::test_support::Server as TestServer;
+    use anyserve_client::execution::{WorkerSession, v2};
+    use anyserve_core::auth::{SignedTokenClaims, internal_revocation_bearer, sign_token};
+    use anyserve_core::runtime::api::RuntimeConfig;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
+    use axum::{Json, Router};
     use clap::Parser;
+    use std::sync::Mutex;
 
     #[derive(Parser)]
     struct TestServeCli {
@@ -539,6 +757,7 @@ mod grpc_toggle_tests {
             listen: "127.0.0.1:3001".into(),
             allowed_origins: Vec::new(),
             public_endpoint: Some("wss://anyserve.example.com".into()),
+            auth_portal_url: None,
         });
         assert!(validate_listeners(&cfg).is_ok());
     }
@@ -724,5 +943,200 @@ mod grpc_toggle_tests {
             Some(&ephemeral),
         );
         assert!(ephemeral_banner.contains("Auth:     enabled (auto-generated, ephemeral)"));
+    }
+
+    #[test]
+    fn revocation_backoff_doubles_and_caps_at_30s() {
+        let base = Duration::from_secs(2);
+        assert_eq!(next_revocation_delay(base, 0), Duration::from_secs(2));
+        assert_eq!(next_revocation_delay(base, 1), Duration::from_secs(4));
+        assert_eq!(next_revocation_delay(base, 2), Duration::from_secs(8));
+        assert_eq!(next_revocation_delay(base, 3), Duration::from_secs(16));
+        assert_eq!(next_revocation_delay(base, 4), Duration::from_secs(30));
+        assert_eq!(next_revocation_delay(base, 20), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn poll_revocations_once_handles_200_304_401_key_rotation_and_error_disconnects() {
+        #[derive(Clone)]
+        enum MockMode {
+            Snapshot {
+                expected_bearer: String,
+                version: u64,
+                jtis: Vec<String>,
+            },
+            NotModified {
+                expected_bearer: String,
+            },
+            ServerError,
+        }
+
+        let mode = Arc::new(Mutex::new(MockMode::ServerError));
+        let mode_route = Arc::clone(&mode);
+        let app = Router::new().route(
+            "/internal/revocations",
+            get(move |headers: HeaderMap| {
+                let mode = mode_route.lock().unwrap().clone();
+                async move {
+                    let bearer = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "));
+                    match mode {
+                        MockMode::Snapshot {
+                            expected_bearer,
+                            version,
+                            jtis,
+                        } => {
+                            if bearer != Some(expected_bearer.as_str()) {
+                                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+                            }
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "version": version,
+                                    "revoked_jtis": jtis,
+                                })),
+                            )
+                        }
+                        MockMode::NotModified { expected_bearer } => {
+                            if bearer != Some(expected_bearer.as_str()) {
+                                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+                            }
+                            (StatusCode::NOT_MODIFIED, Json(serde_json::json!({})))
+                        }
+                        MockMode::ServerError => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({"error": "db down"})),
+                        ),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let new_key = b"new-signing-key-0123456789abcdef".to_vec();
+        let old_key = b"old-signing-key-0123456789abcdef".to_vec();
+        let new_bearer = internal_revocation_bearer(&new_key);
+        let old_bearer = internal_revocation_bearer(&old_key);
+
+        let auth = AuthPolicy::default().with_signing_keys([new_key.clone(), old_key.clone()]);
+        let cfg = AuthRevocationConfig {
+            url: format!("http://{addr}/internal/revocations"),
+            bearer_token: new_bearer.clone(),
+            poll_interval: Duration::from_secs(1),
+        };
+        let client = build_revocation_http_client().unwrap();
+        let grpc_server = TestServer::start(RuntimeConfig::default(), auth.clone()).await;
+        let runtime = grpc_server.runtime.clone();
+        let sync_ok = AtomicBool::new(false);
+
+        let connect_signed_worker = |endpoint: String, token: String, worker_id: &'static str| async move {
+            let mut ws = WorkerSession::connect(
+                &endpoint,
+                Some(&token),
+                v2::Hello {
+                    worker_id: worker_id.into(),
+                    interfaces: vec!["demo.v1".into()],
+                    max_concurrency: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let welcome = ws.messages.message().await.unwrap().unwrap().msg;
+            assert!(matches!(welcome, Some(v2::server_message::Msg::Welcome(_))));
+            ws
+        };
+
+        // Connect a worker backed by signed jti-revoked.
+        let tok_rev = sign_token(
+            &new_key,
+            &SignedTokenClaims {
+                jti: "jti-revoked".into(),
+                ns: "team-a".into(),
+                role: "worker".into(),
+                sub: "w1".into(),
+                iat: 1_700_000_000,
+                exp: None,
+                fp: None,
+            },
+        )
+        .unwrap();
+        let _w_rev = connect_signed_worker(grpc_server.endpoint.clone(), tok_rev, "w-rev").await;
+        assert_eq!(runtime.list_workers().len(), 1);
+
+        // 1. 200 OK applies revocation, sets sync_ok=true, and disconnects revoked session.
+        *mode.lock().unwrap() = MockMode::Snapshot {
+            expected_bearer: new_bearer.clone(),
+            version: 1,
+            jtis: vec!["jti-revoked".into()],
+        };
+        poll_revocations_once(&client, &cfg, &auth, &runtime, &sync_ok)
+            .await
+            .unwrap();
+        assert!(sync_ok.load(Ordering::Relaxed));
+        assert!(auth.is_jti_revoked("jti-revoked"));
+        assert!(runtime.list_workers().is_empty());
+
+        // 2. 304 Not Modified keeps sync_ok=true and updates last_sync.
+        *mode.lock().unwrap() = MockMode::NotModified {
+            expected_bearer: new_bearer,
+        };
+        poll_revocations_once(&client, &cfg, &auth, &runtime, &sync_ok)
+            .await
+            .unwrap();
+        assert!(sync_ok.load(Ordering::Relaxed));
+        assert!(auth.revocation_last_sync_at_ms().is_some());
+
+        // 3. 401 on primary bearer falls back to secondary key during signing-key rotation.
+        *mode.lock().unwrap() = MockMode::Snapshot {
+            expected_bearer: old_bearer,
+            version: 2,
+            jtis: vec!["jti-revoked".into(), "jti-rotated".into()],
+        };
+        poll_revocations_once(&client, &cfg, &auth, &runtime, &sync_ok)
+            .await
+            .unwrap();
+        assert!(sync_ok.load(Ordering::Relaxed));
+        assert!(auth.is_jti_revoked("jti-rotated"));
+        assert_eq!(auth.revocation_version(), 2);
+
+        // 4. HTTP 500 sets sync_ok=false while STILL disconnecting expired sessions.
+        let now_secs = anyserve_core::now_ms() / 1000;
+        let tok_exp = sign_token(
+            &new_key,
+            &SignedTokenClaims {
+                jti: "jti-exp".into(),
+                ns: "team-a".into(),
+                role: "worker".into(),
+                sub: "w-exp".into(),
+                iat: now_secs,
+                exp: Some(now_secs + 1),
+                fp: None,
+            },
+        )
+        .unwrap();
+        let _w_exp = connect_signed_worker(grpc_server.endpoint.clone(), tok_exp, "w-exp").await;
+        assert_eq!(runtime.list_workers().len(), 1);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        *mode.lock().unwrap() = MockMode::ServerError;
+        let err = poll_revocations_once(&client, &cfg, &auth, &runtime, &sync_ok)
+            .await
+            .unwrap_err();
+        assert!(err.contains("500"), "{err}");
+        assert!(!sync_ok.load(Ordering::Relaxed));
+        assert!(
+            runtime.list_workers().is_empty(),
+            "expired session must still be disconnected when HTTP poll fails"
+        );
+
+        grpc_server.stop().await;
+        server_task.abort();
     }
 }

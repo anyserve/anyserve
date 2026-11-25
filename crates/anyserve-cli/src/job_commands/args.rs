@@ -1,5 +1,15 @@
 use clap::{Args, Subcommand, ValueEnum};
 
+#[derive(Args, Debug)]
+pub(crate) struct JobArgs {
+    #[arg(long, global = true)]
+    pub(crate) token: Option<String>,
+    #[arg(long, global = true)]
+    pub(crate) namespace: Option<String>,
+    #[command(subcommand)]
+    pub(crate) command: JobCommands,
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum JobCommands {
     #[command(alias = "list")]

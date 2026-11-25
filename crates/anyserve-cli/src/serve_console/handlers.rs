@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyserve_core::auth::{AuthPolicy, DEFAULT_NAMESPACE, Principal};
 use anyserve_core::error::{ErrorKind, RuntimeError};
@@ -19,28 +20,31 @@ use axum::{Json, Router};
 
 use super::api::{
     AnalyticsQuery, AnalyticsResponse, AnalyticsSource, ApiError, AppState, BudgetsSummary,
-    CancelJobResponse, ConsoleScopeSummary, ControlPlaneSummary, HistorySummary, InterfaceSummary,
-    JobDetailResponse, JobsQuery, JobsResponse, NamespaceQuery, OverviewResponse, PoolSummary,
-    QueueSummary, WorkersResponse,
+    CancelJobResponse, ConsoleScopeSummary, ControlPlaneSummary, DrainWorkerResponse,
+    HistorySummary, InfoResponse, InterfaceSummary, JobDetailResponse, JobsQuery, JobsResponse,
+    NamespaceQuery, OverviewResponse, PoolSummary, QueueSummary, WorkersResponse,
 };
 use super::snapshot::{
     duration_ms, health_summary, interface_policy_summary, job_detail_response, job_summary,
     jobs_histogram_summary, journal_stats_summary, worker_rollup, worker_summary,
 };
 
-pub(crate) fn router(state: AppState, auth: Arc<AuthPolicy>) -> Router {
+pub(crate) fn router(state: AppState) -> Router {
+    let auth = Arc::clone(&state.auth);
     let allowed_origins = Arc::clone(&state.allowed_origins);
     let http_ws = anyserve_core::http_ws_service::router(state.runtime.clone(), Arc::clone(&auth));
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/api/info", get(info))
         .route("/api/overview", get(overview))
         .route("/api/jobs", get(list_jobs))
         .route("/api/analytics/jobs", get(analytics_jobs))
         .route("/api/jobs/:job_id", get(get_job))
         .route("/api/jobs/:job_id/cancel", post(cancel_job))
         .route("/api/workers", get(list_workers))
+        .route("/api/workers/:session_id/drain", post(drain_worker))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             auth,
@@ -62,7 +66,7 @@ async fn analytics_jobs(
     Extension(principal): Extension<Principal>,
     Query(query): Query<AnalyticsQuery>,
 ) -> Result<Json<AnalyticsResponse>, ApiError> {
-    let namespace = enforce_namespace(&principal, query.namespace, false)?;
+    let namespace = enforce_namespace(&state.auth, &principal, query.namespace, false)?;
     let page = state
         .runtime
         .scan_job_metadata(JobScan {
@@ -98,13 +102,26 @@ async fn readyz(State(state): State<AppState>) -> StatusCode {
 }
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let revocation_sync_ok = state
+        .revocation_sync_ok
+        .as_ref()
+        .map(|ok| ok.load(Ordering::Relaxed));
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
-        super::metrics::render(&state.runtime),
+        super::metrics::render(&state.runtime, &state.auth, revocation_sync_ok),
     )
+}
+
+async fn info(State(state): State<AppState>) -> Json<InfoResponse> {
+    Json(InfoResponse {
+        auth_enabled: state.auth.is_enabled(),
+        auth_portal_url: state.control_plane.auth_portal_url.clone(),
+        public_endpoint: state.control_plane.public_endpoint.clone(),
+        grpc_enabled: state.control_plane.grpc_enabled,
+    })
 }
 
 async fn overview(
@@ -142,7 +159,10 @@ async fn overview(
                 oldest_queued_age_ms: current.map_or(0, |s| s.oldest_queued_age_ms),
                 sessions: current.map_or(0, |s| s.sessions),
                 free_slots: current.map_or(0, |s| s.free_slots),
-                policy: config.interfaces.get(name).map(interface_policy_summary),
+                policy: principal
+                    .is_operator
+                    .then(|| config.interfaces.get(name).map(interface_policy_summary))
+                    .flatten(),
             }
         })
         .collect();
@@ -161,14 +181,11 @@ async fn overview(
         })
         .collect();
 
-    let scope = state
-        .control_plane
-        .auth_enabled
-        .then(|| ConsoleScopeSummary {
-            is_operator: principal.is_operator,
-            namespace: principal.namespace.clone(),
-            subject: principal.subject.clone(),
-        });
+    let scope = state.auth.is_enabled().then(|| ConsoleScopeSummary {
+        is_operator: principal.is_operator,
+        namespace: principal.namespace.clone(),
+        subject: principal.subject.clone(),
+    });
     let budgets = if principal.is_operator {
         BudgetsSummary {
             input_bytes: stats.input_bytes,
@@ -189,19 +206,36 @@ async fn overview(
         }
     };
 
+    let (grpc_listen, console_listen, max_sessions) = if principal.is_operator {
+        (
+            state.control_plane.grpc_listen.clone(),
+            state.control_plane.console_listen.clone(),
+            config.max_sessions,
+        )
+    } else {
+        (String::new(), String::new(), 0)
+    };
+
+    let mut health = health_summary(health);
+    if !principal.is_operator {
+        health.journal.message = None;
+    }
+
     Ok(Json(OverviewResponse {
         runtime: state.mode,
-        health: health_summary(health),
+        health,
         control_plane: ControlPlaneSummary {
-            grpc_listen: state.control_plane.grpc_listen.clone(),
+            grpc_enabled: state.control_plane.grpc_enabled,
+            grpc_listen,
             grpc_tls_enabled: state.control_plane.grpc_tls_enabled,
-            console_listen: state.control_plane.console_listen.clone(),
+            console_listen,
             public_endpoint: state.control_plane.public_endpoint.clone(),
-            auth_enabled: state.control_plane.auth_enabled,
+            auth_portal_url: state.control_plane.auth_portal_url.clone(),
+            auth_enabled: state.auth.is_enabled(),
             generation: stats.generation,
             retained_jobs: stats.retained_jobs,
             sessions: stats.sessions,
-            max_sessions: config.max_sessions,
+            max_sessions,
             priority_levels: config.priority_levels,
             default_max_attempts: config.default_max_attempts,
             heartbeat_interval_ms: duration_ms(config.heartbeat_interval),
@@ -235,7 +269,7 @@ async fn list_jobs(
     Extension(principal): Extension<Principal>,
     Query(query): Query<JobsQuery>,
 ) -> Result<Json<JobsResponse>, ApiError> {
-    let namespace = enforce_namespace(&principal, query.namespace, true)?;
+    let namespace = enforce_namespace(&state.auth, &principal, query.namespace, true)?;
     let page_token = normalize_optional_filter(query.page_token).or_else(|| {
         query
             .offset
@@ -302,7 +336,7 @@ async fn get_job(
     Path(job_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<JobDetailResponse>, ApiError> {
-    let ns = enforce_namespace(&principal, query.namespace, false)?
+    let ns = enforce_namespace(&state.auth, &principal, query.namespace, false)?
         .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
     let preview = state
         .runtime
@@ -320,7 +354,7 @@ async fn cancel_job(
     Path(job_id): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Json<CancelJobResponse>, ApiError> {
-    let ns = enforce_namespace(&principal, query.namespace, false)?
+    let ns = enforce_namespace(&state.auth, &principal, query.namespace, false)?
         .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
     let job = state
         .runtime
@@ -367,27 +401,46 @@ async fn list_workers(
     }))
 }
 
+async fn drain_worker(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(session_id): Path<String>,
+) -> Result<Json<DrainWorkerResponse>, ApiError> {
+    let scope_ns = (!principal.is_operator).then_some(principal.namespace.as_str());
+    state
+        .runtime
+        .drain_session(scope_ns, &session_id)
+        .map_err(api_error)?;
+    Ok(Json(DrainWorkerResponse {
+        session_id,
+        draining: true,
+    }))
+}
+
 async fn cors_middleware(
     State(allowed_origins): State<Arc<BTreeSet<String>>>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let allowed_origin = (!allowed_origins.is_empty())
-        .then(|| {
-            request
-                .headers()
-                .get(ORIGIN)
-                .filter(|value| {
-                    value
-                        .to_str()
-                        .ok()
-                        .is_some_and(|origin| allowed_origins.contains(origin))
-                })
-                .cloned()
+    if allowed_origins.is_empty() {
+        return next.run(request).await;
+    }
+    let is_preflight = request.method() == Method::OPTIONS;
+    let allowed_origin = request
+        .headers()
+        .get(ORIGIN)
+        .filter(|value| {
+            value
+                .to_str()
+                .ok()
+                .is_some_and(|origin| allowed_origins.contains(origin))
         })
-        .flatten();
+        .cloned();
+    if !is_preflight && allowed_origin.is_none() && request.uri().path().starts_with("/assets/") {
+        return next.run(request).await;
+    }
 
-    let mut response = if request.method() == Method::OPTIONS {
+    let mut response = if is_preflight {
         StatusCode::NO_CONTENT.into_response()
     } else {
         next.run(request).await
@@ -395,37 +448,40 @@ async fn cors_middleware(
 
     let headers = response.headers_mut();
     headers.insert(VARY, HeaderValue::from_static("Origin"));
-    headers.insert(
-        ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
-    );
-    headers.insert(
-        ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static(
-            "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
-        ),
-    );
-
     if let Some(origin) = allowed_origin {
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+        if is_preflight {
+            headers.insert(
+                ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, POST, OPTIONS"),
+            );
+            headers.insert(
+                ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static(
+                    "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
+                ),
+            );
+        }
     }
 
     response
 }
 
 fn enforce_namespace(
+    auth: &AuthPolicy,
     principal: &Principal,
     requested: Option<String>,
     allow_all_keyword: bool,
 ) -> Result<Option<String>, ApiError> {
     let normalized = normalize_optional_filter(requested);
     if principal.is_operator {
-        return Ok(normalized);
+        return Ok(normalized.filter(|ns| !(allow_all_keyword && ns.eq_ignore_ascii_case("all"))));
     }
     if let Some(ref ns) = normalized
         && !(allow_all_keyword && ns.eq_ignore_ascii_case("all"))
         && ns != &principal.namespace
     {
+        auth.record_rejection();
         return Err(ApiError::forbidden("token cannot access another namespace"));
     }
     Ok(Some(principal.namespace.clone()))

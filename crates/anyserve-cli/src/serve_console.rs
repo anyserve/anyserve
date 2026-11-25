@@ -7,8 +7,10 @@ mod snapshot;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use axum::serve;
@@ -24,9 +26,12 @@ use handlers::router;
 
 #[derive(Clone, Debug)]
 pub struct ControlPlaneMetadata {
+    pub grpc_enabled: bool,
     pub grpc_listen: String,
     pub grpc_tls_enabled: bool,
     pub public_endpoint: Option<String>,
+    pub auth_portal_url: Option<String>,
+    pub revocation_sync_ok: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) fn format_host_port(host: &str, port: u16) -> String {
@@ -38,6 +43,7 @@ pub(crate) fn format_host_port(host: &str, port: u16) -> String {
     }
 }
 
+#[cfg(test)]
 pub async fn run_server(
     addr: SocketAddr,
     runtime: Runtime,
@@ -45,22 +51,41 @@ pub async fn run_server(
     control_plane: ControlPlaneMetadata,
     runtime_mode: RuntimeMode,
     auth: Arc<AuthPolicy>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind console listener {addr}"))?;
-    let console_listen = if addr.port() == 0 {
-        listener
-            .local_addr()
-            .map(|local| local.to_string())
-            .unwrap_or(config.listen)
-    } else {
-        config.listen
-    };
+    run_server_with_listener(
+        listener,
+        runtime,
+        config,
+        control_plane,
+        runtime_mode,
+        auth,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_server_with_listener(
+    listener: tokio::net::TcpListener,
+    runtime: Runtime,
+    config: ServeConsoleConfig,
+    control_plane: ControlPlaneMetadata,
+    runtime_mode: RuntimeMode,
+    auth: Arc<AuthPolicy>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let console_listen = listener
+        .local_addr()
+        .map(|local| local.to_string())
+        .unwrap_or(config.listen);
 
     let state = AppState {
         runtime,
+        auth,
+        revocation_sync_ok: control_plane.revocation_sync_ok,
         allowed_origins: Arc::new(
             config
                 .allowed_origins
@@ -71,15 +96,16 @@ pub async fn run_server(
         ),
         mode: runtime_mode_summary(runtime_mode),
         control_plane: Arc::new(ControlPlaneStatic {
+            grpc_enabled: control_plane.grpc_enabled,
             grpc_listen: control_plane.grpc_listen,
             grpc_tls_enabled: control_plane.grpc_tls_enabled,
             console_listen,
             public_endpoint: control_plane.public_endpoint,
-            auth_enabled: auth.is_enabled(),
+            auth_portal_url: control_plane.auth_portal_url,
         }),
     };
 
-    serve(listener, router(state, auth))
+    serve(listener, router(state))
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;
         })

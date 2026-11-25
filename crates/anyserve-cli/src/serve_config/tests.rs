@@ -705,3 +705,205 @@ fn signing_keys_and_revocation_url_resolve_from_env_and_auto_token_stays_noop() 
     assert!(!p.is_operator);
     assert!(!dir.exists());
 }
+
+#[test]
+fn env_scoped_tokens_tenant_quotas_journal_max_bytes_and_memory_limit_resolve() {
+    let raw = r#"
+[runtime]
+max_pending_bytes = 999999
+
+[runtime.tenant_quotas]
+max_sessions_per_namespace = 4
+max_pending_jobs_per_namespace = 12
+max_interfaces_per_namespace = 6
+
+[journal]
+max_bytes = 1048576
+"#;
+    let resolved = config_with_env(
+        raw,
+        ServeOverrides {
+            memory_limit_mb: Some(100),
+            journal_max_bytes: Some(2_097_152),
+            ..Default::default()
+        },
+        |name| match name {
+            "ANYSERVE_SCOPED_TOKENS" => Some(
+                r#"[{"token":"sc-1","role":"client","namespace":"tenant-x","subject":"app-x","forcedPool":"gpu-a"}]"#.into(),
+            ),
+            _ => None,
+        },
+    )
+    .unwrap();
+
+    // Explicit max_pending_bytes is preserved; unspecified budgets are derived from 100 MiB.
+    assert_eq!(resolved.runtime.max_pending_bytes, 999_999);
+    assert_eq!(resolved.runtime.max_result_bytes, 25 * 1024 * 1024);
+    assert_eq!(resolved.runtime.max_event_bytes, 10 * 1024 * 1024);
+    assert_eq!(
+        resolved.runtime.tenant_quotas.max_sessions_per_namespace,
+        Some(4)
+    );
+    assert_eq!(
+        resolved
+            .runtime
+            .tenant_quotas
+            .max_pending_jobs_per_namespace,
+        Some(12)
+    );
+    assert_eq!(
+        resolved.runtime.tenant_quotas.max_interfaces_per_namespace,
+        Some(6)
+    );
+    assert_eq!(
+        resolved.runtime.journal.as_ref().unwrap().max_bytes,
+        Some(2_097_152)
+    );
+
+    let p = resolved.auth.principal_for_token("sc-1").unwrap();
+    assert_eq!(p.namespace, "tenant-x");
+    assert_eq!(p.subject, "app-x");
+    assert_eq!(p.forced_pool.as_deref(), Some("gpu-a"));
+
+    // Zero overrides / env vars are rejected.
+    let err = config_with_env(
+        "",
+        ServeOverrides {
+            memory_limit_mb: Some(0),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("positive"), "{err}");
+
+    let err = config_with_env("", ServeOverrides::default(), |name| {
+        (name == "ANYSERVE_JOURNAL_MAX_BYTES").then(|| "0".into())
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("positive"), "{err}");
+}
+
+#[test]
+fn revocation_env_precedence_portal_url_validation_scoped_tokens_and_budget_clamping() {
+    // 1. ANYSERVE_AUTH_REVOCATION_URL overrides TOML [auth].revocation_url.
+    let rev_resolved = config_with_env(
+        "[auth]\nrevocation_url = 'http://toml-auth:3002/internal/revocations'\n",
+        ServeOverrides::default(),
+        |name| match name {
+            "ANYSERVE_TOKEN_SIGNING_KEY" => Some("k-0123456789abcdef".into()),
+            "ANYSERVE_AUTH_REVOCATION_URL" => {
+                Some("http://env-auth:3002/internal/revocations".into())
+            }
+            _ => None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        rev_resolved.auth_revocation.unwrap().url,
+        "http://env-auth:3002/internal/revocations"
+    );
+
+    // 2. auth_portal_url rejects non-http(s) schemes (e.g. javascript:) from both TOML and env.
+    for (toml_str, env_url) in [
+        (
+            "[console]\nauth_portal_url = 'javascript:alert(1)'\n",
+            None::<&str>,
+        ),
+        ("[console]\n", Some("javascript:alert(1)")),
+        ("[console]\n", Some("data:text/html,evil")),
+    ] {
+        let err = config_with_env(toml_str, ServeOverrides::default(), |name| {
+            (name == "ANYSERVE_CONSOLE_AUTH_PORTAL_URL").then(|| env_url.map(str::to_owned))?
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("http:// or https://"), "{err}");
+    }
+
+    // 3. ANYSERVE_SCOPED_TOKENS rejects unknown fields and trims forced_pool / subject.
+    let err = config_with_env("", ServeOverrides::default(), |name| {
+        (name == "ANYSERVE_SCOPED_TOKENS").then(|| {
+            r#"[{"token":"sc-1","role":"client","namespace":"t1","typoField":123}]"#.into()
+        })
+    })
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("unknown field"), "{err:#}");
+
+    let trimmed = config_with_env("", ServeOverrides::default(), |name| {
+        (name == "ANYSERVE_SCOPED_TOKENS").then(|| {
+            r#"[{"token":" sc-trim ","role":"worker","namespace":"t1","subject":" sub-1 ","forced_pool":" pool-a "}]"#.into()
+        })
+    })
+    .unwrap();
+    let p = trimmed.auth.principal_for_token("sc-trim").unwrap();
+    assert_eq!(p.subject, "sub-1");
+    assert_eq!(p.forced_pool.as_deref(), Some("pool-a"));
+
+    // 4. --memory-limit 0 reports the CLI flag name (--memory-limit).
+    let err = config_with_env(
+        "",
+        ServeOverrides {
+            memory_limit_mb: Some(0),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("--memory-limit must be positive"),
+        "{err}"
+    );
+    let err = config_with_env(
+        "",
+        ServeOverrides {
+            journal_max_bytes: Some(0),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("--journal-max-bytes must be positive"),
+        "{err}"
+    );
+
+    // 5. Small --memory-limit clamps unspecified inline and event_log budgets.
+    let small_mem = config_with_env(
+        "",
+        ServeOverrides {
+            memory_limit_mb: Some(16),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap();
+    assert_eq!(small_mem.runtime.max_pending_bytes, 4 * 1024 * 1024);
+    assert_eq!(small_mem.runtime.max_result_bytes, 4 * 1024 * 1024);
+    assert!(small_mem.runtime.limits.max_inline_total_bytes <= small_mem.runtime.max_pending_bytes);
+    assert!(
+        small_mem.runtime.limits.max_inline_object_bytes
+            <= small_mem.runtime.limits.max_inline_total_bytes
+    );
+    assert!(small_mem.runtime.event_log_max_bytes as u64 <= small_mem.runtime.max_event_bytes);
+
+    // 6. journal.max_bytes < 65536 is rejected from both TOML and CLI/env.
+    let err = config_with_env(
+        "[journal]\nmax_bytes = 4096\n",
+        ServeOverrides::default(),
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("65536"), "{err}");
+
+    let err = config_with_env(
+        "",
+        ServeOverrides {
+            journal_max_bytes: Some(1024),
+            ..Default::default()
+        },
+        |_| None,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("65536"), "{err}");
+}

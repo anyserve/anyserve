@@ -28,10 +28,14 @@ pub(crate) async fn fallback_handler(request: Request<Body>) -> Response {
 }
 
 pub(crate) fn is_control_plane_path(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/metrics")
-        || ["/api", "/rpc", "/ws"]
-            .into_iter()
-            .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+    ["/healthz", "/readyz", "/metrics", "/api", "/rpc", "/ws"]
+        .into_iter()
+        .any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
 }
 
 fn asset_response(asset: &EmbeddedAsset, head_only: bool) -> Response {
@@ -158,6 +162,11 @@ mod tests {
             "/rpc/v2/unknown",
             "/ws/v2/unknown",
             "/healthz",
+            "/healthz/",
+            "/readyz",
+            "/readyz/",
+            "/metrics",
+            "/metrics/",
         ] {
             assert_eq!(
                 serve_embedded_asset(TEST_ASSETS, &Method::GET, path).status(),

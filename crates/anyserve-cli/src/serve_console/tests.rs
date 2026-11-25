@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::serve_config::{RuntimeMode, ServeConsoleConfig};
@@ -45,17 +46,20 @@ impl ConsoleClient {
         };
         let state = AppState {
             runtime,
+            auth: Arc::new(auth),
+            revocation_sync_ok: meta.revocation_sync_ok,
             allowed_origins: Arc::new(BTreeSet::from(["http://console.test".to_string()])),
             mode: runtime_mode_summary(mode),
             control_plane: Arc::new(ControlPlaneStatic {
+                grpc_enabled: meta.grpc_enabled,
                 grpc_listen: meta.grpc_listen,
                 grpc_tls_enabled: meta.grpc_tls_enabled,
                 console_listen: addr.to_string(),
                 public_endpoint: meta.public_endpoint,
-                auth_enabled: auth.is_enabled(),
+                auth_portal_url: meta.auth_portal_url,
             }),
         };
-        let app = router(state, Arc::new(auth));
+        let app = router(state);
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self {
             http: Client::new(),
@@ -99,9 +103,12 @@ async fn spawn_console(runtime: Runtime) -> ConsoleClient {
 
 async fn spawn_console_auth(runtime: Runtime, auth: AuthPolicy) -> ConsoleClient {
     let meta = ControlPlaneMetadata {
+        grpc_enabled: true,
         grpc_listen: "127.0.0.1:50052".into(),
         grpc_tls_enabled: false,
         public_endpoint: None,
+        auth_portal_url: None,
+        revocation_sync_ok: None,
     };
     ConsoleClient::spawn(runtime, auth, meta).await
 }
@@ -1123,9 +1130,12 @@ async fn overview_exposes_health_control_plane_budgets_journal_policies_and_pool
         server.runtime.clone(),
         AuthPolicy::new(["op-secret".into()], []),
         ControlPlaneMetadata {
+            grpc_enabled: true,
             grpc_listen: "0.0.0.0:50062".into(),
             grpc_tls_enabled: true,
             public_endpoint: Some("wss://anyserve.example.com".into()),
+            auth_portal_url: None,
+            revocation_sync_ok: None,
         },
     )
     .await;
@@ -1244,11 +1254,15 @@ async fn run_server_serves_control_plane_metadata_and_shuts_down_cleanly() {
         listen: "127.0.0.1:0".into(),
         allowed_origins: vec![" http://console.test ".into(), "".into()],
         public_endpoint: None,
+        auth_portal_url: None,
     };
     let meta = ControlPlaneMetadata {
+        grpc_enabled: true,
         grpc_listen: "127.0.0.1:50099".into(),
         grpc_tls_enabled: true,
         public_endpoint: None,
+        auth_portal_url: None,
+        revocation_sync_ok: None,
     };
     let task = tokio::spawn(run_server(
         addr,
@@ -1727,10 +1741,12 @@ async fn overview_omits_recommended_poll_ms_when_none_and_serializes_when_some()
     );
 
     let make_summary = |recommended_poll_ms: Option<u64>| ControlPlaneSummary {
+        grpc_enabled: true,
         grpc_listen: "127.0.0.1:50052".into(),
         grpc_tls_enabled: false,
         console_listen: "127.0.0.1:3001".into(),
         public_endpoint: None,
+        auth_portal_url: None,
         auth_enabled: false,
         generation: 1,
         retained_jobs: 0,
@@ -1813,4 +1829,652 @@ async fn embedded_console_serves_ui_and_assets_while_preserving_auth_and_api_404
             .await,
         404
     );
+    // Trailing slashes on reserved control-plane endpoints return 404 (not SPA index.html).
+    for reserved in ["/metrics/", "/healthz/", "/readyz/"] {
+        assert_eq!(
+            c.status(Method::GET, reserved, Some("op-token")).await,
+            404,
+            "GET {reserved}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn console_info_worker_drain_tenant_overview_redaction_and_metrics_work() {
+    let runtime = test_runtime().await;
+    let mut echo_spec = spec("echo.v1", Durability::Ephemeral);
+    echo_spec.policy.max_attempts = Some(1);
+    let auth = AuthPolicy::new(vec!["op-tok".into()], Vec::new()).with_scoped_tokens([
+        ScopedToken {
+            token: "c-alpha".into(),
+            role: Role::Client,
+            namespace: "alpha".into(),
+            subject: "alice".into(),
+            forced_pool: None,
+        },
+        ScopedToken {
+            token: "w-alpha".into(),
+            role: Role::Worker,
+            namespace: "alpha".into(),
+            subject: "w-a".into(),
+            forced_pool: None,
+        },
+        ScopedToken {
+            token: "w-beta".into(),
+            role: Role::Worker,
+            namespace: "beta".into(),
+            subject: "w-b".into(),
+            forced_pool: None,
+        },
+    ]);
+
+    // Generate 1 cancelled job and >100 interfaces in queued jobs to test metrics cardinality cap + lifecycle counters.
+    let cancel_id = submit(&runtime, Some("alpha"), echo_spec).await;
+    runtime
+        .cancel_in("alpha", &cancel_id, "test cancel".into())
+        .await
+        .unwrap();
+    for i in 0..105 {
+        submit(
+            &runtime,
+            Some("alpha"),
+            spec(&format!("cap.iface.{i:03}"), Durability::Ephemeral),
+        )
+        .await;
+    }
+
+    let c = ConsoleClient::spawn(
+        runtime.clone(),
+        auth.clone(),
+        ControlPlaneMetadata {
+            grpc_enabled: false,
+            grpc_listen: "10.0.0.1:50052".into(),
+            grpc_tls_enabled: false,
+            public_endpoint: Some("https://relay.example.com".into()),
+            auth_portal_url: Some("https://relay.example.com/tokens".into()),
+            revocation_sync_ok: None,
+        },
+    )
+    .await;
+
+    // Connect WebSocket workers directly to ConsoleClient's mounted /ws/v2/worker/session in alpha & beta.
+    let ws_ep = c.base.replacen("http://", "ws://", 1);
+    let mut wa = WorkerSession::connect_with_namespace(
+        &ws_ep,
+        Some("w-alpha"),
+        None,
+        v2::Hello {
+            worker_id: "wa-1".into(),
+            interfaces: vec!["echo.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let wa_session_id = match wa.messages.message().await.unwrap().unwrap().msg {
+        Some(v2::server_message::Msg::Welcome(w)) => w.session_id,
+        other => panic!("expected welcome for wa, got {other:?}"),
+    };
+    let mut wb = WorkerSession::connect_with_namespace(
+        &ws_ep,
+        Some("w-beta"),
+        None,
+        v2::Hello {
+            worker_id: "wb-1".into(),
+            interfaces: vec!["echo.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let wb_session_id = match wb.messages.message().await.unwrap().unwrap().msg {
+        Some(v2::server_message::Msg::Welcome(w)) => w.session_id,
+        other => panic!("expected welcome for wb, got {other:?}"),
+    };
+
+    // /api/info is unauthenticated and returns auth_portal_url + grpc_enabled.
+    let info = c.json(Method::GET, "/api/info", None).await;
+    assert_eq!(info["auth_enabled"], true);
+    assert_eq!(info["grpc_enabled"], false);
+    assert_eq!(info["auth_portal_url"], "https://relay.example.com/tokens");
+    assert_eq!(info["public_endpoint"], "https://relay.example.com");
+
+    // Tenant overview redacts internal topology/max_sessions while keeping public fields.
+    let tenant_ov = c.json(Method::GET, "/api/overview", Some("c-alpha")).await;
+    assert_eq!(tenant_ov["control_plane"]["grpc_listen"], "");
+    assert_eq!(tenant_ov["control_plane"]["console_listen"], "");
+    assert_eq!(tenant_ov["control_plane"]["max_sessions"], 0);
+    assert_eq!(tenant_ov["control_plane"]["grpc_enabled"], false);
+    assert_eq!(
+        tenant_ov["control_plane"]["auth_portal_url"],
+        "https://relay.example.com/tokens"
+    );
+
+    // Operator overview retains full internal listeners.
+    let op_ov = c.json(Method::GET, "/api/overview", Some("op-tok")).await;
+    assert_eq!(op_ov["control_plane"]["grpc_listen"], "10.0.0.1:50052");
+    assert!(
+        !op_ov["control_plane"]["console_listen"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Cross-tenant drain returns 404; own-namespace drain returns 200; operator drains any.
+    assert_eq!(
+        c.status(
+            Method::POST,
+            &format!("/api/workers/{wb_session_id}/drain"),
+            Some("c-alpha"),
+        )
+        .await,
+        404
+    );
+    let drained = c
+        .json(
+            Method::POST,
+            &format!("/api/workers/{wa_session_id}/drain"),
+            Some("c-alpha"),
+        )
+        .await;
+    assert_eq!(drained["draining"], true);
+    assert_eq!(
+        c.status(
+            Method::POST,
+            &format!("/api/workers/{wb_session_id}/drain"),
+            Some("op-tok"),
+        )
+        .await,
+        200
+    );
+
+    // Trigger an auth rejection and inspect /metrics.
+    assert_eq!(c.status(Method::GET, "/api/overview", None).await, 401);
+    let prom = c.text("/metrics", Some("op-tok")).await;
+    assert!(prom.contains("anyserve_jobs_submitted_total 106"), "{prom}");
+    assert!(
+        prom.contains("anyserve_jobs_completed_total{state=\"cancelled\"} 1"),
+        "{prom}"
+    );
+    assert!(prom.contains("anyserve_attempts_started_total "), "{prom}");
+    assert!(prom.contains("anyserve_auth_rejections_total 1"), "{prom}");
+    assert!(
+        prom.contains("anyserve_interface_jobs{interface=\"_other\",state=\"queued\"}"),
+        "{prom}"
+    );
+    let iface_series = prom
+        .lines()
+        .filter(|l| l.starts_with("anyserve_interface_free_slots{"))
+        .count();
+    assert_eq!(iface_series, 101, "expected 100 explicit + 1 _other series");
+}
+
+fn assert_valid_prometheus_grouping(body: &str) {
+    let mut seen_families: BTreeSet<String> = BTreeSet::new();
+    let mut active_family: Option<String> = None;
+    let mut active_has_help = false;
+    let mut active_has_type = false;
+    let mut active_samples = 0usize;
+
+    let close_family = |family: Option<String>, has_help: bool, has_type: bool, samples: usize| {
+        if let Some(name) = family {
+            assert!(has_help, "metric family {name} missing # HELP");
+            assert!(has_type, "metric family {name} missing # TYPE");
+            assert!(samples > 0, "metric family {name} emitted no samples");
+        }
+    };
+
+    for raw_line in body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let name = rest.split_whitespace().next().unwrap().to_owned();
+            if active_family.as_deref() != Some(name.as_str()) {
+                close_family(
+                    active_family.take(),
+                    active_has_help,
+                    active_has_type,
+                    active_samples,
+                );
+                assert!(
+                    seen_families.insert(name.clone()),
+                    "metric family {name} appeared non-contiguously:\n{body}"
+                );
+                active_family = Some(name);
+                active_has_help = true;
+                active_has_type = false;
+                active_samples = 0;
+            } else {
+                assert!(
+                    !active_has_help && active_samples == 0,
+                    "duplicate/misplaced # HELP for {name}"
+                );
+                active_has_help = true;
+            }
+        } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let name = rest.split_whitespace().next().unwrap().to_owned();
+            assert_eq!(
+                active_family.as_deref(),
+                Some(name.as_str()),
+                "# TYPE {name} does not match active family {active_family:?}:\n{body}"
+            );
+            assert!(
+                !active_has_type && active_samples == 0,
+                "duplicate/misplaced # TYPE for {name}"
+            );
+            active_has_type = true;
+        } else if !line.starts_with('#') {
+            let name = line
+                .split(['{', ' '])
+                .next()
+                .expect("sample metric name")
+                .to_owned();
+            assert_eq!(
+                active_family.as_deref(),
+                Some(name.as_str()),
+                "sample {line} interleaved with family {active_family:?}:\n{body}"
+            );
+            assert!(
+                active_has_help && active_has_type,
+                "sample {line} preceded # HELP/# TYPE"
+            );
+            active_samples += 1;
+        }
+    }
+    close_family(
+        active_family,
+        active_has_help,
+        active_has_type,
+        active_samples,
+    );
+}
+
+#[tokio::test]
+async fn metrics_output_is_strictly_contiguous_avoids_other_collision_and_exposes_revocation_health()
+ {
+    let path = temporary_path("metrics-compliance.sqlite");
+    let cfg = RuntimeConfig {
+        journal: Some(JournalConfig::new(&path)),
+        ..Default::default()
+    };
+    let runtime = Runtime::start(cfg).await.unwrap();
+    let auth = AuthPolicy::new(vec!["op-tok".into()], Vec::new());
+    let sync_ok = Arc::new(AtomicBool::new(false));
+    let c = ConsoleClient::spawn(
+        runtime.clone(),
+        auth.clone(),
+        ControlPlaneMetadata {
+            grpc_enabled: false,
+            grpc_listen: "127.0.0.1:50052".into(),
+            grpc_tls_enabled: false,
+            public_endpoint: None,
+            auth_portal_url: None,
+            revocation_sync_ok: Some(Arc::clone(&sync_ok)),
+        },
+    )
+    .await;
+
+    // Empty runtime: no orphan interface/pool headers, sync_ok=0, no last_sync_age yet.
+    let empty_prom = c.text("/metrics", Some("op-tok")).await;
+    assert_valid_prometheus_grouping(&empty_prom);
+    assert!(
+        !empty_prom.contains("anyserve_interface_jobs"),
+        "{empty_prom}"
+    );
+    assert!(
+        empty_prom.contains("anyserve_auth_revocation_sync_ok 0\n"),
+        "{empty_prom}"
+    );
+    assert!(
+        !empty_prom.contains("anyserve_auth_revocation_last_sync_age_seconds"),
+        "{empty_prom}"
+    );
+
+    // Mark revocation synced and verify sync_ok=1 + last_sync_age_seconds.
+    auth.mark_revocation_synced();
+    sync_ok.store(true, Ordering::Relaxed);
+
+    // Submit >100 interfaces including a literal "_other" interface to verify zero duplicate "_other" series.
+    submit(&runtime, None, spec("_other", Durability::Ephemeral)).await;
+    for i in 0..102 {
+        submit(
+            &runtime,
+            None,
+            spec(&format!("m.iface.{i:03}"), Durability::Ephemeral),
+        )
+        .await;
+    }
+    let full_prom = c.text("/metrics", Some("op-tok")).await;
+    assert_valid_prometheus_grouping(&full_prom);
+    assert!(
+        full_prom.contains("anyserve_auth_revocation_sync_ok 1\n"),
+        "{full_prom}"
+    );
+    assert!(
+        full_prom.contains("anyserve_auth_revocation_last_sync_age_seconds "),
+        "{full_prom}"
+    );
+    let other_free_slot_lines = full_prom
+        .lines()
+        .filter(|l| l.starts_with("anyserve_interface_free_slots{interface=\"_other\"} "))
+        .count();
+    assert_eq!(other_free_slot_lines, 1, "{full_prom}");
+
+    drop(c);
+    runtime.shutdown().await;
+    cleanup_sqlite(&path);
+}
+
+#[tokio::test]
+async fn tenant_overview_redacts_policy_and_journal_error_and_operator_namespace_all_works() {
+    let path = temporary_path("tenant-redaction.sqlite");
+    let mut journal_cfg = JournalConfig::new(&path);
+    journal_cfg.max_bytes = Some(65_536);
+    let cfg = RuntimeConfig {
+        journal: Some(journal_cfg),
+        interfaces: BTreeMap::from([(
+            "secret.iface.v1".into(),
+            InterfacePolicy {
+                max_queue: Some(42),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let runtime = Runtime::start(cfg).await.unwrap();
+
+    // Trigger SQLite max_bytes degradation so health.journal.message becomes Some(...).
+    let mut oversized = spec("secret.iface.v1", Durability::Durable);
+    oversized.inputs = vec![Object::inline(vec![b'x'; 256 * 1024])];
+    let _ = runtime
+        .submit(SubmitRequest {
+            namespace: Some("alpha".into()),
+            spec: oversized,
+            ..Default::default()
+        })
+        .await;
+
+    // Submit ephemeral jobs in two distinct namespaces (ephemeral stays writable while journal is degraded).
+    submit(
+        &runtime,
+        Some("alpha"),
+        spec("secret.iface.v1", Durability::Ephemeral),
+    )
+    .await;
+    submit(
+        &runtime,
+        Some("beta"),
+        spec("secret.iface.v1", Durability::Ephemeral),
+    )
+    .await;
+
+    let auth =
+        AuthPolicy::new(vec!["op-tok".into()], Vec::new()).with_scoped_tokens([ScopedToken {
+            token: "tenant-alpha".into(),
+            role: Role::Client,
+            namespace: "alpha".into(),
+            subject: "alice".into(),
+            forced_pool: None,
+        }]);
+    let c = spawn_console_auth(runtime.clone(), auth.clone()).await;
+
+    // Operator sees interface policy AND raw journal error message.
+    let op_ov = c.json(Method::GET, "/api/overview", Some("op-tok")).await;
+    assert_eq!(op_ov["health"]["journal"]["status"], "unavailable");
+    assert!(
+        op_ov["health"]["journal"]["message"].is_string(),
+        "operator should see journal diagnostic: {op_ov}"
+    );
+    let op_iface = op_ov["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "secret.iface.v1")
+        .unwrap();
+    assert_eq!(op_iface["policy"]["max_queue"], 42);
+
+    // Tenant sees neither interface policy nor raw journal error message.
+    let t_ov = c
+        .json(Method::GET, "/api/overview", Some("tenant-alpha"))
+        .await;
+    assert_eq!(t_ov["health"]["journal"]["status"], "unavailable");
+    assert!(
+        t_ov["health"]["journal"]["message"].is_null(),
+        "tenant must not see raw journal message: {t_ov}"
+    );
+    let t_iface = t_ov["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "secret.iface.v1")
+        .unwrap();
+    assert!(
+        t_iface["policy"].is_null(),
+        "tenant must not see interface policy: {t_iface}"
+    );
+
+    // Operator GET /api/jobs?namespace=all returns jobs across ALL namespaces.
+    let op_all = c
+        .json(Method::GET, "/api/jobs?namespace=all", Some("op-tok"))
+        .await;
+    assert_eq!(op_all["total"], 2, "{op_all}");
+
+    // Cross-namespace 403 rejection increments anyserve_auth_rejections_total.
+    let before = auth.auth_rejections_total();
+    assert_eq!(
+        c.status(
+            Method::GET,
+            "/api/jobs?namespace=beta",
+            Some("tenant-alpha")
+        )
+        .await,
+        403
+    );
+    assert_eq!(auth.auth_rejections_total(), before + 1);
+
+    drop(c);
+    runtime.shutdown().await;
+    cleanup_sqlite(&path);
+}
+
+#[tokio::test]
+async fn drain_worker_enforces_auth_notifies_connected_and_preserves_drain_across_reconnect() {
+    let cfg = RuntimeConfig {
+        reconnect_grace: Some(Duration::from_secs(30)),
+        ..Default::default()
+    };
+    let runtime = Runtime::start(cfg).await.unwrap();
+    let auth =
+        AuthPolicy::new(vec!["op-tok".into()], vec!["op-worker".into()]).with_scoped_tokens([
+            ScopedToken {
+                token: "c-alpha".into(),
+                role: Role::Client,
+                namespace: "alpha".into(),
+                subject: "alice".into(),
+                forced_pool: None,
+            },
+            ScopedToken {
+                token: "w-alpha".into(),
+                role: Role::Worker,
+                namespace: "alpha".into(),
+                subject: "w-a".into(),
+                forced_pool: None,
+            },
+            ScopedToken {
+                token: "w-beta".into(),
+                role: Role::Worker,
+                namespace: "beta".into(),
+                subject: "w-b".into(),
+                forced_pool: None,
+            },
+        ]);
+    let c = spawn_console_auth(runtime.clone(), auth).await;
+    let ws_ep = c.base.replacen("http://", "ws://", 1);
+
+    // Unknown session -> 404; worker token -> 403.
+    assert_eq!(
+        c.status(
+            Method::POST,
+            "/api/workers/no-such-session/drain",
+            Some("op-tok")
+        )
+        .await,
+        404
+    );
+    assert_eq!(
+        c.status(
+            Method::POST,
+            "/api/workers/no-such-session/drain",
+            Some("w-alpha")
+        )
+        .await,
+        403
+    );
+
+    // 1. Connected worker receives ServerMessage::Drain immediately on POST /drain.
+    let mut w_conn = WorkerSession::connect_with_namespace(
+        &ws_ep,
+        Some("w-alpha"),
+        None,
+        v2::Hello {
+            worker_id: "w-live".into(),
+            interfaces: vec!["demo.drain.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let live_sid = match w_conn.messages.message().await.unwrap().unwrap().msg {
+        Some(v2::server_message::Msg::Welcome(w)) => w.session_id,
+        other => panic!("expected Welcome, got {other:?}"),
+    };
+    assert_eq!(
+        c.status(
+            Method::POST,
+            &format!("/api/workers/{live_sid}/drain"),
+            Some("c-alpha"),
+        )
+        .await,
+        200
+    );
+    let drain_msg = tokio::time::timeout(Duration::from_secs(2), w_conn.messages.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .msg;
+    assert!(
+        matches!(drain_msg, Some(v2::server_message::Msg::Drain(_))),
+        "expected Drain frame, got {drain_msg:?}"
+    );
+
+    // 2. Disconnected reconnect-grace worker preserves draining=true and receives Drain on reconnect.
+    let mut w_beta = WorkerSession::connect_with_namespace(
+        &ws_ep,
+        Some("w-beta"),
+        None,
+        v2::Hello {
+            worker_id: "w-reconn".into(),
+            interfaces: vec!["demo.drain.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let beta_sid = match w_beta.messages.message().await.unwrap().unwrap().msg {
+        Some(v2::server_message::Msg::Welcome(w)) => w.session_id,
+        other => panic!("expected Welcome, got {other:?}"),
+    };
+    send_msg(
+        &mut w_beta,
+        v2::worker_message::Msg::Credit(v2::Credit { free_slots: 1 }),
+    )
+    .await;
+    submit(
+        &runtime,
+        Some("beta"),
+        spec("demo.drain.v1", Durability::Ephemeral),
+    )
+    .await;
+    accept_assign(&mut w_beta).await;
+    wait_until(|| {
+        runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.session_id == beta_sid && w.active_leases == 1)
+    })
+    .await;
+    drop(w_beta);
+    wait_until(|| {
+        runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.session_id == beta_sid && !w.connected)
+    })
+    .await;
+
+    // Cross-tenant drain returns 404; operator drain succeeds while disconnected.
+    assert_eq!(
+        c.status(
+            Method::POST,
+            &format!("/api/workers/{beta_sid}/drain"),
+            Some("c-alpha"),
+        )
+        .await,
+        404
+    );
+    assert_eq!(
+        c.status(
+            Method::POST,
+            &format!("/api/workers/{beta_sid}/drain"),
+            Some("op-tok"),
+        )
+        .await,
+        200
+    );
+
+    // Reconnect with the same session_id: server must preserve draining and send Drain right after Welcome.
+    let mut w_reconn = WorkerSession::connect_with_namespace(
+        &ws_ep,
+        Some("w-beta"),
+        None,
+        v2::Hello {
+            worker_id: "w-reconn".into(),
+            resume_session_id: beta_sid.clone(),
+            interfaces: vec!["demo.drain.v1".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let first = w_reconn.messages.message().await.unwrap().unwrap().msg;
+    assert!(matches!(first, Some(v2::server_message::Msg::Welcome(_))));
+    let second = tokio::time::timeout(Duration::from_secs(2), w_reconn.messages.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .msg;
+    assert!(
+        matches!(second, Some(v2::server_message::Msg::Drain(_))),
+        "reconnected drained worker should receive Drain after Welcome, got {second:?}"
+    );
+    assert!(
+        runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.session_id == beta_sid && w.connected && w.draining)
+    );
+
+    drop(w_conn);
+    drop(w_reconn);
+    drop(c);
+    runtime.shutdown().await;
 }

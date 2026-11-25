@@ -58,9 +58,34 @@ pub(super) struct AuthConfigFile {
 
 pub(super) const DEFAULT_CLIENT_TOKENS_ENV: &str = "ANYSERVE_CLIENT_TOKENS";
 pub(super) const DEFAULT_WORKER_TOKENS_ENV: &str = "ANYSERVE_WORKER_TOKENS";
-pub(super) const DEFAULT_SIGNING_KEYS_ENV: &str = "ANYSERVE_TOKEN_SIGNING_KEY";
+pub(super) const DEFAULT_SCOPED_TOKENS_ENV: &str = "ANYSERVE_SCOPED_TOKENS";
+pub(super) const DEFAULT_SIGNING_KEYS_ENV: &str = anyserve_core::auth::SIGNING_KEYS_ENV;
 pub(super) const DEFAULT_REVOCATION_URL_ENV: &str = "ANYSERVE_AUTH_REVOCATION_URL";
 pub(super) const PUBLIC_ENDPOINT_ENV: &str = "ANYSERVE_PUBLIC_ENDPOINT";
+pub(super) const CONSOLE_AUTH_PORTAL_URL_ENV: &str = "ANYSERVE_CONSOLE_AUTH_PORTAL_URL";
+pub(super) const MEMORY_LIMIT_MB_ENV: &str = "ANYSERVE_MEMORY_LIMIT_MB";
+pub(super) const JOURNAL_MAX_BYTES_ENV: &str = "ANYSERVE_JOURNAL_MAX_BYTES";
+pub(super) const MIN_JOURNAL_MAX_BYTES: u64 = 65_536;
+
+pub(super) fn validate_journal_max_bytes(bytes: u64) -> Result<()> {
+    anyhow::ensure!(
+        bytes >= MIN_JOURNAL_MAX_BYTES,
+        "journal.max_bytes must be at least {MIN_JOURNAL_MAX_BYTES} bytes (64 KiB)"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvScopedToken {
+    token: String,
+    role: String,
+    namespace: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default, alias = "forcedPool")]
+    forced_pool: Option<String>,
+}
 
 pub(super) fn split_tokens(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -68,6 +93,32 @@ pub(super) fn split_tokens(raw: &str) -> Vec<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn parse_scoped_token_entry(
+    token: String,
+    role_raw: &str,
+    namespace_raw: &str,
+    subject: Option<String>,
+    forced_pool: Option<String>,
+) -> Result<anyserve_core::auth::ScopedToken> {
+    let role = match role_raw.trim().to_ascii_lowercase().as_str() {
+        "client" => anyserve_core::auth::Role::Client,
+        "worker" => anyserve_core::auth::Role::Worker,
+        other => anyhow::bail!("unknown scoped_token role '{other}' (expected client|worker)"),
+    };
+    let namespace = namespace_raw.trim();
+    anyserve_core::auth::validate_namespace(namespace)
+        .map_err(|s| anyhow::anyhow!("invalid scoped_token namespace: {}", s.message()))?;
+    let token = token.trim();
+    anyhow::ensure!(!token.is_empty(), "scoped_token token must not be empty");
+    Ok(anyserve_core::auth::ScopedToken {
+        token: token.to_owned(),
+        role,
+        namespace: namespace.to_string(),
+        subject: nonempty_trimmed(subject).unwrap_or_else(|| format!("{}-token", role_raw.trim())),
+        forced_pool: nonempty_trimmed(forced_pool),
+    })
 }
 
 impl AuthConfigFile {
@@ -118,8 +169,13 @@ impl AuthConfigFile {
         .into_iter()
         .map(String::into_bytes)
         .collect();
-        let revocation_url = nonempty_trimmed(self.revocation_url)
-            .or_else(|| nonempty_trimmed(env(DEFAULT_REVOCATION_URL_ENV)));
+        let revocation_url = nonempty_trimmed(env(DEFAULT_REVOCATION_URL_ENV))
+            .or_else(|| nonempty_trimmed(self.revocation_url));
+        if revocation_url.is_some() && signing_keys.is_empty() {
+            tracing::warn!(
+                "revocation_url is set without ANYSERVE_TOKEN_SIGNING_KEY; signed token revocation polling is inactive"
+            );
+        }
         let auth_revocation = revocation_url
             .zip(signing_keys.first())
             .map(|(url, primary_key)| AuthRevocationConfig {
@@ -142,26 +198,26 @@ impl AuthConfigFile {
                     anyhow::bail!("auth.scoped_tokens entry requires token or token_env")
                 }
             };
-            let role = match entry.role.trim().to_ascii_lowercase().as_str() {
-                "client" => anyserve_core::auth::Role::Client,
-                "worker" => anyserve_core::auth::Role::Worker,
-                other => {
-                    anyhow::bail!("unknown scoped_token role '{other}' (expected client|worker)")
-                }
-            };
-            anyserve_core::auth::validate_namespace(entry.namespace.trim())
-                .map_err(|s| anyhow::anyhow!("invalid scoped_token namespace: {}", s.message()))?;
-            scoped.push(anyserve_core::auth::ScopedToken {
+            scoped.push(parse_scoped_token_entry(
                 token,
-                role,
-                namespace: entry.namespace.trim().to_string(),
-                subject: if entry.subject.trim().is_empty() {
-                    format!("{}-token", entry.role)
-                } else {
-                    entry.subject
-                },
-                forced_pool: entry.forced_pool.filter(|p| !p.trim().is_empty()),
-            });
+                &entry.role,
+                &entry.namespace,
+                Some(entry.subject),
+                entry.forced_pool,
+            )?);
+        }
+        if let Some(raw_scoped) = nonempty_trimmed(env(DEFAULT_SCOPED_TOKENS_ENV)) {
+            let entries: Vec<EnvScopedToken> = serde_json::from_str(&raw_scoped)
+                .with_context(|| format!("parse {DEFAULT_SCOPED_TOKENS_ENV} JSON array"))?;
+            for entry in entries {
+                scoped.push(parse_scoped_token_entry(
+                    entry.token,
+                    &entry.role,
+                    &entry.namespace,
+                    entry.subject,
+                    entry.forced_pool,
+                )?);
+            }
         }
         Ok((
             AuthPolicy::new(client_tokens, worker_tokens)
@@ -197,9 +253,10 @@ pub(super) struct ServeConsoleConfigFile {
     #[serde(default)]
     allowed_origins: Vec<String>,
     public_endpoint: Option<String>,
+    auth_portal_url: Option<String>,
 }
 
-pub(super) fn nonempty_trimmed(value: Option<String>) -> Option<String> {
+pub(crate) fn nonempty_trimmed(value: Option<String>) -> Option<String> {
     value.and_then(|raw| {
         let trimmed = raw.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
@@ -207,25 +264,43 @@ pub(super) fn nonempty_trimmed(value: Option<String>) -> Option<String> {
 }
 
 impl ServeConsoleConfigFile {
+    /// The console section implied by `--console-listen` when the TOML has none.
+    pub(super) fn with_listen(listen: String) -> Self {
+        Self {
+            listen: Some(listen),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn resolve_with_env(
         self,
         mut env: impl FnMut(&str) -> Option<String>,
-    ) -> Option<ServeConsoleConfig> {
+    ) -> Result<Option<ServeConsoleConfig>> {
         if !self.enabled.unwrap_or(true) {
-            return None;
+            return Ok(None);
         }
         // A non-empty env var overrides the TOML value (like the journal URL), so
         // one baked-in image can advertise the endpoint of each deployment.
         let public_endpoint = nonempty_trimmed(env(PUBLIC_ENDPOINT_ENV))
             .or_else(|| nonempty_trimmed(self.public_endpoint));
+        let auth_portal_url = nonempty_trimmed(env(CONSOLE_AUTH_PORTAL_URL_ENV))
+            .or_else(|| nonempty_trimmed(self.auth_portal_url));
+        if let Some(ref url) = auth_portal_url {
+            let lower = url.to_ascii_lowercase();
+            anyhow::ensure!(
+                lower.starts_with("http://") || lower.starts_with("https://"),
+                "console auth_portal_url must use http:// or https:// scheme (got '{url}')"
+            );
+        }
 
-        Some(ServeConsoleConfig {
+        Ok(Some(ServeConsoleConfig {
             listen: self
                 .listen
                 .unwrap_or_else(|| DEFAULT_CONSOLE_LISTEN.to_string()),
             allowed_origins: self.allowed_origins,
             public_endpoint,
-        })
+            auth_portal_url,
+        }))
     }
 }
 
@@ -255,6 +330,7 @@ pub(super) struct JournalConfigFile {
     queue_capacity: Option<usize>,
     max_batch: Option<usize>,
     retention_secs: Option<u64>,
+    max_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -388,20 +464,36 @@ mod postgres_tests {
         let empty: ServeConsoleConfigFile = toml::from_str("public_endpoint='   '").unwrap();
         let resolved = empty
             .resolve_with_env(|name| {
-                assert_eq!(name, "ANYSERVE_PUBLIC_ENDPOINT");
-                Some("  wss://edge.example.com  ".into())
+                (name == "ANYSERVE_PUBLIC_ENDPOINT").then(|| "  wss://edge.example.com  ".into())
             })
+            .unwrap()
             .unwrap();
         assert_eq!(
             resolved.public_endpoint.as_deref(),
             Some("wss://edge.example.com")
+        );
+        assert!(resolved.auth_portal_url.is_none());
+
+        let with_portal = ServeConsoleConfigFile::default()
+            .resolve_with_env(|name| {
+                (name == "ANYSERVE_CONSOLE_AUTH_PORTAL_URL")
+                    .then(|| " https://relay.example.com/tokens ".into())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            with_portal.auth_portal_url.as_deref(),
+            Some("https://relay.example.com/tokens")
         );
 
         let explicit = || -> ServeConsoleConfigFile {
             toml::from_str("public_endpoint='wss://toml.example.com'").unwrap()
         };
         let resolved = explicit()
-            .resolve_with_env(|_| Some(" wss://env.example.com ".into()))
+            .resolve_with_env(|name| {
+                (name == "ANYSERVE_PUBLIC_ENDPOINT").then(|| " wss://env.example.com ".into())
+            })
+            .unwrap()
             .unwrap();
         assert_eq!(
             resolved.public_endpoint.as_deref(),
@@ -409,7 +501,10 @@ mod postgres_tests {
         );
 
         for env_value in [None, Some("   ".to_string())] {
-            let resolved = explicit().resolve_with_env(|_| env_value.clone()).unwrap();
+            let resolved = explicit()
+                .resolve_with_env(|_| env_value.clone())
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 resolved.public_endpoint.as_deref(),
                 Some("wss://toml.example.com")
@@ -585,14 +680,31 @@ impl JournalConfigFile {
         if let Some(value) = self.retention_secs {
             config.retention = Duration::from_secs(value);
         }
+        if let Some(value) = self.max_bytes {
+            config.max_bytes = Some(value);
+        }
         if (!postgres && !cloudflare && config.path.as_os_str().is_empty())
             || config.queue_capacity == 0
             || config.max_batch == 0
+            || config.max_bytes == Some(0)
         {
-            anyhow::bail!("journal path, queue_capacity and max_batch must be non-empty/positive");
+            anyhow::bail!(
+                "journal path, queue_capacity, max_batch and max_bytes must be non-empty/positive"
+            );
+        }
+        if let Some(bytes) = config.max_bytes {
+            validate_journal_max_bytes(bytes)?;
         }
         Ok(Some(config))
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TenantQuotasFile {
+    max_sessions_per_namespace: Option<usize>,
+    max_pending_jobs_per_namespace: Option<usize>,
+    max_interfaces_per_namespace: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -617,6 +729,7 @@ pub(super) struct RuntimeConfigFile {
     max_terminal_jobs: Option<usize>,
     event_log_max_events: Option<usize>,
     event_log_max_bytes: Option<usize>,
+    tenant_quotas: Option<TenantQuotasFile>,
     #[serde(default)]
     interfaces: BTreeMap<String, InterfaceConfigFile>,
 }
@@ -639,8 +752,18 @@ struct InterfaceConfigFile {
     pool_tiers: Vec<PoolTierFile>,
 }
 impl RuntimeConfigFile {
-    pub(super) fn resolve(self) -> Result<RuntimeConfig> {
+    /// `memory_limit_mb` scales the byte budgets; explicit TOML budgets below still win.
+    pub(super) fn resolve_with_memory_limit(
+        self,
+        memory_limit_mb: Option<u64>,
+    ) -> Result<RuntimeConfig> {
         let mut config = RuntimeConfig::default();
+        if let Some(mb) = memory_limit_mb {
+            let total = mb.saturating_mul(1024 * 1024);
+            config.max_pending_bytes = (total / 4).max(1024 * 1024);
+            config.max_result_bytes = config.max_pending_bytes;
+            config.max_event_bytes = (total / 10).max(1024 * 1024);
+        }
         if let Some(value) = self.heartbeat_interval_ms {
             config.heartbeat_interval = Duration::from_millis(value);
         }
@@ -697,6 +820,30 @@ impl RuntimeConfigFile {
         }
         if let Some(value) = self.event_log_max_bytes {
             config.event_log_max_bytes = value;
+        }
+        if memory_limit_mb.is_some() {
+            let inline_cap = config.max_pending_bytes.min(config.max_result_bytes);
+            if self.max_inline_total_bytes.is_none() {
+                config.limits.max_inline_total_bytes =
+                    config.limits.max_inline_total_bytes.min(inline_cap);
+            }
+            if self.max_inline_object_bytes.is_none() {
+                config.limits.max_inline_object_bytes = config
+                    .limits
+                    .max_inline_object_bytes
+                    .min(config.limits.max_inline_total_bytes);
+            }
+            if self.event_log_max_bytes.is_none() {
+                let event_cap = usize::try_from(config.max_event_bytes).unwrap_or(usize::MAX);
+                config.event_log_max_bytes = config.event_log_max_bytes.min(event_cap);
+            }
+        }
+        if let Some(quotas) = self.tenant_quotas {
+            config.tenant_quotas = anyserve_core::runtime::api::TenantQuotas {
+                max_sessions_per_namespace: quotas.max_sessions_per_namespace,
+                max_pending_jobs_per_namespace: quotas.max_pending_jobs_per_namespace,
+                max_interfaces_per_namespace: quotas.max_interfaces_per_namespace,
+            };
         }
         for name in self.interfaces.keys() {
             if !anyserve_core::runtime::api::is_valid_interface_name(name) {

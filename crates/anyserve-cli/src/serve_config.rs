@@ -12,6 +12,7 @@ use anyserve_core::auth::AuthPolicy;
 use anyserve_core::runtime::api::{JournalConfig, RuntimeConfig};
 
 use file::AnyserveConfigFile;
+pub(crate) use file::nonempty_trimmed;
 
 const DEFAULT_CONSOLE_LISTEN: &str = "127.0.0.1:3001";
 const DEFAULT_REVOCATION_POLL_MS: u64 = 2_000;
@@ -71,6 +72,8 @@ pub struct ServeOverrides {
     pub no_grpc: bool,
     pub ephemeral: bool,
     pub journal_path: Option<PathBuf>,
+    pub journal_max_bytes: Option<u64>,
+    pub memory_limit_mb: Option<u64>,
     pub console_listen: Option<String>,
     pub public_endpoint: Option<String>,
     pub client_tokens: Vec<String>,
@@ -90,6 +93,8 @@ impl std::fmt::Debug for ServeOverrides {
             .field("no_grpc", &self.no_grpc)
             .field("ephemeral", &self.ephemeral)
             .field("journal_path", &self.journal_path)
+            .field("journal_max_bytes", &self.journal_max_bytes)
+            .field("memory_limit_mb", &self.memory_limit_mb)
             .field("console_listen", &self.console_listen)
             .field("public_endpoint", &self.public_endpoint)
             .field("client_token_args", &self.client_tokens.len())
@@ -161,6 +166,7 @@ pub struct ServeConsoleConfig {
     pub listen: String,
     pub allowed_origins: Vec<String>,
     pub public_endpoint: Option<String>,
+    pub auth_portal_url: Option<String>,
 }
 
 impl ResolvedServeConfig {
@@ -182,14 +188,34 @@ impl ResolvedServeConfig {
         let server = file_config.server.unwrap_or_default();
         let tls = server.tls.unwrap_or_default();
         let defaults = GrpcConfig::default();
-        let mut runtime = file_config.runtime.unwrap_or_default().resolve()?;
+        let memory_limit_mb = resolve_positive_u64_override(
+            "--memory-limit",
+            overrides.memory_limit_mb,
+            file::MEMORY_LIMIT_MB_ENV,
+            &mut env,
+        )?;
+        let journal_max_bytes = resolve_positive_u64_override(
+            "--journal-max-bytes",
+            overrides.journal_max_bytes,
+            file::JOURNAL_MAX_BYTES_ENV,
+            &mut env,
+        )?;
+        let mut runtime = file_config
+            .runtime
+            .unwrap_or_default()
+            .resolve_with_memory_limit(memory_limit_mb)?;
         runtime.journal = if overrides.ephemeral {
             None
         } else {
-            file_config
+            let mut journal = file_config
                 .journal
                 .unwrap_or_default()
-                .resolve_with_env(overrides.journal_path, &mut env)?
+                .resolve_with_env(overrides.journal_path, &mut env)?;
+            if let (Some(limit), Some(cfg)) = (journal_max_bytes, journal.as_mut()) {
+                file::validate_journal_max_bytes(limit)?;
+                cfg.max_bytes = Some(limit);
+            }
+            journal
         };
         let (mut auth, auth_revocation) = file_config.auth.unwrap_or_default().resolve_with_env(
             &overrides.client_tokens,
@@ -200,16 +226,15 @@ impl ResolvedServeConfig {
         let cli_public_endpoint = file::nonempty_trimmed(overrides.public_endpoint);
         let mut console = file_config
             .console
-            .and_then(|config| config.resolve_with_env(&mut env));
+            .map(|config| config.resolve_with_env(&mut env))
+            .transpose()?
+            .flatten();
         if let Some(listen) = file::nonempty_trimmed(overrides.console_listen) {
             match console.as_mut() {
                 Some(cfg) => cfg.listen = listen,
                 None => {
-                    console = Some(ServeConsoleConfig {
-                        listen,
-                        allowed_origins: Vec::new(),
-                        public_endpoint: file::nonempty_trimmed(env(file::PUBLIC_ENDPOINT_ENV)),
-                    });
+                    console = file::ServeConsoleConfigFile::with_listen(listen)
+                        .resolve_with_env(&mut env)?;
                 }
             }
         }
@@ -273,6 +298,30 @@ impl ResolvedServeConfig {
             Some(j) if j.postgres.is_some() => RuntimeMode::MemoryPlusPostgres,
             Some(_) => RuntimeMode::MemoryPlusSqlite,
             None => RuntimeMode::Memory,
+        }
+    }
+}
+
+fn resolve_positive_u64_override(
+    cli_flag: &str,
+    cli_value: Option<u64>,
+    env_name: &str,
+    env: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Option<u64>> {
+    match cli_value {
+        Some(0) => anyhow::bail!("{cli_flag} must be positive"),
+        Some(v) => Ok(Some(v)),
+        None => {
+            let parsed = file::nonempty_trimmed(env(env_name))
+                .map(|raw| {
+                    raw.parse::<u64>()
+                        .with_context(|| format!("invalid integer in {env_name}: '{raw}'"))
+                })
+                .transpose()?;
+            if parsed == Some(0) {
+                anyhow::bail!("{env_name} must be positive");
+            }
+            Ok(parsed)
         }
     }
 }

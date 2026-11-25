@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -7,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::serve_config::RuntimeMode;
+use anyserve_core::auth::AuthPolicy;
 use anyserve_core::runtime::{
     Runtime,
     api::{Demand, ExecutionPolicy},
@@ -15,6 +17,8 @@ use anyserve_core::runtime::{
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) runtime: Runtime,
+    pub(crate) auth: Arc<AuthPolicy>,
+    pub(crate) revocation_sync_ok: Option<Arc<AtomicBool>>,
     pub(crate) allowed_origins: Arc<BTreeSet<String>>,
     pub(crate) mode: RuntimeModeSummary,
     pub(crate) control_plane: Arc<ControlPlaneStatic>,
@@ -22,11 +26,12 @@ pub(crate) struct AppState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ControlPlaneStatic {
+    pub(crate) grpc_enabled: bool,
     pub(crate) grpc_listen: String,
     pub(crate) grpc_tls_enabled: bool,
     pub(crate) console_listen: String,
     pub(crate) public_endpoint: Option<String>,
-    pub(crate) auth_enabled: bool,
+    pub(crate) auth_portal_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -74,6 +79,22 @@ pub(crate) struct ConsoleScopeSummary {
 }
 
 #[derive(Serialize)]
+pub(crate) struct InfoResponse {
+    pub(crate) auth_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_portal_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) public_endpoint: Option<String>,
+    pub(crate) grpc_enabled: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DrainWorkerResponse {
+    pub(crate) session_id: String,
+    pub(crate) draining: bool,
+}
+
+#[derive(Serialize)]
 pub(crate) struct OverviewResponse {
     pub(crate) runtime: RuntimeModeSummary,
     pub(crate) health: HealthSummary,
@@ -105,10 +126,13 @@ pub(crate) struct JournalHealthSummary {
 
 #[derive(Serialize)]
 pub(crate) struct ControlPlaneSummary {
+    pub(crate) grpc_enabled: bool,
     pub(crate) grpc_listen: String,
     pub(crate) grpc_tls_enabled: bool,
     pub(crate) console_listen: String,
     pub(crate) public_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_portal_url: Option<String>,
     pub(crate) auth_enabled: bool,
     pub(crate) generation: u64,
     pub(crate) retained_jobs: usize,

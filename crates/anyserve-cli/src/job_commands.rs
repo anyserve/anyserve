@@ -2,15 +2,22 @@ use std::io::{self, BufRead, IsTerminal};
 
 use anyhow::{Context, Result, bail};
 use anyserve_client::execution::{ExecutionClient, v2};
+use anyserve_client::{NAMESPACE_ENV, TOKEN_ENV};
 use serde_json::{Value, json};
 
-mod args;
-pub(crate) use args::JobCommands;
-use args::OutputFormat;
+use crate::{arg_or_env, process_env};
 
-pub(crate) async fn run_job_command(endpoint: &str, command: JobCommands) -> Result<()> {
-    let mut client = ExecutionClient::connect(endpoint).await?;
-    match command {
+mod args;
+pub(crate) use args::JobArgs;
+use args::{JobCommands, OutputFormat};
+
+pub(crate) async fn run_job_command(endpoint: &str, args: JobArgs) -> Result<()> {
+    let token = arg_or_env(args.token, TOKEN_ENV, process_env);
+    let namespace = arg_or_env(args.namespace, NAMESPACE_ENV, process_env);
+    let mut client =
+        ExecutionClient::connect_with_options(endpoint, token.as_deref(), namespace.as_deref())
+            .await?;
+    match args.command {
         JobCommands::Ls(args) => {
             let page = client
                 .list(v2::ListJobsRequest {
@@ -88,7 +95,7 @@ pub(crate) async fn run_job_command(endpoint: &str, command: JobCommands) -> Res
 }
 
 fn job_json(job: &v2::Job) -> Value {
-    json!({ "job_id": job.job_id, "state": state_name(job.state),
+    json!({ "job_id": job.job_id, "namespace": job.namespace, "state": state_name(job.state),
         "durability": if job.durability == v2::Durability::Durable as i32 { "durable" } else { "ephemeral" },
         "interface": job.interface, "attempt_count": job.attempt_count,
         "current_attempt_id": job.current_attempt_id, "current_worker_id": job.current_worker_id,
