@@ -6,7 +6,7 @@ Optional standalone GitHub OAuth login and self-service token portal plugin for 
 
 1. Users sign in with GitHub on `/tokens` (OAuth callback: `<ANYSERVE_AUTH_PUBLIC_URL>/auth/github/callback`).
 2. Each GitHub user is mapped strictly to isolated namespace `gh-<github_id>` and can mint, inspect, and immediately revoke `client` and `worker` signed tokens (`asv1.*`, never operator-privileged).
-3. `anyserve` validates signed tokens locally with `ANYSERVE_TOKEN_SIGNING_KEY` and polls `/internal/revocations` via `ANYSERVE_AUTH_REVOCATION_URL` for near-instant revocation without restarting or dropping active worker WebSockets.
+3. `anyserve` validates signed tokens locally with `ANYSERVE_TOKEN_SIGNING_KEY` and polls `/internal/revocations` via `ANYSERVE_AUTH_REVOCATION_URL` for near-instant revocation without restarting—proactively disconnecting revoked or expired worker sessions while leaving unaffected workers connected.
 
 ## Docker Compose / CLI usage
 

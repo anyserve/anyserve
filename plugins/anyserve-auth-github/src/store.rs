@@ -168,26 +168,6 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub async fn count_active_tokens(&self, github_id: i64, now_secs: u64) -> Result<u64> {
-        let now_i64 = i64::try_from(now_secs).context("timestamp out of range")?;
-        let row = sqlx::query(
-            r#"
-            SELECT COUNT(*) AS cnt
-            FROM tokens
-            WHERE github_id = ?1
-              AND revoked_at IS NULL
-              AND (expires_at IS NULL OR expires_at > ?2)
-            "#,
-        )
-        .bind(github_id)
-        .bind(now_i64)
-        .fetch_one(&self.pool)
-        .await
-        .context("count active tokens")?;
-        let count: i64 = row.try_get("cnt")?;
-        Ok(u64::try_from(count.max(0)).unwrap_or(0))
-    }
-
     pub async fn list_user_tokens(&self, github_id: i64) -> Result<Vec<TokenRecord>> {
         let rows = sqlx::query(
             r#"
@@ -218,38 +198,6 @@ impl SqliteStore {
             });
         }
         Ok(out)
-    }
-
-    pub async fn insert_token(
-        &self,
-        github_id: i64,
-        namespace: &str,
-        record: &TokenRecord,
-    ) -> Result<()> {
-        let created = i64::try_from(record.created_at).context("created_at out of range")?;
-        let expires = record
-            .expires_at
-            .map(i64::try_from)
-            .transpose()
-            .context("expires_at out of range")?;
-        sqlx::query(
-            r#"
-            INSERT INTO tokens(jti, github_id, namespace, role, label, token_preview, created_at, expires_at, revoked_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
-            "#,
-        )
-        .bind(&record.jti)
-        .bind(github_id)
-        .bind(namespace)
-        .bind(&record.role)
-        .bind(&record.label)
-        .bind(&record.token_preview)
-        .bind(created)
-        .bind(expires)
-        .execute(&self.pool)
-        .await
-        .context("insert minted token metadata")?;
-        Ok(())
     }
 
     pub async fn revoke_token(&self, github_id: i64, jti: &str, now_secs: u64) -> Result<bool> {
@@ -317,15 +265,74 @@ impl SqliteStore {
         Ok(count)
     }
 
-    pub async fn revocation_snapshot(&self, now_secs: u64) -> Result<RevocationSnapshot> {
+    /// Records a minted token unless the user already holds `max_tokens` active ones;
+    /// returns `false` at the limit. One statement keeps the count and the insert atomic.
+    pub async fn mint_token_with_limit(
+        &self,
+        github_id: i64,
+        namespace: &str,
+        record: &TokenRecord,
+        now_secs: u64,
+        max_tokens: u64,
+    ) -> Result<bool> {
+        let now_i64 = i64::try_from(now_secs).context("timestamp out of range")?;
+        let created = i64::try_from(record.created_at).context("created_at out of range")?;
+        let expires = record
+            .expires_at
+            .map(i64::try_from)
+            .transpose()
+            .context("expires_at out of range")?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO tokens(jti, github_id, namespace, role, label, token_preview, created_at, expires_at, revoked_at)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL
+            WHERE (
+                SELECT COUNT(*)
+                FROM tokens
+                WHERE github_id = ?2
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > ?9)
+            ) < ?10
+            "#,
+        )
+        .bind(&record.jti)
+        .bind(github_id)
+        .bind(namespace)
+        .bind(&record.role)
+        .bind(&record.label)
+        .bind(&record.token_preview)
+        .bind(created)
+        .bind(expires)
+        .bind(now_i64)
+        .bind(i64::try_from(max_tokens).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .context("insert minted token metadata")?
+        .rows_affected();
+        Ok(inserted == 1)
+    }
+
+    pub async fn revocation_snapshot_if_changed(
+        &self,
+        since_version: Option<u64>,
+        now_secs: u64,
+    ) -> Result<Option<RevocationSnapshot>> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin revocation snapshot transaction")?;
         let ver_row = sqlx::query(
             "SELECT CAST(value AS INTEGER) AS v FROM meta WHERE key = 'revocation_version'",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .context("read revocation_version")?;
         let version_i64: i64 = ver_row.try_get("v")?;
         let version = u64::try_from(version_i64.max(0)).unwrap_or(0);
+        if since_version == Some(version) {
+            return Ok(None);
+        }
 
         let cutoff = i64::try_from(now_secs.saturating_sub(60)).unwrap_or(0);
         let jti_rows = sqlx::query(
@@ -337,7 +344,7 @@ impl SqliteStore {
             "#,
         )
         .bind(cutoff)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .context("read active revoked jtis")?;
 
@@ -345,9 +352,10 @@ impl SqliteStore {
         for row in jti_rows {
             revoked_jtis.push(row.try_get("jti")?);
         }
-        Ok(RevocationSnapshot {
+        tx.commit().await.context("commit revocation snapshot tx")?;
+        Ok(Some(RevocationSnapshot {
             version,
             revoked_jtis,
-        })
+        }))
     }
 }

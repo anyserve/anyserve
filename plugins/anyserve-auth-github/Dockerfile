@@ -10,6 +10,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release -p anyserve-auth-github && cp target/release/anyserve-auth-github /usr/local/bin/anyserve-auth-github
 
 FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin anyserve && \
+    mkdir -p /data && chown 10001:10001 /data
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /usr/local/bin/anyserve-auth-github /usr/local/bin/anyserve-auth-github
+USER anyserve
 ENTRYPOINT ["anyserve-auth-github"]

@@ -284,8 +284,19 @@ pub(crate) struct State {
     pub rng: u64,
     pub connection_seq: u64,
     pub shutting_down: bool,
+    pub counters: LifecycleCounters,
     /// Taken out under the lock, freed once it is released.
     pub released: Released,
+}
+
+/// Monotonic totals since this Runtime started.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LifecycleCounters {
+    pub jobs_submitted: u64,
+    pub jobs_succeeded: u64,
+    pub jobs_failed: u64,
+    pub jobs_cancelled: u64,
+    pub attempts_started: u64,
 }
 
 impl State {
@@ -340,6 +351,16 @@ impl State {
         map.entry(namespace.to_string())
             .or_default()
             .insert(key.to_string(), 1);
+    }
+
+    /// Removes `namespace -> key` and drops the namespace map once it is empty.
+    pub(crate) fn remove_nested<T>(map: &mut NsIfaceMap<T>, namespace: &str, key: &str) {
+        if let Some(m) = map.get_mut(namespace) {
+            m.remove(key);
+            if m.is_empty() {
+                map.remove(namespace);
+            }
+        }
     }
 
     pub(crate) fn dec_in(map: &mut NsIfaceMap<usize>, namespace: &str, key: &str) {
@@ -634,6 +655,8 @@ pub(crate) struct Session {
     pub namespace: String,
     pub pool: String,
     pub forced_pool: Option<String>,
+    pub token_jti: Option<String>,
+    pub token_exp: Option<u64>,
     pub interfaces: BTreeSet<String>,
     pub attributes: Metadata,
     pub metadata: Metadata,

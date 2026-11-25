@@ -54,6 +54,7 @@ struct TestWorker {
     control: tokio::sync::mpsc::Sender<pb::WorkerMessage>,
     messages: tonic::Streaming<pb::ServerMessage>,
     client: pb::worker_client::WorkerClient<tonic::transport::Channel>,
+    namespace: Option<String>,
 }
 
 impl TestWorker {
@@ -104,7 +105,20 @@ impl TestWorker {
             control,
             messages,
             client: pb::worker_client::WorkerClient::new(channel),
+            namespace: namespace.map(str::to_string),
         }
+    }
+
+    fn attempt_request(
+        &self,
+        rx: tokio::sync::mpsc::Receiver<pb::AttemptUp>,
+    ) -> tonic::Request<ReceiverStream<pb::AttemptUp>> {
+        let mut req = tonic::Request::new(ReceiverStream::new(rx));
+        if let Some(ns) = &self.namespace {
+            req.metadata_mut()
+                .insert("x-anyserve-namespace", ns.parse().unwrap());
+        }
+        req
     }
 
     async fn next_assign(&mut self) -> pb::Assign {
@@ -156,7 +170,7 @@ impl TestWorker {
         .unwrap();
         let mut down = self
             .client
-            .attempt(ReceiverStream::new(rx))
+            .attempt(self.attempt_request(rx))
             .await
             .unwrap()
             .into_inner();
@@ -206,7 +220,7 @@ impl TestWorker {
         .unwrap();
         let mut down = self
             .client
-            .attempt(ReceiverStream::new(rx))
+            .attempt(self.attempt_request(rx))
             .await
             .unwrap()
             .into_inner();

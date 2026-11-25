@@ -33,6 +33,15 @@ const GRPC_CODE_HEADER: &str = "x-anyserve-grpc-code";
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+#[derive(Debug)]
+pub(crate) enum ExecuteError {
+    /// Pre-admission failure safe to fail over to another endpoint (TCP connect
+    /// refused or explicit server `x-anyserve-grpc-code: 14` standby/unavailable).
+    Retryable(Status),
+    /// Mid-flight or terminal failure that must NOT be retried across endpoints.
+    Fatal(Status),
+}
+
 #[derive(Clone)]
 pub(crate) struct HttpWsClient {
     http_base: String,
@@ -53,11 +62,11 @@ impl HttpWsClient {
         })
     }
 
-    pub(crate) async fn unary<Req, Resp>(&self, path: &str, req: &Req) -> Result<Resp, Status>
-    where
-        Req: ProstMessage,
-        Resp: ProstMessage + Default,
-    {
+    async fn post_proto<Req: ProstMessage>(
+        &self,
+        path: &str,
+        req: &Req,
+    ) -> Result<(http::StatusCode, http::HeaderMap, bytes::Bytes), reqwest::Error> {
         let url = format!("{}{path}", self.http_base);
         let mut builder = self
             .http
@@ -70,10 +79,22 @@ impl HttpWsClient {
         if let Some(ns) = self.auth.namespace_header() {
             builder = builder.header(NAMESPACE_HEADER, ns);
         }
-        let resp = builder.send().await.map_err(map_reqwest_error)?;
+        let resp = builder.send().await?;
         let status = resp.status();
         let headers = resp.headers().clone();
-        let body = resp.bytes().await.map_err(map_reqwest_error)?;
+        let body = resp.bytes().await?;
+        Ok((status, headers, body))
+    }
+
+    pub(crate) async fn unary<Req, Resp>(&self, path: &str, req: &Req) -> Result<Resp, Status>
+    where
+        Req: ProstMessage,
+        Resp: ProstMessage + Default,
+    {
+        let (status, headers, body) = self
+            .post_proto(path, req)
+            .await
+            .map_err(map_reqwest_error)?;
         if !status.is_success() {
             return Err(status_from_http_parts(status, &headers, &body));
         }
@@ -92,6 +113,52 @@ impl HttpWsClient {
         )
         .await?;
         Ok(ExecutionEvents::new(RpcStream::Ws(rx)))
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        start: &v2::InvokeStart,
+    ) -> Result<v2::ExecutionEvent, ExecuteError> {
+        let (status, headers, body) = self
+            .post_proto("/rpc/v2/client/execute", start)
+            .await
+            .map_err(|err| {
+                let is_connect = err.is_connect();
+                let status = map_reqwest_error(err);
+                if is_connect {
+                    ExecuteError::Retryable(status)
+                } else {
+                    ExecuteError::Fatal(status)
+                }
+            })?;
+        if !status.is_success() {
+            let grpc_status = status_from_http_parts(status, &headers, &body);
+            let retryable = explicit_grpc_code(&headers) == Some(Code::Unavailable)
+                && !grpc_status
+                    .message()
+                    .contains("execution ended without a terminal event");
+            return Err(if retryable {
+                ExecuteError::Retryable(grpc_status)
+            } else {
+                ExecuteError::Fatal(grpc_status)
+            });
+        }
+        if !is_protobuf_content_type(&headers) || body.is_empty() {
+            return Err(ExecuteError::Fatal(Status::internal(
+                "unexpected empty or non-protobuf response from /rpc/v2/client/execute",
+            )));
+        }
+        let event = v2::ExecutionEvent::decode(body).map_err(|err| {
+            ExecuteError::Fatal(Status::internal(format!(
+                "decode protobuf response from /rpc/v2/client/execute: {err}"
+            )))
+        })?;
+        if !matches!(event.event, Some(v2::execution_event::Event::Finished(_))) {
+            return Err(ExecuteError::Fatal(Status::internal(
+                "response from /rpc/v2/client/execute did not contain a terminal Finished event",
+            )));
+        }
+        Ok(event)
     }
 
     pub(crate) async fn invoke_stream(
@@ -133,11 +200,31 @@ pub(crate) fn build_http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(20)))
+        .tcp_keepalive_interval(Some(Duration::from_secs(20)))
         .build()
         .context("build anyserve HTTP client")
 }
 
+/// Whether reqwest will route through a proxy, so a direct TCP dial proves nothing.
+fn has_proxy_env() -> bool {
+    const VARS: [&str; 6] = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    VARS.iter()
+        .any(|key| std::env::var(key).is_ok_and(|val| !val.trim().is_empty()))
+}
+
+/// Fails fast when the endpoint is unreachable; skipped behind a proxy.
 pub(crate) async fn probe_tcp(endpoint: &str) -> Result<()> {
+    if has_proxy_env() {
+        return Ok(());
+    }
     let uri: http::Uri = endpoint
         .parse()
         .with_context(|| format!("parse anyserve endpoint '{endpoint}'"))?;
@@ -412,18 +499,32 @@ fn decode_envelope<T: ProstMessage + Default>(data: &[u8]) -> Result<T, Status> 
     }
 }
 
-pub(crate) fn status_from_http_parts(
-    status: http::StatusCode,
-    headers: &http::HeaderMap,
-    body: &[u8],
-) -> Status {
-    let code = headers
+fn explicit_grpc_code(headers: &http::HeaderMap) -> Option<Code> {
+    headers
         .get(GRPC_CODE_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| raw.trim().parse::<i32>().ok())
         .filter(|&code| code > 0)
         .map(Code::from_i32)
-        .unwrap_or_else(|| fallback_code_from_http(status));
+}
+
+fn is_protobuf_content_type(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| raw.split(';').next().unwrap_or("").trim())
+        .is_some_and(|ct| {
+            ct.eq_ignore_ascii_case("application/x-protobuf")
+                || ct.eq_ignore_ascii_case("application/octet-stream")
+        })
+}
+
+pub(crate) fn status_from_http_parts(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> Status {
+    let code = explicit_grpc_code(headers).unwrap_or_else(|| fallback_code_from_http(status));
     let message = if body.is_empty() {
         status
             .canonical_reason()
@@ -444,7 +545,9 @@ fn fallback_code_from_http(status: http::StatusCode) -> Code {
         409 => Code::AlreadyExists,
         412 => Code::FailedPrecondition,
         413 | 429 => Code::ResourceExhausted,
-        502..=504 => Code::Unavailable,
+        501 => Code::Unimplemented,
+        502 | 503 => Code::Unavailable,
+        504 => Code::DeadlineExceeded,
         _ => Code::Internal,
     }
 }
@@ -1174,9 +1277,10 @@ mod tests {
             ),
             (http::StatusCode::PAYLOAD_TOO_LARGE, Code::ResourceExhausted),
             (http::StatusCode::TOO_MANY_REQUESTS, Code::ResourceExhausted),
+            (http::StatusCode::NOT_IMPLEMENTED, Code::Unimplemented),
             (http::StatusCode::BAD_GATEWAY, Code::Unavailable),
             (http::StatusCode::SERVICE_UNAVAILABLE, Code::Unavailable),
-            (http::StatusCode::GATEWAY_TIMEOUT, Code::Unavailable),
+            (http::StatusCode::GATEWAY_TIMEOUT, Code::DeadlineExceeded),
             (http::StatusCode::INTERNAL_SERVER_ERROR, Code::Internal),
             (http::StatusCode::IM_A_TEAPOT, Code::Internal),
         ];
@@ -1653,5 +1757,191 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.job.unwrap().namespace, "leader2");
+    }
+
+    #[tokio::test]
+    async fn execute_pooled_http_ws_fallback_validation_and_failover_safety() {
+        #[derive(Clone, Copy)]
+        enum ExecMode {
+            OkFinished,
+            NotImplemented,
+            NotFound,
+            Empty200,
+            Html200,
+            NonTerminal200,
+            GatewayTimeout,
+            Standby503WithHeader,
+            RawProxy503NoHeader,
+            MidFlightDrop,
+        }
+
+        async fn spawn_exec_mock(mode: ExecMode, name: &str) -> (TestServer, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_clone = Arc::clone(&calls);
+            let name_owned = name.to_owned();
+            let ws_state = MockState::new(name);
+            let app = Router::new()
+                .route(
+                    "/rpc/v2/client/execute",
+                    post(move |body: Bytes| {
+                        let calls = Arc::clone(&calls_clone);
+                        let name = name_owned.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let _ = v2::InvokeStart::decode(body);
+                            match mode {
+                                ExecMode::OkFinished => proto_response(&v2::ExecutionEvent {
+                                    job_id: format!("exec-{name}"),
+                                    event: Some(v2::execution_event::Event::Finished(
+                                        v2::ExecutionFinished {
+                                            state: v2::JobState::Succeeded as i32,
+                                            ..Default::default()
+                                        },
+                                    )),
+                                    ..Default::default()
+                                }),
+                                ExecMode::NotImplemented => {
+                                    http_error(StatusCode::NOT_IMPLEMENTED, None, "unimplemented")
+                                }
+                                ExecMode::NotFound => {
+                                    http_error(StatusCode::NOT_FOUND, None, "not found")
+                                }
+                                ExecMode::Empty200 => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(
+                                        axum::http::header::CONTENT_TYPE,
+                                        "application/x-protobuf",
+                                    )
+                                    .body(axum::body::Body::empty())
+                                    .unwrap(),
+                                ExecMode::Html200 => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(axum::http::header::CONTENT_TYPE, "text/html")
+                                    .body(axum::body::Body::from("<html>ok</html>"))
+                                    .unwrap(),
+                                ExecMode::NonTerminal200 => proto_response(&v2::ExecutionEvent {
+                                    job_id: "not-done".into(),
+                                    event: Some(v2::execution_event::Event::Accepted(
+                                        v2::Accepted {},
+                                    )),
+                                    ..Default::default()
+                                }),
+                                ExecMode::GatewayTimeout => {
+                                    http_error(StatusCode::GATEWAY_TIMEOUT, None, "proxy timeout")
+                                }
+                                ExecMode::Standby503WithHeader => http_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    Some(Code::Unavailable),
+                                    "standby replica",
+                                ),
+                                ExecMode::RawProxy503NoHeader => http_error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    None,
+                                    "upstream overloaded",
+                                ),
+                                ExecMode::MidFlightDrop => unreachable!(),
+                            }
+                        }
+                    }),
+                )
+                .route("/ws/v2/client/invoke", get(handle_invoke))
+                .with_state(ws_state);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = if matches!(mode, ExecMode::MidFlightDrop) {
+                let calls_drop = Arc::clone(&calls);
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    while let Ok((mut sock, _)) = listener.accept().await {
+                        let mut buf = [0u8; 1024];
+                        let n = sock.read(&mut buf).await.unwrap_or(0);
+                        if n > 0 {
+                            calls_drop.fetch_add(1, Ordering::SeqCst);
+                        }
+                        drop(sock);
+                    }
+                })
+            } else {
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                })
+            };
+            (
+                TestServer {
+                    ws_url: format!("ws://{addr}"),
+                    task,
+                },
+                calls,
+            )
+        }
+
+        // 1. Pooled HTTP execute success.
+        let (ok_srv, ok_calls) = spawn_exec_mock(ExecMode::OkFinished, "ok").await;
+        let mut client = ExecutionClient::connect(&ok_srv.ws_url).await.unwrap();
+        let ev = client.execute(v2::JobSpec::default()).await.unwrap();
+        assert_eq!(ev.job_id, "exec-ok");
+        assert_eq!(ok_calls.load(Ordering::SeqCst), 1);
+
+        // 2. 501 and 404 fall back cleanly to WS invoke.
+        for (mode, name) in [
+            (ExecMode::NotImplemented, "fb501"),
+            (ExecMode::NotFound, "fb404"),
+        ] {
+            let (srv, _) = spawn_exec_mock(mode, name).await;
+            let mut c = ExecutionClient::connect(&srv.ws_url).await.unwrap();
+            let ev = c.execute(v2::JobSpec::default()).await.unwrap();
+            assert_eq!(ev.job_id, name);
+            assert!(matches!(
+                ev.event,
+                Some(v2::execution_event::Event::Finished(_))
+            ));
+        }
+
+        // 3. Empty 200, HTML 200, and non-terminal 200 rejected with Code::Internal.
+        for mode in [
+            ExecMode::Empty200,
+            ExecMode::Html200,
+            ExecMode::NonTerminal200,
+        ] {
+            let (srv, _) = spawn_exec_mock(mode, "bad200").await;
+            let mut c = ExecutionClient::connect(&srv.ws_url).await.unwrap();
+            assert_eq!(
+                c.execute(v2::JobSpec::default()).await.unwrap_err().code(),
+                Code::Internal
+            );
+        }
+
+        // 4. Standby 503 + x-anyserve-grpc-code: 14 fails over to healthy leader2.
+        let (standby, _) = spawn_exec_mock(ExecMode::Standby503WithHeader, "standby").await;
+        let (leader2, l2_calls) = spawn_exec_mock(ExecMode::OkFinished, "leader2").await;
+        let mut c = ExecutionClient::connect(&format!("{},{}", standby.ws_url, leader2.ws_url))
+            .await
+            .unwrap();
+        let ev = c.execute(v2::JobSpec::default()).await.unwrap();
+        assert_eq!(ev.job_id, "exec-leader2");
+        assert_eq!(l2_calls.load(Ordering::SeqCst), 1);
+
+        // 5. 504 => DeadlineExceeded, raw proxy 503 (no grpc code header), and mid-flight TCP drop
+        //    must NEVER retry on leader2!
+        for (mode, expected_code) in [
+            (ExecMode::GatewayTimeout, Code::DeadlineExceeded),
+            (ExecMode::RawProxy503NoHeader, Code::Unavailable),
+            (ExecMode::MidFlightDrop, Code::Unavailable),
+        ] {
+            let (bad1, bad1_calls) = spawn_exec_mock(mode, "bad1").await;
+            let (backup, backup_calls) = spawn_exec_mock(ExecMode::OkFinished, "backup").await;
+            let mut c = ExecutionClient::connect(&format!("{},{}", bad1.ws_url, backup.ws_url))
+                .await
+                .unwrap();
+            let err = c.execute(v2::JobSpec::default()).await.unwrap_err();
+            assert_eq!(err.code(), expected_code);
+            assert_eq!(bad1_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                backup_calls.load(Ordering::SeqCst),
+                0,
+                "execute must not duplicate across endpoints after non-standby failure"
+            );
+        }
     }
 }

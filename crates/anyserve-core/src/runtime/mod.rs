@@ -376,39 +376,27 @@ impl Inner {
         if session.tx.is_some() || session.connection != connection {
             return;
         }
-        let leases: Vec<String> = session.active.iter().cloned().collect();
-        for lease_id in leases {
-            let Some(lease) = st.leases.get(&lease_id) else {
-                continue;
-            };
-            if lease.cancelling {
-                self.release_lease_locked(st, &lease_id);
-                continue;
-            }
-            let job_id = lease.job_id.clone();
-            let current = st.jobs.get(&job_id).is_some_and(|job| {
-                job.attempt.as_ref().is_some_and(|a| a.lease_id == lease_id)
-                    && matches!(job.phase, Phase::Assigned | Phase::Running)
-            });
-            if current {
-                self.attempt_ended_locked(
-                    st,
-                    &job_id,
-                    ErrorInfo::new(codes::WORKER_LOST, "worker session ended", true),
-                    LeaseEnd::Release,
-                    None,
-                    now,
-                );
-            }
-        }
-        st.remove_session(session_id);
+        self.evict_session_locked(st, session_id, "worker session ended", now);
     }
 
     fn maintain(&self) {
         let now = now_ms();
+        let now_secs = now / 1000;
         {
             let mut st = self.lock();
             self.evict_terminal_locked(&mut st, now);
+            let expired: Vec<String> = st
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.token_exp.is_some_and(|exp| exp <= now_secs))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !expired.is_empty() {
+                for session_id in expired {
+                    self.revoke_session_locked(&mut st, &session_id, now);
+                }
+                self.dispatch_locked(&mut st, now);
+            }
         }
         if matches!(
             *self.journal_status.lock().expect("journal status poisoned"),
@@ -968,9 +956,21 @@ impl Runtime {
                 limits.max_inline_total_bytes
             )));
         }
+        let ident_limit = limits.max_identifier_bytes as usize;
+        if spec.demand.affinity_key.len() > ident_limit
+            || spec.policy.fairness_key.len() > ident_limit
+            || spec.policy.concurrency_key.len() > ident_limit
+        {
+            return Err(RuntimeError::invalid(format!(
+                "routing keys (affinity_key, fairness_key, concurrency_key) must be at most {ident_limit} bytes"
+            )));
+        }
         let metadata_bytes =
             |m: &api::Metadata| m.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
         let metadata = spec.demand.interface.len()
+            + spec.demand.affinity_key.len()
+            + spec.policy.fairness_key.len()
+            + spec.policy.concurrency_key.len()
             + metadata_bytes(&spec.metadata)
             + metadata_bytes(&spec.demand.required_attributes)
             + metadata_bytes(&spec.demand.preferred_attributes)
@@ -1118,7 +1118,8 @@ impl Runtime {
                     );
                     if durability == Durability::Ephemeral {
                         let view = st.jobs[&scoped_id].view(false);
-                        self.inner.dispatch_locked(&mut st, now);
+                        self.inner
+                            .dispatch_pair_locked(&mut st, namespace, &view.interface, now);
                         Next::Done(Box::new(SubmitOutcome {
                             job: view,
                             created: true,
@@ -1220,10 +1221,12 @@ impl Runtime {
                     );
                     let job = st.jobs.get_mut(&scoped_id).expect("job");
                     job.streamed = true;
+                    let iface = job.spec.demand.interface.clone();
                     let log = Arc::clone(&job.log);
                     log.set_primary(true);
                     let changes = log.subscribe();
-                    self.inner.dispatch_locked(&mut st, now);
+                    self.inner
+                        .dispatch_pair_locked(&mut st, namespace, &iface, now);
                     (log, changes)
                 }
             }
@@ -1614,7 +1617,7 @@ impl Runtime {
             let reason = if reason.trim().is_empty() {
                 "cancelled".to_string()
             } else {
-                reason
+                api::truncate_utf8(reason, api::MAX_ERROR_MESSAGE_BYTES)
             };
             job.cancel_requested.get_or_insert(reason);
             job.waiters.push(tx);
@@ -1661,6 +1664,34 @@ impl Runtime {
             .filter(|session| session.namespace == namespace && session.worker_id == worker_id)
             .min_by(|a, b| a.id.cmp(&b.id))
             .map(state::Session::worker_view)
+    }
+
+    /// Immediately revokes and fences worker sessions (connected or in reconnect
+    /// grace) whose signed token JTI has been revoked or whose credential has expired.
+    pub fn disconnect_revoked_and_expired_sessions(&self, auth: &crate::auth::AuthPolicy) -> usize {
+        let now = now_ms();
+        let now_secs = now / 1000;
+        let mut st = self.inner.lock();
+        let victims: Vec<String> = st
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session
+                    .token_jti
+                    .as_deref()
+                    .is_some_and(|jti| auth.is_jti_revoked(jti))
+                    || session.token_exp.is_some_and(|exp| exp <= now_secs)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let count = victims.len();
+        for session_id in victims {
+            self.inner.revoke_session_locked(&mut st, &session_id, now);
+        }
+        if count > 0 {
+            self.inner.dispatch_locked(&mut st, now);
+        }
+        count
     }
 
     fn health_locked(&self, st: &State, journal: api::JournalHealth) -> Health {
@@ -1771,7 +1802,8 @@ impl Runtime {
             if session.tx.is_some() && !session.draining {
                 workers.healthy += 1;
                 for (name, value) in &session.total_capacity {
-                    *workers.total_capacity.entry(name.clone()).or_insert(0) += value;
+                    let entry = workers.total_capacity.entry(name.clone()).or_insert(0);
+                    *entry = entry.saturating_add(*value);
                 }
             }
             if session.interfaces.len() > 1 && !session.active.is_empty() {
@@ -1853,13 +1885,16 @@ impl Runtime {
                 ((ns.to_string(), iface.to_string(), pool.to_string()), stats)
             })
             .collect();
-        let (input_bytes, result_bytes, event_bytes) = if namespace_filter.is_some() {
-            (0, 0, 0)
+        let ((input_bytes, result_bytes, event_bytes), counters) = if namespace_filter.is_some() {
+            Default::default()
         } else {
             (
-                self.inner.input_budget.used(),
-                self.inner.result_budget.used(),
-                self.inner.event_budget.used(),
+                (
+                    self.inner.input_budget.used(),
+                    self.inner.result_budget.used(),
+                    self.inner.event_budget.used(),
+                ),
+                st.counters,
             )
         };
         (
@@ -1878,6 +1913,11 @@ impl Runtime {
                 input_bytes,
                 result_bytes,
                 event_bytes,
+                jobs_submitted_total: counters.jobs_submitted,
+                jobs_succeeded_total: counters.jobs_succeeded,
+                jobs_failed_total: counters.jobs_failed,
+                jobs_cancelled_total: counters.jobs_cancelled,
+                attempts_started_total: counters.attempts_started,
             },
             workers,
         )

@@ -24,11 +24,67 @@ use crate::now_ms;
 
 /// How often a frame waiting for room in the shared event budget retries.
 const BUDGET_RETRY: Duration = Duration::from_millis(250);
+/// Bounds on worker-reported `Load.custom` entries kept per session.
+const MAX_LOAD_CUSTOM_ENTRIES: usize = 64;
+const MAX_LOAD_CUSTOM_KEY_BYTES: usize = 128;
+const MAX_LOAD_CUSTOM_TOTAL_KEY_BYTES: usize = 8192;
+
+/// The only place worker-reported load is sanitized: `load_score` trusts the result.
+fn worker_load(load: pb::Load) -> WorkerLoad {
+    let utilization = if load.utilization.is_finite() {
+        load.utilization.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut custom = std::collections::BTreeMap::new();
+    let mut key_bytes = 0usize;
+    for (k, v) in load.custom {
+        if !v.is_finite() || k.is_empty() || k.len() > MAX_LOAD_CUSTOM_KEY_BYTES {
+            continue;
+        }
+        if custom.len() >= MAX_LOAD_CUSTOM_ENTRIES
+            || key_bytes + k.len() > MAX_LOAD_CUSTOM_TOTAL_KEY_BYTES
+        {
+            break;
+        }
+        key_bytes += k.len();
+        custom.insert(k, v);
+    }
+    WorkerLoad {
+        queued: load.queued,
+        running: load.running,
+        utilization,
+        custom,
+    }
+}
 
 pub(crate) struct SessionHandle {
     pub session_id: String,
     pub connection: u64,
     pub messages: mpsc::Receiver<pb::ServerMessage>,
+}
+
+/// Failure opening a worker session or attempt stream: either the signed
+/// credential was revoked/expired under the runtime lock, or a domain error.
+#[derive(Debug)]
+pub(crate) enum WorkerOpenError {
+    Unauthenticated(&'static str),
+    Runtime(RuntimeError),
+}
+
+impl From<RuntimeError> for WorkerOpenError {
+    fn from(err: RuntimeError) -> Self {
+        Self::Runtime(err)
+    }
+}
+
+impl From<WorkerOpenError> for tonic::Status {
+    fn from(err: WorkerOpenError) -> Self {
+        match err {
+            WorkerOpenError::Unauthenticated(msg) => tonic::Status::unauthenticated(msg),
+            WorkerOpenError::Runtime(err) => err.into(),
+        }
+    }
 }
 
 /// What an `Attempt` stream may do.
@@ -81,19 +137,25 @@ impl Runtime {
                 role: crate::auth::Role::Worker,
                 ..Default::default()
             },
+            &crate::auth::AuthPolicy::default(),
         )
+        .map_err(|err| match err {
+            WorkerOpenError::Runtime(err) => err,
+            WorkerOpenError::Unauthenticated(msg) => RuntimeError::invalid(msg),
+        })
     }
 
     pub(crate) fn open_session_for(
         &self,
         hello: pb::Hello,
         principal: crate::auth::Principal,
-    ) -> Result<SessionHandle, RuntimeError> {
+        auth: &crate::auth::AuthPolicy,
+    ) -> Result<SessionHandle, WorkerOpenError> {
         self.ensure_active_leader()?;
         let limits = &self.inner.config.limits;
         let identifier = limits.max_identifier_bytes as usize;
         if hello.interfaces.is_empty() {
-            return Err(RuntimeError::invalid("Hello.interfaces is required"));
+            return Err(RuntimeError::invalid("Hello.interfaces is required").into());
         }
         if hello.interfaces.len() > limits.max_objects as usize
             || !hello.interfaces.iter().all(|i| is_valid_interface_name(i))
@@ -101,7 +163,8 @@ impl Runtime {
             return Err(RuntimeError::invalid(format!(
                 "Hello.interfaces entries must be 1..={MAX_INTERFACE_BYTES} bytes (no ASCII whitespace or control characters) and at most {} interfaces",
                 limits.max_objects
-            )));
+            ))
+            .into());
         }
         if hello.worker_id.len() > identifier
             || hello.resume_session_id.len() > identifier
@@ -109,19 +172,54 @@ impl Runtime {
         {
             return Err(RuntimeError::invalid(format!(
                 "Hello identifiers must be at most {identifier} bytes"
-            )));
+            ))
+            .into());
         }
         if hello.held_lease_ids.len() > limits.max_objects as usize {
-            return Err(RuntimeError::invalid("too many held leases"));
+            return Err(RuntimeError::invalid("too many held leases").into());
+        }
+        if hello.max_concurrency > 65_536 {
+            return Err(
+                RuntimeError::invalid("Hello.max_concurrency must be at most 65536").into(),
+            );
+        }
+        if hello.total_capacity.len() > limits.max_objects as usize {
+            return Err(RuntimeError::invalid(format!(
+                "Hello.total_capacity may contain at most {} entries",
+                limits.max_objects
+            ))
+            .into());
+        }
+        let mut capacity_key_bytes = 0usize;
+        for (key, value) in &hello.total_capacity {
+            if key.is_empty() || key.len() > identifier {
+                return Err(RuntimeError::invalid(format!(
+                    "Hello.total_capacity keys must be 1..={identifier} bytes"
+                ))
+                .into());
+            }
+            if *value < 0 {
+                return Err(RuntimeError::invalid(
+                    "Hello.total_capacity values cannot be negative",
+                )
+                .into());
+            }
+            capacity_key_bytes += key.len();
         }
         let attributes = to_metadata(hello.attributes);
         let metadata = to_metadata(hello.metadata);
         let limit = limits.max_metadata_bytes as usize;
         let interface_bytes: usize = hello.interfaces.iter().map(String::len).sum();
-        if metadata_size(&attributes) + metadata_size(&metadata) + interface_bytes > limit {
+        if metadata_size(&attributes)
+            + metadata_size(&metadata)
+            + interface_bytes
+            + capacity_key_bytes
+            > limit
+        {
             return Err(RuntimeError::invalid(format!(
                 "worker attributes and metadata exceed {limit} bytes"
-            )));
+            ))
+            .into());
         }
         let worker_id = if hello.worker_id.trim().is_empty() {
             new_id()
@@ -135,14 +233,22 @@ impl Runtime {
             .forced_pool
             .clone()
             .unwrap_or_else(|| hello.pool.clone());
-        let namespace = principal.namespace;
 
         let inner = &self.inner;
         let mut st = inner.lock();
         let now = now_ms();
-        if st.shutting_down {
-            return Err(RuntimeError::unavailable("runtime is shutting down"));
+        if auth.is_principal_invalidated(&principal, now / 1000) {
+            auth.record_rejection();
+            return Err(WorkerOpenError::Unauthenticated(
+                "bearer token has been revoked or expired",
+            ));
         }
+        if st.shutting_down {
+            return Err(RuntimeError::unavailable("runtime is shutting down").into());
+        }
+        let namespace = principal.namespace;
+        let token_jti = principal.jti;
+        let token_exp = principal.exp;
         let resume = !hello.resume_session_id.is_empty()
             && st
                 .sessions
@@ -150,8 +256,43 @@ impl Runtime {
                 .is_some_and(|session| {
                     session.worker_id == worker_id && session.namespace == namespace
                 });
-        if !resume && st.sessions.len() >= inner.config.max_sessions {
-            return Err(RuntimeError::exhausted("worker session limit reached"));
+        if !resume {
+            if st.sessions.len() >= inner.config.max_sessions {
+                return Err(RuntimeError::exhausted("worker session limit reached").into());
+            }
+            if let Some(ns_limit) = inner.config.tenant_quotas.max_sessions_per_namespace {
+                let ns_sessions = st
+                    .sessions
+                    .values()
+                    .filter(|session| session.namespace == namespace)
+                    .count();
+                if ns_sessions >= ns_limit {
+                    return Err(RuntimeError::exhausted(format!(
+                        "worker session limit reached for namespace '{namespace}'"
+                    ))
+                    .into());
+                }
+            }
+        }
+        if let Some(ns_iface_limit) = inner.config.tenant_quotas.max_interfaces_per_namespace {
+            let resuming_id = resume.then_some(hello.resume_session_id.as_str());
+            let kept_other = st.sessions_by_interface.get(&namespace).map_or(0, |m| {
+                m.iter()
+                    .filter(|(iface, ids)| {
+                        !interfaces.contains(iface.as_str())
+                            && match resuming_id {
+                                Some(sid) => ids.len() > 1 || !ids.contains(sid),
+                                None => !ids.is_empty(),
+                            }
+                    })
+                    .count()
+            });
+            if kept_other + interfaces.len() > ns_iface_limit {
+                return Err(RuntimeError::exhausted(format!(
+                    "registered interface limit reached for namespace '{namespace}'"
+                ))
+                .into());
+            }
         }
         st.connection_seq += 1;
         let connection = st.connection_seq;
@@ -162,11 +303,15 @@ impl Runtime {
         } else {
             new_id()
         };
+        let mut was_draining = false;
         if resume {
             st.unindex_session(&session_id);
             let session = st.sessions.get_mut(&session_id).expect("resumed session");
+            was_draining = session.draining;
             session.pool = pool;
             session.forced_pool = principal.forced_pool;
+            session.token_jti = token_jti;
+            session.token_exp = token_exp;
             session.interfaces = interfaces;
             session.attributes = attributes;
             session.metadata = metadata;
@@ -174,7 +319,6 @@ impl Runtime {
             session.max_concurrency = max_concurrency;
             session.reported_free = max_concurrency;
             session.assigned_since_report = 0;
-            session.draining = false;
             session.tx = Some(tx.clone());
             session.connection = connection;
             session.disconnected_at_ms = None;
@@ -188,6 +332,8 @@ impl Runtime {
                     namespace: namespace.clone(),
                     pool,
                     forced_pool: principal.forced_pool,
+                    token_jti,
+                    token_exp,
                     interfaces,
                     attributes,
                     metadata,
@@ -276,8 +422,13 @@ impl Runtime {
                 resumed_lease_ids: resumed,
             })),
         };
-        // The queue holds the welcome and every fence: capacity covers them.
+        // The queue holds the welcome, optional drain, and every fence: capacity covers them.
         let _ = tx.try_send(welcome);
+        if was_draining {
+            let _ = tx.try_send(pb::ServerMessage {
+                msg: Some(pb::server_message::Msg::Drain(pb::Drain {})),
+            });
+        }
         for lease_id in fenced {
             let _ = tx.try_send(pb::ServerMessage {
                 msg: Some(pb::server_message::Msg::Fence(pb::Fence {
@@ -357,12 +508,7 @@ impl Runtime {
             }
             pb::worker_message::Msg::Heartbeat(heartbeat) => {
                 if let Some(load) = heartbeat.load {
-                    session.load = WorkerLoad {
-                        queued: load.queued,
-                        running: load.running,
-                        utilization: load.utilization,
-                        custom: load.custom.into_iter().collect(),
-                    };
+                    session.load = worker_load(load);
                 }
             }
             pb::worker_message::Msg::Draining(draining) => {
@@ -436,7 +582,10 @@ impl Runtime {
                     let reason = if reply.reject_reason.is_empty() {
                         "worker rejected the assignment".to_string()
                     } else {
-                        reply.reject_reason
+                        super::api::truncate_utf8(
+                            reply.reject_reason,
+                            super::api::MAX_ERROR_MESSAGE_BYTES,
+                        )
                     };
                     inner.attempt_ended_locked(
                         &mut st,
@@ -470,15 +619,67 @@ impl Runtime {
         }
     }
 
+    /// Requests an active worker session to drain cleanly. A session of another tenant
+    /// (when `namespace` is given) is reported as not found.
+    pub fn drain_session(
+        &self,
+        namespace: Option<&str>,
+        session_id: &str,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_active_leader()?;
+        let inner = &self.inner;
+        let mut st = inner.lock();
+        let session = st
+            .sessions
+            .get_mut(session_id)
+            .filter(|session| namespace.is_none_or(|ns| session.namespace == ns))
+            .ok_or_else(|| RuntimeError::not_found("worker session", session_id))?;
+        session.draining = true;
+        inner.send_locked(
+            &mut st,
+            session_id,
+            pb::server_message::Msg::Drain(pb::Drain {}),
+            now_ms(),
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn open_attempt(
         &self,
         open: &pb::AttemptOpen,
     ) -> Result<(AttemptLink, u64), RuntimeError> {
+        let principal = crate::auth::Principal {
+            role: crate::auth::Role::Worker,
+            ..Default::default()
+        };
+        self.open_attempt_for(&principal, &crate::auth::AuthPolicy::default(), open)
+            .await
+            .map_err(|err| match err {
+                WorkerOpenError::Runtime(err) => err,
+                WorkerOpenError::Unauthenticated(msg) => RuntimeError::invalid(msg),
+            })
+    }
+
+    pub(crate) async fn open_attempt_for(
+        &self,
+        principal: &crate::auth::Principal,
+        auth: &crate::auth::AuthPolicy,
+        open: &pb::AttemptOpen,
+    ) -> Result<(AttemptLink, u64), WorkerOpenError> {
         self.ensure_active_leader()?;
-        if let Some(opened) = self.open_attempt_in_memory(open)? {
+        if let Some(opened) = self.open_attempt_in_memory(principal, auth, open)? {
             return Ok(opened);
         }
-        if self.receipt_on_disk(&open.lease_id).await?.is_some() {
+        if let Some((job_id, _)) = self.receipt_on_disk(&open.lease_id).await?
+            && super::identity::decode_scoped_id(&job_id).0 == principal.namespace
+        {
+            if auth.is_principal_invalidated(principal, now_ms() / 1000) {
+                auth.record_rejection();
+                return Err(WorkerOpenError::Unauthenticated(
+                    "bearer token has been revoked or expired",
+                ));
+            }
             return Ok((
                 AttemptLink::Replay {
                     lease_id: open.lease_id.clone(),
@@ -488,7 +689,8 @@ impl Runtime {
         }
         Err(RuntimeError::stale(
             "lease is not active in this generation and has no recorded outcome",
-        ))
+        )
+        .into())
     }
 
     /// Evicts the oldest terminal jobs to free `needed` result bytes; used
@@ -514,27 +716,42 @@ impl Runtime {
 
     fn open_attempt_in_memory(
         &self,
+        principal: &crate::auth::Principal,
+        auth: &crate::auth::AuthPolicy,
         open: &pb::AttemptOpen,
-    ) -> Result<Option<(AttemptLink, u64)>, RuntimeError> {
+    ) -> Result<Option<(AttemptLink, u64)>, WorkerOpenError> {
         let inner = &self.inner;
         let mut st = inner.lock();
         let now = now_ms();
-        let live = open.generation == st.generation
-            && st
-                .leases
-                .get(&open.lease_id)
-                .is_some_and(|lease| !lease.cancelling);
-        if live {
-            let job_id = st.leases[&open.lease_id].job_id.clone();
+        if auth.is_principal_invalidated(principal, now / 1000) {
+            auth.record_rejection();
+            return Err(WorkerOpenError::Unauthenticated(
+                "bearer token has been revoked or expired",
+            ));
+        }
+        let namespace = principal.namespace.as_str();
+        let live_job_id = (open.generation == st.generation)
+            .then(|| {
+                st.leases
+                    .get(&open.lease_id)
+                    .filter(|lease| !lease.cancelling)
+                    .map(|lease| lease.job_id.clone())
+            })
+            .flatten();
+        if let Some(job_id) = live_job_id {
             let job = st.jobs.get_mut(&job_id).expect("leased job");
+            if job.namespace != namespace {
+                return Err(RuntimeError::stale(
+                    "lease is not active in this generation and has no recorded outcome",
+                )
+                .into());
+            }
             let Some(attempt) = job
                 .attempt
                 .as_ref()
                 .filter(|attempt| attempt.lease_id == open.lease_id)
             else {
-                return Err(RuntimeError::stale(
-                    "lease is not the job's current attempt",
-                ));
+                return Err(RuntimeError::stale("lease is not the job's current attempt").into());
             };
             let resume_from = attempt.last_frame_seq;
             let inputs = attempt.inputs_via_attempt.then(|| InputPlan {
@@ -557,7 +774,9 @@ impl Runtime {
                 resume_from,
             )));
         }
-        if st.finished_leases.contains_key(&open.lease_id) {
+        if let Some((job_id, _)) = st.finished_leases.get(&open.lease_id)
+            && super::identity::decode_scoped_id(job_id).0 == namespace
+        {
             return Ok(Some((
                 AttemptLink::Replay {
                     lease_id: open.lease_id.clone(),
@@ -892,6 +1111,16 @@ mod tests {
             .expect("session open")
             .msg
             .expect("message body")
+    }
+
+    fn worker_principal(namespace: &str) -> crate::auth::Principal {
+        crate::auth::Principal {
+            namespace: namespace.into(),
+            role: crate::auth::Role::Worker,
+            subject: format!("{namespace}-w"),
+            is_operator: false,
+            ..Default::default()
+        }
     }
 
     fn hello(worker_id: &str, resume: &str, held: Vec<String>) -> pb::Hello {
@@ -1320,22 +1549,15 @@ mod tests {
     #[tokio::test]
     async fn cross_namespace_held_leases_are_fenced_even_for_matching_worker_id() {
         let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
-        let alpha_principal = crate::auth::Principal {
-            namespace: "alpha".into(),
-            role: crate::auth::Role::Worker,
-            subject: "alpha-w".into(),
-            forced_pool: None,
-            is_operator: false,
-        };
-        let beta_principal = crate::auth::Principal {
-            namespace: "beta".into(),
-            role: crate::auth::Role::Worker,
-            subject: "beta-w".into(),
-            forced_pool: None,
-            is_operator: false,
-        };
+        let auth = crate::auth::AuthPolicy::default();
+        let alpha_principal = worker_principal("alpha");
+        let beta_principal = worker_principal("beta");
         let mut alpha_session = runtime
-            .open_session_for(hello("shared-worker", "", Vec::new()), alpha_principal)
+            .open_session_for(
+                hello("shared-worker", "", Vec::new()),
+                alpha_principal,
+                &auth,
+            )
             .unwrap();
         let mut spec = JobSpec::default();
         spec.demand.interface = "echo".into();
@@ -1356,6 +1578,7 @@ mod tests {
             .open_session_for(
                 hello("shared-worker", "", vec![lease_id.clone()]),
                 beta_principal,
+                &auth,
             )
             .unwrap();
         match next_message(&mut beta_session).await {
@@ -1481,5 +1704,1014 @@ mod tests {
         runtime.cancel("job-1", "done".into()).await.unwrap();
         let timers = runtime.inner.timers.lock();
         assert!(timers.keys.is_empty(), "{:?}", timers.keys);
+    }
+
+    #[tokio::test]
+    async fn cross_namespace_attempt_open_is_fenced_live_and_replay() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let auth = crate::auth::AuthPolicy::default();
+        let alpha = worker_principal("alpha");
+        let beta = worker_principal("beta");
+        let mut w_alpha = runtime
+            .open_session_for(hello("w-alpha", "", Vec::new()), alpha.clone(), &auth)
+            .unwrap();
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("alpha".into()),
+                job_id: Some("j-alpha".into()),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let assign = next_assign(&mut w_alpha).await;
+
+        // Tenant "beta" must not open tenant "alpha"'s live lease.
+        let err = match runtime
+            .open_attempt_for(
+                &beta,
+                &auth,
+                &pb::AttemptOpen {
+                    lease_id: assign.lease_id.clone(),
+                    generation: assign.generation,
+                    resume_after_sequence: 0,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("beta worker must not open alpha live lease"),
+            Err(WorkerOpenError::Runtime(err)) => err,
+            Err(other) => panic!("expected StaleLease, got {other:?}"),
+        };
+        assert_eq!(err.kind, ErrorKind::StaleLease);
+
+        // Tenant "alpha" opens and completes the attempt.
+        let (link, _) = runtime
+            .open_attempt_for(
+                &alpha,
+                &auth,
+                &pb::AttemptOpen {
+                    lease_id: assign.lease_id.clone(),
+                    generation: assign.generation,
+                    resume_after_sequence: 0,
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .finish_attempt(&link, AttemptOutcome::Succeeded, Vec::new())
+            .await
+            .unwrap();
+
+        // Tenant "beta" must also be fenced when attempting to replay alpha's finished lease.
+        let err = match runtime
+            .open_attempt_for(
+                &beta,
+                &auth,
+                &pb::AttemptOpen {
+                    lease_id: assign.lease_id.clone(),
+                    generation: assign.generation,
+                    resume_after_sequence: 0,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("beta worker must not replay alpha finished lease"),
+            Err(WorkerOpenError::Runtime(err)) => err,
+            Err(other) => panic!("expected StaleLease, got {other:?}"),
+        };
+        assert_eq!(err.kind, ErrorKind::StaleLease);
+    }
+
+    #[tokio::test]
+    async fn empty_queues_and_namespaces_are_cleaned_up_on_dequeue() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "ephemeral.iface".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        let outcome = runtime
+            .submit(SubmitRequest {
+                namespace: Some("tenant-temp".into()),
+                job_id: Some("temp-1".into()),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!runtime.inner.lock().queues.is_empty());
+        runtime
+            .cancel_in("tenant-temp", &outcome.job.job_id, "done".into())
+            .await
+            .unwrap();
+        let st = runtime.inner.lock();
+        assert!(
+            st.queues.is_empty(),
+            "empty namespace/interface queues leaked: {:?}",
+            st.queues.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_heartbeat_and_routing_key_bounds_enforced() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        // max_concurrency > 65536 rejected.
+        let mut bad_hello = hello("w1", "", Vec::new());
+        bad_hello.max_concurrency = 100_000;
+        assert!(runtime.open_session(bad_hello).is_err());
+
+        // Negative or oversized total_capacity rejected.
+        let mut neg_cap = hello("w1", "", Vec::new());
+        neg_cap.total_capacity.insert("gpu".into(), -1);
+        assert!(runtime.open_session(neg_cap).is_err());
+
+        // Routing key length > max_identifier_bytes rejected.
+        let mut big_key = JobSpec::default();
+        big_key.demand.interface = "echo".into();
+        big_key.demand.affinity_key = "k".repeat(300);
+        assert!(
+            runtime
+                .submit(SubmitRequest {
+                    spec: big_key,
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+
+        // Heartbeat utilization NaN/Inf sanitized and custom capped; saturating total_capacity sum.
+        let mut big_cap = hello("w-cap-1", "", Vec::new());
+        big_cap.total_capacity.insert("mem".into(), i64::MAX);
+        let h1 = runtime.open_session(big_cap).unwrap();
+        let mut big_cap2 = hello("w-cap-2", "", Vec::new());
+        big_cap2.total_capacity.insert("mem".into(), i64::MAX);
+        let _h2 = runtime.open_session(big_cap2).unwrap();
+
+        let mut custom = std::collections::HashMap::new();
+        custom.insert("nan".into(), f64::NAN);
+        for i in 0..80 {
+            custom.insert(format!("k{i}"), i as f64);
+        }
+        runtime
+            .session_message(
+                &h1.session_id,
+                h1.connection,
+                pb::worker_message::Msg::Heartbeat(pb::Heartbeat {
+                    load: Some(pb::Load {
+                        queued: 1,
+                        running: 1,
+                        utilization: f64::NAN,
+                        custom,
+                    }),
+                }),
+            )
+            .unwrap();
+        let snap = runtime.snapshot();
+        assert_eq!(snap.workers.total_capacity["mem"], i64::MAX);
+        let w = runtime
+            .list_workers()
+            .into_iter()
+            .find(|w| w.session_id == h1.session_id)
+            .unwrap();
+        assert_eq!(w.load.utilization, 0.0);
+        assert!(w.load.custom.len() <= 64);
+        assert!(!w.load.custom.contains_key("nan"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_revoked_and_expired_sessions_isolates_victims() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let policy = crate::auth::AuthPolicy::default();
+        let now = crate::now_ms() / 1000;
+        let p_revoked = crate::auth::Principal {
+            jti: Some("jti-bad".into()),
+            exp: Some(now + 3600),
+            ..worker_principal("ns-a")
+        };
+        let p_keep = crate::auth::Principal {
+            jti: Some("jti-ok".into()),
+            exp: Some(now + 3600),
+            ..worker_principal("ns-b")
+        };
+        let s_bad = runtime
+            .open_session_for(hello("w-bad", "", Vec::new()), p_revoked, &policy)
+            .unwrap();
+        let s_ok = runtime
+            .open_session_for(hello("w-ok", "", Vec::new()), p_keep, &policy)
+            .unwrap();
+
+        policy.apply_revocations(crate::auth::RevocationSnapshot {
+            version: 1,
+            revoked_jtis: vec!["jti-bad".into()],
+        });
+        assert_eq!(runtime.disconnect_revoked_and_expired_sessions(&policy), 1);
+        let workers = runtime.list_workers();
+        assert!(!workers.iter().any(|w| w.session_id == s_bad.session_id));
+        assert!(
+            workers
+                .iter()
+                .any(|w| w.session_id == s_ok.session_id && w.connected)
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_quotas_isolate_noisy_namespace() {
+        let runtime = Runtime::start(RuntimeConfig {
+            tenant_quotas: crate::runtime::api::TenantQuotas {
+                max_sessions_per_namespace: Some(1),
+                max_pending_jobs_per_namespace: Some(1),
+                max_interfaces_per_namespace: Some(1),
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let auth = crate::auth::AuthPolicy::default();
+
+        let _s1 = runtime
+            .open_session_for(
+                hello("w1", "", Vec::new()),
+                worker_principal("noisy"),
+                &auth,
+            )
+            .unwrap();
+        // Second session in "noisy" is blocked, while "clean" succeeds.
+        assert!(
+            runtime
+                .open_session_for(
+                    hello("w2", "", Vec::new()),
+                    worker_principal("noisy"),
+                    &auth
+                )
+                .is_err()
+        );
+        let _clean = runtime
+            .open_session_for(
+                hello("w1", "", Vec::new()),
+                worker_principal("clean"),
+                &auth,
+            )
+            .unwrap();
+
+        let mut spec1 = JobSpec::default();
+        spec1.demand.interface = "unserved.a".into();
+        spec1.policy.durability = Some(Durability::Ephemeral);
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("noisy".into()),
+                spec: spec1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Second pending job / interface in "noisy" rejected; "clean" succeeds.
+        let mut spec2 = JobSpec::default();
+        spec2.demand.interface = "unserved.b".into();
+        spec2.policy.durability = Some(Durability::Ephemeral);
+        assert!(
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some("noisy".into()),
+                    spec: spec2.clone(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("clean".into()),
+                spec: spec2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_counters_and_drain_session_behave_accurately() {
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let auth = crate::auth::AuthPolicy::default();
+        let alpha = worker_principal("alpha");
+        let mut h = runtime
+            .open_session_for(hello("w-drain", "", Vec::new()), alpha.clone(), &auth)
+            .unwrap();
+        let _welcome = next_message(&mut h).await;
+
+        // Cross-namespace drain reports NotFound without affecting the session.
+        let err = runtime
+            .drain_session(Some("beta"), &h.session_id)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NotFound);
+        assert!(!runtime.list_workers()[0].draining);
+
+        // Submit + dispatch + succeed 1 job, fail 1 job, cancel 1 queued job.
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        spec.policy.max_attempts = Some(1);
+
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("alpha".into()),
+                spec: spec.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let a1 = next_assign(&mut h).await;
+        let (link1, _) = runtime
+            .open_attempt_for(
+                &alpha,
+                &auth,
+                &pb::AttemptOpen {
+                    lease_id: a1.lease_id.clone(),
+                    generation: a1.generation,
+                    resume_after_sequence: 0,
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .finish_attempt(&link1, AttemptOutcome::Succeeded, Vec::new())
+            .await
+            .unwrap();
+
+        // Fail 1 job cleanly.
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("alpha".into()),
+                spec: spec.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let a2 = next_assign(&mut h).await;
+        let (link2, _) = runtime
+            .open_attempt_for(
+                &alpha,
+                &auth,
+                &pb::AttemptOpen {
+                    lease_id: a2.lease_id,
+                    generation: a2.generation,
+                    resume_after_sequence: 0,
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .finish_attempt(
+                &link2,
+                AttemptOutcome::Failed(ErrorInfo::new("boom", "boom", false)),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        // Drain session in matching namespace.
+        runtime.drain_session(Some("alpha"), &h.session_id).unwrap();
+        assert!(runtime.list_workers()[0].draining);
+        assert!(matches!(
+            next_message(&mut h).await,
+            pb::server_message::Msg::Drain(_)
+        ));
+
+        // Submit & cancel a queued job while worker is draining.
+        let j3 = runtime
+            .submit(SubmitRequest {
+                namespace: Some("alpha".into()),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job
+            .job_id;
+        runtime
+            .cancel_in("alpha", &j3, "test cancel".into())
+            .await
+            .unwrap();
+
+        let stats = runtime.snapshot().stats;
+        assert_eq!(stats.jobs_submitted_total, 3);
+        assert_eq!(stats.attempts_started_total, 2);
+        assert_eq!(stats.jobs_succeeded_total, 1);
+        assert_eq!(stats.jobs_failed_total, 1);
+        assert_eq!(stats.jobs_cancelled_total, 1);
+    }
+
+    #[tokio::test]
+    async fn max_interfaces_per_namespace_covers_ephemeral_accepting_and_workers() {
+        use crate::journal::{
+            BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle, Recovery,
+        };
+
+        struct HoldAcceptBackend {
+            gate: Arc<tokio::sync::Notify>,
+            held_tx: Arc<std::sync::Mutex<Vec<oneshot::Sender<CommitOutcome>>>>,
+        }
+
+        impl JournalBackend for HoldAcceptBackend {
+            fn try_acquire_leadership(&self) -> BoxFuture<'_, anyhow::Result<Option<Leadership>>> {
+                Box::pin(async {
+                    Ok(Some(Leadership {
+                        term: 1,
+                        recovery: Recovery {
+                            generation: 1,
+                            active: Vec::new(),
+                        },
+                        lease: LeaseHandle::always_held(),
+                    }))
+                })
+            }
+            fn enqueue(
+                &self,
+                _term: u64,
+                op: JournalOp,
+            ) -> Result<oneshot::Receiver<CommitOutcome>, RuntimeError> {
+                let (tx, rx) = oneshot::channel();
+                if matches!(op, JournalOp::Accept(_)) {
+                    self.held_tx.lock().unwrap().push(tx);
+                    self.gate.notify_waiters();
+                } else {
+                    let _ = tx.send(CommitOutcome::Committed);
+                }
+                Ok(rx)
+            }
+            fn spec_hash<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn receipt<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<(String, String)>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn load_job<'a>(
+                &'a self,
+                _: &'a str,
+                _: bool,
+                _: Arc<crate::runtime::events::ByteBudget>,
+            ) -> BoxFuture<'a, anyhow::Result<Option<crate::journal::StoredJob>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn load_job_preview<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<crate::journal::StoredJobPreview>>>
+            {
+                Box::pin(async { Ok(None) })
+            }
+            fn scan_jobs<'a>(
+                &'a self,
+                _: u64,
+                _: u64,
+                _: Option<(u64, String)>,
+                _: Option<&'a str>,
+                _: usize,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<crate::journal::StoredJob>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn purge<'a>(&'a self, _: u64, _: u64) -> BoxFuture<'a, anyhow::Result<usize>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn stats(&self) -> crate::runtime::api::JournalStats {
+                Default::default()
+            }
+            fn close(&self) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let held_tx = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Arc::new(HoldAcceptBackend {
+            gate: Arc::clone(&gate),
+            held_tx: Arc::clone(&held_tx),
+        });
+        let runtime = Runtime::start_with_backend(
+            RuntimeConfig {
+                tenant_quotas: crate::runtime::api::TenantQuotas {
+                    max_sessions_per_namespace: None,
+                    max_pending_jobs_per_namespace: None,
+                    max_interfaces_per_namespace: Some(2),
+                },
+                ..Default::default()
+            },
+            Some(backend),
+        )
+        .await
+        .unwrap();
+        let auth = crate::auth::AuthPolicy::default();
+
+        // 1. Ephemeral distinct interface cap (without pending-job cap collision).
+        let make_spec = |iface: &str, dur: Durability| {
+            let mut spec = JobSpec::default();
+            spec.demand.interface = iface.into();
+            spec.policy.durability = Some(dur);
+            spec
+        };
+        for iface in ["eph.a", "eph.b", "eph.a"] {
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some("ns-eph".into()),
+                    spec: make_spec(iface, Durability::Ephemeral),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some("ns-eph".into()),
+                    spec: make_spec("eph.c", Durability::Ephemeral),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::ResourceExhausted
+        );
+
+        // 2. Concurrent durable Accepting jobs count distinct interfaces before commit.
+        let rt1 = runtime.clone();
+        let s1 = tokio::spawn(async move {
+            rt1.submit(SubmitRequest {
+                namespace: Some("ns-dur".into()),
+                spec: make_spec("dur.a", Durability::Durable),
+                ..Default::default()
+            })
+            .await
+        });
+        let rt2 = runtime.clone();
+        let s2 = tokio::spawn(async move {
+            rt2.submit(SubmitRequest {
+                namespace: Some("ns-dur".into()),
+                spec: make_spec("dur.b", Durability::Durable),
+                ..Default::default()
+            })
+            .await
+        });
+        while held_tx.lock().unwrap().len() < 2 {
+            gate.notified().await;
+        }
+        assert_eq!(
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some("ns-dur".into()),
+                    spec: make_spec("dur.c", Durability::Durable),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::ResourceExhausted
+        );
+        for tx in held_tx.lock().unwrap().drain(..) {
+            let _ = tx.send(CommitOutcome::Committed);
+        }
+        s1.await.unwrap().unwrap();
+        s2.await.unwrap().unwrap();
+
+        // 3. Worker Hello.interfaces cap (fresh, cross-session, and resume replacement).
+        let mut too_many = hello("w-over", "", Vec::new());
+        too_many.interfaces = vec!["i.1".into(), "i.2".into(), "i.3".into()];
+        assert!(
+            runtime
+                .open_session_for(too_many, worker_principal("ns-w"), &auth)
+                .is_err()
+        );
+
+        let mut h1_hello = hello("w-1", "", Vec::new());
+        h1_hello.interfaces = vec!["i.1".into(), "i.2".into()];
+        let h1 = runtime
+            .open_session_for(h1_hello, worker_principal("ns-w"), &auth)
+            .unwrap();
+        let mut h2_hello = hello("w-2", "", Vec::new());
+        h2_hello.interfaces = vec!["i.2".into(), "i.3".into()];
+        assert!(
+            runtime
+                .open_session_for(h2_hello, worker_principal("ns-w"), &auth)
+                .is_err()
+        );
+        // Resuming w-1 replaces its own interface set, so ["i.3", "i.4"] stays within cap 2.
+        let mut resume_h1 = hello("w-1", &h1.session_id, Vec::new());
+        resume_h1.interfaces = vec!["i.3".into(), "i.4".into()];
+        let _resumed = runtime
+            .open_session_for(resume_h1, worker_principal("ns-w"), &auth)
+            .unwrap();
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn active_lease_revocation_fences_immediately_expires_via_maintenance_and_preserves_drain()
+     {
+        let runtime = Runtime::start(RuntimeConfig {
+            reconnect_grace: Some(Duration::from_secs(60)),
+            default_max_attempts: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let policy = crate::auth::AuthPolicy::default();
+        let now_s = crate::now_ms() / 1000;
+        let p_rev = crate::auth::Principal {
+            jti: Some("jti-active".into()),
+            exp: Some(now_s + 3600),
+            ..worker_principal("ns-r")
+        };
+        let mut handle = runtime
+            .open_session_for(hello("w-rev", "", Vec::new()), p_rev.clone(), &policy)
+            .unwrap();
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        let job = runtime
+            .submit(SubmitRequest {
+                namespace: Some("ns-r".into()),
+                spec: spec.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        let assign = next_assign(&mut handle).await;
+        let (link, _) = runtime
+            .open_attempt_for(
+                &p_rev,
+                &policy,
+                &pb::AttemptOpen {
+                    lease_id: assign.lease_id.clone(),
+                    generation: assign.generation,
+                    resume_after_sequence: 0,
+                },
+            )
+            .await
+            .unwrap();
+        runtime
+            .push_frame(
+                &assign.lease_id,
+                pb::Frame {
+                    sequence: 1,
+                    data: Bytes::from_static(b"ok"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Revoke JTI: session + lease fenced IMMEDIATELY without waiting 60s reconnect_grace.
+        policy.apply_revocations(crate::auth::RevocationSnapshot {
+            version: 1,
+            revoked_jtis: vec!["jti-active".into()],
+        });
+        assert_eq!(runtime.disconnect_revoked_and_expired_sessions(&policy), 1);
+        assert!(runtime.list_workers().is_empty());
+        assert!(handle.messages.recv().await.is_none());
+        assert_eq!(
+            runtime
+                .get_job_in("ns-r", &job.job_id, false)
+                .await
+                .unwrap()
+                .state,
+            JobState::Queued
+        );
+        assert_eq!(
+            runtime
+                .push_frame(
+                    &assign.lease_id,
+                    pb::Frame {
+                        sequence: 2,
+                        data: Bytes::from_static(b"stale"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::StaleLease
+        );
+        assert!(matches!(
+            runtime
+                .finish_attempt(&link, AttemptOutcome::Succeeded, Vec::new())
+                .await
+                .unwrap(),
+            FinishStatus::Fenced(_)
+        ));
+
+        // TOCTOU check under runtime lock rejects revoked credentials on open_session_for / open_attempt_for.
+        let before_rej = policy.auth_rejections_total();
+        assert!(matches!(
+            runtime.open_session_for(hello("w-rev", "", Vec::new()), p_rev.clone(), &policy),
+            Err(WorkerOpenError::Unauthenticated(_))
+        ));
+        assert!(matches!(
+            runtime
+                .open_attempt_for(
+                    &p_rev,
+                    &policy,
+                    &pb::AttemptOpen {
+                        lease_id: assign.lease_id,
+                        generation: assign.generation,
+                        resume_after_sequence: 0,
+                    },
+                )
+                .await,
+            Err(WorkerOpenError::Unauthenticated(_))
+        ));
+        assert_eq!(policy.auth_rejections_total(), before_rej + 2);
+
+        // Built-in maintenance loop sweeps expired session even without revocation poller.
+        let p_exp = crate::auth::Principal {
+            jti: Some("jti-exp".into()),
+            exp: Some(crate::now_ms() / 1000 + 1),
+            ..worker_principal("ns-exp")
+        };
+        let mut h_exp = runtime
+            .open_session_for(hello("w-exp", "", Vec::new()), p_exp, &policy)
+            .unwrap();
+        let _welcome = next_message(&mut h_exp).await;
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while h_exp.messages.recv().await.is_some() {}
+        })
+        .await
+        .expect("maintenance loop must evict expired worker session");
+        assert!(
+            !runtime
+                .list_workers()
+                .iter()
+                .any(|w| w.session_id == h_exp.session_id)
+        );
+
+        // Draining set while disconnected in reconnect grace survives reconnect and sends Drain.
+        let p_drain = worker_principal("ns-d");
+        let mut h_drain = runtime
+            .open_session_for(hello("w-d", "", Vec::new()), p_drain.clone(), &policy)
+            .unwrap();
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("ns-d".into()),
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let d_assign = next_assign(&mut h_drain).await;
+        let sid = h_drain.session_id.clone();
+        runtime.session_closed(&sid, h_drain.connection);
+        runtime.drain_session(Some("ns-d"), &sid).unwrap();
+        let mut h_resumed = runtime
+            .open_session_for(
+                hello("w-d", &sid, vec![d_assign.lease_id]),
+                p_drain,
+                &policy,
+            )
+            .unwrap();
+        assert!(matches!(
+            next_message(&mut h_resumed).await,
+            pb::server_message::Msg::Welcome(_)
+        ));
+        assert!(matches!(
+            next_message(&mut h_resumed).await,
+            pb::server_message::Msg::Drain(_)
+        ));
+        assert!(
+            runtime
+                .list_workers()
+                .iter()
+                .any(|w| w.session_id == sid && w.draining)
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unbounded_error_and_reason_strings_are_truncated_at_utf8_boundaries() {
+        use crate::runtime::api::{MAX_ERROR_CODE_BYTES, MAX_ERROR_MESSAGE_BYTES};
+
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let mut w = runtime
+            .open_session(hello("w-err", "", Vec::new()))
+            .unwrap();
+        let long_msg = "é".repeat(3_000); // 6000 bytes, 2-byte UTF-8 chars
+        let long_code = "🦀".repeat(50); // 200 bytes, 4-byte UTF-8 chars
+
+        // 1. ErrorInfo::bounded caps both code and message cleanly on UTF-8 char boundaries.
+        let bounded = ErrorInfo::bounded(long_code, long_msg.clone(), false);
+        assert!(bounded.code.len() <= MAX_ERROR_CODE_BYTES);
+        assert_eq!(bounded.code.len(), MAX_ERROR_CODE_BYTES);
+        assert!(bounded.message.len() <= MAX_ERROR_MESSAGE_BYTES);
+        assert_eq!(bounded.message.len(), MAX_ERROR_MESSAGE_BYTES);
+
+        // 2. AssignReply.reject_reason capped cleanly.
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".into();
+        spec.policy.durability = Some(Durability::Ephemeral);
+        spec.policy.max_attempts = Some(1);
+        let j1 = runtime
+            .submit(SubmitRequest {
+                spec: spec.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        let a1 = next_assign(&mut w).await;
+        runtime
+            .session_message(
+                &w.session_id,
+                w.connection,
+                pb::worker_message::Msg::AssignReply(pb::AssignReply {
+                    lease_id: a1.lease_id,
+                    accepted: false,
+                    reject_reason: long_msg.clone(),
+                }),
+            )
+            .unwrap();
+        let v1 = runtime.get_job(&j1.job_id, false).await.unwrap();
+        assert!(v1.error.unwrap().message.len() <= MAX_ERROR_MESSAGE_BYTES);
+
+        // 3. CancelRequest.reason capped cleanly.
+        spec.demand.interface = "unserved".into();
+        let j2 = runtime
+            .submit(SubmitRequest {
+                spec,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .job;
+        let cancelled = runtime.cancel(&j2.job_id, long_msg).await.unwrap();
+        assert!(cancelled.error.unwrap().message.len() <= MAX_ERROR_MESSAGE_BYTES);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_counters_ignore_recovery_and_rolled_back_commits() {
+        use crate::journal::{
+            BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle, Recovery,
+            StoredJob,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RollbackBackend {
+            rollback_accept: AtomicBool,
+            rollback_start: AtomicBool,
+        }
+
+        impl JournalBackend for RollbackBackend {
+            fn try_acquire_leadership(&self) -> BoxFuture<'_, anyhow::Result<Option<Leadership>>> {
+                let mut spec = JobSpec::default();
+                spec.demand.interface = "echo".into();
+                spec.policy.durability = Some(Durability::Durable);
+                let recovered = StoredJob {
+                    job_id: "recovered-0".into(),
+                    state: JobState::Queued,
+                    spec,
+                    spec_hash: "hr".into(),
+                    attempt_count: 0,
+                    max_attempts: 3,
+                    created_at_ms: 100,
+                    updated_at_ms: 100,
+                    error: None,
+                    outputs: Vec::new(),
+                    last_attempt_id: None,
+                    last_worker_id: None,
+                    failed_workers: Default::default(),
+                };
+                Box::pin(async move {
+                    Ok(Some(Leadership {
+                        term: 1,
+                        recovery: Recovery {
+                            generation: 1,
+                            active: vec![recovered],
+                        },
+                        lease: LeaseHandle::always_held(),
+                    }))
+                })
+            }
+            fn enqueue(
+                &self,
+                _term: u64,
+                op: JournalOp,
+            ) -> Result<oneshot::Receiver<CommitOutcome>, RuntimeError> {
+                let (tx, rx) = oneshot::channel();
+                let outcome = match op {
+                    JournalOp::Accept(_) if self.rollback_accept.load(Ordering::Acquire) => {
+                        CommitOutcome::RolledBack("disk full".into())
+                    }
+                    JournalOp::AttemptStart(_) if self.rollback_start.load(Ordering::Acquire) => {
+                        CommitOutcome::RolledBack("disk full".into())
+                    }
+                    _ => CommitOutcome::Committed,
+                };
+                let _ = tx.send(outcome);
+                Ok(rx)
+            }
+            fn spec_hash<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn receipt<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<(String, String)>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn load_job<'a>(
+                &'a self,
+                _: &'a str,
+                _: bool,
+                _: Arc<crate::runtime::events::ByteBudget>,
+            ) -> BoxFuture<'a, anyhow::Result<Option<StoredJob>>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn load_job_preview<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxFuture<'a, anyhow::Result<Option<crate::journal::StoredJobPreview>>>
+            {
+                Box::pin(async { Ok(None) })
+            }
+            fn scan_jobs<'a>(
+                &'a self,
+                _: u64,
+                _: u64,
+                _: Option<(u64, String)>,
+                _: Option<&'a str>,
+                _: usize,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<StoredJob>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn purge<'a>(&'a self, _: u64, _: u64) -> BoxFuture<'a, anyhow::Result<usize>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn stats(&self) -> crate::runtime::api::JournalStats {
+                Default::default()
+            }
+            fn close(&self) -> BoxFuture<'_, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let backend = Arc::new(RollbackBackend {
+            rollback_accept: AtomicBool::new(true),
+            rollback_start: AtomicBool::new(true),
+        });
+        let runtime = Runtime::start_with_backend(
+            RuntimeConfig::default(),
+            Some(Arc::clone(&backend) as Arc<dyn JournalBackend>),
+        )
+        .await
+        .unwrap();
+        // Recovered job did NOT increment jobs_submitted_total.
+        assert_eq!(runtime.stats().jobs_submitted_total, 0);
+
+        // Rolled-back durable accept does NOT increment jobs_submitted_total.
+        let mut spec = JobSpec::default();
+        spec.demand.interface = "echo".into();
+        spec.policy.durability = Some(Durability::Durable);
+        assert!(
+            runtime
+                .submit(SubmitRequest {
+                    spec: spec.clone(),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(runtime.stats().jobs_submitted_total, 0);
+
+        // Restore journal writes via Probe, then trigger rolled-back AttemptStart on recovered job.
+        backend.rollback_accept.store(false, Ordering::Release);
+        {
+            let _ = runtime.inner.commit(JournalOp::Probe, |_, _| {});
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _w = runtime.open_session(hello("w-rb", "", Vec::new())).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(runtime.stats().attempts_started_total, 0);
+
+        // Once AttemptStart commits, attempts_started_total increments cleanly.
+        backend.rollback_start.store(false, Ordering::Release);
+        {
+            let _ = runtime.inner.commit(JournalOp::Probe, |_, _| {});
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while runtime.stats().attempts_started_total == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("committed attempt start must increment counter");
+        assert_eq!(runtime.stats().attempts_started_total, 1);
+        runtime.shutdown().await;
     }
 }

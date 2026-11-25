@@ -9,6 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::interceptor::InterceptedService;
@@ -112,14 +113,31 @@ impl ExecutionClient {
         F: FnMut(SlotClient, R) -> Fut,
         Fut: std::future::Future<Output = Result<T, Status>>,
     {
+        self.call_with_retry(req, |slot, r| {
+            let fut = op(slot, r);
+            async move {
+                fut.await.map_err(|status| {
+                    let retryable = status.code() == Code::Unavailable;
+                    (status, retryable)
+                })
+            }
+        })
+        .await
+    }
+
+    async fn call_with_retry<R: Clone, T, F, Fut>(&self, req: R, mut op: F) -> Result<T, Status>
+    where
+        F: FnMut(SlotClient, R) -> Fut,
+        Fut: std::future::Future<Output = Result<T, (Status, bool)>>,
+    {
         let (start_idx, primary) = self.slot.lock().expect("client slot poisoned").clone();
         if self.endpoints.len() == 1 {
-            return op(primary, req).await;
+            return op(primary, req).await.map_err(|(status, _)| status);
         }
         let mut last_status = match op(primary, req.clone()).await {
             Ok(val) => return Ok(val),
-            Err(status) if status.code() == Code::Unavailable => status,
-            Err(status) => return Err(status),
+            Err((status, true)) => status,
+            Err((status, false)) => return Err(status),
         };
         let n = self.endpoints.len();
         for offset in 1..n {
@@ -133,10 +151,10 @@ impl ExecutionClient {
                     *self.slot.lock().expect("client slot poisoned") = (idx, candidate);
                     return Ok(val);
                 }
-                Err(status) if status.code() == Code::Unavailable => {
+                Err((status, true)) => {
                     last_status = status;
                 }
-                Err(status) => {
+                Err((status, false)) => {
                     *self.slot.lock().expect("client slot poisoned") = (idx, candidate);
                     return Err(status);
                 }
@@ -152,9 +170,20 @@ impl ExecutionClient {
         job_id: Option<String>,
         spec: v2::JobSpec,
     ) -> Result<v2::SubmitResponse, Status> {
+        self.submit_with_policy(job_id, spec, v2::ConflictPolicy::UseExisting)
+            .await
+    }
+
+    /// Submits a job with an explicit conflict policy (`UseExisting` or `Fail`).
+    pub async fn submit_with_policy(
+        &mut self,
+        job_id: Option<String>,
+        spec: v2::JobSpec,
+        conflict_policy: v2::ConflictPolicy,
+    ) -> Result<v2::SubmitResponse, Status> {
         let req = v2::SubmitRequest {
             job_id: job_id.unwrap_or_default(),
-            conflict_policy: v2::ConflictPolicy::UseExisting as i32,
+            conflict_policy: conflict_policy as i32,
             spec: Some(spec),
         };
         self.call_with(req, |slot, r| async move {
@@ -164,6 +193,68 @@ impl ExecutionClient {
             }
         })
         .await
+    }
+
+    /// Executes a non-streaming ephemeral job and waits for its terminal `ExecutionEvent`.
+    /// Over `ws://`/`wss://`, prefers pooled `POST /rpc/v2/client/execute` and falls back
+    /// to WebSocket `invoke` when the server returns `Unimplemented` or `NotFound`.
+    /// Across multiple endpoints, fails over only on explicit pre-admission unavailability
+    /// (standby / connect refusal), never retrying after mid-flight transport drops or 504.
+    pub async fn execute(&mut self, spec: v2::JobSpec) -> Result<v2::ExecutionEvent, Status> {
+        let start = v2::InvokeStart {
+            spec: Some(spec),
+            streaming_input: false,
+        };
+        let mut events = self
+            .call_with_retry(start, |slot, s| async move {
+                match slot {
+                    SlotClient::HttpWs(ws) => match ws.execute(&s).await {
+                        Ok(event) => Ok(Ok(event)),
+                        Err(ws_transport::ExecuteError::Retryable(status)) => Err((status, true)),
+                        Err(ws_transport::ExecuteError::Fatal(status))
+                            if matches!(status.code(), Code::Unimplemented | Code::NotFound) =>
+                        {
+                            let req = v2::InvokeRequest {
+                                msg: Some(v2::invoke_request::Msg::Start(s)),
+                            };
+                            ws.invoke(req)
+                                .await
+                                .map(Err)
+                                .map_err(|status| (status, false))
+                        }
+                        Err(ws_transport::ExecuteError::Fatal(status)) => Err((status, false)),
+                    },
+                    SlotClient::Grpc(mut c) => {
+                        let req = v2::InvokeRequest {
+                            msg: Some(v2::invoke_request::Msg::Start(s)),
+                        };
+                        let stream = c
+                            .invoke(tokio_stream::iter([req]))
+                            .await
+                            .map_err(|status| {
+                                let retryable = status.code() == Code::Unavailable;
+                                (status, retryable)
+                            })?
+                            .into_inner();
+                        Ok(Err(ExecutionEvents::new(RpcStream::Grpc(stream))))
+                    }
+                }
+            })
+            .await?;
+        match events {
+            Ok(terminal) => Ok(terminal),
+            Err(ref mut stream) => {
+                while let Some(ev) = stream.next().await {
+                    let ev = ev?;
+                    if matches!(ev.event, Some(v2::execution_event::Event::Finished(_))) {
+                        return Ok(ev);
+                    }
+                }
+                Err(Status::unavailable(
+                    "execution ended without a terminal event",
+                ))
+            }
+        }
     }
 
     /// An ephemeral invocation. Dropping before Finished cancels execution.

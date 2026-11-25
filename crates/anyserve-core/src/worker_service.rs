@@ -15,24 +15,30 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::auth::{DEFAULT_NAMESPACE, NAMESPACE_HEADER, Principal, Role, validate_namespace};
+use crate::auth::{
+    AuthPolicy, DEFAULT_NAMESPACE, NAMESPACE_HEADER, Principal, Role, validate_namespace,
+};
 use crate::error::ErrorKind;
 use crate::runtime::Runtime;
 use crate::runtime::api::{ErrorInfo, Limits, Metadata, Object, codes};
 use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 use crate::runtime::input::InputStatus;
 use crate::runtime::state::FinishStatus;
-use crate::runtime::worker::{AttemptLink, AttemptOutcome, InputPlan};
+use crate::runtime::worker::{AttemptLink, AttemptOutcome, InputPlan, WorkerOpenError};
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 pub struct WorkerGrpcService {
     runtime: Runtime,
+    default_auth: AuthPolicy,
 }
 
 impl WorkerGrpcService {
     pub fn new(runtime: Runtime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            default_auth: AuthPolicy::default(),
+        }
     }
 
     /// The tonic server with message limits matching the runtime's budgets.
@@ -96,6 +102,8 @@ fn worker_principal<T>(request: &Request<T>) -> Result<Principal, Status> {
         subject: "anonymous".to_string(),
         forced_pool: None,
         is_operator: false,
+        jti: None,
+        exp: None,
     })
 }
 
@@ -110,6 +118,7 @@ impl Worker for WorkerGrpcService {
     ) -> Result<Response<Self::SessionStream>, Status> {
         self.runtime.ensure_active_leader()?;
         let principal = worker_principal(&request)?;
+        let auth = request.extensions().get::<Arc<AuthPolicy>>().cloned();
         let mut inbound = request.into_inner();
         let timeout = self.runtime.config().heartbeat_timeout;
         let hello = match tokio::time::timeout(timeout, inbound.message()).await {
@@ -120,36 +129,68 @@ impl Worker for WorkerGrpcService {
             Ok(Err(status)) => return Err(status),
             Err(_) => return Err(Status::deadline_exceeded("no Hello received")),
         };
-        let handle = self.runtime.open_session_for(hello, principal)?;
+        let handle = self.runtime.open_session_for(
+            hello,
+            principal,
+            auth.as_deref().unwrap_or(&self.default_auth),
+        )?;
         let runtime = self.runtime.clone();
         let (session_id, connection) = (handle.session_id.clone(), handle.connection);
+        let (closed_tx, mut closed_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
+            let hb_sleep = tokio::time::sleep(timeout);
+            tokio::pin!(hb_sleep);
             loop {
-                match tokio::time::timeout(timeout, inbound.message()).await {
-                    Ok(Ok(Some(pb::WorkerMessage { msg: Some(msg) }))) => {
-                        if let Err(error) = runtime.session_message(&session_id, connection, msg) {
-                            if error.kind == ErrorKind::StaleLease {
-                                tracing::debug!(session_id, error = %error, "ignored worker message");
-                            } else {
-                                tracing::warn!(session_id, error = %error, "invalid worker message");
-                            }
-                        }
-                    }
-                    Ok(Ok(Some(_))) => {}
-                    Ok(Ok(None)) => break,
-                    Ok(Err(status)) => {
-                        tracing::debug!(session_id, status = %status, "worker session stream failed");
-                        break;
-                    }
-                    Err(_) => {
+                tokio::select! {
+                    _ = &mut closed_rx => break,
+                    _ = &mut hb_sleep => {
                         tracing::warn!(session_id, "worker session missed its heartbeat timeout");
                         break;
+                    }
+                    next = inbound.message() => match next {
+                        Ok(Some(pb::WorkerMessage { msg: Some(msg) })) => {
+                            hb_sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + timeout);
+                            if let Err(error) = runtime.session_message(&session_id, connection, msg)
+                            {
+                                if error.kind == ErrorKind::StaleLease {
+                                    tracing::debug!(
+                                        session_id,
+                                        error = %error,
+                                        "ignored worker message"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        session_id,
+                                        error = %error,
+                                        "invalid worker message"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(Some(pb::WorkerMessage { msg: None })) => {}
+                        Ok(None) => break,
+                        Err(status) => {
+                            tracing::debug!(
+                                session_id,
+                                status = %status,
+                                "worker session stream failed"
+                            );
+                            break;
+                        }
                     }
                 }
             }
             runtime.session_closed(&session_id, connection);
         });
-        let stream: Self::SessionStream = Box::pin(ReceiverStream::new(handle.messages).map(Ok));
+        let mut messages = handle.messages;
+        let stream: Self::SessionStream = Box::pin(async_stream::stream! {
+            let _closed = closed_tx;
+            while let Some(msg) = messages.recv().await {
+                yield Ok(msg);
+            }
+        });
         Ok(Response::new(stream))
     }
 
@@ -158,7 +199,8 @@ impl Worker for WorkerGrpcService {
         request: Request<Streaming<pb::AttemptUp>>,
     ) -> Result<Response<Self::AttemptStream>, Status> {
         self.runtime.ensure_active_leader()?;
-        require_worker(&request)?;
+        let principal = worker_principal(&request)?;
+        let auth = request.extensions().get::<Arc<AuthPolicy>>().cloned();
         let mut inbound = request.into_inner();
         let timeout = self.runtime.config().heartbeat_timeout;
         let open = match tokio::time::timeout(timeout, inbound.message()).await {
@@ -174,9 +216,17 @@ impl Worker for WorkerGrpcService {
             Err(_) => return Err(Status::deadline_exceeded("no Open received")),
         };
         let (tx, rx) = mpsc::channel::<Result<pb::AttemptDown, Status>>(64);
-        let (link, resume_from) = match self.runtime.open_attempt(&open).await {
+        let (link, resume_from) = match self
+            .runtime
+            .open_attempt_for(
+                &principal,
+                auth.as_deref().unwrap_or(&self.default_auth),
+                &open,
+            )
+            .await
+        {
             Ok(opened) => opened,
-            Err(error) if error.kind == ErrorKind::StaleLease => {
+            Err(WorkerOpenError::Runtime(error)) if error.kind == ErrorKind::StaleLease => {
                 let _ = tx
                     .send(Ok(finished(
                         pb::attempt_finished::Status::Fenced,
@@ -517,16 +567,15 @@ impl ResultAssembler {
                 "Finish arrived before the last result chunk",
             ));
         }
-        let outcome = match finish.outcome {
-            Some(pb::finish::Outcome::Succeeded(_)) => AttemptOutcome::Succeeded,
-            Some(pb::finish::Outcome::Failed(error)) => AttemptOutcome::Failed(ErrorInfo {
-                code: error.code,
-                message: error.message,
-                retryable: error.retryable,
-            }),
-            Some(pb::finish::Outcome::Cancelled(_)) => AttemptOutcome::Cancelled,
-            None => return Err(Status::invalid_argument("Finish requires an outcome")),
-        };
+        let outcome =
+            match finish.outcome {
+                Some(pb::finish::Outcome::Succeeded(_)) => AttemptOutcome::Succeeded,
+                Some(pb::finish::Outcome::Failed(error)) => AttemptOutcome::Failed(
+                    ErrorInfo::bounded(error.code, error.message, error.retryable),
+                ),
+                Some(pb::finish::Outcome::Cancelled(_)) => AttemptOutcome::Cancelled,
+                None => return Err(Status::invalid_argument("Finish requires an outcome")),
+            };
         if self.too_large && matches!(outcome, AttemptOutcome::Succeeded) {
             return Ok((
                 AttemptOutcome::Failed(ErrorInfo::new(

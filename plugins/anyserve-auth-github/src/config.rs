@@ -66,8 +66,8 @@ pub struct Config {
     pub grpc_endpoint: Option<String>,
     pub ws_endpoint: Option<String>,
     pub console_url: Option<String>,
-    pub signing_key: Vec<u8>,
-    pub revocation_bearer: String,
+    pub signing_keys: Vec<Vec<u8>>,
+    pub revocation_bearers: Vec<String>,
     pub github_client_id: String,
     pub github_client_secret: String,
     pub db_path: PathBuf,
@@ -87,8 +87,8 @@ impl std::fmt::Debug for Config {
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("ws_endpoint", &self.ws_endpoint)
             .field("console_url", &self.console_url)
-            .field("signing_key", &"[redacted]")
-            .field("revocation_bearer", &"[redacted]")
+            .field("signing_key_count", &self.signing_keys.len())
+            .field("revocation_bearer_count", &self.revocation_bearers.len())
             .field("github_client_id", &self.github_client_id)
             .field("github_client_secret", &"[redacted]")
             .field("db_path", &self.db_path)
@@ -101,6 +101,12 @@ impl std::fmt::Debug for Config {
 }
 
 impl Config {
+    pub fn primary_signing_key(&self) -> &[u8] {
+        self.signing_keys
+            .first()
+            .expect("Config always has at least one signing key")
+    }
+
     pub fn from_args(args: Args) -> Result<Self> {
         let env_str = |key: &str| std::env::var(key).ok();
         let listen_raw = args
@@ -118,17 +124,20 @@ impl Config {
         )
         .unwrap_or_else(|| "http://127.0.0.1:3002".to_string());
 
-        let raw_signing = args
-            .signing_key
-            .or_else(|| env_str("ANYSERVE_TOKEN_SIGNING_KEY"))
-            .unwrap_or_default();
-        let primary_key = raw_signing
-            .split(',')
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .context("ANYSERVE_TOKEN_SIGNING_KEY (--signing-key) must not be empty")?;
-        let signing_key = primary_key.as_bytes().to_vec();
-        let revocation_bearer = anyserve_core::auth::internal_revocation_bearer(&signing_key);
+        let signing_keys = anyserve_core::auth::parse_signing_keys(
+            &args
+                .signing_key
+                .or_else(|| env_str(anyserve_core::auth::SIGNING_KEYS_ENV))
+                .unwrap_or_default(),
+        );
+        anyhow::ensure!(
+            !signing_keys.is_empty(),
+            "ANYSERVE_TOKEN_SIGNING_KEY (--signing-key) must not be empty"
+        );
+        let revocation_bearers: Vec<String> = signing_keys
+            .iter()
+            .map(|k| anyserve_core::auth::internal_revocation_bearer(k))
+            .collect();
 
         let github_client_id = clean_nonempty(
             args.github_client_id
@@ -175,8 +184,8 @@ impl Config {
                 args.console_url
                     .or_else(|| env_str("ANYSERVE_AUTH_CONSOLE_URL")),
             ),
-            signing_key,
-            revocation_bearer,
+            signing_keys,
+            revocation_bearers,
             github_client_id,
             github_client_secret,
             db_path: args
@@ -219,7 +228,9 @@ impl Config {
     }
 
     pub fn cookie_secure(&self) -> bool {
-        self.public_url.starts_with("https://")
+        self.public_url
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
     }
 }
 

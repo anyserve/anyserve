@@ -624,7 +624,7 @@ impl JournalBackend for PgJournal {
             }
             query
                 .push(" ORDER BY created_at_ms DESC, job_id DESC LIMIT ")
-                .push_bind(limit.clamp(1, 250) as i64);
+                .push_bind(limit.clamp(1, 251) as i64);
             query
                 .build()
                 .fetch_all(&self.read_pool)

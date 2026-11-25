@@ -144,7 +144,10 @@ pub(crate) async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .initial_connection_window_size(32 * 1024 * 1024)
         .http2_keep_alive_interval(Duration::from_secs(20))
         .keep_alive_while_idle(true);
-    if endpoint.starts_with("https://") {
+    if endpoint
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
         transport = transport
             .tls_config(ClientTlsConfig::new().with_enabled_roots())
             .context("configure anyserve gRPC TLS")?;

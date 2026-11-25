@@ -276,6 +276,9 @@ enum Request {
         before_ms: u64,
         reply: oneshot::Sender<Result<usize>>,
     },
+    PurgeOverCap {
+        reply: oneshot::Sender<Result<usize>>,
+    },
     Close {
         reply: oneshot::Sender<()>,
     },
@@ -286,6 +289,7 @@ pub(crate) struct Journal {
     read_pool: SqlitePool,
     pending: Arc<AtomicUsize>,
     stats: Arc<Mutex<JournalStats>>,
+    max_bytes: Option<u64>,
 }
 
 const SCHEMA: &[&str] = &[
@@ -295,6 +299,7 @@ const SCHEMA: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS journal_jobs (
         job_id TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL DEFAULT 'default',
         state TEXT NOT NULL,
         spec_hash TEXT NOT NULL,
         spec_json TEXT NOT NULL,
@@ -350,11 +355,22 @@ impl Journal {
             None => (at, id),
         });
         let mut out = Vec::with_capacity(limit);
-        let batch_size = limit.clamp(1, 250);
+        let batch_size = limit.clamp(1, 251);
         loop {
             let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
+            match namespace {
+                Some(ns) => {
+                    query
+                        .push(" INDEXED BY journal_jobs_ns_history WHERE namespace = ")
+                        .push_bind(ns)
+                        .push(" AND");
+                }
+                None => {
+                    query.push(" INDEXED BY journal_jobs_history WHERE");
+                }
+            }
             query
-                .push(" INDEXED BY journal_jobs_history WHERE state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
+                .push(" state IN ('succeeded', 'failed', 'cancelled') AND created_at_ms >= ")
                 .push_bind(from_ms as i64)
                 .push(" AND created_at_ms < ")
                 .push_bind(to_ms as i64);
@@ -414,13 +430,7 @@ impl Journal {
                 SqliteSynchronous::Normal
             })
             .busy_timeout(Duration::from_secs(5));
-        let mut writer_options = options.clone();
-        if let Some(max_bytes) = config.max_bytes {
-            // SQLite's default page size; the cap applies to this connection.
-            writer_options =
-                writer_options.pragma("max_page_count", (max_bytes / 4096).max(1).to_string());
-        }
-        let mut conn = SqliteConnection::connect_with(&writer_options)
+        let mut conn = SqliteConnection::connect_with(&options)
             .await
             .with_context(|| format!("open journal {}", config.path.display()))?;
         for statement in SCHEMA {
@@ -429,8 +439,21 @@ impl Journal {
                 .await
                 .with_context(|| format!("migrate journal: {statement}"))?;
         }
+        migrate_namespace_column(&mut conn).await?;
         let generation = next_generation(&mut conn).await?;
         let recovery = load_recovery(&mut conn, generation).await?;
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&mut conn)
+            .await
+            .context("read SQLite page_size")?;
+        let page_size = u64::try_from(page_size).unwrap_or(4096).max(512);
+        if let Some(max_bytes) = config.max_bytes {
+            let max_pages = (max_bytes / page_size).max(1);
+            sqlx::query(&format!("PRAGMA max_page_count = {max_pages}"))
+                .execute(&mut conn)
+                .await
+                .context("configure SQLite max_page_count")?;
+        }
         let read_pool = SqlitePoolOptions::new()
             .max_connections(4)
             .after_connect(|connection, _| {
@@ -447,6 +470,8 @@ impl Journal {
             conn,
             rx,
             config.max_batch.max(1),
+            config.max_bytes,
+            page_size,
             Arc::clone(&pending),
             Arc::clone(&stats),
             lock,
@@ -457,6 +482,7 @@ impl Journal {
                 read_pool,
                 pending,
                 stats,
+                max_bytes: config.max_bytes,
             },
             recovery,
         ))
@@ -606,9 +632,10 @@ impl Journal {
             .transpose()
     }
 
-    /// Deletes terminal jobs last updated before `before_ms`; returns how many.
-    /// Each batch is its own short transaction and queue entry, so commits
-    /// queued meanwhile are not held up behind a large purge.
+    /// Deletes terminal jobs last updated before `before_ms` and, when
+    /// `max_bytes` is configured, oldest terminal jobs until used pages fall
+    /// under the cap target. Each batch is its own short transaction so live
+    /// commits are never starved behind a large purge.
     pub(crate) async fn purge(&self, before_ms: u64) -> Result<usize> {
         let mut removed = 0;
         loop {
@@ -620,9 +647,24 @@ impl Journal {
             let batch = receiver.await.map_err(|_| anyhow!("journal is closed"))??;
             removed += batch;
             if batch < PURGE_BATCH {
-                return Ok(removed);
+                break;
             }
         }
+        if self.max_bytes.is_some() {
+            loop {
+                let (reply, receiver) = oneshot::channel();
+                self.tx
+                    .send(Request::PurgeOverCap { reply })
+                    .await
+                    .map_err(|_| anyhow!("journal is closed"))?;
+                let batch = receiver.await.map_err(|_| anyhow!("journal is closed"))??;
+                removed += batch;
+                if batch == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// Finishes queued operations, then closes the database and its lock.
@@ -761,6 +803,48 @@ fn acquire_lock(path: &Path) -> Result<File> {
         )
     })?;
     Ok(file)
+}
+
+/// Adds and backfills `journal_jobs.namespace` on journals created before it existed.
+/// Fresh journals get the column from `SCHEMA`, and every insert writes it, so the
+/// backfill runs once, atomically with the `ALTER`.
+async fn migrate_namespace_column(conn: &mut SqliteConnection) -> Result<()> {
+    let has_namespace = sqlx::query("PRAGMA table_info(journal_jobs)")
+        .fetch_all(&mut *conn)
+        .await
+        .context("inspect journal_jobs columns")?
+        .iter()
+        .any(|row| {
+            row.try_get::<String, _>("name")
+                .is_ok_and(|name| name == "namespace")
+        });
+    if !has_namespace {
+        let mut tx = conn.begin().await.context("begin namespace migration tx")?;
+        sqlx::query(
+            "ALTER TABLE journal_jobs ADD COLUMN namespace TEXT NOT NULL DEFAULT 'default'",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("add namespace column to journal_jobs")?;
+        sqlx::query(
+            "UPDATE journal_jobs
+             SET namespace = substr(job_id, 5, instr(substr(job_id, 5), ':') - 1)
+             WHERE job_id GLOB '@ns:*:*' AND instr(substr(job_id, 5), ':') > 1",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("backfill journal_jobs namespace")?;
+        tx.commit().await.context("commit namespace migration tx")?;
+    }
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS journal_jobs_ns_history
+         ON journal_jobs(namespace, created_at_ms, job_id)
+         WHERE state IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .execute(&mut *conn)
+    .await
+    .context("create journal_jobs_ns_history index")?;
+    Ok(())
 }
 
 async fn next_generation(conn: &mut SqliteConnection) -> Result<u64> {
@@ -982,12 +1066,14 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
                 policy: &spec.policy,
                 metadata: &spec.metadata,
             };
+            let namespace = crate::runtime::identity::decode_scoped_id(&record.job_id).0;
             sqlx::query(
-                "INSERT INTO journal_jobs (job_id, state, spec_hash, spec_json, attempt_count,
+                "INSERT INTO journal_jobs (job_id, namespace, state, spec_hash, spec_json, attempt_count,
                     max_attempts, created_at_ms, updated_at_ms)
-                 VALUES (?, 'queued', ?, ?, 0, ?, ?, ?)",
+                 VALUES (?, ?, 'queued', ?, ?, 0, ?, ?, ?)",
             )
             .bind(&record.job_id)
+            .bind(namespace)
             .bind(&record.spec_hash)
             .bind(serde_json::to_string(&stored)?)
             .bind(record.max_attempts as i64)
@@ -1166,8 +1252,53 @@ async fn commit_batch(
     }
 }
 
-/// Terminal jobs deleted per purge transaction.
+/// Terminal jobs deleted per retention purge transaction.
 const PURGE_BATCH: usize = 500;
+/// Terminal jobs deleted per `max_bytes` eviction batch.
+const MAX_BYTES_PURGE_BATCH: usize = 32;
+/// Target utilization percentage of `max_bytes` after eviction.
+const MAX_BYTES_TARGET_PCT: u64 = 85;
+/// Cap emergency batches per `SQLITE_FULL` event so live commits are not starved.
+const EMERGENCY_PURGE_MAX_BATCHES: usize = 64;
+
+fn is_sqlite_full(reason: &str) -> bool {
+    reason.contains("database or disk is full")
+        || reason.contains("SQLITE_FULL")
+        || reason.contains("(code: 13)")
+}
+
+async fn db_used_bytes(conn: &mut SqliteConnection, page_size: u64) -> Result<u64> {
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(&mut *conn)
+        .await?;
+    let freelist_count: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(&mut *conn)
+        .await?;
+    let used_pages = u64::try_from(page_count.saturating_sub(freelist_count).max(0)).unwrap_or(0);
+    Ok(used_pages.saturating_mul(page_size))
+}
+
+async fn delete_job_ids(tx: &mut Transaction<'_, Sqlite>, removed: &[String]) -> Result<()> {
+    for prefix in [
+        "DELETE FROM journal_objects WHERE job_id IN (",
+        "DELETE FROM journal_jobs WHERE job_id IN (",
+    ] {
+        let mut query = QueryBuilder::<Sqlite>::new(prefix);
+        let mut ids = query.separated(", ");
+        for job_id in removed {
+            ids.push_bind(job_id);
+        }
+        ids.push_unseparated(")");
+        query.build().execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+async fn wal_checkpoint_passive(conn: &mut SqliteConnection) {
+    let _ = sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+        .execute(&mut *conn)
+        .await;
+}
 
 async fn purge(conn: &mut SqliteConnection, before_ms: u64) -> Result<usize> {
     let mut tx = conn.begin().await?;
@@ -1183,20 +1314,59 @@ async fn purge(conn: &mut SqliteConnection, before_ms: u64) -> Result<usize> {
     if removed.is_empty() {
         return Ok(0);
     }
-    for prefix in [
-        "DELETE FROM journal_objects WHERE job_id IN (",
-        "DELETE FROM journal_jobs WHERE job_id IN (",
-    ] {
-        let mut query = QueryBuilder::<Sqlite>::new(prefix);
-        let mut ids = query.separated(", ");
-        for job_id in &removed {
-            ids.push_bind(job_id);
-        }
-        ids.push_unseparated(")");
-        query.build().execute(&mut *tx).await?;
-    }
+    delete_job_ids(&mut tx, &removed).await?;
     tx.commit().await?;
+    wal_checkpoint_passive(conn).await;
     Ok(removed.len())
+}
+
+async fn purge_over_cap_batch(
+    conn: &mut SqliteConnection,
+    max_bytes: u64,
+    page_size: u64,
+    force: bool,
+) -> Result<usize> {
+    let target = max_bytes.saturating_mul(MAX_BYTES_TARGET_PCT) / 100;
+    if !force && db_used_bytes(conn, page_size).await? <= target {
+        return Ok(0);
+    }
+    let mut tx = conn.begin().await?;
+    let removed: Vec<String> = sqlx::query_scalar(
+        "SELECT job_id FROM journal_jobs
+         WHERE state IN ('succeeded', 'failed', 'cancelled')
+         ORDER BY updated_at_ms ASC, job_id ASC
+         LIMIT ?",
+    )
+    .bind(MAX_BYTES_PURGE_BATCH as i64)
+    .fetch_all(&mut *tx)
+    .await?;
+    if removed.is_empty() {
+        return Ok(0);
+    }
+    delete_job_ids(&mut tx, &removed).await?;
+    tx.commit().await?;
+    wal_checkpoint_passive(conn).await;
+    Ok(removed.len())
+}
+
+async fn emergency_purge_on_full(conn: &mut SqliteConnection, max_bytes: u64, page_size: u64) {
+    let mut total = 0usize;
+    for batch_idx in 0..EMERGENCY_PURGE_MAX_BATCHES {
+        match purge_over_cap_batch(conn, max_bytes, page_size, batch_idx == 0).await {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(error) => {
+                tracing::warn!(%error, "emergency SQLite max_bytes purge failed");
+                break;
+            }
+        }
+    }
+    if total > 0 {
+        tracing::info!(
+            removed = total,
+            "purged oldest terminal journal jobs after SQLITE_FULL"
+        );
+    }
 }
 
 async fn flush_batch(
@@ -1204,13 +1374,18 @@ async fn flush_batch(
     batch: &mut Vec<(JournalOp, oneshot::Sender<CommitOutcome>)>,
     pending: &AtomicUsize,
     stats: &Mutex<JournalStats>,
-) {
+) -> bool {
     let started = Instant::now();
     let ops: Vec<&JournalOp> = batch.iter().map(|(op, _)| op).collect();
     let outcomes = commit_batch(conn, &ops).await;
     drop(ops);
     let elapsed = started.elapsed();
     let batch_len = batch.len();
+    let hit_full = outcomes.as_ref().is_some_and(|outcomes| {
+        outcomes
+            .iter()
+            .any(|o| matches!(o, CommitOutcome::RolledBack(reason) if is_sqlite_full(reason)))
+    });
     let committed = match &outcomes {
         None => batch_len as u64,
         Some(outcomes) => outcomes
@@ -1238,12 +1413,16 @@ async fn flush_batch(
             }
         }
     }
+    hit_full
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn writer(
     mut conn: SqliteConnection,
     mut rx: mpsc::Receiver<Request>,
     max_batch: usize,
+    max_bytes: Option<u64>,
+    page_size: u64,
     pending: Arc<AtomicUsize>,
     stats: Arc<Mutex<JournalStats>>,
     _lock: File,
@@ -1265,12 +1444,12 @@ async fn writer(
                     if let Request::Op { op, reply } = request {
                         batch.push((op, reply));
                         if batch.len() >= max_batch {
-                            flush_batch(&mut conn, &mut batch, &pending, &stats).await;
+                            let _ = flush_batch(&mut conn, &mut batch, &pending, &stats).await;
                         }
                     }
                 }
                 if !batch.is_empty() {
-                    flush_batch(&mut conn, &mut batch, &pending, &stats).await;
+                    let _ = flush_batch(&mut conn, &mut batch, &pending, &stats).await;
                 }
                 rx.close();
                 let _ = conn.close().await;
@@ -1279,6 +1458,13 @@ async fn writer(
             }
             Request::Purge { before_ms, reply } => {
                 let _ = reply.send(purge(&mut conn, before_ms).await);
+            }
+            Request::PurgeOverCap { reply } => {
+                let res = match max_bytes {
+                    Some(cap) => purge_over_cap_batch(&mut conn, cap, page_size, false).await,
+                    None => Ok(0),
+                };
+                let _ = reply.send(res);
             }
             Request::Op { op, reply } => {
                 batch.push((op, reply));
@@ -1292,7 +1478,10 @@ async fn writer(
                         Err(_) => break,
                     }
                 }
-                flush_batch(&mut conn, &mut batch, &pending, &stats).await;
+                let hit_full = flush_batch(&mut conn, &mut batch, &pending, &stats).await;
+                if hit_full && let Some(cap) = max_bytes {
+                    emergency_purge_on_full(&mut conn, cap, page_size).await;
+                }
             }
         }
     }
@@ -1740,5 +1929,268 @@ mod tests {
         assert_eq!(obj_count, 0);
         conn.close().await.unwrap();
         journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_sqlite_migration_adds_and_backfills_namespace_column() {
+        let cfg = config("ns-migrate");
+        std::fs::create_dir_all(cfg.path.parent().unwrap()).unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(&cfg.path)
+            .create_if_missing(true);
+        let mut raw = SqliteConnection::connect_with(&options).await.unwrap();
+        // Simulate pre-namespace schema without the namespace column.
+        sqlx::query(
+            "CREATE TABLE journal_jobs (
+                job_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                spec_hash TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                error_json TEXT,
+                winning_lease_id TEXT,
+                result_digest TEXT,
+                last_attempt_id TEXT,
+                last_worker_id TEXT
+            )",
+        )
+        .execute(&mut raw)
+        .await
+        .unwrap();
+        let spec_json = serde_json::to_string(&StoredSpec {
+            demand: Demand {
+                interface: "echo".into(),
+                ..Default::default()
+            },
+            policy: ExecutionPolicy::default(),
+            metadata: Metadata::new(),
+        })
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO journal_jobs(job_id, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+             VALUES ('@ns:alpha:j1', 'succeeded', 'h1', ?, 1, 100, 101),
+                    ('@ns:beta:j2', 'succeeded', 'h2', ?, 1, 102, 103)",
+        )
+        .bind(&spec_json)
+        .bind(&spec_json)
+        .execute(&mut raw)
+        .await
+        .unwrap();
+        raw.close().await.unwrap();
+
+        let (journal, _) = Journal::open(&cfg).await.unwrap();
+        let alpha_jobs = journal
+            .scan_jobs(0, 1000, None, Some("alpha"), 10)
+            .await
+            .unwrap();
+        assert_eq!(alpha_jobs.len(), 1);
+        assert_eq!(alpha_jobs[0].job_id, "@ns:alpha:j1");
+        let beta_jobs = journal
+            .scan_jobs(0, 1000, None, Some("beta"), 10)
+            .await
+            .unwrap();
+        assert_eq!(beta_jobs.len(), 1);
+        assert_eq!(beta_jobs[0].job_id, "@ns:beta:j2");
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn legacy_migration_succeeds_under_tight_max_bytes_and_purges_oldest_terminal_jobs() {
+        let mut cfg = config("tight-max-bytes");
+        std::fs::create_dir_all(cfg.path.parent().unwrap()).unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(&cfg.path)
+            .create_if_missing(true);
+        let mut raw = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE journal_jobs (
+                job_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                spec_hash TEXT NOT NULL,
+                spec_json TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                error_json TEXT,
+                winning_lease_id TEXT,
+                result_digest TEXT,
+                last_attempt_id TEXT,
+                last_worker_id TEXT
+            )",
+        )
+        .execute(&mut raw)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE journal_objects (
+                job_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                uri TEXT,
+                content BLOB,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY (job_id, role, idx)
+            )",
+        )
+        .execute(&mut raw)
+        .await
+        .unwrap();
+        let spec_json = serde_json::to_string(&StoredSpec {
+            demand: Demand {
+                interface: "echo".into(),
+                ..Default::default()
+            },
+            policy: ExecutionPolicy::default(),
+            metadata: Metadata::new(),
+        })
+        .unwrap();
+        // Seed legacy DB with ~160 KiB of terminal payloads + scoped IDs, then open with a tight 128 KiB cap.
+        for i in 0..16u64 {
+            let job_id = if i == 0 {
+                "@ns:alpha:j0".to_string()
+            } else if i == 1 {
+                "@ns:default:@ns:weird:id".to_string()
+            } else {
+                format!("legacy-{i:02}")
+            };
+            sqlx::query(
+                "INSERT INTO journal_jobs(job_id, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+                 VALUES (?, 'succeeded', 'h', ?, 1, ?, ?)",
+            )
+            .bind(&job_id)
+            .bind(&spec_json)
+            .bind((100 + i) as i64)
+            .bind((1000 + i) as i64)
+            .execute(&mut raw)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO journal_objects(job_id, role, idx, uri, content, metadata_json)
+                 VALUES (?, 'output', 0, NULL, ?, '{}')",
+            )
+            .bind(&job_id)
+            .bind(vec![b'x'; 10 * 1024])
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        }
+        raw.close().await.unwrap();
+
+        cfg.max_bytes = Some(128 * 1024);
+        let (journal, _) = Journal::open(&cfg).await.unwrap();
+        // Single-SQL namespace backfill populated alpha and default properly despite tight max_bytes.
+        let alpha = journal
+            .scan_jobs(0, 1000, None, Some("alpha"), 10)
+            .await
+            .unwrap();
+        assert_eq!(alpha.len(), 1);
+        assert_eq!(alpha[0].job_id, "@ns:alpha:j0");
+
+        // Purge with before_ms = 0 deletes nothing by age, but max_bytes cap evicts oldest terminal jobs.
+        let evicted = journal.purge(0).await.unwrap();
+        assert!(
+            evicted > 0,
+            "expected max_bytes purge to evict oldest terminal jobs"
+        );
+        let mut verify_conn = connect(&cfg).await;
+        let used = db_used_bytes(&mut verify_conn, 4096).await.unwrap();
+        assert!(
+            used <= 128 * 1024 * MAX_BYTES_TARGET_PCT / 100,
+            "expected used bytes ({used}) <= 85% of 128 KiB"
+        );
+        verify_conn.close().await.unwrap();
+
+        // After eviction, new durable commits succeed cleanly under max_bytes.
+        assert_eq!(
+            commit(
+                &journal,
+                JournalOp::Accept(Box::new(AcceptRecord {
+                    job_id: "fresh-after-purge".into(),
+                    spec_hash: "hf".into(),
+                    spec: Arc::new(JobSpec::default()),
+                    max_attempts: 1,
+                    created_at_ms: 2000,
+                }))
+            )
+            .await,
+            CommitOutcome::Committed
+        );
+        journal.close().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_scan_job_metadata_paginates_past_250_rows() {
+        use crate::runtime::Runtime;
+        use crate::runtime::api::{JobScan, RuntimeConfig};
+
+        let mut cfg = config("scan-260");
+        cfg.full_sync = false;
+        let (journal, _) = Journal::open(&cfg).await.unwrap();
+        journal.close().await;
+
+        let mut conn = connect(&cfg).await;
+        let spec_json = serde_json::to_string(&StoredSpec {
+            demand: Demand {
+                interface: "echo".into(),
+                ..Default::default()
+            },
+            policy: ExecutionPolicy::default(),
+            metadata: Metadata::new(),
+        })
+        .unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        for i in 0..260i64 {
+            sqlx::query(
+                "INSERT INTO journal_jobs(job_id, namespace, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+                 VALUES (?, 'default', 'succeeded', 'h', ?, 1, ?, ?)",
+            )
+            .bind(format!("j-{i:03}"))
+            .bind(&spec_json)
+            .bind(1_000 + i)
+            .bind(2_000 + i)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        conn.close().await.unwrap();
+
+        let runtime = Runtime::start(RuntimeConfig {
+            journal: Some(cfg),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let page1 = runtime
+            .scan_job_metadata(JobScan {
+                archived: true,
+                from_ms: 500,
+                to_ms: 5_000,
+                limit: 250,
+                cursor: None,
+                namespace: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page1.jobs.len(), 250);
+        assert!(page1.next_page_token.is_some());
+        let page2 = runtime
+            .scan_job_metadata(JobScan {
+                archived: true,
+                from_ms: 500,
+                to_ms: 5_000,
+                limit: 250,
+                cursor: page1.next_page_token,
+                namespace: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page2.jobs.len(), 10);
+        assert!(page2.next_page_token.is_none());
+        runtime.shutdown().await;
     }
 }

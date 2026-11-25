@@ -7,7 +7,10 @@
 //! and [`crate::worker_service`] over `/rpc/v2/*` and `/ws/v2/*`.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyserve_proto::v2 as pb;
@@ -20,24 +23,26 @@ use axum::http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
+use futures::{SinkExt, Stream, StreamExt};
 use prost::Message as ProstMessage;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio::sync::{Notify, mpsc};
 use tonic::Status;
 
-use crate::auth::{AuthPolicy, Principal, Role};
+use crate::auth::{AuthPolicy, Principal, Role, wait_credential_invalidated};
 use crate::client_service::{
     cancel_request, event_to_proto, get_job_request, handle_invoke_message, list_jobs_request,
     start_invoke, submit_request,
 };
 use crate::error::ErrorKind;
+use crate::runtime::worker::WorkerOpenError;
 use crate::runtime::{Runtime, api};
 use crate::worker_service::{down, finished, receive_uploads, send_inputs};
 
 pub const GRPC_CODE_HEADER: &str = "x-anyserve-grpc-code";
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 const WS_MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
+const WS_WATCH_MAX_BYTES: usize = 16 * 1024;
+const WS_ATTEMPT_INBOUND_SLOTS: usize = 16;
 const WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 type WsTx = SplitSink<WebSocket, Message>;
@@ -68,6 +73,7 @@ fn router_with_ping_interval(
     };
     let unary = Router::new()
         .route("/rpc/v2/client/submit", post(rpc_submit))
+        .route("/rpc/v2/client/execute", post(rpc_execute))
         .route("/rpc/v2/client/get_job", post(rpc_get_job))
         .route("/rpc/v2/client/cancel", post(rpc_cancel))
         .route("/rpc/v2/client/list_jobs", post(rpc_list_jobs))
@@ -139,7 +145,7 @@ async fn handle_unary_client<Req, Resp, F, Fut>(
 where
     Req: ProstMessage + Default,
     Resp: ProstMessage,
-    F: FnOnce(Runtime, String, Req) -> Fut,
+    F: FnOnce(Runtime, Arc<AuthPolicy>, Principal, Req) -> Fut,
     Fut: Future<Output = Result<Resp, Status>>,
 {
     let principal = match authorize_http(&state, &headers, Role::Client) {
@@ -154,7 +160,7 @@ where
             )));
         }
     };
-    match handler(state.runtime, principal.namespace, req).await {
+    match handler(state.runtime, state.auth, principal, req).await {
         Ok(resp) => {
             let mut out = Vec::with_capacity(resp.encoded_len());
             if let Err(err) = resp.encode(&mut out) {
@@ -202,9 +208,56 @@ async fn rpc_submit(State(state): State<HttpWsState>, headers: HeaderMap, body: 
         state,
         headers,
         body,
-        |runtime, namespace, mut req: pb::SubmitRequest| async move {
+        |runtime, _auth, principal, mut req: pb::SubmitRequest| async move {
             merge_trace_header_pairs(req.spec.as_mut(), &trace_headers);
-            submit_request(&runtime, namespace, req).await
+            submit_request(&runtime, principal.namespace, req).await
+        },
+    )
+    .await
+}
+
+async fn rpc_execute(
+    State(state): State<HttpWsState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let trace_headers = extract_http_trace_headers(&headers);
+    handle_unary_client(
+        state,
+        headers,
+        body,
+        |runtime, auth, principal, mut start: pb::InvokeStart| async move {
+            if start.streaming_input {
+                return Err(Status::invalid_argument(
+                    "/rpc/v2/client/execute does not accept streaming_input",
+                ));
+            }
+            merge_trace_header_pairs(start.spec.as_mut(), &trace_headers);
+            let mut execution = start_invoke(&runtime, principal.namespace.clone(), start).await?;
+            let invalidated = wait_credential_invalidated(&auth, &principal);
+            tokio::pin!(invalidated);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut invalidated => {
+                        auth.record_rejection();
+                        return Err(Status::unauthenticated(
+                            "bearer token has been revoked or expired",
+                        ));
+                    }
+                    next = execution.next() => {
+                        let Some(event) = next else {
+                            return Err(Status::unavailable(
+                                "execution ended without a terminal event",
+                            ));
+                        };
+                        let event = event?;
+                        if matches!(event.kind, api::EventKind::Finished { .. }) {
+                            return Ok(event_to_proto(event));
+                        }
+                    }
+                }
+            }
         },
     )
     .await
@@ -219,8 +272,8 @@ async fn rpc_get_job(
         state,
         headers,
         body,
-        |runtime, namespace, req: pb::GetJobRequest| async move {
-            get_job_request(&runtime, &namespace, req).await
+        |runtime, _auth, principal, req: pb::GetJobRequest| async move {
+            get_job_request(&runtime, &principal.namespace, req).await
         },
     )
     .await
@@ -231,8 +284,8 @@ async fn rpc_cancel(State(state): State<HttpWsState>, headers: HeaderMap, body: 
         state,
         headers,
         body,
-        |runtime, namespace, req: pb::CancelRequest| async move {
-            cancel_request(&runtime, &namespace, req).await
+        |runtime, _auth, principal, req: pb::CancelRequest| async move {
+            cancel_request(&runtime, &principal.namespace, req).await
         },
     )
     .await
@@ -247,8 +300,8 @@ async fn rpc_list_jobs(
         state,
         headers,
         body,
-        |runtime, namespace, req: pb::ListJobsRequest| async move {
-            list_jobs_request(&runtime, namespace, req).await
+        |runtime, _auth, principal, req: pb::ListJobsRequest| async move {
+            list_jobs_request(&runtime, principal.namespace, req).await
         },
     )
     .await
@@ -263,10 +316,17 @@ async fn ws_worker_session(
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    ws.max_frame_size(WS_MAX_FRAME_SIZE)
-        .max_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+    let max_ctrl = state.runtime.config().limits.max_control_message_bytes as usize;
+    ws.max_frame_size(max_ctrl)
+        .max_message_size(max_ctrl)
         .on_upgrade(move |socket| {
-            handle_worker_session(state.runtime, principal, socket, state.ping_interval)
+            handle_worker_session(
+                state.runtime,
+                state.auth,
+                principal,
+                socket,
+                state.ping_interval,
+            )
         })
 }
 
@@ -275,12 +335,21 @@ async fn ws_worker_attempt(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(response) = authorize_http(&state, &headers, Role::Worker) {
-        return response;
-    }
+    let principal = match authorize_http(&state, &headers, Role::Worker) {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
     ws.max_frame_size(WS_MAX_FRAME_SIZE)
         .max_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_worker_attempt(state.runtime, socket, state.ping_interval))
+        .on_upgrade(move |socket| {
+            handle_worker_attempt(
+                state.runtime,
+                state.auth,
+                principal,
+                socket,
+                state.ping_interval,
+            )
+        })
 }
 
 async fn ws_client_invoke(
@@ -298,6 +367,7 @@ async fn ws_client_invoke(
         .on_upgrade(move |socket| {
             handle_client_invoke(
                 state.runtime,
+                state.auth,
                 principal,
                 socket,
                 state.ping_interval,
@@ -315,10 +385,16 @@ async fn ws_client_watch(
         Ok(principal) => principal,
         Err(response) => return response,
     };
-    ws.max_frame_size(WS_MAX_FRAME_SIZE)
-        .max_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
+    ws.max_frame_size(WS_WATCH_MAX_BYTES)
+        .max_message_size(WS_WATCH_MAX_BYTES)
         .on_upgrade(move |socket| {
-            handle_client_watch(state.runtime, principal, socket, state.ping_interval)
+            handle_client_watch(
+                state.runtime,
+                state.auth,
+                principal,
+                socket,
+                state.ping_interval,
+            )
         })
 }
 
@@ -419,8 +495,31 @@ impl Drop for SessionGuard {
     }
 }
 
+struct MeteredInbound {
+    rx: mpsc::Receiver<(Result<pb::AttemptUp, Status>, usize)>,
+    queued_bytes: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+}
+
+impl Stream for MeteredInbound {
+    type Item = Result<pb::AttemptUp, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Ready(Some((item, bytes))) => {
+                self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                self.drained.notify_one();
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 async fn handle_worker_session(
     runtime: Runtime,
+    auth: Arc<AuthPolicy>,
     principal: Principal,
     socket: WebSocket,
     ping_period: Duration,
@@ -455,7 +554,7 @@ async fn handle_worker_session(
             return;
         }
     };
-    let mut handle = match runtime.open_session_for(hello, principal) {
+    let mut handle = match runtime.open_session_for(hello, principal, &auth) {
         Ok(handle) => handle,
         Err(error) => {
             send_error_and_close(&mut ws_tx, &Status::from(error)).await;
@@ -510,9 +609,7 @@ async fn handle_worker_session(
                                     }
                                 }
                             }
-                            Ok(pb::WorkerMessage { msg: None }) => {
-                                hb_sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
-                            }
+                            Ok(pb::WorkerMessage { msg: None }) => {}
                             Err(err) => {
                                 send_error_and_close(
                                     &mut ws_tx,
@@ -539,7 +636,13 @@ async fn handle_worker_session(
     }
 }
 
-async fn handle_worker_attempt(runtime: Runtime, socket: WebSocket, ping_period: Duration) {
+async fn handle_worker_attempt(
+    runtime: Runtime,
+    auth: Arc<AuthPolicy>,
+    principal: Principal,
+    socket: WebSocket,
+    ping_period: Duration,
+) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut ping_interval = new_ping_interval(ping_period);
     let timeout = runtime.config().heartbeat_timeout;
@@ -571,9 +674,9 @@ async fn handle_worker_attempt(runtime: Runtime, socket: WebSocket, ping_period:
         }
     };
 
-    let (link, resume_from) = match runtime.open_attempt(&open).await {
+    let (link, resume_from) = match runtime.open_attempt_for(&principal, &auth, &open).await {
         Ok(opened) => opened,
-        Err(error) if error.kind == ErrorKind::StaleLease => {
+        Err(WorkerOpenError::Runtime(error)) if error.kind == ErrorKind::StaleLease => {
             let _ = send_ok(
                 &mut ws_tx,
                 &finished(pb::attempt_finished::Status::Fenced, error.message()),
@@ -624,22 +727,34 @@ async fn handle_worker_attempt(runtime: Runtime, socket: WebSocket, ping_period:
         replay => (replay, None),
     };
 
-    let (inbound_tx, inbound_rx) = mpsc::channel::<Result<pb::AttemptUp, Status>>(256);
+    let (inbound_tx, inbound_rx) =
+        mpsc::channel::<(Result<pb::AttemptUp, Status>, usize)>(WS_ATTEMPT_INBOUND_SLOTS);
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    let drained = Arc::new(Notify::new());
+    let window_bytes = (limits.attempt_window_bytes as usize).max(1);
     let mut inbound_tx = Some(inbound_tx);
     let mut upload_task = tokio::spawn(receive_uploads(
         runtime,
         link,
-        ReceiverStream::new(inbound_rx),
+        MeteredInbound {
+            rx: inbound_rx,
+            queued_bytes: Arc::clone(&queued_bytes),
+            drained: Arc::clone(&drained),
+        },
         tx,
         limits,
         timeout,
         false,
     ));
     let mut upload_done = false;
-    let mut pending_up: Option<Result<pb::AttemptUp, Status>> = None;
+    let mut pending_up: Option<(Result<pb::AttemptUp, Status>, usize)> = None;
 
     loop {
         let mut close_inbound = false;
+        let window_wait = drained.notified();
+        tokio::pin!(window_wait);
+        window_wait.as_mut().enable();
+        let can_read = pending_up.is_none() && queued_bytes.load(Ordering::Acquire) < window_bytes;
         let should_exit = tokio::select! {
             _ = &mut upload_task, if !upload_done => {
                 upload_done = true;
@@ -664,18 +779,25 @@ async fn handle_worker_attempt(runtime: Runtime, socket: WebSocket, ping_period:
             _ = ping_interval.tick() => {
                 ws_tx.send(Message::Ping(Vec::new())).await.is_err()
             }
-            frame = ws_rx.next(), if pending_up.is_none() => {
+            _ = &mut window_wait, if pending_up.is_none() && !can_read && inbound_tx.is_some() => {
+                false
+            }
+            frame = ws_rx.next(), if can_read => {
                 match frame {
                     Some(Ok(Message::Binary(bytes))) => {
+                        let frame_bytes = bytes.len().max(1);
                         match pb::AttemptUp::decode(bytes.as_slice()) {
                             Ok(up) => {
                                 if let Some(tx_in) = inbound_tx.as_ref() {
-                                    match tx_in.try_send(Ok(up)) {
+                                    queued_bytes.fetch_add(frame_bytes, Ordering::AcqRel);
+                                    match tx_in.try_send((Ok(up), frame_bytes)) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(item)) => {
+                                            queued_bytes.fetch_sub(frame_bytes, Ordering::AcqRel);
                                             pending_up = Some(item);
                                         }
                                         Err(mpsc::error::TrySendError::Closed(_)) => {
+                                            queued_bytes.fetch_sub(frame_bytes, Ordering::AcqRel);
                                             close_inbound = true;
                                         }
                                     }
@@ -713,8 +835,9 @@ async fn handle_worker_attempt(runtime: Runtime, socket: WebSocket, ping_period:
             }, if pending_up.is_some() && inbound_tx.is_some() => {
                 match permit {
                     Ok(permit) => {
-                        if let Some(item) = pending_up.take() {
-                            permit.send(item);
+                        if let Some((item, frame_bytes)) = pending_up.take() {
+                            queued_bytes.fetch_add(frame_bytes, Ordering::AcqRel);
+                            permit.send((item, frame_bytes));
                         }
                     }
                     Err(_) => {
@@ -744,6 +867,7 @@ async fn handle_worker_attempt(runtime: Runtime, socket: WebSocket, ping_period:
 
 async fn handle_client_invoke(
     runtime: Runtime,
+    auth: Arc<AuthPolicy>,
     principal: Principal,
     socket: WebSocket,
     ping_period: Duration,
@@ -751,12 +875,13 @@ async fn handle_client_invoke(
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut ping_interval = new_ping_interval(ping_period);
+    let initial_timeout = runtime.config().heartbeat_timeout;
 
     let first = match recv_initial_proto::<pb::InvokeRequest>(
         &mut ws_rx,
         &mut ws_tx,
         &mut ping_interval,
-        None,
+        Some((initial_timeout, "no Start received")),
     )
     .await
     {
@@ -778,8 +903,17 @@ async fn handle_client_invoke(
             return;
         }
     };
+    if auth.is_principal_invalidated(&principal, crate::now_ms() / 1000) {
+        auth.record_rejection();
+        send_error_and_close(
+            &mut ws_tx,
+            &Status::unauthenticated("bearer token has been revoked or expired"),
+        )
+        .await;
+        return;
+    }
     merge_trace_header_pairs(start.spec.as_mut(), &trace_headers);
-    let mut execution = match start_invoke(&runtime, principal.namespace, start).await {
+    let mut execution = match start_invoke(&runtime, principal.namespace.clone(), start).await {
         Ok(execution) => execution,
         Err(status) => {
             send_error_and_close(&mut ws_tx, &status).await;
@@ -788,9 +922,21 @@ async fn handle_client_invoke(
     };
     let input = execution.take_input();
     let mut input_done = input.is_none();
+    let invalidated = wait_credential_invalidated(&auth, &principal);
+    tokio::pin!(invalidated);
 
     loop {
         tokio::select! {
+            biased;
+            _ = &mut invalidated => {
+                auth.record_rejection();
+                send_error_and_close(
+                    &mut ws_tx,
+                    &Status::unauthenticated("bearer token has been revoked or expired"),
+                )
+                .await;
+                break;
+            }
             _ = ping_interval.tick() => {
                 if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
@@ -860,18 +1006,20 @@ async fn handle_client_invoke(
 
 async fn handle_client_watch(
     runtime: Runtime,
+    auth: Arc<AuthPolicy>,
     principal: Principal,
     socket: WebSocket,
     ping_period: Duration,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut ping_interval = new_ping_interval(ping_period);
+    let initial_timeout = runtime.config().heartbeat_timeout;
 
     let req = match recv_initial_proto::<pb::WatchRequest>(
         &mut ws_rx,
         &mut ws_tx,
         &mut ping_interval,
-        None,
+        Some((initial_timeout, "no WatchRequest received")),
     )
     .await
     {
@@ -882,6 +1030,15 @@ async fn handle_client_watch(
         }
         Err(None) => return,
     };
+    if auth.is_principal_invalidated(&principal, crate::now_ms() / 1000) {
+        auth.record_rejection();
+        send_error_and_close(
+            &mut ws_tx,
+            &Status::unauthenticated("bearer token has been revoked or expired"),
+        )
+        .await;
+        return;
+    }
     let mut events = match runtime.watch_in(&principal.namespace, &req.job_id, req.after_sequence) {
         Ok(events) => events,
         Err(err) => {
@@ -889,9 +1046,21 @@ async fn handle_client_watch(
             return;
         }
     };
+    let invalidated = wait_credential_invalidated(&auth, &principal);
+    tokio::pin!(invalidated);
 
     loop {
         tokio::select! {
+            biased;
+            _ = &mut invalidated => {
+                auth.record_rejection();
+                send_error_and_close(
+                    &mut ws_tx,
+                    &Status::unauthenticated("bearer token has been revoked or expired"),
+                )
+                .await;
+                break;
+            }
             _ = ping_interval.tick() => {
                 if ws_tx.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
@@ -1931,5 +2100,337 @@ mod tests {
         })
         .await
         .expect("non-streaming invoke WS disconnect must cancel queued job");
+    }
+
+    #[tokio::test]
+    async fn http_pooled_execute_completes_and_cross_tenant_attempt_is_fenced() {
+        let policy = AuthPolicy::new(vec!["op-c".into()], Vec::new()).with_scoped_tokens([
+            crate::auth::ScopedToken {
+                token: "c-alpha".into(),
+                role: Role::Client,
+                namespace: "alpha".into(),
+                subject: "c-a".into(),
+                forced_pool: None,
+            },
+            crate::auth::ScopedToken {
+                token: "w-alpha".into(),
+                role: Role::Worker,
+                namespace: "alpha".into(),
+                subject: "w-a".into(),
+                forced_pool: None,
+            },
+            crate::auth::ScopedToken {
+                token: "w-beta".into(),
+                role: Role::Worker,
+                namespace: "beta".into(),
+                subject: "w-b".into(),
+                forced_pool: None,
+            },
+        ]);
+        let server = TestServer::start(RuntimeConfig::default(), policy).await;
+
+        // Connect worker in alpha via WS session.
+        let mut ws_worker = server
+            .connect_ws("/ws/v2/worker/session", Some("w-alpha"), None)
+            .await
+            .unwrap();
+        ws_worker
+            .send(TsMessage::Binary(
+                pb::WorkerMessage {
+                    msg: Some(pb::worker_message::Msg::Hello(pb::Hello {
+                        worker_id: "w1".into(),
+                        interfaces: vec!["fast.echo".into()],
+                        max_concurrency: 2,
+                        ..Default::default()
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let _welcome = recv_ws_envelope::<pb::ServerMessage>(&mut ws_worker)
+            .await
+            .unwrap()
+            .unwrap();
+        ws_worker
+            .send(TsMessage::Binary(
+                pb::WorkerMessage {
+                    msg: Some(pb::worker_message::Msg::Credit(pb::Credit {
+                        free_slots: 2,
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+
+        // Call POST /rpc/v2/client/execute in namespace alpha.
+        let http = reqwest::Client::new();
+        let start = pb::InvokeStart {
+            spec: Some(job_spec("fast.echo", b"ping".to_vec())),
+            streaming_input: false,
+        };
+        let url = format!("{}/rpc/v2/client/execute", server.base_http);
+        let req_task = tokio::spawn(async move {
+            http.post(url)
+                .header("content-type", PROTOBUF_CONTENT_TYPE)
+                .header("authorization", "Bearer c-alpha")
+                .body(start.encode_to_vec())
+                .send()
+                .await
+                .unwrap()
+        });
+
+        let assign = match recv_ws_envelope::<pb::ServerMessage>(&mut ws_worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .msg
+        {
+            Some(pb::server_message::Msg::Assign(assign)) => assign,
+            other => panic!("expected Assign, got {other:?}"),
+        };
+
+        // Cross-tenant worker (beta) tries to open alpha's lease via /ws/v2/worker/attempt.
+        let mut bad_attempt = server
+            .connect_ws("/ws/v2/worker/attempt", Some("w-beta"), None)
+            .await
+            .unwrap();
+        bad_attempt
+            .send(TsMessage::Binary(
+                pb::AttemptUp {
+                    msg: Some(pb::attempt_up::Msg::Open(pb::AttemptOpen {
+                        lease_id: assign.lease_id.clone(),
+                        generation: assign.generation,
+                        resume_after_sequence: 0,
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let bad_down = recv_ws_envelope::<pb::AttemptDown>(&mut bad_attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        match bad_down.msg {
+            Some(pb::attempt_down::Msg::Finished(fin)) => {
+                assert_eq!(fin.status, pb::attempt_finished::Status::Fenced as i32);
+            }
+            other => panic!("expected Fenced, got {other:?}"),
+        }
+
+        // Open with w-alpha and finish with "pong".
+        let mut ok_attempt = server
+            .connect_ws("/ws/v2/worker/attempt", Some("w-alpha"), None)
+            .await
+            .unwrap();
+        ok_attempt
+            .send(TsMessage::Binary(
+                pb::AttemptUp {
+                    msg: Some(pb::attempt_up::Msg::Open(pb::AttemptOpen {
+                        lease_id: assign.lease_id,
+                        generation: assign.generation,
+                        resume_after_sequence: 0,
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let _opened = recv_ws_envelope::<pb::AttemptDown>(&mut ok_attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        ok_attempt
+            .send(TsMessage::Binary(
+                pb::AttemptUp {
+                    msg: Some(pb::attempt_up::Msg::Result(pb::ResultChunk {
+                        index: 0,
+                        data: b"pong".to_vec().into(),
+                        last: true,
+                        metadata: HashMap::new(),
+                        uri: String::new(),
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let _ack = recv_ws_envelope::<pb::AttemptDown>(&mut ok_attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        ok_attempt
+            .send(TsMessage::Binary(
+                pb::AttemptUp {
+                    msg: Some(pb::attempt_up::Msg::Finish(pb::Finish {
+                        outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        while let Some(Ok(down)) = recv_ws_envelope::<pb::AttemptDown>(&mut ok_attempt).await {
+            if matches!(down.msg, Some(pb::attempt_down::Msg::Finished(_))) {
+                break;
+            }
+        }
+        let resp = req_task.await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = resp.bytes().await.unwrap();
+        let ev = pb::ExecutionEvent::decode(body).unwrap();
+        match ev.event {
+            Some(pb::execution_event::Event::Finished(fin)) => {
+                assert_eq!(fin.state, pb::JobState::Succeeded as i32);
+                assert_eq!(
+                    fin.outputs[0].body,
+                    Some(pb::object::Body::Inline(b"pong".to_vec().into()))
+                );
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_signed_client_token_terminates_active_execute_invoke_and_watch_streams() {
+        let key = b"test-client-stream-rev-key-32b!!".to_vec();
+        let auth = AuthPolicy::default().with_signing_keys([key.clone()]);
+        let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+        let server =
+            TestServer::start_with_runtime(runtime.clone(), auth.clone(), WS_PING_INTERVAL).await;
+
+        let now_s = crate::now_ms() / 1000;
+        let token = crate::auth::sign_token(
+            &key,
+            &crate::auth::SignedTokenClaims {
+                jti: "jti-stream-rev".into(),
+                ns: "tenant-s".into(),
+                role: "client".into(),
+                sub: "gh:streamuser".into(),
+                iat: now_s,
+                exp: Some(now_s + 3600),
+                fp: None,
+            },
+        )
+        .unwrap();
+
+        // Submit a queued job in tenant-s so /ws/v2/client/watch stays open waiting.
+        let sub: pb::SubmitResponse = server
+            .unary(
+                "/rpc/v2/client/submit",
+                Some(&token),
+                None,
+                &pb::SubmitRequest {
+                    job_id: "watch-rev-1".into(),
+                    spec: Some(job_spec("unserved.rev", b"x".to_vec())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(sub.created);
+
+        // 1. Open active POST /rpc/v2/client/execute (blocked waiting for worker).
+        let http = server.http.clone();
+        let exec_url = format!("{}/rpc/v2/client/execute", server.base_http);
+        let exec_tok = token.clone();
+        let exec_task = tokio::spawn(async move {
+            let start = pb::InvokeStart {
+                spec: Some(job_spec("unserved.rev", b"hi".to_vec())),
+                streaming_input: false,
+            };
+            http.post(exec_url)
+                .header(header::CONTENT_TYPE, PROTOBUF_CONTENT_TYPE)
+                .bearer_auth(exec_tok)
+                .body(start.encode_to_vec())
+                .send()
+                .await
+                .unwrap()
+        });
+
+        // 2. Open active /ws/v2/client/invoke.
+        let mut invoke_ws = server
+            .connect_ws("/ws/v2/client/invoke", Some(&token), None)
+            .await
+            .unwrap();
+        invoke_ws
+            .send(TsMessage::Binary(
+                pb::InvokeRequest {
+                    msg: Some(pb::invoke_request::Msg::Start(pb::InvokeStart {
+                        spec: Some(job_spec("unserved.rev", b"hi".to_vec())),
+                        streaming_input: false,
+                    })),
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let accepted = recv_ws_envelope::<pb::ExecutionEvent>(&mut invoke_ws)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            accepted.event,
+            Some(pb::execution_event::Event::Accepted(_))
+        ));
+
+        // 3. Open active /ws/v2/client/watch.
+        let mut watch_ws = server
+            .connect_ws("/ws/v2/client/watch", Some(&token), None)
+            .await
+            .unwrap();
+        watch_ws
+            .send(TsMessage::Binary(
+                pb::WatchRequest {
+                    job_id: "watch-rev-1".into(),
+                    after_sequence: 0,
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        let _watch_acc = recv_ws_envelope::<pb::ExecutionEvent>(&mut watch_ws)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Wait briefly so rpc_execute has entered its select loop, then revoke the JTI!
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        auth.apply_revocations(crate::auth::RevocationSnapshot {
+            version: 1,
+            revoked_jtis: vec!["jti-stream-rev".into()],
+        });
+
+        let exec_resp = tokio::time::timeout(Duration::from_secs(2), exec_task)
+            .await
+            .expect("rpc_execute must terminate promptly on revocation")
+            .unwrap();
+        assert_eq!(exec_resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            exec_resp.headers()[GRPC_CODE_HEADER],
+            (tonic::Code::Unauthenticated as i32).to_string().as_str()
+        );
+
+        let (inv_code, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            recv_ws_envelope::<pb::ExecutionEvent>(&mut invoke_ws),
+        )
+        .await
+        .expect("ws invoke must terminate promptly on revocation")
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(inv_code, tonic::Code::Unauthenticated as u8);
+
+        let (watch_code, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            recv_ws_envelope::<pb::ExecutionEvent>(&mut watch_ws),
+        )
+        .await
+        .expect("ws watch must terminate promptly on revocation")
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(watch_code, tonic::Code::Unauthenticated as u8);
     }
 }

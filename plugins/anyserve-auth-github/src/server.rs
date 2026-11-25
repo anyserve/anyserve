@@ -2,9 +2,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyserve_core::auth::{SignedTokenClaims, constant_time_eq, sign_token};
-use axum::extract::{Path, Query, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
+use axum::extract::{Path, Query, Request, State};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_TYPE, HeaderName, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -14,20 +17,21 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::github::{GitHubClient, check_user_eligibility};
 use crate::session::{
-    OAUTH_STATE_COOKIE_NAME, OAUTH_STATE_TTL_SECS, OAuthState, SESSION_COOKIE_NAME,
-    SESSION_TTL_SECS, SessionUser, derive_cookie_key, format_cookie, read_cookie, seal_cookie,
+    OAUTH_STATE_TTL_SECS, OAuthState, SESSION_TTL_SECS, SessionUser, derive_cookie_key,
+    format_cookie, oauth_state_cookie_name, read_cookie, seal_cookie, session_cookie_name,
     unseal_cookie,
 };
 use crate::store::{SqliteStore, TokenRecord, make_token_preview};
 
 const PORTAL_HTML: &str = include_str!("portal.html");
+const PORTAL_CSP: &str = "default-src 'self'; img-src 'self' https:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'";
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub store: SqliteStore,
     pub github: GitHubClient,
-    pub cookie_key: [u8; 32],
+    pub cookie_keys: Vec<[u8; 32]>,
 }
 
 impl AppState {
@@ -39,13 +43,37 @@ impl AppState {
             config.github_client_secret.clone(),
             config.callback_url(),
         )?;
-        let cookie_key = derive_cookie_key(&config.signing_key);
+        let cookie_keys = config
+            .signing_keys
+            .iter()
+            .map(|k| derive_cookie_key(k))
+            .collect();
         Ok(Self {
             config: Arc::new(config),
             store,
             github,
-            cookie_key,
+            cookie_keys,
         })
+    }
+
+    fn primary_cookie_key(&self) -> &[u8; 32] {
+        self.cookie_keys
+            .first()
+            .expect("AppState always has at least one cookie key")
+    }
+
+    fn unseal_any<T: serde::de::DeserializeOwned>(&self, purpose: &str, raw: &str) -> Option<T> {
+        self.cookie_keys
+            .iter()
+            .find_map(|key| unseal_cookie(key, purpose, raw))
+    }
+
+    fn session_cookie_name(&self) -> &'static str {
+        session_cookie_name(self.config.cookie_secure())
+    }
+
+    fn oauth_state_cookie_name(&self) -> &'static str {
+        oauth_state_cookie_name(self.config.cookie_secure())
     }
 }
 
@@ -63,7 +91,28 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/api/tokens/:jti/revoke", post(api_revoke_token))
         .route("/auth/api/tokens/revoke-all", post(api_revoke_all_tokens))
         .route("/internal/revocations", get(internal_revocations))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+async fn security_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(PORTAL_CSP),
+    );
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 fn now_secs() -> u64 {
@@ -91,6 +140,11 @@ fn json_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
+fn internal_error(context: &'static str, err: impl std::fmt::Display) -> Response {
+    tracing::warn!(context, error = %err, "internal auth plugin error");
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
 fn require_csrf_header(headers: &HeaderMap) -> Result<(), &'static str> {
     let ok = headers
         .get("x-requested-with")
@@ -104,21 +158,18 @@ fn require_csrf_header(headers: &HeaderMap) -> Result<(), &'static str> {
 }
 
 fn authenticated_user(state: &AppState, headers: &HeaderMap) -> Option<SessionUser> {
-    let raw = read_cookie(headers, SESSION_COOKIE_NAME)?;
-    let user: SessionUser = unseal_cookie(&state.cookie_key, raw)?;
+    let cookie_name = state.session_cookie_name();
+    let raw = read_cookie(headers, cookie_name)?;
+    let user: SessionUser = state.unseal_any(cookie_name, raw)?;
     (now_secs() < user.exp).then_some(user)
 }
 
 async fn portal_page() -> Response {
     (
-        [
-            (
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            ),
-            (CACHE_CONTROL, HeaderValue::from_static("no-store")),
-            (X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
-        ],
+        [(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        )],
         Html(PORTAL_HTML),
     )
         .into_response()
@@ -126,8 +177,10 @@ async fn portal_page() -> Response {
 
 async fn oauth_start(State(state): State<AppState>) -> Response {
     let nonce = Uuid::new_v4().simple().to_string();
+    let state_cookie = state.oauth_state_cookie_name();
     let cookie_val = match seal_cookie(
-        &state.cookie_key,
+        state.primary_cookie_key(),
+        state_cookie,
         &OAuthState {
             nonce: nonce.clone(),
             exp: now_secs() + OAUTH_STATE_TTL_SECS,
@@ -135,11 +188,12 @@ async fn oauth_start(State(state): State<AppState>) -> Response {
     ) {
         Ok(v) => v,
         Err(err) => {
-            return portal_redirect_with_error(&format!("failed to start login: {err}"));
+            tracing::warn!(error = %err, "seal OAuth state cookie");
+            return portal_redirect_with_error("failed to start login");
         }
     };
     let set_cookie = format_cookie(
-        OAUTH_STATE_COOKIE_NAME,
+        state_cookie,
         &cookie_val,
         OAUTH_STATE_TTL_SECS as i64,
         state.config.cookie_secure(),
@@ -153,7 +207,6 @@ struct OAuthCallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
-    error_description: Option<String>,
 }
 
 async fn oauth_callback(
@@ -161,19 +214,21 @@ async fn oauth_callback(
     headers: HeaderMap,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
-    let clear_state = format_cookie(OAUTH_STATE_COOKIE_NAME, "", 0, state.config.cookie_secure());
+    let state_cookie = state.oauth_state_cookie_name();
+    let clear_state = format_cookie(state_cookie, "", 0, state.config.cookie_secure());
 
     if let Some(err) = query.error {
-        let desc = query.error_description.unwrap_or(err);
-        return (
-            [(SET_COOKIE, clear_state)],
-            portal_redirect_with_error(&desc),
-        )
-            .into_response();
+        let msg = match err.as_str() {
+            "access_denied" => "GitHub login was cancelled",
+            "redirect_uri_mismatch" => "OAuth redirect URI mismatch",
+            "incorrect_client_credentials" => "OAuth client configuration error",
+            _ => "GitHub OAuth login failed; please try again",
+        };
+        return ([(SET_COOKIE, clear_state)], portal_redirect_with_error(msg)).into_response();
     }
 
-    let Some(expected_cookie) = read_cookie(&headers, OAUTH_STATE_COOKIE_NAME)
-        .and_then(|c| unseal_cookie::<OAuthState>(&state.cookie_key, c))
+    let Some(expected_cookie) = read_cookie(&headers, state_cookie)
+        .and_then(|c| state.unseal_any::<OAuthState>(state_cookie, c))
         .filter(|s| now_secs() < s.exp)
     else {
         return (
@@ -201,9 +256,10 @@ async fn oauth_callback(
     let access_token = match state.github.exchange_code(&code).await {
         Ok(tok) => tok,
         Err(err) => {
+            tracing::warn!(error = %err, "GitHub OAuth code exchange failed");
             return (
                 [(SET_COOKIE, clear_state)],
-                portal_redirect_with_error(&err.to_string()),
+                portal_redirect_with_error("GitHub OAuth login failed; please try again"),
             )
                 .into_response();
         }
@@ -211,9 +267,10 @@ async fn oauth_callback(
     let gh_user = match state.github.fetch_user(&access_token).await {
         Ok(user) => user,
         Err(err) => {
+            tracing::warn!(error = %err, "GitHub user profile fetch failed");
             return (
                 [(SET_COOKIE, clear_state)],
-                portal_redirect_with_error(&err.to_string()),
+                portal_redirect_with_error("failed to load GitHub profile; please try again"),
             )
                 .into_response();
         }
@@ -245,15 +302,18 @@ async fn oauth_callback(
         )
         .await
     {
+        tracing::warn!(error = %err, "save GitHub user record");
         return (
             [(SET_COOKIE, clear_state)],
-            portal_redirect_with_error(&format!("failed to save user: {err}")),
+            portal_redirect_with_error("failed to save user record; please try again"),
         )
             .into_response();
     }
 
+    let session_name = state.session_cookie_name();
     let session_cookie = match seal_cookie(
-        &state.cookie_key,
+        state.primary_cookie_key(),
+        session_name,
         &SessionUser {
             github_id: gh_user.id,
             login: gh_user.login,
@@ -264,15 +324,16 @@ async fn oauth_callback(
     ) {
         Ok(v) => v,
         Err(err) => {
+            tracing::warn!(error = %err, "seal session cookie");
             return (
                 [(SET_COOKIE, clear_state)],
-                portal_redirect_with_error(&format!("failed to create session: {err}")),
+                portal_redirect_with_error("failed to create session; please try again"),
             )
                 .into_response();
         }
     };
     let set_session = format_cookie(
-        SESSION_COOKIE_NAME,
+        session_name,
         &session_cookie,
         SESSION_TTL_SECS as i64,
         state.config.cookie_secure(),
@@ -292,7 +353,12 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(msg) = require_csrf_header(&headers) {
         return json_error(StatusCode::FORBIDDEN, msg);
     }
-    let clear = format_cookie(SESSION_COOKIE_NAME, "", 0, state.config.cookie_secure());
+    let clear = format_cookie(
+        state.session_cookie_name(),
+        "",
+        0,
+        state.config.cookie_secure(),
+    );
     ([(SET_COOKIE, clear)], StatusCode::NO_CONTENT).into_response()
 }
 
@@ -319,7 +385,7 @@ async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     };
     let tokens = match state.store.list_user_tokens(user.github_id).await {
         Ok(list) => list,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => return internal_error("list user tokens", err),
     };
     Json(serde_json::json!({
         "authenticated": true,
@@ -359,6 +425,17 @@ async fn api_mint_token(
     let Some(user) = authenticated_user(&state, &headers) else {
         return json_error(StatusCode::UNAUTHORIZED, "authentication required");
     };
+    if !state.config.allowed_users.is_empty()
+        && !state
+            .config
+            .allowed_users
+            .contains(&user.login.to_ascii_lowercase())
+    {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "GitHub account is no longer allowlisted",
+        );
+    }
     let role = req.role.trim().to_ascii_lowercase();
     if role != "client" && role != "worker" {
         return json_error(StatusCode::BAD_REQUEST, "role must be 'client' or 'worker'");
@@ -379,20 +456,6 @@ async fn api_mint_token(
     };
 
     let now = now_secs();
-    let active = match state.store.count_active_tokens(user.github_id, now).await {
-        Ok(count) => count,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-    };
-    if active >= state.config.max_tokens_per_user {
-        return json_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "active token limit ({}) reached; revoke an unused token first",
-                state.config.max_tokens_per_user
-            ),
-        );
-    }
-
     let jti = format!("jti_{}", Uuid::new_v4().simple());
     let exp = (state.config.token_ttl_days > 0)
         .then(|| now.saturating_add(state.config.token_ttl_days.saturating_mul(86_400)));
@@ -405,9 +468,9 @@ async fn api_mint_token(
         exp,
         fp: None,
     };
-    let token = match sign_token(&state.config.signing_key, &claims) {
+    let token = match sign_token(state.config.primary_signing_key(), &claims) {
         Ok(t) => t,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => return internal_error("sign token", err),
     };
     let record = TokenRecord {
         jti,
@@ -418,17 +481,32 @@ async fn api_mint_token(
         expires_at: exp,
         revoked_at: None,
     };
-    if let Err(err) = state
+    match state
         .store
-        .insert_token(user.github_id, &user.namespace, &record)
+        .mint_token_with_limit(
+            user.github_id,
+            &user.namespace,
+            &record,
+            now,
+            state.config.max_tokens_per_user,
+        )
         .await
     {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+        Ok(true) => {}
+        Ok(false) => {
+            return json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "active token limit ({}) reached; revoke an unused token first",
+                    state.config.max_tokens_per_user
+                ),
+            );
+        }
+        Err(err) => return internal_error("mint token", err),
     }
 
     (
         StatusCode::CREATED,
-        [(CACHE_CONTROL, HeaderValue::from_static("no-store"))],
         Json(serde_json::json!({
             "token": token,
             "record": record,
@@ -455,7 +533,7 @@ async fn api_revoke_token(
     {
         Ok(true) => Json(serde_json::json!({ "revoked": true, "jti": jti })).into_response(),
         Ok(false) => json_error(StatusCode::NOT_FOUND, "active token not found"),
-        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => internal_error("revoke token", err),
     }
 }
 
@@ -472,7 +550,7 @@ async fn api_revoke_all_tokens(State(state): State<AppState>, headers: HeaderMap
         .await
     {
         Ok(count) => Json(serde_json::json!({ "revoked_count": count })).into_response(),
-        Err(err) => json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(err) => internal_error("revoke all tokens", err),
     }
 }
 
@@ -497,18 +575,26 @@ async fn internal_revocations(
     let Some(candidate) = bearer else {
         return json_error(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
-    if !constant_time_eq(&state.config.revocation_bearer, candidate) {
+    let valid_bearer = state
+        .config
+        .revocation_bearers
+        .iter()
+        .fold(false, |ok, expected| {
+            ok | constant_time_eq(expected, candidate)
+        });
+    if !valid_bearer {
         return json_error(StatusCode::UNAUTHORIZED, "invalid internal bearer token");
     }
 
-    let snapshot = match state.store.revocation_snapshot(now_secs()).await {
-        Ok(s) => s,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-    };
-    if query.since_version == Some(snapshot.version) {
-        return StatusCode::NOT_MODIFIED.into_response();
+    match state
+        .store
+        .revocation_snapshot_if_changed(query.since_version, now_secs())
+        .await
+    {
+        Ok(Some(snapshot)) => Json(snapshot).into_response(),
+        Ok(None) => StatusCode::NOT_MODIFIED.into_response(),
+        Err(err) => internal_error("read revocation snapshot", err),
     }
-    Json(snapshot).into_response()
 }
 
 #[cfg(test)]
@@ -559,14 +645,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
         let key = b"plugin-test-signing-key-32bytes!".to_vec();
+        let old_key = b"plugin-old-signing-key-32bytes!!".to_vec();
         let cfg = Config {
             listen: addr,
             public_url: base_url.clone(),
             grpc_endpoint: Some("https://grpc.example.com".into()),
             ws_endpoint: Some("wss://ws.example.com".into()),
             console_url: Some("https://console.example.com".into()),
-            revocation_bearer: anyserve_core::auth::internal_revocation_bearer(&key),
-            signing_key: key,
+            revocation_bearers: vec![
+                anyserve_core::auth::internal_revocation_bearer(&key),
+                anyserve_core::auth::internal_revocation_bearer(&old_key),
+            ],
+            signing_keys: vec![key, old_key],
             github_client_id: "cid".into(),
             github_client_secret: "csecret".into(),
             db_path: PathBuf::from(":memory:"),
@@ -642,7 +732,7 @@ mod tests {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .find(|s| s.starts_with(SESSION_COOKIE_NAME))
+            .find(|s| s.starts_with(crate::session::SESSION_COOKIE_BASE))
             .unwrap()
             .split(';')
             .next()
@@ -712,7 +802,7 @@ mod tests {
         assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // 5. Verify minted tokens directly with anyserve_core::auth::AuthPolicy.
-        let policy = AuthPolicy::default().with_signing_keys([cfg.signing_key.clone()]);
+        let policy = AuthPolicy::default().with_signing_keys(cfg.signing_keys.clone());
         let mut ch = HeaderMap::new();
         ch.insert(
             axum::http::header::AUTHORIZATION,
@@ -730,7 +820,7 @@ mod tests {
         );
         assert_eq!(policy.role_for_token(&worker_tok), Some(Role::Worker));
 
-        // 6. /internal/revocations requires internal bearer; 200 vs 304 since_version.
+        // 6. /internal/revocations requires internal bearer (primary or rotated secondary); 200 vs 304 since_version.
         let unauth_rev = client
             .get(format!("{base}/internal/revocations"))
             .send()
@@ -740,7 +830,7 @@ mod tests {
 
         let rev0: RevocationSnapshot = client
             .get(format!("{base}/internal/revocations"))
-            .bearer_auth(&cfg.revocation_bearer)
+            .bearer_auth(&cfg.revocation_bearers[0])
             .send()
             .await
             .unwrap()
@@ -752,7 +842,7 @@ mod tests {
 
         let not_mod = client
             .get(format!("{base}/internal/revocations?since_version=0"))
-            .bearer_auth(&cfg.revocation_bearer)
+            .bearer_auth(&cfg.revocation_bearers[1])
             .send()
             .await
             .unwrap();
@@ -770,7 +860,7 @@ mod tests {
 
         let rev1: RevocationSnapshot = client
             .get(format!("{base}/internal/revocations?since_version=0"))
-            .bearer_auth(&cfg.revocation_bearer)
+            .bearer_auth(&cfg.revocation_bearers[0])
             .send()
             .await
             .unwrap()
@@ -798,7 +888,7 @@ mod tests {
 
         let rev2: RevocationSnapshot = client
             .get(format!("{base}/internal/revocations?since_version=1"))
-            .bearer_auth(&cfg.revocation_bearer)
+            .bearer_auth(&cfg.revocation_bearers[0])
             .send()
             .await
             .unwrap()
@@ -860,8 +950,186 @@ mod tests {
             .get_all(SET_COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .any(|v| v.starts_with(SESSION_COOKIE_NAME));
+            .any(|v| v.starts_with(crate::session::SESSION_COOKIE_BASE));
         assert!(!has_session);
         assert!(!format!("{cfg:?}").contains("csecret"));
+
+        // Verify an existing session cookie signed by the secondary key still authenticates,
+        // while a non-allowlisted user holding a signed session cookie is blocked from minting.
+        let secondary_cookie_key = derive_cookie_key(&cfg.signing_keys[1]);
+        let cookie_name = session_cookie_name(cfg.cookie_secure());
+        let forged_disallowed_cookie = seal_cookie(
+            &secondary_cookie_key,
+            cookie_name,
+            &SessionUser {
+                github_id: 42,
+                login: "BlockedUser".into(),
+                avatar_url: String::new(),
+                namespace: "gh-42".into(),
+                exp: now_secs() + 600,
+            },
+        )
+        .unwrap();
+        let mint_blocked = client
+            .post(format!("{base}/auth/api/tokens"))
+            .header(
+                "cookie",
+                format!("{cookie_name}={forged_disallowed_cookie}"),
+            )
+            .header("x-requested-with", "fetch")
+            .json(&serde_json::json!({ "role": "client", "label": "late" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(mint_blocked.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn parallel_mint_token_with_limit_enforces_exact_cap() {
+        let dir = std::env::temp_dir().join(format!("anyserve-auth-race-{}", Uuid::new_v4()));
+        let db_path = dir.join("auth.sqlite");
+        let store = SqliteStore::open(&db_path).await.unwrap();
+        let now = now_secs();
+        store
+            .upsert_user(77, "racer", "", "gh-77", now)
+            .await
+            .unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..20u64 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                let record = TokenRecord {
+                    jti: format!("jti-race-{i}"),
+                    role: "client".into(),
+                    label: format!("t-{i}"),
+                    token_preview: "asv1.test...1234".into(),
+                    created_at: now,
+                    expires_at: Some(now + 3600),
+                    revoked_at: None,
+                };
+                store
+                    .mint_token_with_limit(77, "gh-77", &record, now, 5)
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut minted = 0usize;
+        for t in tasks {
+            if t.await.unwrap() {
+                minted += 1;
+            }
+        }
+        assert_eq!(minted, 5);
+        assert_eq!(store.list_user_tokens(77).await.unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn security_headers_host_cookies_key_rotation_and_error_sanitization() {
+        let mock_gh = spawn_mock_github(501, "SecUser", "2020-01-01T00:00:00Z").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let key1 = b"sec-primary-key-32-bytes-long!!!".to_vec();
+        let key2 = b"sec-rotated-key-32-bytes-long!!!".to_vec();
+        let cfg = Config {
+            listen: addr,
+            // Mixed-case HTTPS must still trigger cookie_secure() and __Host- cookies.
+            public_url: "HTTPS://auth.example.com".into(),
+            grpc_endpoint: None,
+            ws_endpoint: None,
+            console_url: None,
+            revocation_bearers: vec![anyserve_core::auth::internal_revocation_bearer(&key1)],
+            signing_keys: vec![key1.clone(), key2.clone()],
+            github_client_id: "cid".into(),
+            github_client_secret: "csecret".into(),
+            db_path: PathBuf::from(":memory:"),
+            token_ttl_days: 7,
+            max_tokens_per_user: 5,
+            min_account_age_days: 0,
+            allowed_users: Default::default(),
+            github_oauth_base: mock_gh.clone(),
+            github_api_base: mock_gh,
+        };
+        assert!(cfg.cookie_secure());
+        let store = SqliteStore::open_in_memory().await.unwrap();
+        let state = AppState::new(cfg.clone(), store).unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app(state)).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // 1. Security headers present on portal, API, and internal revocation routes.
+        let portal = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(portal.headers()["x-frame-options"], "DENY");
+        assert_eq!(portal.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(portal.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(portal.headers()["cache-control"], "no-store");
+        let csp = portal.headers()["content-security-policy"]
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("script-src 'unsafe-inline'"));
+
+        // 2. __Host- prefix + Secure attribute on HTTPS public_url.
+        let start = client
+            .get(format!("{base}/auth/github"))
+            .send()
+            .await
+            .unwrap();
+        let set_cookie = start.headers()[SET_COOKIE].to_str().unwrap();
+        assert!(set_cookie.starts_with("__Host-anyserve_oauth_state="));
+        assert!(set_cookie.contains("; Secure"));
+
+        // 3. Purpose-bound HMAC blocks cross-purpose replay and allows secondary rotated key.
+        let k2 = derive_cookie_key(&key2);
+        let user = SessionUser {
+            github_id: 501,
+            login: "SecUser".into(),
+            avatar_url: String::new(),
+            namespace: "gh-501".into(),
+            exp: now_secs() + 600,
+        };
+        let wrong_purpose = seal_cookie(&k2, "__Host-anyserve_oauth_state", &user).unwrap();
+        let unauth_me: serde_json::Value = client
+            .get(format!("{base}/auth/api/me"))
+            .header("cookie", format!("__Host-anyserve_session={wrong_purpose}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(unauth_me["authenticated"], false);
+
+        let right_purpose = seal_cookie(&k2, "__Host-anyserve_session", &user).unwrap();
+        let ok_me = client
+            .get(format!("{base}/auth/api/me"))
+            .header("cookie", format!("__Host-anyserve_session={right_purpose}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_me.headers()["cache-control"], "no-store");
+        let ok_json: serde_json::Value = ok_me.json().await.unwrap();
+        assert_eq!(ok_json["authenticated"], true);
+        assert_eq!(ok_json["user"]["namespace"], "gh-501");
+
+        // 4. oauth_callback does NOT reflect attacker-controlled error_description.
+        let cb = client
+            .get(format!(
+                "{base}/auth/github/callback?error=access_denied&error_description=phishing+evil.example"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let loc = cb.headers()["location"].to_str().unwrap();
+        assert!(!loc.contains("phishing"));
+        assert!(!loc.contains("evil.example"));
+        assert!(loc.contains("error="));
     }
 }

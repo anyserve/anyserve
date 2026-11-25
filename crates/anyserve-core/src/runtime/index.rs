@@ -385,6 +385,12 @@ impl JobIndex {
         self.counts
     }
 
+    pub(crate) fn namespace_pending_count(&self, namespace: &str) -> usize {
+        self.namespaces
+            .get(namespace)
+            .map_or(0, |ns| ns.jobs[0].len() + ns.jobs[1].len())
+    }
+
     pub(crate) fn interfaces(&self, now: u64) -> BTreeMap<String, InterfaceStats> {
         let mut merged: BTreeMap<String, InterfaceStats> = BTreeMap::new();
         for ns in self.namespaces.values() {

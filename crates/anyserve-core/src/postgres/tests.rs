@@ -1192,3 +1192,75 @@ async fn postgres_legacy_schemas_are_rejected_cleanly() {
     schema_v2.drop_schema().await;
     schema_nodes.drop_schema().await;
 }
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_scan_jobs_paginates_past_250_rows() {
+    let schema = TestSchema::create("pg_scan250").await;
+    let runtime = Runtime::start(RuntimeConfig {
+        journal: Some(schema.journal_config(5_000, 80)),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema.url)
+        .await
+        .unwrap();
+    let spec_json = serde_json::to_string(&crate::journal::StoredSpec {
+        demand: Demand {
+            interface: "echo".into(),
+            ..Default::default()
+        },
+        policy: ExecutionPolicy::default(),
+        metadata: Metadata::new(),
+    })
+    .unwrap();
+    for i in 0..260i64 {
+        sqlx::query(&format!(
+            "INSERT INTO \"{}\".jobs (job_id, namespace, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+             VALUES ($1, 'default', 'succeeded', 'h', $2, 1, $3, $4)",
+            schema.schema
+        ))
+        .bind(format!("pg-j-{i:03}"))
+        .bind(&spec_json)
+        .bind(1_000 + i)
+        .bind(2_000 + i)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+
+    let page1 = runtime
+        .scan_job_metadata(JobScan {
+            archived: true,
+            from_ms: 500,
+            to_ms: 5_000,
+            limit: 250,
+            cursor: None,
+            namespace: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page1.jobs.len(), 250);
+    assert!(page1.next_page_token.is_some());
+
+    let page2 = runtime
+        .scan_job_metadata(JobScan {
+            archived: true,
+            from_ms: 500,
+            to_ms: 5_000,
+            limit: 250,
+            cursor: page1.next_page_token,
+            namespace: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page2.jobs.len(), 10);
+    assert!(page2.next_page_token.is_none());
+
+    runtime.shutdown().await;
+    schema.drop_schema().await;
+}

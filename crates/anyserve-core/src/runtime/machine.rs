@@ -264,7 +264,35 @@ impl Inner {
         if st.unfinished_jobs >= self.config.max_pending_jobs {
             return Err(RuntimeError::exhausted("unfinished job limit reached"));
         }
+        let quotas = &self.config.tenant_quotas;
+        if let Some(ns_pending_limit) = quotas.max_pending_jobs_per_namespace
+            && st.job_index.namespace_pending_count(namespace) >= ns_pending_limit
+        {
+            return Err(RuntimeError::exhausted(format!(
+                "unfinished job limit reached for namespace '{namespace}'"
+            )));
+        }
         let interface = &spec.demand.interface;
+        if let Some(ns_iface_limit) = quotas.max_interfaces_per_namespace {
+            let already_tracked = st.queue(namespace, interface).is_some()
+                || st.accepting_count(namespace, interface) > 0;
+            if !already_tracked {
+                let queued_ifaces = st.queues.get(namespace);
+                let mut distinct = queued_ifaces.map_or(0, HashMap::len);
+                if let Some(accepting_ifaces) = st.accepting.get(namespace) {
+                    for iface in accepting_ifaces.keys() {
+                        if queued_ifaces.is_none_or(|q| !q.contains_key(iface)) {
+                            distinct += 1;
+                        }
+                    }
+                }
+                if distinct >= ns_iface_limit {
+                    return Err(RuntimeError::exhausted(format!(
+                        "queued interface limit reached for namespace '{namespace}'"
+                    )));
+                }
+            }
+        }
         let queued = st.queue(namespace, interface).map(|q| q.len()).unwrap_or(0)
             + st.accepting_count(namespace, interface);
         if queued >= self.max_queue(interface) {
@@ -340,6 +368,7 @@ impl Inner {
         };
         st.insert_job(job);
         if durability == Durability::Ephemeral {
+            st.counters.jobs_submitted += 1;
             self.accepted_locked(st, &job_id, now);
         }
     }
@@ -419,11 +448,18 @@ impl Inner {
                 self.remove_unaccepted_locked(&mut st, job_id, &reason);
             }
             CommitOutcome::Committed => {
+                st.counters.jobs_submitted += 1;
                 self.accepted_locked(&mut st, job_id, now);
-                let job = st.jobs.get_mut(job_id).expect("job exists");
-                let mut waiters = std::mem::take(&mut job.accept_waiters);
-                notify_job_waiters(&mut waiters, job);
-                self.dispatch_locked(&mut st, now);
+                let (ns, iface, mut waiters) = {
+                    let job = st.jobs.get_mut(job_id).expect("job exists");
+                    (
+                        job.namespace.clone(),
+                        job.spec.demand.interface.clone(),
+                        std::mem::take(&mut job.accept_waiters),
+                    )
+                };
+                notify_job_waiters(&mut waiters, &st.jobs[job_id]);
+                self.dispatch_pair_locked(&mut st, &ns, &iface, now);
             }
             // It may be on disk: keep the id reserved and the job frozen.
             CommitOutcome::Unknown(reason) => self.freeze_locked(&mut st, job_id, &reason),
@@ -583,23 +619,26 @@ impl Inner {
         };
         let priority_cap = self.config.priority_levels.saturating_sub(1);
         let priority = job.spec.policy.priority.min(priority_cap);
-        let namespace = &job.namespace;
-        let interface = &job.spec.demand.interface;
-        let fairness_key = &job.spec.policy.fairness_key;
-        if let Some(queue) = st
+        let namespace = job.namespace.as_str();
+        let interface = job.spec.demand.interface.as_str();
+        // Field access (not `State::queue_mut`) keeps `st.queues` disjoint from the `st.jobs` borrow.
+        let Some(queue) = st
             .queues
-            .get_mut(namespace.as_str())
-            .and_then(|m| m.get_mut(interface.as_str()))
-        {
-            queue.remove(priority, fairness_key, &key);
+            .get_mut(namespace)
+            .and_then(|m| m.get_mut(interface))
+        else {
+            return;
+        };
+        queue.remove(priority, &job.spec.policy.fairness_key, &key);
+        if queue.is_empty() {
+            State::remove_nested(&mut st.queues, namespace, interface);
+            State::remove_nested(&mut st.scan_cursor, namespace, interface);
         }
     }
 
     // ---------------------------------------------------------------- dispatch
 
-    /// Assigns queued jobs to sessions with free slots using two-level Priority
-    /// and round-robin across `fairness_key`s, tiered pools, concurrency limits,
-    /// and bounded-load affinity routing.
+    /// Assigns queued jobs across all `(namespace, interface)` queues with free worker slots.
     pub(crate) fn dispatch_locked(&self, st: &mut State, now: u64) {
         if st.shutting_down || st.job_index.counts()[0] == 0 {
             return;
@@ -617,93 +656,125 @@ impl Inner {
                 }
             }
         }
-        if queue_keys.is_empty() {
-            return;
-        }
-        let mut durable_ok: Option<bool> = None;
         let mut rotation_pending = false;
-        let priority_cap = self.config.priority_levels.saturating_sub(1);
+        let mut durable_ok = None;
         for (namespace, interface) in queue_keys {
-            let mut candidates: Vec<String> = st
-                .interface_sessions(&namespace, &interface)
-                .into_iter()
-                .flatten()
-                .filter(|id| st.sessions.get(*id).is_some_and(|s| s.free_slots() > 0))
-                .cloned()
-                .collect();
-            if candidates.is_empty() {
-                continue;
-            }
-            let queue = &st.queues[namespace.as_str()][interface.as_str()];
-            let mut keys = queue.collect_candidates(DISPATCH_SCAN);
-            if queue.len() > DISPATCH_SCAN {
-                let cursor = st
-                    .scan_cursor
-                    .get(namespace.as_str())
-                    .and_then(|m| m.get(interface.as_str()));
-                let (mut window, next_cursor) = queue.collect_window(cursor, DISPATCH_SCAN);
-                if let Some(next_cursor) = next_cursor {
-                    st.scan_cursor
-                        .entry(namespace.clone())
-                        .or_default()
-                        .insert(interface.clone(), next_cursor);
-                    rotation_pending = true;
-                } else if let Some(m) = st.scan_cursor.get_mut(namespace.as_str()) {
-                    m.remove(interface.as_str());
-                }
-                {
-                    let seen: HashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
-                    window.retain(|k| !seen.contains(k.job_id.as_str()));
-                }
-                keys.extend(window);
-            } else if let Some(m) = st.scan_cursor.get_mut(namespace.as_str()) {
-                m.remove(interface.as_str());
-            }
-            let policy = self.config.interfaces.get(&interface);
-            for key in keys {
-                let Some(job) = st.jobs.get(&key.job_id) else {
-                    continue;
-                };
-                if job.not_before_ms > now
-                    || (job.durability == Durability::Durable
-                        && !*durable_ok.get_or_insert_with(|| self.journal_writable()))
-                {
-                    continue;
-                }
-                let ckey = &job.spec.policy.concurrency_key;
-                if !ckey.is_empty() {
-                    let cap = self.max_in_flight_per_key(&interface).unwrap_or(1);
-                    if st.in_flight_key_count(&namespace, ckey) >= cap {
-                        continue;
-                    }
-                }
-                let mut rng = st.rng;
-                let picked = pick_session(st, job, policy, &mut candidates, now, &mut rng);
-                st.rng = rng;
-                if let Some(session_id) = picked {
-                    let prio = job.spec.policy.priority.min(priority_cap);
-                    let fairness_key = job.spec.policy.fairness_key.clone();
-                    self.begin_attempt_locked(st, &key.job_id, &session_id, now);
-                    if let Some(queue) = st.queue_mut(&namespace, &interface) {
-                        queue.rotate_key_to_back(prio, &fairness_key);
-                    }
-                    if st
-                        .sessions
-                        .get(&session_id)
-                        .is_none_or(|s| s.free_slots() == 0)
-                        && let Some(pos) = candidates.iter().position(|id| id == &session_id)
-                    {
-                        candidates.swap_remove(pos);
-                    }
-                }
-                if candidates.is_empty() {
-                    break;
-                }
-            }
+            rotation_pending |=
+                self.dispatch_pair_inner_locked(st, &namespace, &interface, now, &mut durable_ok);
         }
         if rotation_pending {
             self.timers.schedule(now, super::TimerKey::Dispatch);
         }
+    }
+
+    /// Assigns queued jobs for a single `(namespace, interface)` without scanning unrelated tenants.
+    pub(crate) fn dispatch_pair_locked(
+        &self,
+        st: &mut State,
+        namespace: &str,
+        interface: &str,
+        now: u64,
+    ) {
+        if st.shutting_down {
+            return;
+        }
+        if self.dispatch_pair_inner_locked(st, namespace, interface, now, &mut None) {
+            self.timers.schedule(now, super::TimerKey::Dispatch);
+        }
+    }
+
+    /// `durable_ok` memoizes `journal_writable()` across the pairs of one dispatch pass.
+    fn dispatch_pair_inner_locked(
+        &self,
+        st: &mut State,
+        namespace: &str,
+        interface: &str,
+        now: u64,
+        durable_ok: &mut Option<bool>,
+    ) -> bool {
+        let Some(queue_len) = st
+            .queue(namespace, interface)
+            .filter(|q| !q.is_empty())
+            .map(|q| q.len())
+        else {
+            return false;
+        };
+        let mut candidates: Vec<String> = st
+            .interface_sessions(namespace, interface)
+            .into_iter()
+            .flatten()
+            .filter(|id| st.sessions.get(*id).is_some_and(|s| s.free_slots() > 0))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        let mut rotation_pending = false;
+        let queue = &st.queues[namespace][interface];
+        let mut keys = queue.collect_candidates(DISPATCH_SCAN);
+        if queue_len > DISPATCH_SCAN {
+            let cursor = st.scan_cursor.get(namespace).and_then(|m| m.get(interface));
+            let (mut window, next_cursor) = queue.collect_window(cursor, DISPATCH_SCAN);
+            if let Some(next_cursor) = next_cursor {
+                st.scan_cursor
+                    .entry(namespace.to_string())
+                    .or_default()
+                    .insert(interface.to_string(), next_cursor);
+                rotation_pending = true;
+            } else if let Some(m) = st.scan_cursor.get_mut(namespace) {
+                m.remove(interface);
+            }
+            {
+                let seen: HashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
+                window.retain(|k| !seen.contains(k.job_id.as_str()));
+            }
+            keys.extend(window);
+        } else if let Some(m) = st.scan_cursor.get_mut(namespace) {
+            m.remove(interface);
+        }
+        let priority_cap = self.config.priority_levels.saturating_sub(1);
+        let policy = self.config.interfaces.get(interface);
+        for key in keys {
+            let Some(job) = st.jobs.get(&key.job_id) else {
+                continue;
+            };
+            if job.not_before_ms > now
+                || (job.durability == Durability::Durable
+                    && !*durable_ok.get_or_insert_with(|| self.journal_writable()))
+            {
+                continue;
+            }
+            let ckey = &job.spec.policy.concurrency_key;
+            if !ckey.is_empty() {
+                let cap = self.max_in_flight_per_key(interface).unwrap_or(1);
+                if st.in_flight_key_count(namespace, ckey) >= cap {
+                    continue;
+                }
+            }
+            let mut rng = st.rng;
+            let picked = pick_session(st, job, policy, &mut candidates, now, &mut rng);
+            st.rng = rng;
+            if let Some(session_id) = picked {
+                let prio = job.spec.policy.priority.min(priority_cap);
+                let fairness_key = job.spec.policy.fairness_key.clone();
+                self.begin_attempt_locked(st, &key.job_id, &session_id, now);
+                if let Some(queue) = st.queue_mut(namespace, interface) {
+                    queue.rotate_key_to_back(prio, &fairness_key);
+                }
+                if st
+                    .sessions
+                    .get(&session_id)
+                    .is_none_or(|s| s.free_slots() == 0)
+                    && let Some(pos) = candidates.iter().position(|id| id == &session_id)
+                {
+                    candidates.swap_remove(pos);
+                }
+            }
+            if candidates.is_empty() {
+                break;
+            }
+        }
+        rotation_pending
     }
 
     /// Direct zero-queue ephemeral dispatch path: when no queued backlog exists for
@@ -870,6 +941,8 @@ impl Inner {
             },
         );
         st.insert_job(job);
+        st.counters.jobs_submitted += 1;
+        st.counters.attempts_started += 1;
         self.send_locked(
             st,
             &session_id,
@@ -934,6 +1007,7 @@ impl Inner {
             },
         );
         if !durable {
+            st.counters.attempts_started += 1;
             self.send_assign_locked(st, job_id, now);
             return;
         }
@@ -1004,6 +1078,7 @@ impl Inner {
                 self.release_lease_locked(&mut st, lease_id);
             }
             CommitOutcome::Committed => {
+                st.counters.attempts_started += 1;
                 if st.jobs[job_id].cancel_requested.is_some() {
                     self.cancel_locked(&mut st, job_id, now);
                 } else if !st.leases.get(lease_id).is_some_and(|lease| {
@@ -1154,6 +1229,55 @@ fn build_assign(generation: u64, job: &Job) -> pb::Assign {
 }
 
 impl Inner {
+    /// Drops the control stream, immediately fences and releases every active
+    /// lease without entering `reconnect_grace`, and removes the session.
+    pub(crate) fn revoke_session_locked(&self, st: &mut State, session_id: &str, now: u64) {
+        self.evict_session_locked(st, session_id, "worker session revoked or expired", now);
+    }
+
+    pub(crate) fn evict_session_locked(
+        &self,
+        st: &mut State,
+        session_id: &str,
+        reason: &str,
+        now: u64,
+    ) {
+        let Some(session) = st.sessions.get_mut(session_id) else {
+            return;
+        };
+        session.tx = None;
+        let leases: Vec<String> = session.active.iter().cloned().collect();
+        for lease_id in leases {
+            let Some(lease) = st.leases.get(&lease_id) else {
+                continue;
+            };
+            if lease.cancelling {
+                self.release_lease_locked(st, &lease_id);
+                continue;
+            }
+            let job_id = lease.job_id.clone();
+            let current = st.jobs.get(&job_id).is_some_and(|job| {
+                job.attempt.as_ref().is_some_and(|a| a.lease_id == lease_id)
+                    && matches!(job.phase, Phase::Assigned | Phase::Running)
+            });
+            if current {
+                self.attempt_ended_locked(
+                    st,
+                    &job_id,
+                    ErrorInfo::new(codes::WORKER_LOST, reason, true),
+                    LeaseEnd::Release,
+                    None,
+                    now,
+                );
+            }
+            // Guarantee immediate lease removal from `st.leases` even if a durable
+            // job transitioned to `Phase::Terminating` or `Phase::Starting`, so
+            // in-flight `push_frame`/`finish_attempt` are fenced immediately.
+            self.release_lease_locked(st, &lease_id);
+        }
+        st.remove_session(session_id);
+    }
+
     /// Ends the session's current connection; its leases wait `reconnect_grace`
     /// (falling back to `heartbeat_timeout`) for a reconnect.
     pub(crate) fn disconnect_locked(&self, st: &mut State, session_id: &str, now: u64) {
@@ -1506,6 +1630,12 @@ impl Inner {
             job.phase = Phase::Terminal(plan.state);
             job.updated_at_ms = now;
         });
+        match plan.state {
+            JobState::Succeeded => st.counters.jobs_succeeded += 1,
+            JobState::Failed => st.counters.jobs_failed += 1,
+            JobState::Cancelled => st.counters.jobs_cancelled += 1,
+            JobState::Queued | JobState::Running => {}
+        }
         let job = st.jobs.get_mut(job_id).expect("job");
         self.timers.cancel(&std::mem::take(&mut job.timers));
         if let Some(timer) = job.total_timer.take() {

@@ -5,13 +5,17 @@
 //! Protocol adapter for native clients. State transitions belong to Runtime.
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyserve_proto::v2::{self as pb, client_server::Client};
 use futures::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::auth::{DEFAULT_NAMESPACE, NAMESPACE_HEADER, Principal, validate_namespace};
+use crate::auth::{
+    AuthPolicy, DEFAULT_NAMESPACE, NAMESPACE_HEADER, Principal, validate_namespace,
+    wait_optional_credential_invalidated,
+};
 use crate::runtime::{Runtime, api};
 
 fn request_namespace<T>(request: &Request<T>) -> Result<String, Status> {
@@ -74,8 +78,14 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<Self::InvokeStream>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
+        let principal = request.extensions().get::<Principal>().cloned();
+        let auth = request.extensions().get::<Arc<AuthPolicy>>().cloned();
         let (headers, _, mut incoming) = request.into_parts();
-        let mut start = match incoming.message().await?.and_then(|message| message.msg) {
+        let timeout = self.runtime.config().heartbeat_timeout;
+        let first = tokio::time::timeout(timeout, incoming.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("no invocation Start received"))?;
+        let mut start = match first?.and_then(|message| message.msg) {
             Some(pb::invoke_request::Msg::Start(start)) => start,
             _ => {
                 return Err(Status::invalid_argument(
@@ -83,6 +93,14 @@ impl Client for ClientGrpcService {
                 ));
             }
         };
+        if let (Some(auth), Some(principal)) = (auth.as_deref(), principal.as_ref())
+            && auth.is_principal_invalidated(principal, crate::now_ms() / 1000)
+        {
+            auth.record_rejection();
+            return Err(Status::unauthenticated(
+                "bearer token has been revoked or expired",
+            ));
+        }
         merge_grpc_trace_headers(start.spec.as_mut(), &headers);
         let mut execution = start_invoke(&self.runtime, namespace, start).await?;
         let input = execution.take_input();
@@ -90,18 +108,29 @@ impl Client for ClientGrpcService {
             // Execution owns the cancellation guard. Its Drop runs even if the
             // HTTP/2 caller disappears before this generator is first polled.
             let pump = pump_input(incoming, input);
+            let invalidated = wait_optional_credential_invalidated(auth.as_deref(), principal.as_ref());
             tokio::pin!(pump);
+            tokio::pin!(invalidated);
             let mut input_done = false;
             loop {
                 enum Next {
+                    Invalidated,
                     Input(Result<(), Status>),
                     Event(Option<Result<api::ExecutionEvent, crate::error::RuntimeError>>),
                 }
                 let next = tokio::select! {
+                    biased;
+                    _ = &mut invalidated => Next::Invalidated,
                     result = &mut pump, if !input_done => Next::Input(result),
                     next = execution.next() => Next::Event(next),
                 };
                 match next {
+                    Next::Invalidated => {
+                        if let Some(auth) = &auth {
+                            auth.record_rejection();
+                        }
+                        Err(Status::unauthenticated("bearer token has been revoked or expired"))?;
+                    }
                     Next::Input(result) => { result?; input_done = true; }
                     Next::Event(next) => {
                         let event = next.ok_or_else(|| Status::unavailable("execution ended without a terminal event"))??;
@@ -122,10 +151,49 @@ impl Client for ClientGrpcService {
     ) -> Result<Response<Self::WatchStream>, Status> {
         self.runtime.ensure_active_leader()?;
         let namespace = request_namespace(&request)?;
+        let principal = request.extensions().get::<Principal>().cloned();
+        let auth = request.extensions().get::<Arc<AuthPolicy>>().cloned();
+        if let (Some(auth), Some(principal)) = (auth.as_deref(), principal.as_ref())
+            && auth.is_principal_invalidated(principal, crate::now_ms() / 1000)
+        {
+            auth.record_rejection();
+            return Err(Status::unauthenticated(
+                "bearer token has been revoked or expired",
+            ));
+        }
         let request = request.into_inner();
-        let events = self
-            .runtime
-            .watch_in(&namespace, &request.job_id, request.after_sequence)?;
+        let mut events =
+            self.runtime
+                .watch_in(&namespace, &request.job_id, request.after_sequence)?;
+        if let (Some(auth), Some(principal)) = (auth, principal)
+            && (principal.jti.is_some() || principal.exp.is_some())
+        {
+            let stream = async_stream::stream! {
+                let invalidated = crate::auth::wait_credential_invalidated(&auth, &principal);
+                tokio::pin!(invalidated);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut invalidated => {
+                            auth.record_rejection();
+                            yield Err(Status::unauthenticated(
+                                "bearer token has been revoked or expired",
+                            ));
+                            break;
+                        }
+                        next = events.next() => match next {
+                            Some(Ok(event)) => yield Ok(event_to_proto(event)),
+                            Some(Err(err)) => {
+                                yield Err(Status::from(err));
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            };
+            return Ok(Response::new(Box::pin(stream)));
+        }
         Ok(Response::new(Box::pin(events.map(|event| {
             event.map(event_to_proto).map_err(Status::from)
         }))))

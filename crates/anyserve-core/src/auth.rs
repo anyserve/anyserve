@@ -7,8 +7,10 @@
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
@@ -23,6 +25,17 @@ use tower::{Layer, Service};
 pub const DEFAULT_NAMESPACE: &str = "default";
 pub const NAMESPACE_HEADER: &str = "x-anyserve-namespace";
 pub const SIGNED_TOKEN_PREFIX: &str = "asv1.";
+/// Comma-separated token signing keys, newest (signing) key first.
+pub const SIGNING_KEYS_ENV: &str = "ANYSERVE_TOKEN_SIGNING_KEY";
+
+/// Splits a comma-separated signing-key list, dropping blank entries; the first key signs.
+pub fn parse_signing_keys(raw: &str) -> Vec<Vec<u8>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(|key| key.as_bytes().to_vec())
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedTokenClaims {
@@ -48,6 +61,7 @@ pub struct RevocationSnapshot {
 struct RevocationState {
     version: u64,
     revoked_jtis: HashSet<String>,
+    last_sync_at_ms: Option<u64>,
 }
 
 fn now_secs() -> u64 {
@@ -117,24 +131,9 @@ pub fn verify_signed_token(
     if keys.is_empty() {
         return None;
     }
-    let body = token.strip_prefix(SIGNED_TOKEN_PREFIX)?;
-    let (payload_b64, sig_b64) = body.split_once('.')?;
-    if sig_b64.contains('.') {
-        return None;
-    }
+    let (payload_b64, sig_b64) = split_signed_token(token)?;
     let sig = URL_SAFE_NO_PAD.decode(sig_b64).ok()?;
-    if sig.len() != 32 {
-        return None;
-    }
-    let signing_input = format!("{SIGNED_TOKEN_PREFIX}{payload_b64}");
-    let verified = keys.iter().fold(false, |ok, key| {
-        if key.is_empty() {
-            return ok;
-        }
-        let expected = hmac_sha256(key, signing_input.as_bytes());
-        ok | constant_time_bytes_eq(&expected, &sig)
-    });
-    if !verified {
+    if !signature_matches(keys, payload_b64, &sig) {
         return None;
     }
     let raw_claims = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
@@ -147,6 +146,55 @@ pub fn verify_signed_token(
         return None;
     }
     Some(claims)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectedToken {
+    pub claims: SignedTokenClaims,
+    pub signature_valid: Option<bool>,
+}
+
+/// Splits `asv1.<payload>.<signature>` into its two base64 segments.
+fn split_signed_token(token: &str) -> Option<(&str, &str)> {
+    let (payload_b64, sig_b64) = token.strip_prefix(SIGNED_TOKEN_PREFIX)?.split_once('.')?;
+    (!sig_b64.contains('.')).then_some((payload_b64, sig_b64))
+}
+
+/// Checks `sig` against every non-empty key without short-circuiting.
+fn signature_matches(keys: &[Vec<u8>], payload_b64: &str, sig: &[u8]) -> bool {
+    if sig.len() != 32 {
+        return false;
+    }
+    let signing_input = format!("{SIGNED_TOKEN_PREFIX}{payload_b64}");
+    keys.iter()
+        .filter(|key| !key.is_empty())
+        .fold(false, |ok, key| {
+            ok | constant_time_bytes_eq(&hmac_sha256(key, signing_input.as_bytes()), sig)
+        })
+}
+
+/// Decodes an `asv1.` token payload and optionally verifies its signature if `keys` is non-empty.
+pub fn inspect_signed_token(token: &str, keys: &[Vec<u8>]) -> anyhow::Result<InspectedToken> {
+    let (payload_b64, sig_b64) = split_signed_token(token).with_context(|| {
+        format!("token must have the form '{SIGNED_TOKEN_PREFIX}<payload>.<signature>'")
+    })?;
+    let raw_claims = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .context("decode token payload")?;
+    let claims: SignedTokenClaims =
+        serde_json::from_slice(&raw_claims).context("parse token claims JSON")?;
+    let signature_valid = if keys.is_empty() {
+        None
+    } else {
+        let sig = URL_SAFE_NO_PAD
+            .decode(sig_b64)
+            .context("decode token signature")?;
+        Some(signature_matches(keys, payload_b64, &sig))
+    };
+    Ok(InspectedToken {
+        claims,
+        signature_valid,
+    })
 }
 
 /// Derives the shared bearer secret used by internal plugin endpoints (e.g. `/internal/revocations`)
@@ -200,6 +248,10 @@ pub struct Principal {
     /// True only for operator-level client tokens (`[auth].client_tokens`) or
     /// when auth is disabled; `false` for tenant `[[auth.scoped_tokens]]` and workers.
     pub is_operator: bool,
+    /// Optional signed-token JTI (for targeted revocation enforcement).
+    pub jti: Option<String>,
+    /// Optional Unix timestamp in seconds when the signed credential expires.
+    pub exp: Option<u64>,
 }
 
 impl Default for Principal {
@@ -210,6 +262,8 @@ impl Default for Principal {
             subject: "anonymous".to_string(),
             forced_pool: None,
             is_operator: true,
+            jti: None,
+            exp: None,
         }
     }
 }
@@ -256,13 +310,21 @@ impl std::fmt::Debug for ScopedToken {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AuthPolicy {
     client_tokens: BTreeSet<String>,
     worker_tokens: BTreeSet<String>,
     scoped_tokens: Vec<ScopedToken>,
     signing_keys: Vec<Vec<u8>>,
     revocations: Arc<RwLock<RevocationState>>,
+    revocation_tx: Arc<tokio::sync::watch::Sender<u64>>,
+    auth_rejections_total: Arc<AtomicU64>,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self::new(std::iter::empty(), std::iter::empty())
+    }
 }
 
 impl std::fmt::Debug for AuthPolicy {
@@ -289,12 +351,15 @@ impl AuthPolicy {
                 .filter(|token| !token.is_empty())
                 .collect()
         };
+        let (revocation_tx, _) = tokio::sync::watch::channel(0u64);
         Self {
             client_tokens: clean(&mut client_tokens.into_iter()),
             worker_tokens: clean(&mut worker_tokens.into_iter()),
             scoped_tokens: Vec::new(),
             signing_keys: Vec::new(),
             revocations: Arc::new(RwLock::new(RevocationState::default())),
+            revocation_tx: Arc::new(revocation_tx),
+            auth_rejections_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -321,18 +386,73 @@ impl AuthPolicy {
             .version
     }
 
-    pub fn apply_revocations(&self, snapshot: RevocationSnapshot) {
-        let mut guard = self.revocations.write().expect("revocations lock poisoned");
-        guard.version = snapshot.version;
-        guard.revoked_jtis = snapshot.revoked_jtis.into_iter().collect();
+    pub fn revocation_last_sync_at_ms(&self) -> Option<u64> {
+        self.revocations
+            .read()
+            .expect("revocations lock poisoned")
+            .last_sync_at_ms
     }
 
-    fn is_jti_revoked(&self, jti: &str) -> bool {
+    pub fn mark_revocation_synced(&self) {
+        let mut guard = self.revocations.write().expect("revocations lock poisoned");
+        guard.last_sync_at_ms = Some(crate::now_ms());
+    }
+
+    pub fn apply_revocations(&self, snapshot: RevocationSnapshot) {
+        {
+            let mut guard = self.revocations.write().expect("revocations lock poisoned");
+            guard.version = snapshot.version;
+            guard.revoked_jtis = snapshot.revoked_jtis.into_iter().collect();
+            guard.last_sync_at_ms = Some(crate::now_ms());
+        }
+        self.revocation_tx
+            .send_modify(|seq| *seq = seq.wrapping_add(1));
+    }
+
+    pub fn subscribe_revocations(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revocation_tx.subscribe()
+    }
+
+    pub fn signing_key_count(&self) -> usize {
+        self.signing_keys.len()
+    }
+
+    /// Returns the derived internal revocation bearer for each configured signing key
+    /// (newest/primary first), enabling rotation fallback in revocation pollers.
+    pub fn revocation_bearers(&self) -> Vec<String> {
+        self.signing_keys
+            .iter()
+            .map(|key| internal_revocation_bearer(key))
+            .collect()
+    }
+
+    pub fn is_jti_revoked(&self, jti: &str) -> bool {
         self.revocations
             .read()
             .expect("revocations lock poisoned")
             .revoked_jtis
             .contains(jti)
+    }
+
+    pub(crate) fn is_principal_invalidated(&self, principal: &Principal, now_secs: u64) -> bool {
+        principal.exp.is_some_and(|exp| exp <= now_secs)
+            || principal
+                .jti
+                .as_deref()
+                .is_some_and(|jti| self.is_jti_revoked(jti))
+    }
+
+    pub fn auth_rejections_total(&self) -> u64 {
+        self.auth_rejections_total.load(Ordering::Relaxed)
+    }
+
+    pub fn record_rejection(&self) {
+        self.auth_rejections_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn reject<T>(&self, status: Status) -> Result<T, Status> {
+        self.record_rejection();
+        Err(status)
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -357,6 +477,8 @@ impl AuthPolicy {
                     subject: entry.subject.clone(),
                     forced_pool: entry.forced_pool.clone(),
                     is_operator: false,
+                    jti: None,
+                    exp: None,
                 });
             }
         }
@@ -367,6 +489,8 @@ impl AuthPolicy {
                 subject: "worker-token".to_string(),
                 forced_pool: None,
                 is_operator: false,
+                jti: None,
+                exp: None,
             });
         }
         if contains_token(&self.client_tokens, candidate) && matched.is_none() {
@@ -376,6 +500,8 @@ impl AuthPolicy {
                 subject: "client-token".to_string(),
                 forced_pool: None,
                 is_operator: true,
+                jti: None,
+                exp: None,
             });
         }
         if matched.is_none()
@@ -390,6 +516,8 @@ impl AuthPolicy {
                 subject: claims.sub,
                 forced_pool: claims.fp,
                 is_operator: false,
+                jti: Some(claims.jti),
+                exp: claims.exp,
             });
         }
         matched
@@ -405,14 +533,15 @@ impl AuthPolicy {
         if !self.is_enabled() {
             return Ok(());
         }
-        let token = bearer_token(headers)
-            .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+        let Some(token) = bearer_token(headers) else {
+            return self.reject(Status::unauthenticated("missing or invalid bearer token"));
+        };
         match self.principal_for_token(token) {
             Some(principal) if principal.role == Role::Client && principal.is_operator => Ok(()),
-            Some(_) => Err(Status::permission_denied(
+            Some(_) => self.reject(Status::permission_denied(
                 "management API requires an operator client token",
             )),
-            None => Err(Status::unauthenticated("missing or invalid bearer token")),
+            None => self.reject(Status::unauthenticated("missing or invalid bearer token")),
         }
     }
 
@@ -422,14 +551,15 @@ impl AuthPolicy {
         if !self.is_enabled() {
             return Self::unauthenticated_principal(Role::Client, headers);
         }
-        let token = bearer_token(headers)
-            .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+        let Some(token) = bearer_token(headers) else {
+            return self.reject(Status::unauthenticated("missing or invalid bearer token"));
+        };
         match self.principal_for_token(token) {
             Some(principal) if principal.role == Role::Client => Ok(principal),
-            Some(_) => Err(Status::permission_denied(
+            Some(_) => self.reject(Status::permission_denied(
                 "worker token cannot access console API",
             )),
-            None => Err(Status::unauthenticated("missing or invalid bearer token")),
+            None => self.reject(Status::unauthenticated("missing or invalid bearer token")),
         }
     }
 
@@ -453,6 +583,8 @@ impl AuthPolicy {
             subject: "anonymous".to_string(),
             forced_pool: None,
             is_operator: role == Role::Client,
+            jti: None,
+            exp: None,
         })
     }
 
@@ -468,13 +600,15 @@ impl AuthPolicy {
         if !self.is_enabled() {
             return Self::unauthenticated_principal(default_role, headers).map(Some);
         }
-        let principal = bearer_token(headers)
-            .and_then(|token| self.principal_for_token(token))
-            .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+        let Some(principal) =
+            bearer_token(headers).and_then(|token| self.principal_for_token(token))
+        else {
+            return self.reject(Status::unauthenticated("missing or invalid bearer token"));
+        };
         if (principal.role == Role::Client && path.starts_with(V2_WORKER_PREFIX))
             || (principal.role == Role::Worker && path.starts_with(V2_CLIENT_PREFIX))
         {
-            return Err(Status::permission_denied(
+            return self.reject(Status::permission_denied(
                 "token role cannot call this execution service",
             ));
         }
@@ -499,11 +633,11 @@ impl AuthPolicy {
         }
         match bearer_token(headers).and_then(|token| self.principal_for_token(token)) {
             Some(principal) if principal.role == expected => Ok(principal),
-            Some(_) => Err(Status::permission_denied(match expected {
+            Some(_) => self.reject(Status::permission_denied(match expected {
                 Role::Client => "worker token cannot be used for client requests",
                 Role::Worker => "client token cannot be used for worker requests",
             })),
-            None => Err(Status::unauthenticated("missing or invalid bearer token")),
+            None => self.reject(Status::unauthenticated("missing or invalid bearer token")),
         }
     }
 }
@@ -525,6 +659,61 @@ fn contains_token(tokens: &BTreeSet<String>, candidate: &str) -> bool {
     tokens.iter().fold(false, |found, token| {
         found | constant_time_eq(token, candidate)
     })
+}
+
+const MAX_EXPIRY_SLEEP: Duration = Duration::from_secs(86_400);
+
+async fn wait_for_expiry(exp: Option<u64>) {
+    let Some(exp) = exp else {
+        return std::future::pending().await;
+    };
+    let exp_ms = exp.saturating_mul(1000);
+    loop {
+        let now_ms = crate::now_ms();
+        if now_ms >= exp_ms {
+            return;
+        }
+        let wait = Duration::from_millis(exp_ms - now_ms).min(MAX_EXPIRY_SLEEP);
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Resolves when `principal`'s signed credential is revoked or expires.
+/// Stays pending forever when `principal` has neither `jti` nor `exp`.
+pub(crate) async fn wait_credential_invalidated(auth: &AuthPolicy, principal: &Principal) {
+    if principal.jti.is_none() && principal.exp.is_none() {
+        return std::future::pending().await;
+    }
+    let mut rev_rx = auth.subscribe_revocations();
+    let _ = rev_rx.borrow_and_update();
+    if auth.is_principal_invalidated(principal, now_secs()) {
+        return;
+    }
+    let wait_revocation = async {
+        let Some(jti) = principal.jti.as_deref() else {
+            return std::future::pending().await;
+        };
+        while rev_rx.changed().await.is_ok() {
+            if auth.is_jti_revoked(jti) {
+                return;
+            }
+        }
+        std::future::pending().await
+    };
+    tokio::select! {
+        _ = wait_for_expiry(principal.exp) => {}
+        _ = wait_revocation => {}
+    }
+}
+
+pub(crate) async fn wait_optional_credential_invalidated(
+    auth: Option<&AuthPolicy>,
+    principal: Option<&Principal>,
+) {
+    match (auth, principal) {
+        (Some(auth), Some(principal)) => wait_credential_invalidated(auth, principal).await,
+        _ => std::future::pending().await,
+    }
 }
 
 #[derive(Clone)]
@@ -576,6 +765,7 @@ where
                 if let Some(principal) = principal {
                     request.extensions_mut().insert(principal.role);
                     request.extensions_mut().insert(principal);
+                    request.extensions_mut().insert(Arc::clone(&self.policy));
                 }
                 Box::pin(self.inner.call(request))
             }

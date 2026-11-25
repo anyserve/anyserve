@@ -33,6 +33,23 @@ pub const OBJECT_SIZE_METADATA_KEY: &str = "anyserve.size_bytes";
 /// Maximum UTF-8 byte length of an interface name (`1..=64` bytes with no ASCII
 /// whitespace or control characters).
 pub const MAX_INTERFACE_BYTES: usize = 64;
+/// Maximum UTF-8 byte length of an error code (`ErrorInfo::code`).
+pub const MAX_ERROR_CODE_BYTES: usize = 128;
+/// Maximum UTF-8 byte length of an error message or cancellation/rejection reason.
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+/// Truncates `s` to at most `max_bytes` UTF-8 bytes without splitting a character.
+pub fn truncate_utf8(mut s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s
+}
 
 /// Returns `true` when `name` is `1..=MAX_INTERFACE_BYTES` UTF-8 bytes and
 /// contains no ASCII control or whitespace characters.
@@ -188,9 +205,13 @@ pub struct ErrorInfo {
 
 impl ErrorInfo {
     pub fn new(code: &str, message: impl Into<String>, retryable: bool) -> Self {
+        Self::bounded(code.to_string(), message.into(), retryable)
+    }
+
+    pub fn bounded(code: String, message: String, retryable: bool) -> Self {
         Self {
-            code: code.to_string(),
-            message: message.into(),
+            code: truncate_utf8(code, MAX_ERROR_CODE_BYTES),
+            message: truncate_utf8(message, MAX_ERROR_MESSAGE_BYTES),
             retryable,
         }
     }
@@ -575,6 +596,12 @@ pub struct RuntimeStats {
     pub result_bytes: u64,
     /// Bytes held against `max_event_bytes`.
     pub event_bytes: u64,
+    /// Monotonic runtime counters since this Runtime started.
+    pub jobs_submitted_total: u64,
+    pub jobs_succeeded_total: u64,
+    pub jobs_failed_total: u64,
+    pub jobs_cancelled_total: u64,
+    pub attempts_started_total: u64,
 }
 
 /// Size limits. Every inline budget stays below the 64 MiB gRPC message limit
@@ -633,6 +660,13 @@ pub struct InterfacePolicy {
     pub pool_tiers: Vec<PoolTier>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TenantQuotas {
+    pub max_sessions_per_namespace: Option<usize>,
+    pub max_pending_jobs_per_namespace: Option<usize>,
+    pub max_interfaces_per_namespace: Option<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConfig {
     pub heartbeat_interval: Duration,
@@ -681,6 +715,7 @@ pub struct RuntimeConfig {
     /// `RESOURCE_EXHAUSTED`.
     pub max_result_bytes: u64,
     pub max_sessions: usize,
+    pub tenant_quotas: TenantQuotas,
     pub limits: Limits,
     pub journal: Option<JournalConfig>,
 }
@@ -710,6 +745,7 @@ impl Default for RuntimeConfig {
             max_event_bytes: 1024 * 1024 * 1024,
             max_result_bytes: 2 * 1024 * 1024 * 1024,
             max_sessions: 4_096,
+            tenant_quotas: TenantQuotas::default(),
             limits: Limits::default(),
             journal: None,
         }
