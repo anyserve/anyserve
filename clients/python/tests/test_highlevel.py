@@ -49,6 +49,7 @@ class Attempt:
         self.frames = []
         self.outputs = None
         self.failure = None
+        self.failure_code = None
         self.on_frame = None
 
     @property
@@ -63,8 +64,9 @@ class Attempt:
     def complete(self, outputs):
         self.outputs = outputs
 
-    def fail(self, message, retryable=False):
+    def fail(self, message, retryable=False, code=None):
         self.failure = (message, retryable)
+        self.failure_code = code
 
 
 class RPCFailure(RuntimeError):
@@ -445,22 +447,13 @@ class HighLevelTests(unittest.TestCase):
         self.assertEqual(connection.credits[-1], 0)
 
     def test_call_returns_the_single_inline_result(self):
-        class Events:
-            def __init__(self, outputs):
-                self.outputs = outputs
-            def __iter__(self):
-                return self
-            def __next__(self):
-                return {"type": "finished", "state": "succeeded", "outputs": self.outputs}
-            def close(self):
-                pass
         class Transport:
             def __init__(self, outputs):
                 self.outputs = outputs
                 self.specs = []
-            def invoke(self, spec):
+            def execute(self, spec):
                 self.specs.append(spec)
-                return Events(self.outputs)
+                return {"type": "finished", "state": "succeeded", "outputs": self.outputs}
         client = ExecutionClient.__new__(ExecutionClient)
         client._transport = Transport([{"inline": b"HELLO", "metadata": {}}])
         self.assertEqual(client.call("echo", b"hello"), b"HELLO")
@@ -666,6 +659,456 @@ class HighLevelTests(unittest.TestCase):
         self.assertEqual(conn.drain_calls, [True])
         self.assertTrue(conn.closed)
         self.assertEqual(signal.getsignal(signal.SIGTERM), before)
+
+    def test_worker_error_code_async_runner_load_provider_graceful_shutdown_and_client_extensions(self):
+        from anyserve.highlevel import _AsyncLoopRunner, _reconnect_backoff
+
+        # 1. WorkerError preserves custom error code.
+        err = WorkerError("bad input", retryable=True, code="INVALID_SHAPE")
+        self.assertEqual(err.code, "INVALID_SHAPE")
+
+        a = Assignment("lease-code")
+        seen_fail = []
+        a.attempt.fail = lambda message, retryable=False, code=None: seen_fail.append((message, retryable, code))
+
+        @worker(interface="fail.code")
+        def fail_handler(_payload: bytes) -> bytes:
+            raise WorkerError("bad input", retryable=True, code="INVALID_SHAPE")
+
+        _process_assignment(fail_handler, get_handler_spec(fail_handler), a)
+        self.assertEqual(seen_fail, [("bad input", True, "INVALID_SHAPE")])
+
+        # 2. _AsyncLoopRunner reuses one persistent event loop across async calls & async generators.
+        runner = _AsyncLoopRunner()
+        try:
+            loops = []
+
+            async def record_loop():
+                loops.append(asyncio.get_running_loop())
+                return len(loops)
+
+            self.assertEqual(runner.run(record_loop()), 1)
+            self.assertEqual(runner.run(record_loop()), 2)
+            self.assertIs(loops[0], loops[1])
+
+            async_gen_assignment = Assignment("lease-ag", b"x")
+
+            @worker(interface="async.gen")
+            async def agen_handler(payload: bytes):
+                loops.append(asyncio.get_running_loop())
+                yield payload + b"1"
+                yield payload + b"2"
+
+            _process_assignment(
+                agen_handler, get_handler_spec(agen_handler), async_gen_assignment, async_runner=runner
+            )
+            self.assertIs(loops[2], loops[0])
+            self.assertEqual(async_gen_assignment.attempt.frames, [b"x1", b"x2"])
+        finally:
+            runner.close()
+
+        # 3. _reconnect_backoff is jittered exponential and bounded.
+        for att, lo, hi in [(0, 0.5, 1.0), (2, 2.0, 4.0), (10, 5.0, 10.0)]:
+            val = _reconnect_backoff(att, 1.0, 10.0)
+            self.assertGreaterEqual(val, lo)
+            self.assertLessEqual(val, hi)
+
+        # 4. serve() pushes load_provider and waits up to graceful_shutdown_timeout before cancelling.
+        finished = threading.Event()
+        slow_assignment = Assignment("lease-slow")
+
+        @worker(interface="slow.v1")
+        def slow_handler(_payload: bytes) -> bytes:
+            time.sleep(0.08)
+            finished.set()
+            return b"done"
+
+        class GracefulConn:
+            def __init__(self):
+                self.msgs = deque([slow_assignment])
+                self.loads = []
+                self.drain_calls = 0
+
+            def credit(self, free):
+                pass
+
+            def accept(self, lease_id, accepted, reason):
+                pass
+
+            def update_load(self, **kwargs):
+                self.loads.append(kwargs)
+
+            def receive(self, timeout):
+                if self.msgs:
+                    a = self.msgs.popleft()
+                    return {"type": "assignment", "lease_id": a.lease_id, "assignment": a}
+                if self.drain_calls == 0:
+                    time.sleep(0.02)
+                    raise KeyboardInterrupt
+                return None
+
+            def drain(self, preempting=False):
+                self.drain_calls += 1
+
+            def close(self):
+                pass
+
+        conn = GracefulConn()
+        with self.assertRaises(KeyboardInterrupt):
+            serve(
+                slow_handler,
+                connection=conn,
+                graceful_shutdown_timeout=2.0,
+                load_provider=lambda: {"queued": 3, "running": 1, "utilization": 0.5, "custom": {"vram": 8.0}},
+            )
+        self.assertTrue(finished.is_set(), "graceful shutdown must wait for in-flight handler")
+        self.assertFalse(slow_assignment.cancelled)
+        self.assertGreaterEqual(len(conn.loads), 1)
+        self.assertEqual(conn.loads[0]["queued"], 3)
+
+        # 5. ExecutionClient & AsyncAsync/Client list, execute, and conflict_policy forwarding.
+        calls = []
+
+        class MockTransport:
+            def submit(self, spec, job_id, conflict_policy=None):
+                calls.append(("submit", job_id, conflict_policy))
+                return {"job_id": job_id or "j1", "state": "queued"}
+
+            def execute(self, spec):
+                calls.append(("execute", spec["interface"]))
+                return {"type": "finished", "state": "succeeded", "outputs": [{"inline": b"fast", "metadata": {}}]}
+
+            def list(self, *, states=None, limit=100, page_token=""):
+                calls.append(("list", states, limit, page_token))
+                return {"jobs": [{"job_id": "j1"}], "next_page_token": "p2"}
+
+        sync_client = ExecutionClient.__new__(ExecutionClient)
+        sync_client._transport = MockTransport()
+        sync_client.submit("echo", b"hi", job_id="j1", conflict_policy="reject")
+        self.assertEqual(sync_client.execute("echo", b"hi"), [{"inline": b"fast", "metadata": {}}])
+        self.assertEqual(sync_client.list(states=["queued"], limit=10, page_token="p1")["next_page_token"], "p2")
+
+        async def run_async():
+            ac = AsyncAnyserveClient.__new__(AsyncAnyserveClient)
+            ac._sync = sync_client
+            res = await ac.list(states=["running"], limit=5)
+            self.assertEqual(res["jobs"][0]["job_id"], "j1")
+
+        asyncio.run(run_async())
+        self.assertIn(("submit", "j1", "reject"), calls)
+        self.assertIn(("execute", "echo"), calls)
+        self.assertIn(("list", ["running"], 5, ""), calls)
+
+    def test_default_and_custom_worker_error_codes(self):
+        self.assertEqual(WorkerError("boom").code, "worker_failed")
+        self.assertEqual(WorkerError("boom", code="").code, "worker_failed")
+        self.assertEqual(WorkerError("boom", code="MY_CODE").code, "MY_CODE")
+
+        @worker(interface="err.unhandled")
+        def unhandled(_payload: bytes) -> bytes:
+            raise RuntimeError("boom")
+
+        a1 = Assignment("l-unhandled")
+        _process_assignment(unhandled, unhandled.spec, a1)
+        self.assertEqual(a1.attempt.failure_code, "worker_failed")
+
+        @worker(interface="err.default")
+        def default_err(_payload: bytes) -> bytes:
+            raise WorkerError("bad")
+
+        a2 = Assignment("l-default")
+        _process_assignment(default_err, default_err.spec, a2)
+        self.assertEqual(a2.attempt.failure_code, "worker_failed")
+
+        @worker(interface="err.custom")
+        def custom_err(_payload: bytes) -> bytes:
+            raise WorkerError("bad", code="MY_CODE")
+
+        a3 = Assignment("l-custom")
+        _process_assignment(custom_err, custom_err.spec, a3)
+        self.assertEqual(a3.attempt.failure_code, "MY_CODE")
+
+    def test_async_handler_and_async_generator_cancel_promptly_on_cancel_and_fence(self):
+        for kind in ("cancel", "fence"):
+            with self.subTest(kind=kind, mode="coroutine"):
+                entered = threading.Event()
+                cleaned = threading.Event()
+                assignment = Assignment(f"async-{kind}")
+
+                @worker(interface=f"async.{kind}")
+                async def slow_async(_payload: bytes) -> bytes:
+                    entered.set()
+                    try:
+                        await asyncio.sleep(60)
+                        return b"never"
+                    finally:
+                        cleaned.set()
+
+                sent_cancel = False
+
+                class CancelConn(Connection):
+                    def receive(self, timeout):
+                        nonlocal sent_cancel
+                        if not sent_cancel and entered.is_set():
+                            sent_cancel = True
+                            return {"type": kind, "lease_id": assignment.lease_id, "reason": "stop"}
+                        return super().receive(timeout)
+
+                conn = CancelConn(
+                    [{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}],
+                    stop_when=lambda: assignment.lease_id in conn.acks and conn.credits[-1] == 1,
+                )
+                started = time.monotonic()
+                with self.assertRaises(KeyboardInterrupt):
+                    serve(slow_async, connection=conn, graceful_shutdown_timeout=1.0)
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 2.0)
+                self.assertTrue(cleaned.is_set())
+                self.assertTrue(assignment.cancelled)
+                self.assertIsNone(assignment.attempt.outputs)
+                self.assertIsNone(assignment.attempt.failure)
+                self.assertEqual(conn.acks, [assignment.lease_id])
+
+            with self.subTest(kind=kind, mode="async_generator"):
+                entered = threading.Event()
+                cleaned = threading.Event()
+                assignment = Assignment(f"agen-{kind}")
+
+                @worker(interface=f"agen.{kind}")
+                async def slow_agen(_payload: bytes):
+                    try:
+                        yield b"first"
+                        entered.set()
+                        await asyncio.sleep(60)
+                        yield b"never"
+                    finally:
+                        cleaned.set()
+
+                sent_cancel = False
+
+                class CancelGenConn(Connection):
+                    def receive(self, timeout):
+                        nonlocal sent_cancel
+                        if not sent_cancel and entered.is_set():
+                            sent_cancel = True
+                            return {"type": kind, "lease_id": assignment.lease_id, "reason": "stop"}
+                        return super().receive(timeout)
+
+                conn = CancelGenConn(
+                    [{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}],
+                    stop_when=lambda: assignment.lease_id in conn.acks and conn.credits[-1] == 1,
+                )
+                started = time.monotonic()
+                with self.assertRaises(KeyboardInterrupt):
+                    serve(slow_agen, connection=conn, graceful_shutdown_timeout=1.0)
+                elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 2.0)
+                self.assertTrue(cleaned.is_set())
+                self.assertEqual(assignment.attempt.frames, [b"first"])
+                self.assertIsNone(assignment.attempt.outputs)
+                self.assertIsNone(assignment.attempt.failure)
+
+    def test_async_handler_exceeding_graceful_shutdown_timeout_does_not_hang(self):
+        entered = threading.Event()
+        cleaned = threading.Event()
+        assignment = Assignment("async-timeout")
+
+        @worker(interface="async.timeout")
+        async def slow_async(_payload: bytes) -> bytes:
+            entered.set()
+            try:
+                await asyncio.sleep(60)
+                return b"never"
+            finally:
+                cleaned.set()
+
+        conn = Connection(
+            [{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}],
+            stop_when=entered.is_set,
+        )
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            serve(slow_async, connection=conn, graceful_shutdown_timeout=0.05)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0)
+        self.assertTrue(cleaned.is_set())
+        self.assertTrue(assignment.cancelled)
+        self.assertTrue(conn.closed)
+        self.assertIsNone(assignment.attempt.failure)
+
+        # Stubborn handler ignoring CancelledError must still let serve() exit & close conn.
+        entered2 = threading.Event()
+        assignment2 = Assignment("async-stubborn")
+
+        @worker(interface="async.stubborn")
+        async def stubborn_async(_payload: bytes) -> bytes:
+            entered2.set()
+            while True:
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    continue
+
+        conn2 = Connection(
+            [{"type": "assignment", "lease_id": assignment2.lease_id, "assignment": assignment2}],
+            stop_when=entered2.is_set,
+        )
+        started2 = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            serve(stubborn_async, connection=conn2, graceful_shutdown_timeout=0.05)
+        elapsed2 = time.monotonic() - started2
+        self.assertLess(elapsed2, 3.5)
+        self.assertTrue(conn2.closed)
+
+    def test_shutdown_never_sends_positive_credit_after_drain_and_sigterm_preempts(self):
+        # 1. Completing in-flight handler during graceful shutdown must not emit positive credit after drain.
+        entered = threading.Event()
+        assignment = Assignment("graceful-credit")
+
+        @worker(interface="graceful.credit")
+        def handler(_payload: bytes) -> bytes:
+            entered.set()
+            time.sleep(0.06)
+            return b"ok"
+
+        timeline: list[tuple[str, object]] = []
+
+        class RecordingConn(Connection):
+            def credit(self, free):
+                timeline.append(("credit", free))
+                super().credit(free)
+
+            def drain(self, preempting=False):
+                timeline.append(("drain", preempting))
+
+        conn = RecordingConn(
+            [{"type": "assignment", "lease_id": assignment.lease_id, "assignment": assignment}],
+            stop_when=entered.is_set,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            serve(handler, connection=conn, graceful_shutdown_timeout=2.0)
+        self.assertIsNotNone(assignment.attempt.outputs)
+        drain_idx = next(i for i, (ev, _) in enumerate(timeline) if ev == "drain")
+        after_drain_credits = [val for ev, val in timeline[drain_idx + 1 :] if ev == "credit"]
+        self.assertTrue(
+            all(c == 0 for c in after_drain_credits),
+            f"positive credit sent after drain: {timeline}",
+        )
+
+        # 2. SIGTERM sends drain(preempting=True) and cancels active async leases immediately without waiting 30s.
+        import signal
+
+        sig_entered = threading.Event()
+        sig_cleaned = threading.Event()
+        sig_assignment = Assignment("sigterm-async")
+
+        @worker(interface="sigterm.async")
+        async def slow_sigterm(_payload: bytes) -> bytes:
+            sig_entered.set()
+            try:
+                await asyncio.sleep(60)
+                return b"never"
+            finally:
+                sig_cleaned.set()
+
+        sig_timeline: list[tuple[str, object]] = []
+
+        class SigtermConn(Connection):
+            def credit(self, free):
+                sig_timeline.append(("credit", free))
+                super().credit(free)
+
+            def drain(self, preempting=False):
+                sig_timeline.append(("drain", preempting))
+
+            def receive(self, timeout):
+                if self.messages:
+                    return self.messages.popleft()
+                if sig_entered.is_set():
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    time.sleep(0.05)
+                else:
+                    time.sleep(0.005)
+                return None
+
+        sig_conn = SigtermConn(
+            [{"type": "assignment", "lease_id": sig_assignment.lease_id, "assignment": sig_assignment}]
+        )
+        started = time.monotonic()
+        serve(slow_sigterm, connection=sig_conn, graceful_shutdown_timeout=30.0)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0)
+        self.assertTrue(sig_cleaned.is_set())
+        self.assertTrue(sig_conn.closed)
+        self.assertIn(("drain", True), sig_timeline)
+        sig_drain_idx = next(i for i, (ev, _) in enumerate(sig_timeline) if ev == "drain")
+        self.assertTrue(
+            all(val == 0 for ev, val in sig_timeline[sig_drain_idx + 1 :] if ev == "credit"),
+            f"positive credit sent after preempting drain: {sig_timeline}",
+        )
+
+    def test_streaming_invocation_exports_and_async_aexit_uses_aclose(self):
+        import anyserve
+        from anyserve import AsyncStreamingInvocation, StreamingInvocation
+
+        self.assertIn("StreamingInvocation", anyserve.__all__)
+        self.assertIn("AsyncStreamingInvocation", anyserve.__all__)
+        self.assertIs(anyserve.StreamingInvocation, StreamingInvocation)
+        self.assertIs(anyserve.AsyncStreamingInvocation, AsyncStreamingInvocation)
+
+        close_threads: list[int] = []
+        sent_chunks: list[bytes] = []
+        finished_input = False
+
+        class FakeNativeInvocation:
+            def __init__(self):
+                self._items = iter([
+                    {"type": "output", "data": b"echo:hi"},
+                    {"type": "finished", "state": "succeeded", "outputs": []},
+                ])
+                self.events = self
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._items)
+
+            def send(self, data, metadata=None):
+                sent_chunks.append(data)
+
+            def finish_input(self):
+                nonlocal finished_input
+                finished_input = True
+
+            def close(self):
+                close_threads.append(threading.get_ident())
+
+        class FakeTransport:
+            def invoke_stream(self, spec):
+                return FakeNativeInvocation()
+
+        async def run_check():
+            loop_tid = threading.get_ident()
+            client = AsyncAnyserveClient.__new__(AsyncAnyserveClient)
+            sync_c = ExecutionClient.__new__(ExecutionClient)
+            sync_c._transport = FakeTransport()
+            client._sync = sync_c
+
+            seen = []
+            async with await client.invoke_stream("duplex") as inv:
+                self.assertIsInstance(inv, AsyncStreamingInvocation)
+                await inv.send(b"hi")
+                await inv.finish_input()
+                async for ev in inv:
+                    seen.append(ev["type"])
+            self.assertEqual(seen, ["output", "finished"])
+            self.assertEqual(sent_chunks, [b"hi"])
+            self.assertTrue(finished_input)
+            self.assertEqual(len(close_threads), 1)
+            self.assertNotEqual(close_threads[0], loop_tid, "__aexit__ must close off the event loop thread")
+
+        asyncio.run(run_check())
 
 
 if __name__ == "__main__":

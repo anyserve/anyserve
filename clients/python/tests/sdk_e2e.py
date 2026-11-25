@@ -69,6 +69,15 @@ def eventually(check, timeout: float = 10):
         time.sleep(0.02)
 
 
+def _fork_child_probe(endpoint: str, token: str, result_queue) -> None:
+    try:
+        client = AnyserveClient(endpoint, token=token)
+        resp = client.list(limit=1)
+        result_queue.put(("ok", isinstance(resp.get("jobs"), list)))
+    except BaseException as exc:
+        result_queue.put(("err", repr(exc)))
+
+
 class SDKEndToEnd(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix="anyserve-sdk-v2-")
@@ -400,6 +409,123 @@ serve([async_unary, async_stream], sys.argv[1], token="worker", worker_id="py-as
             options=ExecutionOptions(affinity_key="a2", fairness_key="f2", concurrency_key="c2"),
         )
         self.assertFalse(j2["created"])
+
+    def test_async_streaming_invocation_list_and_conflict_policy_reject(self):
+        import asyncio
+        from anyserve import AsyncAnyserveClient, AsyncStreamingInvocation
+
+        interface = "test.python.async_duplex"
+        self.start_worker(interface, "duplex")
+
+        async def run_duplex():
+            ac = AsyncAnyserveClient(self.endpoint, token="client")
+            async with await ac.invoke_stream(
+                interface, options=ExecutionOptions(total_timeout_ms=10_000)
+            ) as inv:
+                self.assertIsInstance(inv, AsyncStreamingInvocation)
+                await inv.send(b"hello-async")
+                received = bytearray()
+                async for ev in inv:
+                    if ev["type"] == "output":
+                        received.extend(ev["data"])
+                        if bytes(received) == b"result:hello-async":
+                            break
+                    else:
+                        self.assertNotEqual(ev["type"], "finished")
+                self.assertEqual(bytes(received), b"result:hello-async")
+                await inv.finish_input()
+                terminal = None
+                async for ev in inv:
+                    if ev["type"] == "finished":
+                        terminal = ev
+                        break
+                self.assertIsNotNone(terminal)
+                self.assertEqual(terminal["state"], "succeeded")
+
+            listed = await ac.list(states=["succeeded"], limit=1)
+            self.assertEqual(len(listed["jobs"]), 1)
+            return listed
+
+        listed = asyncio.run(run_duplex())
+        self.assertEqual(listed["jobs"][0]["state"], "succeeded")
+
+        # conflict_policy="reject" rejects duplicate job_id even with identical spec.
+        job_id = str(uuid.uuid4())
+        first = self.client.submit("test.python.conflict", b"same", job_id=job_id, conflict_policy="reject")
+        self.assertTrue(first["created"])
+        with self.assertRaises(RpcError) as dup:
+            self.client.submit("test.python.conflict", b"same", job_id=job_id, conflict_policy="reject")
+        self.assertEqual(dup.exception.status_code, 6)
+
+        # Submit a second queued job and test sync list pagination.
+        job_id2 = str(uuid.uuid4())
+        self.client.submit("test.python.conflict", b"other", job_id=job_id2)
+        page1 = self.client.list(states=["queued"], limit=1)
+        self.assertEqual(len(page1["jobs"]), 1)
+        self.assertTrue(page1["next_page_token"])
+        page2 = self.client.list(states=["queued"], limit=1, page_token=page1["next_page_token"])
+        self.assertEqual(len(page2["jobs"]), 1)
+        self.assertNotEqual(page1["jobs"][0]["job_id"], page2["jobs"][0]["job_id"])
+
+    def test_update_load_validation_and_worker_error_codes(self):
+        interface = "test.python.load_and_errors"
+        conn = WorkerConnection(
+            self.endpoint,
+            {"worker_id": "load-worker", "interfaces": [interface], "max_concurrency": 1},
+            "worker",
+        )
+        try:
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(bad_util=bad), self.assertRaises(ValueError):
+                    conn.update_load(utilization=bad)
+                with self.subTest(bad_custom=bad), self.assertRaises(ValueError):
+                    conn.update_load(custom={"vram": bad})
+            # Out-of-range finite utilization clamps cleanly.
+            conn.update_load(queued=1, running=1, utilization=-0.5, custom={"vram": 4.0})
+            conn.update_load(queued=2, running=1, utilization=1.5, custom={"vram": 8.0})
+            conn.credit(1)
+
+            # Default fail code is "worker_failed"; custom code is preserved.
+            for expected_code, fail_kwargs in [
+                ("worker_failed", {}),
+                ("MY_CODE", {"code": "MY_CODE"}),
+            ]:
+                job = self.client.submit(
+                    interface,
+                    b"x",
+                    options=ExecutionOptions(total_timeout_ms=10_000),
+                )
+                msg = eventually(lambda: conn.receive(0.1))
+                self.assertEqual(msg["type"], "assignment")
+                conn.accept(msg["lease_id"])
+                attempt = msg["assignment"].open()
+                attempt.fail("boom", **fail_kwargs)
+                conn.credit(1)
+                done = eventually(
+                    lambda jid=job["job_id"]: (
+                        g if (g := self.client.get(jid))["state"] == "failed" else None
+                    )
+                )
+                self.assertEqual(done["error"]["code"], expected_code)
+        finally:
+            conn.close()
+
+    def test_fork_safety_after_parent_uses_shared_runtime(self):
+        if "fork" not in multiprocessing.get_all_start_methods():
+            self.skipTest("fork start method not available on this platform")
+        # Ensure parent initializes SHARED_RUNTIME before forking.
+        self.assertIsInstance(self.client.list(limit=1)["jobs"], list)
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+        proc = ctx.Process(target=_fork_child_probe, args=(self.endpoint, "client", queue))
+        proc.start()
+        proc.join(timeout=5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+            self.fail("forked child deadlocked using shared_runtime()")
+        self.assertEqual(proc.exitcode, 0)
+        self.assertEqual(queue.get(timeout=1), ("ok", True))
 
 
 if __name__ == "__main__":

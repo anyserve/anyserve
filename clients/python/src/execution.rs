@@ -8,8 +8,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 
 use crate::{
-    PyObjectRef, SharedRuntime, build_runtime, connection_error, extract_bytes, lock_shared,
-    metadata_to_py, status_error,
+    PyObjectRef, SharedRuntime, connection_error, extract_bytes, lock_shared, metadata_to_py,
+    shared_runtime, status_error,
 };
 
 macro_rules! field {
@@ -42,7 +42,7 @@ impl ExecutionTransport {
         let token = token.or_else(|| std::env::var(anyserve_client::TOKEN_ENV).ok());
         let namespace = namespace.or_else(|| std::env::var(anyserve_client::NAMESPACE_ENV).ok());
         py.detach(move || {
-            let runtime = Arc::new(build_runtime().map_err(error)?);
+            let runtime = shared_runtime().map_err(error)?;
             let client = runtime
                 .block_on(Client::connect_with_options(
                     &endpoint,
@@ -54,18 +54,28 @@ impl ExecutionTransport {
         })
     }
 
-    #[pyo3(signature = (spec, job_id=None))]
+    #[pyo3(signature = (spec, job_id=None, conflict_policy=None))]
     fn submit(
         &self,
         py: Python<'_>,
         spec: &Bound<'_, PyDict>,
         job_id: Option<String>,
+        conflict_policy: Option<String>,
     ) -> PyResult<Py<PyDict>> {
         let spec = parse_spec(spec)?;
+        let policy = match conflict_policy.as_deref() {
+            None | Some("return_existing" | "use_existing") => v2::ConflictPolicy::UseExisting,
+            Some("reject" | "fail") => v2::ConflictPolicy::Fail,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "unsupported conflict_policy '{other}' (expected 'return_existing' or 'reject')"
+                )));
+            }
+        };
         let mut client = self.client.clone();
         let response = py.detach(|| {
             self.runtime
-                .block_on(client.submit(job_id, spec))
+                .block_on(client.submit_with_policy(job_id, spec, policy))
                 .map_err(status_error)
         })?;
         let dict = job_to_py(
@@ -77,6 +87,61 @@ impl ExecutionTransport {
         dict.bind(py)
             .set_item(intern!(py, "created"), response.created)?;
         Ok(dict)
+    }
+
+    fn execute(&self, py: Python<'_>, spec: &Bound<'_, PyDict>) -> PyResult<Py<PyDict>> {
+        let spec = parse_spec(spec)?;
+        let mut client = self.client.clone();
+        let ev = py.detach(|| {
+            self.runtime
+                .block_on(client.execute(spec))
+                .map_err(status_error)
+        })?;
+        event_to_py(py, ev)
+    }
+
+    #[pyo3(signature = (states=None, limit=100, page_token="".to_owned()))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        states: Option<Vec<String>>,
+        limit: u32,
+        page_token: String,
+    ) -> PyResult<Py<PyDict>> {
+        let mut proto_states = Vec::new();
+        for s in states.unwrap_or_default() {
+            let code = match s.as_str() {
+                "queued" | "pending" => v2::JobState::Queued as i32,
+                "running" | "leased" => v2::JobState::Running as i32,
+                "succeeded" => v2::JobState::Succeeded as i32,
+                "failed" => v2::JobState::Failed as i32,
+                "cancelled" => v2::JobState::Cancelled as i32,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unsupported job state '{other}'"
+                    )));
+                }
+            };
+            proto_states.push(code);
+        }
+        let mut client = self.client.clone();
+        let resp = py.detach(|| {
+            self.runtime
+                .block_on(client.list(v2::ListJobsRequest {
+                    states: proto_states,
+                    limit,
+                    page_token,
+                }))
+                .map_err(status_error)
+        })?;
+        let jobs = PyList::empty(py);
+        for job in resp.jobs {
+            jobs.append(job_to_py(py, job)?)?;
+        }
+        let dict = PyDict::new(py);
+        dict.set_item(intern!(py, "jobs"), jobs)?;
+        dict.set_item(intern!(py, "next_page_token"), resp.next_page_token)?;
+        Ok(dict.unbind())
     }
 
     fn invoke(&self, py: Python<'_>, spec: &Bound<'_, PyDict>) -> PyResult<ExecutionEvents> {
@@ -98,12 +163,11 @@ impl ExecutionTransport {
                 .block_on(client.invoke_stream(spec))
                 .map_err(status_error)
         })?;
-        let closed = tokio::sync::watch::channel(false).0;
-        let closed_rx = closed.subscribe();
+        let (events, closed) = shared_events(invocation.events);
         Ok(InputInvocation {
             input: Arc::new(Mutex::new(Some(invocation.input))),
             runtime: Arc::clone(&self.runtime),
-            events: Arc::new(Mutex::new(Some((invocation.events, closed_rx)))),
+            events,
             closed,
         })
     }
@@ -185,13 +249,10 @@ impl InputInvocation {
     fn finish_input(&self, py: Python<'_>) -> PyResult<()> {
         self.send_message(py, v2::invoke_request::Msg::InputEnd(v2::InputEnd {}))
     }
-    fn close(&self) -> PyResult<()> {
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.closed.send_replace(true);
         *lock_shared(&self.input, "invocation input").map_err(error)? = None;
-        if let Ok(mut events) = self.events.try_lock() {
-            *events = None;
-        }
-        Ok(())
+        close_events(py, &self.events, &self.closed)
     }
 }
 impl InputInvocation {
@@ -226,13 +287,30 @@ pub struct ExecutionEvents {
     closed: tokio::sync::watch::Sender<bool>,
 }
 
+fn shared_events(events: ClientEvents) -> (SharedEventStream, tokio::sync::watch::Sender<bool>) {
+    let closed = tokio::sync::watch::channel(false).0;
+    let closed_rx = closed.subscribe();
+    (Arc::new(Mutex::new(Some((events, closed_rx)))), closed)
+}
+
+fn close_events(
+    py: Python<'_>,
+    events: &SharedEventStream,
+    closed: &tokio::sync::watch::Sender<bool>,
+) -> PyResult<()> {
+    closed.send_replace(true);
+    py.detach(|| {
+        *lock_shared(events, "execution events").map_err(error)? = None;
+        Ok(())
+    })
+}
+
 impl ExecutionEvents {
     fn new(runtime: SharedRuntime, events: ClientEvents) -> Self {
-        let closed = tokio::sync::watch::channel(false).0;
-        let closed_rx = closed.subscribe();
+        let (events, closed) = shared_events(events);
         Self {
             runtime,
-            events: Arc::new(Mutex::new(Some((events, closed_rx)))),
+            events,
             closed,
         }
     }
@@ -249,10 +327,14 @@ impl ExecutionEvents {
         }
         let next = py.detach(|| {
             let mut events = lock_shared(&self.events, "execution events").map_err(error)?;
+            if *self.closed.borrow() {
+                *events = None;
+                return Ok(None);
+            }
             let Some((stream, closed)) = events.as_mut() else {
                 return Ok(None);
             };
-            let next = self
+            let result = self
                 .runtime
                 .block_on(async {
                     if *closed.borrow_and_update() {
@@ -264,21 +346,17 @@ impl ExecutionEvents {
                         _ = closed.changed() => Ok(None),
                     }
                 })
-                .map_err(status_error)?;
-            if next.is_none() {
+                .map_err(status_error);
+            if matches!(result, Ok(None) | Err(_)) || *self.closed.borrow() {
                 *events = None;
             }
-            Ok::<_, PyErr>(next)
+            result
         })?;
         next.map(|event| event_to_py(py, event)).transpose()
     }
     /// Release the HTTP/2 response immediately; Invoke then cancels its job.
-    fn close(&self) -> PyResult<()> {
-        self.closed.send_replace(true);
-        if let Ok(mut events) = self.events.try_lock() {
-            *events = None;
-        }
-        Ok(())
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        close_events(py, &self.events, &self.closed)
     }
 }
 

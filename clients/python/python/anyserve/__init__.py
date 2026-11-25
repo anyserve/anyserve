@@ -5,10 +5,12 @@ from .execution import (
     AsyncExecutionClient,
     AsyncExecutionClient as AsyncAnyserveClient,
     AsyncExecutionEvents,
+    AsyncStreamingInvocation,
     ExecutionClient,
     ExecutionClient as AnyserveClient,
     ExecutionEvents,
     ExecutionOptions,
+    StreamingInvocation,
 )
 from .highlevel import HandlerSpec, WorkerError, WorkerHandler, get_handler_spec, serve, worker
 
@@ -42,9 +44,11 @@ __all__ = [
     "AsyncAnyserveClient",
     "AsyncExecutionClient",
     "AsyncExecutionEvents",
+    "AsyncStreamingInvocation",
     "ExecutionClient",
     "ExecutionEvents",
     "ExecutionOptions",
+    "StreamingInvocation",
     "RpcError",
     "WorkerConnection",
     "AttemptContext",

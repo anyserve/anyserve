@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import functools
 import inspect
 import json
 import logging
 import os
+import random
 import signal
 import socket
 import threading
@@ -24,6 +26,7 @@ _RETIRED_RPC_CODES = {9, 10}
 
 _CODEC_BYTES = "bytes"
 _CODEC_JSON = "json"
+_DEFAULT_ERROR_CODE = "worker_failed"
 
 
 class _PreemptShutdown(BaseException):
@@ -38,9 +41,16 @@ class WorkerError(Exception):
     raised by a handler fails the attempt without a retry.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        code: str = _DEFAULT_ERROR_CODE,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.code = code if code and code.strip() else _DEFAULT_ERROR_CODE
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,175 @@ def _normalize_serve_args(
     return pairs, resolved_endpoint
 
 
+def _reconnect_backoff(attempt: int, base: float, cap: float) -> float:
+    exp = min(cap, base * (2 ** min(max(attempt, 0), 16)))
+    return exp * random.uniform(0.5, 1.0)
+
+
+def _push_load(conn: Any, load_provider: Callable[[], dict[str, Any]]) -> None:
+    try:
+        data = load_provider() or {}
+        conn.update_load(
+            queued=int(data.get("queued", 0)),
+            running=int(data.get("running", 0)),
+            utilization=float(data.get("utilization", 0.0)),
+            custom={str(k): float(v) for k, v in (data.get("custom") or {}).items()}
+            if data.get("custom") is not None
+            else None,
+        )
+    except Exception as exc:
+        _LOG.warning("load_provider failed: %s", exc)
+
+
+def _resolve_cancelled(fut: concurrent.futures.Future[Any]) -> None:
+    try:
+        fut.set_exception(asyncio.CancelledError())
+    except concurrent.futures.InvalidStateError:
+        pass
+
+
+class _AsyncLoopRunner:
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        self._closed = False
+        # key -> [done_fut, task, cancel_requested]
+        self._entries: dict[Any, list[Any]] = {}
+        self._thread = threading.Thread(
+            target=self._run, name="anyserve-worker-async", daemon=True
+        )
+        self._thread.start()
+        self._ready.wait()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        self._loop.run_forever()
+
+    def run(
+        self,
+        coro: Any,
+        *,
+        key: Any = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> Any:
+        done_fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+        entry: list[Any] = [done_fut, None, False]
+        entry_key = object() if key is None else key
+        with self._lock:
+            if self._closed or (is_cancelled is not None and is_cancelled()):
+                coro.close()
+                raise asyncio.CancelledError()
+            self._entries[entry_key] = entry
+
+        def _start() -> None:
+            with self._lock:
+                if self._closed or entry[2]:
+                    if self._entries.get(entry_key) is entry:
+                        self._entries.pop(entry_key, None)
+                    coro.close()
+                    _resolve_cancelled(done_fut)
+                    return
+                task = self._loop.create_task(coro)
+                entry[1] = task
+
+            def _on_done(finished: asyncio.Task[Any]) -> None:
+                with self._lock:
+                    if self._entries.get(entry_key) is entry:
+                        self._entries.pop(entry_key, None)
+                if finished.cancelled():
+                    _resolve_cancelled(done_fut)
+                    return
+                exc = finished.exception()
+                try:
+                    if exc is not None:
+                        done_fut.set_exception(exc)
+                    else:
+                        done_fut.set_result(finished.result())
+                except concurrent.futures.InvalidStateError:
+                    pass
+
+            task.add_done_callback(_on_done)
+
+        try:
+            self._loop.call_soon_threadsafe(_start)
+        except RuntimeError:
+            with self._lock:
+                if self._entries.get(entry_key) is entry:
+                    self._entries.pop(entry_key, None)
+            coro.close()
+            raise asyncio.CancelledError()
+        return done_fut.result()
+
+    def cancel(self, key: Any, *, force: bool = False) -> None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return
+            entry[2] = True
+            done_fut, task, _ = entry
+        if task is not None and not self._loop.is_closed():
+            try:
+                self._loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
+        if force:
+            _resolve_cancelled(done_fut)
+
+    def close(self, timeout: float = 0.5) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
+            entry[2] = True
+        if not self._loop.is_closed() and self._thread.is_alive():
+            async def _shutdown() -> None:
+                try:
+                    current = asyncio.current_task()
+                    pending = [
+                        t
+                        for t in asyncio.all_tasks(self._loop)
+                        if t is not current and not t.done()
+                    ]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        done, _ = await asyncio.wait(pending, timeout=timeout)
+                        for task in done:
+                            if not task.cancelled():
+                                task.exception()
+                    ag_task = self._loop.create_task(self._loop.shutdown_asyncgens())
+                    done_ag, pending_ag = await asyncio.wait({ag_task}, timeout=timeout)
+                    for task in done_ag:
+                        if not task.cancelled():
+                            task.exception()
+                    for task in pending_ag:
+                        task.cancel()
+                except Exception:
+                    pass
+                finally:
+                    self._loop.stop()
+
+            shutdown_coro = _shutdown()
+            try:
+                self._loop.call_soon_threadsafe(self._loop.create_task, shutdown_coro)
+            except RuntimeError:
+                shutdown_coro.close()
+                try:
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                except RuntimeError:
+                    pass
+            self._thread.join(timeout=2.0)
+        for entry in entries:
+            _resolve_cancelled(entry[0])
+        if not self._thread.is_alive() and not self._loop.is_closed():
+            self._loop.close()
+
+
 def serve(
     handler: Callable[[Any], Any] | Sequence[Callable[[Any], Any]],
     endpoint_or_handler: Optional[str | Callable[[Any], Any]] = None,
@@ -144,6 +323,9 @@ def serve(
     namespace: Optional[str] = None,
     pool: Optional[str] = None,
     reconnect_interval_secs: float = 1.0,
+    max_reconnect_interval_secs: float = 30.0,
+    graceful_shutdown_timeout: float = 30.0,
+    load_provider: Optional[Callable[[], dict[str, Any]]] = None,
     connection: Any = None,
 ) -> None:
     """Run one or more ``@worker`` handlers over the outbound worker session.
@@ -156,6 +338,10 @@ def serve(
     )
     if reconnect_interval_secs <= 0:
         raise ValueError("reconnect_interval_secs must be positive")
+    if max_reconnect_interval_secs < reconnect_interval_secs:
+        raise ValueError("max_reconnect_interval_secs must be >= reconnect_interval_secs")
+    if graceful_shutdown_timeout < 0:
+        raise ValueError("graceful_shutdown_timeout must be non-negative")
     resolved_endpoint = resolve_endpoint(resolved_endpoint)
     worker_id = worker_id or f"{socket.gethostname()}-{os.getpid()}"
     by_interface = {spec.interface: (fn, spec) for fn, spec in handler_pairs}
@@ -187,11 +373,15 @@ def serve(
             finishing.add(lease_id)
     credit_lock = threading.Lock()
     executor = ThreadPoolExecutor(max_workers=total_concurrency)
+    async_runner = _AsyncLoopRunner()
     session_id = ""
     conn = connection
     credit_sent = False
     session_draining = False
     preempting_shutdown = False
+    reconnect_attempts = 0
+    connected_at = 0.0
+    last_load_push = 0.0
     prev_sigterm = None
     installed_sigterm = False
 
@@ -200,10 +390,27 @@ def serve(
         preempting_shutdown = True
         raise _PreemptShutdown()
 
+    def backoff(what: str, exc: BaseException) -> None:
+        nonlocal reconnect_attempts
+        delay = _reconnect_backoff(
+            reconnect_attempts, reconnect_interval_secs, max_reconnect_interval_secs
+        )
+        reconnect_attempts += 1
+        _LOG.warning("worker %s; reconnecting in %.2fs: %s", what, delay, exc)
+        time.sleep(delay)
+
     if threading.current_thread() is threading.main_thread():
         prev_sigterm = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, _on_sigterm)
         installed_sigterm = True
+
+    def cancel_active(lease_id: str, *, force: bool = False) -> Optional[Any]:
+        with active_lock:
+            entry = active.get(lease_id)
+        if entry is not None:
+            entry[0].cancel()
+        async_runner.cancel(lease_id, force=force)
+        return entry
 
     def report_capacity(current: Any) -> None:
         with credit_lock:
@@ -254,25 +461,32 @@ def serve(
                         conn = WorkerConnection(
                             resolved_endpoint, hello, token, namespace=namespace
                         )
-                    session_draining = False
+                    with active_lock:
+                        session_draining = False
                     session_id = conn.session_id
+                    connected_at = time.monotonic()
                     for item in _active_values(active, active_lock):
                         assignment = item[0]
                         if assignment.lease_id not in conn.resumed_lease_ids:
-                            assignment.cancel()
+                            cancel_active(assignment.lease_id)
                 except RuntimeError as exc:
                     if getattr(exc, "status_code", None) in _PERMANENT_RPC_CODES:
                         raise
-                    _LOG.warning("worker connection failed; reconnecting: %s", exc)
-                    time.sleep(reconnect_interval_secs)
+                    backoff("connection failed", exc)
                     continue
             try:
+                if load_provider is not None and (
+                    not credit_sent or time.monotonic() - last_load_push >= 1.0
+                ):
+                    _push_load(conn, load_provider)
+                    last_load_push = time.monotonic()
                 if not credit_sent:
                     report_capacity(conn)
                     credit_sent = True
                 message = conn.receive(0.2)
                 if message is None:
                     continue
+                reconnect_attempts = 0
                 kind = message["type"]
                 lease_id = message.get("lease_id")
                 if kind == "assignment":
@@ -307,8 +521,12 @@ def serve(
                     if accepted:
                         fn, target_spec = target
                         future = executor.submit(
-                            _process_assignment, fn, target_spec, assignment,
+                            _process_assignment,
+                            fn,
+                            target_spec,
+                            assignment,
                             lambda lease_id=lease_id: mark_finishing(lease_id),
+                            async_runner,
                         )
                         with active_lock:
                             active[lease_id] = (assignment, future, req_cap)
@@ -316,47 +534,76 @@ def serve(
                     else:
                         report_capacity(conn)
                 elif kind in {"cancel", "fence"}:
-                    with active_lock:
-                        entry = active.get(lease_id)
+                    entry = cancel_active(lease_id)
                     if entry is not None:
-                        entry[0].cancel()
                         report_capacity(conn)
                     elif kind == "cancel":
                         conn.cancel_ack(lease_id)
                 elif kind == "drain":
-                    session_draining = True
+                    with active_lock:
+                        session_draining = True
                     report_capacity(conn)
             except RuntimeError as exc:
                 conn.close()
                 if getattr(exc, "status_code", None) in _PERMANENT_RPC_CODES or connection is not None:
                     raise
-                _LOG.warning("worker session interrupted; reconnecting: %s", exc)
+                # A session that stayed up long enough restarts the backoff schedule.
+                if connected_at and time.monotonic() - connected_at >= max(reconnect_interval_secs, 5.0):
+                    reconnect_attempts = 0
                 conn = None
                 credit_sent = False
-                time.sleep(reconnect_interval_secs)
+                backoff("session interrupted", exc)
     except _PreemptShutdown:
         preempting_shutdown = True
     finally:
         if installed_sigterm:
             signal.signal(signal.SIGTERM, prev_sigterm)
-        if conn is not None:
-            try:
-                if preempting_shutdown:
-                    try:
-                        conn.drain(preempting=True)
-                    except TypeError:
+        with credit_lock:
+            with active_lock:
+                session_draining = True
+            if conn is not None:
+                try:
+                    if preempting_shutdown:
+                        try:
+                            conn.drain(preempting=True)
+                        except TypeError:
+                            conn.drain()
+                    else:
                         conn.drain()
-                else:
-                    conn.drain()
-            except RuntimeError:
-                pass
-        for item in _active_values(active, active_lock):
-            item[0].cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
-        if conn is not None:
-            if preempting_shutdown:
-                time.sleep(0.05)
-            conn.close()
+                except RuntimeError:
+                    pass
+        try:
+            if not preempting_shutdown and graceful_shutdown_timeout > 0:
+                concurrent.futures.wait(
+                    [entry[1] for entry in _active_values(active, active_lock)],
+                    timeout=graceful_shutdown_timeout,
+                )
+            remaining = [
+                (lid, entry)
+                for lid, entry in _active_items(active, active_lock)
+                if not entry[1].done()
+            ]
+            for lid, (assignment, _, _) in remaining:
+                assignment.cancel()
+                async_runner.cancel(lid)
+            if remaining:
+                _, still_running = concurrent.futures.wait(
+                    [entry[1] for _, entry in remaining],
+                    timeout=1.0,
+                )
+                if still_running:
+                    for lid, (_, fut, _) in remaining:
+                        if not fut.done():
+                            async_runner.cancel(lid, force=True)
+            executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            try:
+                async_runner.close()
+            finally:
+                if conn is not None:
+                    if preempting_shutdown:
+                        time.sleep(0.05)
+                    conn.close()
 
 
 def _active_ids(active: dict, lock: threading.Lock) -> list[str]:
@@ -369,12 +616,19 @@ def _active_values(active: dict, lock: threading.Lock) -> list:
         return list(active.values())
 
 
+def _active_items(active: dict, lock: threading.Lock) -> list:
+    with lock:
+        return list(active.items())
+
+
 async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> None:
     try:
         async for item in agen:
             if attempt.cancelled:
                 return
-            attempt.frame(_encode_stream_frame(spec.codec, item))
+            await asyncio.to_thread(attempt.frame, _encode_stream_frame(spec.codec, item))
+            if attempt.cancelled:
+                return
     finally:
         await agen.aclose()
 
@@ -382,6 +636,7 @@ async def _drive_async_generator(agen: Any, spec: HandlerSpec, attempt: Any) -> 
 def _process_assignment(
     handler: Callable, spec: HandlerSpec, assignment: Any,
     finishing: Callable[[], None] = lambda: None,
+    async_runner: Optional[_AsyncLoopRunner] = None,
 ) -> None:
     attempt = assignment.open_stream() if spec.streaming_input else assignment.open()
     if attempt.cancelled or attempt.terminal_replay:
@@ -414,10 +669,19 @@ def _process_assignment(
                 raw = b"".join(parts)
             value = _decode_payload(spec.codec, raw)
         result = handler(value, attempt) if spec.pass_context else handler(value)
+        def _run_coro(coro: Any) -> Any:
+            if async_runner is not None:
+                return async_runner.run(
+                    coro,
+                    key=assignment.lease_id,
+                    is_cancelled=lambda: attempt.cancelled,
+                )
+            return asyncio.run(coro)
+
         if inspect.iscoroutine(result):
-            result = asyncio.run(result)
+            result = _run_coro(result)
         if inspect.isasyncgen(result):
-            asyncio.run(_drive_async_generator(result, spec, attempt))
+            _run_coro(_drive_async_generator(result, spec, attempt))
             outputs: list[dict[str, Any]] = []
         elif inspect.isgenerator(result):
             try:
@@ -425,6 +689,8 @@ def _process_assignment(
                     if attempt.cancelled:
                         return
                     attempt.frame(_encode_stream_frame(spec.codec, item))
+                    if attempt.cancelled:
+                        return
             finally:
                 result.close()
             outputs = []
@@ -433,14 +699,24 @@ def _process_assignment(
         if not attempt.cancelled:
             finishing()
             attempt.complete(outputs)
+    except (asyncio.CancelledError, concurrent.futures.CancelledError) as exc:
+        if attempt.cancelled:
+            return
+        _LOG.exception("worker handler cancelled for interface %s", spec.interface)
+        finishing()
+        attempt.fail(_failure_reason(exc), retryable=False, code=_DEFAULT_ERROR_CODE)
     except Exception as exc:
         code = getattr(exc, "status_code", None)
         if code in _TRANSPORT_RPC_CODES or code in _RETIRED_RPC_CODES:
             raise
-        if not attempt.cancelled:
-            retryable = getattr(exc, "retryable", code == 8)
-            finishing()
-            attempt.fail(_failure_reason(exc), retryable=bool(retryable))
+        if attempt.cancelled:
+            return
+        if not isinstance(exc, WorkerError):
+            _LOG.exception("worker handler failed for interface %s", spec.interface)
+        retryable = getattr(exc, "retryable", code == 8)
+        err_code = exc.code if isinstance(exc, WorkerError) else _DEFAULT_ERROR_CODE
+        finishing()
+        attempt.fail(_failure_reason(exc), retryable=bool(retryable), code=err_code)
 
 
 def _input_fragments(attempt: Any):

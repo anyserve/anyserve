@@ -3,10 +3,12 @@ from .execution import (
     AsyncExecutionClient as AsyncAnyserveClient,
     AsyncExecutionClient as AsyncExecutionClient,
     AsyncExecutionEvents as AsyncExecutionEvents,
+    AsyncStreamingInvocation as AsyncStreamingInvocation,
     ExecutionClient as ExecutionClient,
     ExecutionClient as AnyserveClient,
     ExecutionOptions as ExecutionOptions,
     ExecutionEvents as ExecutionEvents,
+    StreamingInvocation as StreamingInvocation,
 )
 from .highlevel import HandlerSpec as HandlerSpec, WorkerError as WorkerError, WorkerHandler as WorkerHandler, get_handler_spec as get_handler_spec, serve as serve, worker as worker
 
@@ -37,7 +39,7 @@ class AttemptContext:
     def input_chunk(self) -> dict[str, Any] | None: ...
     def frame(self, data: bytes, metadata: dict[str, str] | None = ..., progress: bool = ...) -> None: ...
     def complete(self, outputs: list[ObjectRef] | None = ...) -> None: ...
-    def fail(self, message: str, retryable: bool = ...) -> None: ...
+    def fail(self, message: str, retryable: bool = ..., code: str | None = ...) -> None: ...
 
 class WorkerConnection:
     session_id: str
@@ -49,6 +51,13 @@ class WorkerConnection:
     def accept(self, lease_id: str, accepted: bool = ..., reason: str = ...) -> None: ...
     def cancel_ack(self, lease_id: str) -> None: ...
     def drain(self, preempting: bool = ...) -> None: ...
+    def update_load(
+        self,
+        queued: int = ...,
+        running: int = ...,
+        utilization: float = ...,
+        custom: dict[str, float] | None = ...,
+    ) -> None: ...
     def close(self) -> None: ...
 
 class RpcError(RuntimeError):

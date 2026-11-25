@@ -90,13 +90,16 @@ class ExecutionClient:
         self, interface: str, inputs: bytes | list[dict[str, Any]] = b"", *,
         job_id: str | None = None, durability: str = "durable",
         options: ExecutionOptions | None = None,
+        conflict_policy: str | None = None,
     ) -> dict[str, Any]:
         """Return after acceptance. A durable acknowledgement includes saved input.
 
         Reusing a job_id returns the same job only when its specification matches.
         Idempotency lasts for the server's job retention period.
         """
-        return self._transport.submit(_spec(interface, inputs, options, durability), job_id)
+        return self._transport.submit(
+            _spec(interface, inputs, options, durability), job_id, conflict_policy=conflict_policy
+        )
 
     def invoke(
         self, interface: str, inputs: bytes | list[dict[str, Any]] = b"", *,
@@ -115,8 +118,7 @@ class ExecutionClient:
         self, interface: str, inputs: bytes | list[dict[str, Any]] = b"", *,
         options: ExecutionOptions | None = None,
     ) -> list[dict[str, Any]]:
-        with self.invoke(interface, inputs, options=options) as events:
-            return _terminal_outputs(events)
+        return _outputs(self._transport.execute(_spec(interface, inputs, options, "ephemeral")))
 
     def call(
         self, interface: str, payload: bytes = b"", *, options: ExecutionOptions | None = None,
@@ -133,6 +135,15 @@ class ExecutionClient:
                 f"{interface} returned {len(outputs)} result objects; call() expects one inline result"
             )
         return outputs[0]["inline"]
+
+    def list(
+        self,
+        *,
+        states: list[str] | None = None,
+        limit: int = 100,
+        page_token: str = "",
+    ) -> dict[str, Any]:
+        return self._transport.list(states=states, limit=limit, page_token=page_token)
 
     def get(self, job_id: str, *, include_outputs: bool = True) -> dict[str, Any]:
         return self._transport.get(job_id, include_outputs)
@@ -175,13 +186,30 @@ class AsyncExecutionEvents(AsyncIterator[dict[str, Any]]):
         self._events.close()
 
     async def aclose(self) -> None:
-        self._events.close()
+        await asyncio.to_thread(self._events.close)
 
     async def __aenter__(self) -> AsyncExecutionEvents:
         return self
 
     async def __aexit__(self, *_: Any) -> None:
-        self.close()
+        await self.aclose()
+
+
+class AsyncStreamingInvocation(AsyncExecutionEvents):
+    """Async streaming input+output invocation handle."""
+
+    def __init__(self, invocation: StreamingInvocation) -> None:
+        super().__init__(invocation)
+        self._invocation = invocation
+
+    async def send(self, data: bytes, metadata: dict[str, str] | None = None) -> None:
+        await asyncio.to_thread(self._invocation.send, data, metadata)
+
+    async def finish_input(self) -> None:
+        await asyncio.to_thread(self._invocation.finish_input)
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self._invocation.close)
 
 
 class AsyncExecutionClient:
@@ -204,6 +232,7 @@ class AsyncExecutionClient:
         job_id: str | None = None,
         durability: str = "durable",
         options: ExecutionOptions | None = None,
+        conflict_policy: str | None = None,
     ) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._sync.submit,
@@ -212,6 +241,7 @@ class AsyncExecutionClient:
             job_id=job_id,
             durability=durability,
             options=options,
+            conflict_policy=conflict_policy,
         )
 
     async def invoke(
@@ -225,6 +255,17 @@ class AsyncExecutionClient:
             self._sync.invoke, interface, inputs, options=options
         )
         return AsyncExecutionEvents(events)
+
+    async def invoke_stream(
+        self,
+        interface: str,
+        *,
+        options: ExecutionOptions | None = None,
+    ) -> AsyncStreamingInvocation:
+        invocation = await asyncio.to_thread(
+            self._sync.invoke_stream, interface, options=options
+        )
+        return AsyncStreamingInvocation(invocation)
 
     async def execute(
         self,
@@ -251,6 +292,17 @@ class AsyncExecutionClient:
     async def get(self, job_id: str, *, include_outputs: bool = True) -> dict[str, Any]:
         return await asyncio.to_thread(
             self._sync.get, job_id, include_outputs=include_outputs
+        )
+
+    async def list(
+        self,
+        *,
+        states: list[str] | None = None,
+        limit: int = 100,
+        page_token: str = "",
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._sync.list, states=states, limit=limit, page_token=page_token
         )
 
     async def cancel(

@@ -18,7 +18,8 @@ class HandlerSpec:
 
 class WorkerError(Exception):
     retryable: bool
-    def __init__(self, message: str, *, retryable: bool = ...) -> None: ...
+    code: str
+    def __init__(self, message: str, *, retryable: bool = ..., code: str = ...) -> None: ...
 
 class WorkerHandler:
     spec: HandlerSpec
@@ -39,5 +40,8 @@ def serve(
     namespace: str | None = ...,
     pool: str | None = ...,
     reconnect_interval_secs: float = ...,
+    max_reconnect_interval_secs: float = ...,
+    graceful_shutdown_timeout: float = ...,
+    load_provider: Callable[[], dict[str, Any]] | None = ...,
     connection: Any = ...,
 ) -> None: ...

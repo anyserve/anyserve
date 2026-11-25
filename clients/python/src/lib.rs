@@ -1,7 +1,7 @@
 mod execution;
 mod session;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
@@ -11,6 +11,8 @@ pyo3::create_exception!(_native, RpcError, PyRuntimeError);
 use tokio::runtime::{Builder, Runtime};
 
 type SharedRuntime = Arc<Runtime>;
+
+static SHARED_RUNTIME: Mutex<Option<(u32, SharedRuntime)>> = Mutex::new(None);
 
 pub(crate) struct PyObjectRef {
     pub(crate) inline: Option<Vec<u8>>,
@@ -78,12 +80,29 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn build_runtime() -> Result<Runtime> {
-    Builder::new_multi_thread()
-        .worker_threads(1)
+pub(crate) fn shared_runtime() -> Result<SharedRuntime> {
+    let pid = std::process::id();
+    let mut guard = SHARED_RUNTIME
+        .lock()
+        .map_err(|_| anyhow!("shared runtime lock poisoned"))?;
+    if let Some((cached_pid, rt)) = guard.as_ref() {
+        if *cached_pid == pid {
+            return Ok(Arc::clone(rt));
+        }
+        // In a forked child process, dropping the parent's Tokio runtime can
+        // deadlock waiting on threads that no longer exist, so leak it instead.
+        if let Some((_, old_rt)) = guard.take() {
+            std::mem::forget(old_rt);
+        }
+    }
+    let rt = Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
-        .context("create tokio runtime")
+        .map(Arc::new)
+        .map_err(|err| anyhow!("create tokio runtime: {err}"))?;
+    *guard = Some((pid, Arc::clone(&rt)));
+    Ok(rt)
 }
 
 fn lock_shared<'a, T>(shared: &'a Arc<Mutex<T>>, label: &str) -> Result<MutexGuard<'a, T>> {

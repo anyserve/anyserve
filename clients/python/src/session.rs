@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::execution::{error, field, objects_from_py, objects_to_py};
 use crate::{
-    SharedRuntime, build_runtime, connection_error, extract_bytes, metadata_to_py, status_error,
+    SharedRuntime, connection_error, extract_bytes, metadata_to_py, shared_runtime, status_error,
 };
 
 #[pyclass(module = "anyserve._native")]
@@ -22,6 +22,7 @@ pub struct WorkerConnection {
     limits: v2::Limits,
     heartbeat_timeout: Duration,
     heartbeat: tokio::task::JoinHandle<()>,
+    load: Arc<Mutex<Option<v2::Load>>>,
     #[pyo3(get)]
     session_id: String,
     #[pyo3(get)]
@@ -56,7 +57,7 @@ impl WorkerConnection {
         let token = token.or_else(|| std::env::var(anyserve_client::TOKEN_ENV).ok());
         let namespace = namespace.or_else(|| std::env::var(anyserve_client::NAMESPACE_ENV).ok());
         py.detach(move || {
-            let runtime = Arc::new(build_runtime().map_err(error)?);
+            let runtime = shared_runtime().map_err(error)?;
             let (session, welcome) = runtime.block_on(async {
                 let mut session = WorkerSession::connect_with_namespace(
                     &endpoint,
@@ -79,6 +80,8 @@ impl WorkerConnection {
                 .ok_or_else(|| error("Welcome has no data limits"))?;
             let control = session.control;
             let heartbeats = control.clone();
+            let load = Arc::new(Mutex::new(None::<v2::Load>));
+            let hb_load = Arc::clone(&load);
             let heartbeat = runtime.spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(u64::from(
                     welcome.heartbeat_interval_ms.max(1),
@@ -86,10 +89,11 @@ impl WorkerConnection {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
+                    let current_load = hb_load.lock().ok().and_then(|guard| guard.clone());
                     if heartbeats
                         .send(v2::WorkerMessage {
                             msg: Some(v2::worker_message::Msg::Heartbeat(v2::Heartbeat {
-                                load: None,
+                                load: current_load,
                             })),
                         })
                         .await
@@ -107,6 +111,7 @@ impl WorkerConnection {
                 limits,
                 heartbeat_timeout: Duration::from_millis(u64::from(welcome.heartbeat_timeout_ms)),
                 heartbeat,
+                load,
                 session_id: welcome.session_id,
                 generation: welcome.generation,
                 resumed_lease_ids: welcome.resumed_lease_ids,
@@ -217,6 +222,39 @@ impl WorkerConnection {
             py,
             v2::worker_message::Msg::Draining(v2::Draining { preempting }),
         )
+    }
+    #[pyo3(signature = (queued=0, running=0, utilization=0.0, custom=None))]
+    fn update_load(
+        &self,
+        queued: u32,
+        running: u32,
+        utilization: f64,
+        custom: Option<HashMap<String, f64>>,
+    ) -> PyResult<()> {
+        if !utilization.is_finite() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "utilization must be finite",
+            ));
+        }
+        let custom = custom.unwrap_or_default();
+        for (k, v) in &custom {
+            if !v.is_finite() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "load custom metric '{k}' must be finite"
+                )));
+            }
+        }
+        let mut guard = self
+            .load
+            .lock()
+            .map_err(|_| error("worker load lock poisoned"))?;
+        *guard = Some(v2::Load {
+            queued,
+            running,
+            utilization: utilization.clamp(0.0, 1.0),
+            custom,
+        });
+        Ok(())
     }
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         self.heartbeat.abort();
@@ -454,13 +492,22 @@ impl WorkerAttempt {
             v2::finish::Outcome::Succeeded(v2::Succeeded {}),
         )
     }
-    #[pyo3(signature = (message, retryable=false))]
-    fn fail(&self, py: Python<'_>, message: String, retryable: bool) -> PyResult<()> {
+    #[pyo3(signature = (message, retryable=false, code=None))]
+    fn fail(
+        &self,
+        py: Python<'_>,
+        message: String,
+        retryable: bool,
+        code: Option<String>,
+    ) -> PyResult<()> {
+        let code = code
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| "worker_failed".to_owned());
         self.finish(
             py,
             Vec::new(),
             v2::finish::Outcome::Failed(v2::ErrorInfo {
-                code: "worker_failed".to_owned(),
+                code,
                 message,
                 retryable,
             }),
