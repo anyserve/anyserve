@@ -243,7 +243,25 @@ export interface ConsoleBackend {
     nowMs: number,
   ): ConsoleAnalyticsResult;
   listWorkersForConsole(nowMs: number): ConsoleWorkerData[];
+  drainWorkerForConsole(
+    sessionId: string,
+    scopeNamespace: string | null,
+    nowMs: number,
+  ): boolean;
   adminReset(nowMs: number): Promise<AdminResetResult>;
+}
+
+export function safeHttpUrl(raw?: string | null): string | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 
@@ -604,11 +622,23 @@ export async function handleConsoleOrHealthRequest(
       backend.env,
     );
   }
+  if (path === "/api/info" && method === "GET") {
+    return withCorsHeaders(
+      request,
+      jsonResponse({
+        auth_enabled: backend.auth.isEnabled(),
+        auth_portal_url: safeHttpUrl(backend.env.ANYSERVE_CONSOLE_AUTH_PORTAL_URL),
+        public_endpoint: resolvePublicEndpoint(request, backend.env),
+        grpc_enabled: false,
+      }),
+      backend.env,
+    );
+  }
 
   // /metrics and /api/admin/reset remain strictly Operator-only.
   if (path === "/metrics" || path === "/api/admin/reset") {
     try {
-      backend.auth.authorizeOperatorHeaders(request.headers);
+      await backend.auth.authorizeOperatorHeaders(request.headers);
     } catch (err) {
       return withCorsHeaders(request, authMiddlewareErrorResponse(err), backend.env);
     }
@@ -627,7 +657,7 @@ export async function handleConsoleOrHealthRequest(
   // Remaining Console /api/* routes permit both operator and tenant client tokens.
   let principal: Principal;
   try {
-    principal = backend.auth.authorizeConsoleHeaders(request.headers);
+    principal = await backend.auth.authorizeConsoleHeaders(request.headers);
   } catch (err) {
     return withCorsHeaders(request, authMiddlewareErrorResponse(err), backend.env);
   }
@@ -699,27 +729,29 @@ async function dispatchAuthorizedConsoleRoute(
         ready: snap.ready,
         journal: {
           status: snap.journalMessage ? "unavailable" : "healthy",
-          message: snap.journalMessage,
+          message: isOperator ? snap.journalMessage : null,
         },
       },
       control_plane: {
-        grpc_listen: "disabled",
+        grpc_enabled: false,
+        grpc_listen: isOperator ? "disabled" : "",
         grpc_tls_enabled: false,
-        console_listen: "cloudflare-native-do",
+        console_listen: isOperator ? "cloudflare-native-do" : "",
         public_endpoint: resolvePublicEndpoint(request, backend.env),
+        auth_portal_url: safeHttpUrl(backend.env.ANYSERVE_CONSOLE_AUTH_PORTAL_URL),
         auth_enabled: backend.auth.isEnabled(),
         generation: snap.generation,
         retained_jobs: snap.retainedJobs,
         sessions: snap.sessions,
-        max_sessions: snap.maxSessions,
+        max_sessions: isOperator ? snap.maxSessions : 0,
         priority_levels: snap.priorityLevels,
         default_max_attempts: snap.defaultMaxAttempts,
         heartbeat_interval_ms: snap.heartbeatIntervalMs,
         heartbeat_timeout_ms: snap.heartbeatTimeoutMs,
         reconnect_grace_ms: snap.reconnectGraceMs,
         recommended_poll_ms: resolveRecommendedPollMs(backend.env),
-        boot_id: snap.bootId,
-        constructor_runs: snap.constructorRuns,
+        boot_id: isOperator ? snap.bootId : "",
+        constructor_runs: isOperator ? snap.constructorRuns : 0,
       },
       budgets: isOperator
         ? {
@@ -766,18 +798,19 @@ async function dispatchAuthorizedConsoleRoute(
         oldest_queued_age_ms: iface.oldest_queued_age_ms,
         sessions: iface.sessions,
         free_slots: iface.free_slots,
-        policy: iface.policy
-          ? {
-              max_queue: iface.policy.maxQueue,
-              queue_timeout_ms: iface.policy.queueTimeoutMs,
-              max_in_flight_per_key: iface.policy.maxInFlightPerKey,
-              pool_tiers: iface.policy.poolTiers.map((t) => ({
-                pool: t.pool,
-                spillover_after_ms: t.spilloverAfterMs,
-                reconnect_grace_ms: t.reconnectGraceMs,
-              })),
-            }
-          : null,
+        policy:
+          isOperator && iface.policy
+            ? {
+                max_queue: iface.policy.maxQueue,
+                queue_timeout_ms: iface.policy.queueTimeoutMs,
+                max_in_flight_per_key: iface.policy.maxInFlightPerKey,
+                pool_tiers: iface.policy.poolTiers.map((t) => ({
+                  pool: t.pool,
+                  spillover_after_ms: t.spilloverAfterMs,
+                  reconnect_grace_ms: t.reconnectGraceMs,
+                })),
+              }
+            : null,
       })),
       pools: snap.pools,
       refreshed_at_ms: nowMs,
@@ -828,6 +861,22 @@ async function dispatchAuthorizedConsoleRoute(
       draining,
       disconnected,
     });
+  }
+
+  const drainMatch = /^\/api\/workers\/([^/]+)\/drain$/.exec(path);
+  if (drainMatch && method === "POST") {
+    let sessionId: string;
+    try {
+      sessionId = decodeURIComponent(drainMatch[1]!);
+    } catch {
+      return apiErrorResponse(400, "invalid session_id encoding");
+    }
+    const scopeNs =
+      principal && !principal.isOperator ? principal.namespace : null;
+    if (!backend.drainWorkerForConsole(sessionId, scopeNs, nowMs)) {
+      return apiErrorResponse(404, `worker session '${sessionId}' does not exist`);
+    }
+    return jsonResponse({ session_id: sessionId, draining: true });
   }
 
   if (path === "/api/jobs" && method === "GET") {

@@ -196,6 +196,8 @@ export interface SessionMem {
   running: number;
   utilization: number;
   customLoad: Record<string, number>; // memory-only, bounded 64 entries / 8 KiB
+  tokenJti: string | null;
+  tokenExp: number | null;
 }
 
 export interface LeaseMem {

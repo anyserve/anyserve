@@ -7,8 +7,8 @@ import type { AnalyticsJob } from "./types";
 const require = createRequire(import.meta.url);
 let db: Awaited<ReturnType<typeof createDuckDB>>;
 let connection: DuckDBConnection;
-const job = (id: string, state: AnalyticsJob["state"] = "succeeded"): AnalyticsJob => ({
-  job_id: id, state, interface_name: "echo", source: null, created_at_ms: 1_700_000_000_001,
+const job = (id: string, state: AnalyticsJob["state"] = "succeeded", namespace?: string): AnalyticsJob => ({
+  job_id: id, state, interface_name: "echo", ...(namespace ? { namespace } : {}), source: null, created_at_ms: 1_700_000_000_001,
   updated_at_ms: 1_700_000_000_026, duration_ms: 25, current_attempt_id: null,
   latest_worker_id: null, attempt_count: 1, last_error: null, metadata: { tag: "测试" }, durability: "durable",
 });
@@ -20,21 +20,28 @@ beforeAll(async () => {
   connection = db.connect();
   connection.query(ENGINE_SETTINGS);
   connection.query(JOB_SCHEMA);
-  connection.insertArrowFromIPCStream(jobsToIPC([job("A"), job("B", "failed")]), { name: "jobs", create: false });
+  connection.insertArrowFromIPCStream(jobsToIPC([job("A"), job("B", "failed", "team-alpha")]), { name: "jobs", create: false });
   connection.insertArrowFromIPCStream(jobsToIPC([{ ...job("C"), source: "test", latest_worker_id: "worker-1", duration_ms: null }]), { name: "jobs", create: false });
-  connection.insertArrowFromIPCStream(metadataToIPC([job("A"), job("B"), job("C")])!, { name: "job_metadata", create: false });
+  connection.insertArrowFromIPCStream(metadataToIPC([job("A"), job("B", "failed", "team-alpha"), job("C")])!, { name: "job_metadata", create: false });
 }, 30_000);
 afterAll(async () => { connection?.close(); await db?.reset(); });
 
 it("runs real WASM queries over typed Arrow batches with nulls and metadata", () => {
   const row = connection.query("SELECT * FROM jobs WHERE job_id = 'C'").get(0)!;
   expect(row.source).toBe("test"); expect(row.latest_worker_id).toBe("worker-1"); expect(row.duration_ms).toBeNull();
+  expect(row.namespace).toBe("default");
+  expect(connection.query("SELECT namespace FROM jobs WHERE job_id = 'B'").get(0)!.namespace).toBe("team-alpha");
   expect(Number(row.created_at_ms)).toBe(1_700_000_000_001);
   expect(JSON.parse(row.metadata)).toEqual({ tag: "测试" });
-  expect(connection.query("SELECT jobs.job_id FROM jobs JOIN job_metadata USING(job_id) WHERE key = 'tag' AND value = '测试'").numRows).toBe(3);
+  expect(connection.query("SELECT jobs.job_id FROM jobs JOIN job_metadata USING(job_id, namespace) WHERE key = 'tag' AND value = '测试'").numRows).toBe(3);
   for (const preset of QUERY_PRESETS) {
     const statement = connection.prepare(boundedQuery(preset.sql));
-    expect(statement.query().numRows).toBeGreaterThan(0); statement.close();
+    const res = statement.query();
+    expect(res.numRows).toBeGreaterThan(0);
+    if (preset.name === "Failures and retries") {
+      expect(res.schema.fields.map((f) => f.name)).toContain("namespace");
+    }
+    statement.close();
   }
   const rows = connection.query("SELECT state, count(*) AS n FROM jobs GROUP BY state ORDER BY state");
   expect(rows.toArray().map(row => [row.state, Number(row.n)])).toEqual([["failed", 1], ["succeeded", 2]]);

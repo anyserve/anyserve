@@ -32,9 +32,18 @@ export interface InterfaceSummary {
   sessions: number; free_slots: number; policy?: InterfacePolicySummary | null;
 }
 
+export interface InfoResponse {
+  auth_enabled: boolean;
+  auth_portal_url?: string | null;
+  public_endpoint?: string | null;
+  grpc_enabled: boolean;
+}
+
 export interface ControlPlaneSummary {
+  grpc_enabled?: boolean;
   grpc_listen: string; grpc_tls_enabled: boolean; console_listen: string; auth_enabled: boolean;
   public_endpoint?: string | null;
+  auth_portal_url?: string | null;
   recommended_poll_ms?: number | null;
   generation: number; retained_jobs: number; sessions: number; max_sessions: number;
   priority_levels: number; default_max_attempts: number;

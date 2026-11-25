@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   AttemptFinishedStatus,
@@ -158,7 +158,10 @@ import {
   defaultPrincipal,
   grpcErrorResponse,
   httpStatusForGrpcCode,
+  internalRevocationBearer,
+  signToken,
   validateNamespace,
+  verifySignedToken,
 } from "../src/native/auth";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1790,7 +1793,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     ).toBe(false);
   });
 
-  it("supports anonymous mode when no tokens are configured, honouring x-anyserve-namespace and 400/3 on bad namespaces", () => {
+  it("supports anonymous mode when no tokens are configured, honouring x-anyserve-namespace and 400/3 on bad namespaces", async () => {
     const anon = AuthPolicy.fromEnv({
       ANYSERVE_CLIENT_TOKENS: "  ,  ",
       ANYSERVE_WORKER_TOKENS: "",
@@ -1805,7 +1808,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
       isOperator: true,
     });
 
-    expect(anon.verifyClientHeaders(new Headers())).toEqual({
+    expect(await anon.verifyClientHeaders(new Headers())).toEqual({
       namespace: "default",
       role: Role.Client,
       subject: "anonymous",
@@ -1814,7 +1817,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     });
 
     expect(
-      anon.verifyClientHeaders(
+      await anon.verifyClientHeaders(
         new Headers({ [NAMESPACE_HEADER]: "  edge-robot-7  " }),
       ),
     ).toEqual({
@@ -1826,7 +1829,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     });
 
     expect(
-      anon.verifyWorkerHeaders({ [NAMESPACE_HEADER]: "edge-team" }),
+      await anon.verifyWorkerHeaders({ [NAMESPACE_HEADER]: "edge-team" }),
     ).toEqual({
       namespace: "edge-team",
       role: Role.Worker,
@@ -1836,7 +1839,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     });
 
     expect(
-      anon.authorizeOperatorHeaders({ [NAMESPACE_HEADER]: "ops-ns" }),
+      await anon.authorizeOperatorHeaders({ [NAMESPACE_HEADER]: "ops-ns" }),
     ).toEqual({
       namespace: "ops-ns",
       role: Role.Client,
@@ -1852,7 +1855,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
       () => anon.authorizeOperatorHeaders({ [NAMESPACE_HEADER]: "bad/ns" }),
     ]) {
       try {
-        fn();
+        await fn();
         expect.fail("expected 400/3");
       } catch (e) {
         const ge = e as GrpcStatusError;
@@ -1862,7 +1865,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     }
   });
 
-  it("enforces full auth / role / namespace / forcedPool / operator matrix (401/16, 403/7)", () => {
+  it("enforces full auth / role / namespace / forcedPool / operator matrix (401/16, 403/7)", async () => {
     const policy = AuthPolicy.fromEnv({
       ANYSERVE_CLIENT_TOKENS: " op-client-1 , op-client-2 ",
       ANYSERVE_WORKER_TOKENS: " global-worker-1 ",
@@ -1894,21 +1897,21 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
       Authorization: "Bearer op-client-1",
       [NAMESPACE_HEADER]: "spoofed-ns",
     });
-    expect(policy.verifyClientHeaders(opHeaders)).toEqual({
+    expect(await policy.verifyClientHeaders(opHeaders)).toEqual({
       namespace: "default",
       role: Role.Client,
       subject: "client-token",
       forcedPool: null,
       isOperator: true,
     });
-    expect(policy.authorizeOperatorHeaders(opHeaders)).toEqual({
+    expect(await policy.authorizeOperatorHeaders(opHeaders)).toEqual({
       namespace: "default",
       role: Role.Client,
       subject: "client-token",
       forcedPool: null,
       isOperator: true,
     });
-    expect(() => policy.verifyWorkerHeaders(opHeaders)).toThrowError(
+    await expect(policy.verifyWorkerHeaders(opHeaders)).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
@@ -1917,20 +1920,20 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
 
     // 2. Global worker token (lowercase `bearer ` prefix): accepted for worker, 403/7 for client & operator
     const workerHeaders = { authorization: "bearer global-worker-1" };
-    expect(policy.verifyWorkerHeaders(workerHeaders)).toEqual({
+    expect(await policy.verifyWorkerHeaders(workerHeaders)).toEqual({
       namespace: "default",
       role: Role.Worker,
       subject: "worker-token",
       forcedPool: null,
       isOperator: false,
     });
-    expect(() => policy.verifyClientHeaders(workerHeaders)).toThrowError(
+    await expect(policy.verifyClientHeaders(workerHeaders)).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
       }),
     );
-    expect(() => policy.authorizeOperatorHeaders(workerHeaders)).toThrowError(
+    await expect(policy.authorizeOperatorHeaders(workerHeaders)).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
@@ -1942,22 +1945,22 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
       ["Authorization", "Bearer scoped-client-a"],
       [NAMESPACE_HEADER, "spoofed"],
     ] as const;
-    expect(policy.verifyClientHeaders(scopedClientHeaders)).toEqual({
+    expect(await policy.verifyClientHeaders(scopedClientHeaders)).toEqual({
       namespace: "tenant-a",
       role: Role.Client,
       subject: "svc-a",
       forcedPool: null,
       isOperator: false,
     });
-    expect(() =>
+    await expect(
       policy.authorizeOperatorHeaders(scopedClientHeaders),
-    ).toThrowError(
+    ).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
       }),
     );
-    expect(policy.authorizeConsoleHeaders(scopedClientHeaders)).toEqual({
+    expect(await policy.authorizeConsoleHeaders(scopedClientHeaders)).toEqual({
       namespace: "tenant-a",
       role: Role.Client,
       subject: "svc-a",
@@ -1969,16 +1972,16 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
     const scopedDefaultHeaders = {
       Authorization: "Bearer scoped-client-default",
     };
-    expect(policy.verifyClientHeaders(scopedDefaultHeaders)).toEqual({
+    expect(await policy.verifyClientHeaders(scopedDefaultHeaders)).toEqual({
       namespace: "default",
       role: Role.Client,
       subject: "client-token",
       forcedPool: null,
       isOperator: false,
     });
-    expect(() =>
+    await expect(
       policy.authorizeOperatorHeaders(scopedDefaultHeaders),
-    ).toThrowError(
+    ).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
@@ -1990,32 +1993,32 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
       authorization: "Bearer scoped-worker-factory",
       [NAMESPACE_HEADER]: "spoofed",
     });
-    expect(policy.verifyWorkerHeaders(scopedWorkerHeaders)).toEqual({
+    expect(await policy.verifyWorkerHeaders(scopedWorkerHeaders)).toEqual({
       namespace: "factory-a",
       role: Role.Worker,
       subject: "jetson-1",
       forcedPool: "jetson-local",
       isOperator: false,
     });
-    expect(() =>
+    await expect(
       policy.verifyClientHeaders(scopedWorkerHeaders),
-    ).toThrowError(
+    ).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
       }),
     );
-    expect(() =>
+    await expect(
       policy.authorizeOperatorHeaders(scopedWorkerHeaders),
-    ).toThrowError(
+    ).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
       }),
     );
-    expect(() =>
+    await expect(
       policy.authorizeConsoleHeaders(scopedWorkerHeaders),
-    ).toThrowError(
+    ).rejects.toThrowError(
       expect.objectContaining({
         code: GrpcCode.PermissionDenied,
         httpStatus: 403,
@@ -2034,7 +2037,7 @@ describe("native/auth.ts — parity with auth.rs + http_ws_service.rs, matrix & 
         () => policy.verifyWorkerHeaders(badAuth),
         () => policy.authorizeOperatorHeaders(badAuth),
       ]) {
-        expect(call).toThrowError(
+        await expect(call()).rejects.toThrowError(
           expect.objectContaining({
             code: GrpcCode.Unauthenticated,
             httpStatus: 401,
@@ -2274,5 +2277,139 @@ describe("native/proto.ts — schema-driven codec invariants (added)", () => {
     expect(next.principalForToken("c1")?.isOperator).toBe(true);
     expect(base.principalForToken("s1")).toBeNull();
     expect(next).toBeInstanceOf(AuthPolicy);
+  });
+
+  it("verifies asv1 signed tokens via Web Crypto, enforces rotation/expiry/revocation, and never grants operator", async () => {
+    const enc = new TextEncoder();
+    const kOld = enc.encode("old-signing-secret-0123456789abcdef");
+    const kNew = enc.encode("new-signing-secret-0123456789abcdef");
+    const now = Math.floor(Date.now() / 1000);
+    const tok = await signToken(kOld, {
+      jti: "jti-cf-1",
+      ns: "gh-77",
+      role: "client",
+      sub: "gh:dev",
+      iat: now,
+      exp: now + 600,
+      fp: "gpu-l4",
+    });
+
+    const verified = await verifySignedToken(tok, [kNew, kOld], now + 100);
+    expect(verified).toMatchObject({ jti: "jti-cf-1", ns: "gh-77", role: "client", fp: "gpu-l4" });
+    expect(await verifySignedToken(tok, [kNew], now + 100)).toBeNull();
+    expect(await verifySignedToken(tok, [kOld], now + 600)).toBeNull();
+
+    const policy = AuthPolicy.fromEnv({
+      ANYSERVE_CLIENT_TOKENS: "op-static",
+      ANYSERVE_TOKEN_SIGNING_KEY: "new-signing-secret-0123456789abcdef, old-signing-secret-0123456789abcdef",
+    });
+    const principal = await policy.principalForTokenAsync(tok, now + 10);
+    expect(principal).toMatchObject({
+      namespace: "gh-77",
+      role: "client",
+      subject: "gh:dev",
+      forcedPool: "gpu-l4",
+      isOperator: false,
+    });
+    await expect(
+      policy.authorizeOperatorHeaders({ authorization: `Bearer ${tok}` }),
+    ).rejects.toMatchObject({ code: GrpcCode.PermissionDenied });
+
+    policy.applyRevocations({ version: 1, revoked_jtis: ["jti-cf-1"] });
+    expect(await policy.principalForTokenAsync(tok, now + 10)).toBeNull();
+
+    const bearer = await internalRevocationBearer(enc.encode("key-1"));
+    expect(bearer).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("rejects non-numeric/non-finite exp claims and preserves revocations in withScopedTokens", async () => {
+    const enc = new TextEncoder();
+    const key = enc.encode("signing-secret-exp-validation-0123456789");
+    const now = Math.floor(Date.now() / 1000);
+
+    // Manually craft valid HMAC-signed tokens with malformed exp values ("never", NaN/null-like string, object).
+    for (const badExp of ["never", true, { secs: now + 999 }, []]) {
+      const tok = await signToken(key, {
+        jti: "jti-bad-exp",
+        ns: "tenant-x",
+        role: "client",
+        sub: "gh:bad",
+        iat: now,
+        exp: badExp as unknown as number,
+      });
+      expect(await verifySignedToken(tok, [key], now)).toBeNull();
+    }
+
+    // Valid token with numeric future exp succeeds; withScopedTokens preserves revocations & sync state.
+    const validTok = await signToken(key, {
+      jti: "jti-rev-keep",
+      ns: "tenant-x",
+      role: "client",
+      sub: "gh:ok",
+      iat: now,
+      exp: now + 300,
+    });
+    const base = new AuthPolicy([], [], [], { signingKeys: [key] });
+    base.applyRevocations({ version: 5, revoked_jtis: ["jti-rev-keep"] });
+    const derived = base.withScopedTokens([
+      { token: "scoped-1", role: Role.Client, namespace: "tenant-y" },
+    ]);
+    expect(derived.revocationSnapshot()).toEqual({
+      version: 5,
+      revoked_jtis: ["jti-rev-keep"],
+    });
+    expect(await derived.principalForTokenAsync(validTok, now + 10)).toBeNull();
+  });
+
+  it("coalesces concurrent maybeSyncRevocations via single-flight and passes an AbortSignal timeout", async () => {
+    const enc = new TextEncoder();
+    const key = enc.encode("signing-secret-single-flight-0123456789");
+    const now = Math.floor(Date.now() / 1000);
+    const tok = await signToken(key, {
+      jti: "jti-race-1",
+      ns: "tenant-r",
+      role: "client",
+      sub: "gh:racer",
+      iat: now,
+      exp: now + 600,
+    });
+
+    let resolveFetch!: (resp: Response) => void;
+    const fetchMock = vi.fn().mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const policy = AuthPolicy.fromEnv({
+        ANYSERVE_TOKEN_SIGNING_KEY: "signing-secret-single-flight-0123456789",
+        ANYSERVE_AUTH_REVOCATION_URL: "https://rev.internal/revocations",
+        ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS: "2000",
+      });
+
+      // Fire two concurrent verifications BEFORE the revocation fetch resolves.
+      const p1 = policy.principalForTokenAsync(tok, now + 5);
+      const p2 = policy.principalForTokenAsync(tok, now + 5);
+
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      const [, fetchInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(fetchInit.signal).toBeInstanceOf(AbortSignal);
+
+      // Resolve with jti-race-1 revoked: BOTH concurrent callers must observe the revocation (no fail-open race!).
+      resolveFetch(
+        new Response(
+          JSON.stringify({ version: 1, revoked_jtis: ["jti-race-1"] }),
+          { status: 200 },
+        ),
+      );
+      const [r1, r2] = await Promise.all([p1, p2]);
+      expect(r1).toBeNull();
+      expect(r2).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

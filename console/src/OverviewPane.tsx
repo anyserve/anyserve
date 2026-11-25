@@ -34,10 +34,18 @@ export function OverviewPane({
   const healthDot = !overview ? "offline" : health && !health.live ? "bad" : health && !health.ready ? "warn" : "ok";
   const healthLabel = !overview ? "Connecting" : health && !health.live ? "Not live" : health && !health.ready ? "Not ready" : "Ready";
 
+  const grpcListen = cp?.grpc_listen?.trim() ?? "";
+  const consoleListen = cp?.console_listen?.trim() ?? "";
   const cpItems = cp
     ? [
-        { label: "gRPC listen", value: cp.grpc_listen, mono: true, tag: `TLS: ${cp.grpc_tls_enabled ? "On" : "Off"}` },
-        { label: "Console listen", value: cp.console_listen, mono: true, tag: `Auth: ${cp.auth_enabled ? "On" : "Off"}` },
+        ...(cp.grpc_enabled === false
+          ? [{ label: "gRPC listen", value: "Disabled", mono: false, tag: undefined }]
+          : grpcListen
+            ? [{ label: "gRPC listen", value: grpcListen, mono: true, tag: `TLS: ${cp.grpc_tls_enabled ? "On" : "Off"}` }]
+            : []),
+        ...(consoleListen
+          ? [{ label: "Console listen", value: consoleListen, mono: true, tag: `Auth: ${cp.auth_enabled ? "On" : "Off"}` }]
+          : []),
         { label: "Leader generation", value: `#${formatNumber(cp.generation)}` },
         { label: "Priority / Max attempts", value: `${cp.priority_levels} / ${cp.default_max_attempts}` },
         { label: "Heartbeat / Timeout", value: `${formatDuration(cp.heartbeat_interval_ms)} / ${formatDuration(cp.heartbeat_timeout_ms)}` },
@@ -106,7 +114,16 @@ export function OverviewPane({
             </div>
             <div className="kpi-card__value num">{overview ? `${formatNumber(overview.workers.healthy)} / ${formatNumber(overview.workers.total)}` : "0 / 0"}</div>
             <div className="kpi-card__sub">
-              {cp ? <span>Sessions <strong className="num">{formatNumber(cp.sessions)}/{formatNumber(cp.max_sessions)}</strong></span> : null}
+              {cp ? (
+                <span>
+                  Sessions{" "}
+                  <strong className="num">
+                    {cp.max_sessions > 0
+                      ? `${formatNumber(cp.sessions)}/${formatNumber(cp.max_sessions)}`
+                      : formatNumber(cp.sessions)}
+                  </strong>
+                </span>
+              ) : null}
               <span>Active leases <strong className="num">{formatNumber(overview?.workers.active_leases ?? 0)}</strong></span>
               {draining != null ? (
                 draining > 0 ? (

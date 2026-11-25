@@ -8,12 +8,12 @@ export const MAX_RESULT_BYTES = 4 * 1024 * 1024;
 export const QUERY_TIMEOUT_MS = 15_000;
 
 export const JOB_SCHEMA = `CREATE TABLE jobs (
-  job_id VARCHAR, state VARCHAR, interface_name VARCHAR, source VARCHAR,
+  job_id VARCHAR, state VARCHAR, interface_name VARCHAR, namespace VARCHAR, source VARCHAR,
   created_at_ms BIGINT, updated_at_ms BIGINT, duration_ms BIGINT,
   current_attempt_id VARCHAR, latest_worker_id VARCHAR, attempt_count INTEGER,
   last_error VARCHAR, metadata VARCHAR, durability VARCHAR
 );
-CREATE TABLE job_metadata (job_id VARCHAR, key VARCHAR, value VARCHAR)`;
+CREATE TABLE job_metadata (job_id VARCHAR, namespace VARCHAR, key VARCHAR, value VARCHAR)`;
 
 export const ENGINE_SETTINGS = `
   SET memory_limit = '256MB';
@@ -27,11 +27,11 @@ export const ENGINE_SETTINGS = `
 `;
 
 export const QUERY_PRESETS = [
-  { name: "Recent jobs", sql: `SELECT job_id, state, interface_name, latest_worker_id,
+  { name: "Recent jobs", sql: `SELECT job_id, namespace, state, interface_name, latest_worker_id,
        duration_ms, attempt_count, created_at_ms
 FROM jobs
 ORDER BY created_at_ms DESC, job_id DESC` },
-  { name: "Failures and retries", sql: `SELECT job_id, state, interface_name, latest_worker_id,
+  { name: "Failures and retries", sql: `SELECT job_id, namespace, state, interface_name, latest_worker_id,
        attempt_count, last_error
 FROM jobs
 WHERE state = 'failed' OR attempt_count > 1
@@ -68,7 +68,9 @@ export function jobsToArrow(jobs: AnalyticsJob[]): Table {
   const time = (key: "created_at_ms" | "updated_at_ms" | "duration_ms") =>
     vectorFromArray(jobs.map(job => job[key]), new Float64());
   return new Table({
-    job_id: string("job_id"), state: string("state"), interface_name: string("interface_name"), source: string("source"),
+    job_id: string("job_id"), state: string("state"), interface_name: string("interface_name"),
+    namespace: vectorFromArray(jobs.map(job => job.namespace ?? "default"), new Utf8()),
+    source: string("source"),
     created_at_ms: time("created_at_ms"), updated_at_ms: time("updated_at_ms"), duration_ms: time("duration_ms"),
     current_attempt_id: string("current_attempt_id"), latest_worker_id: string("latest_worker_id"),
     attempt_count: vectorFromArray(jobs.map(job => job.attempt_count), new Int32()),
@@ -83,10 +85,18 @@ export function jobsToIPC(jobs: AnalyticsJob[]): Uint8Array {
 }
 
 export function metadataToIPC(jobs: AnalyticsJob[]): Uint8Array | null {
-  const rows = jobs.flatMap(job => Object.entries(job.metadata).map(([key, value]) => ({ job_id: job.job_id, key, value })));
+  const rows = jobs.flatMap(job =>
+    Object.entries(job.metadata).map(([key, value]) => ({
+      job_id: job.job_id,
+      namespace: job.namespace ?? "default",
+      key,
+      value,
+    })),
+  );
   if (!rows.length) return null;
   return tableToIPC(new Table({
     job_id: vectorFromArray(rows.map(row => row.job_id), new Utf8()),
+    namespace: vectorFromArray(rows.map(row => row.namespace), new Utf8()),
     key: vectorFromArray(rows.map(row => row.key), new Utf8()),
     value: vectorFromArray(rows.map(row => row.value), new Utf8()),
   }), "stream");

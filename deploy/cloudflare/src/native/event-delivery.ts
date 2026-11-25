@@ -116,6 +116,69 @@ export const eventDelivery = {
     if (job.callerConnId !== null) {
       tasks.push(this.deliverPrimaryInvokeEvents(scopedJobId));
     }
+    const execWaiter = this.executeWaiters.get(scopedJobId);
+    if (
+      execWaiter &&
+      (job.state === "succeeded" ||
+        job.state === "failed" ||
+        job.state === "cancelled")
+    ) {
+      this.executeWaiters.delete(scopedJobId);
+      tasks.push(
+        (async () => {
+          try {
+            let outputs: pb.ProtoObjectInput[] = [];
+            if (job.state === "succeeded") {
+              const loaded = await this.store.loadBundleObjects(
+                job.scopedJobId,
+                "output",
+                this.host.nowMs(),
+              );
+              outputs = loaded.objects.map((o) =>
+                o.kind === "uri"
+                  ? {
+                      body: { case: "uri" as const, value: o.uri ?? "" },
+                      metadata: o.metadata,
+                    }
+                  : {
+                      body: {
+                        case: "inline" as const,
+                        value: o.data ?? new Uint8Array(0),
+                      },
+                      metadata: o.metadata,
+                    },
+              );
+            }
+            execWaiter.resolve({
+              jobId: job.rawJobId,
+              sequence: job.lastSequence,
+              attemptId: job.lastAttemptId ?? "",
+              atMs: BigInt(job.updatedAtMs),
+              event: {
+                case: "finished",
+                value: {
+                  state: nameToProtoState(job.state),
+                  outputs,
+                  ...(job.error
+                    ? {
+                        error: {
+                          code: job.error.code,
+                          message: job.error.message,
+                          retryable: job.error.retryable,
+                        },
+                      }
+                    : {}),
+                },
+              },
+            });
+          } catch (err) {
+            execWaiter.reject(
+              err instanceof Error ? err : new Error(String(err)),
+            );
+          }
+        })(),
+      );
+    }
     const wSet = this.watchersByJob.get(scopedJobId);
     if (wSet && wSet.size > 0) {
       for (const wid of [...wSet]) {

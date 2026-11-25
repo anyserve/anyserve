@@ -2,6 +2,7 @@ import type {
   AnalyticsResponse,
   AnalyticsSource,
   CancelJobResponse,
+  InfoResponse,
   JobDetailResponse,
   JobsResponse,
   OverviewResponse,
@@ -12,6 +13,19 @@ const apiBase = (import.meta.env.VITE_CONSOLE_API_BASE_URL ?? "").replace(/\/$/,
 const tokenKey = "anyserve.console.token";
 
 export class AuthenticationError extends Error {}
+export class AuthorizationError extends Error {}
+
+export function safeHttpUrl(raw?: string | null): string | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  try {
+    const base = typeof window !== "undefined" ? window.location.origin : "http://localhost";
+    const url = new URL(trimmed, base);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
 
 export function setConsoleToken(token: string): void {
   sessionStorage.setItem(tokenKey, token.trim());
@@ -58,7 +72,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Ignore non-JSON error bodies.
     }
-    if (response.status === 401 || response.status === 403) throw new AuthenticationError(message);
+    if (response.status === 401) throw new AuthenticationError(message);
+    if (response.status === 403) throw new AuthorizationError(message);
     throw new Error(message);
   }
 
@@ -72,6 +87,10 @@ function withNamespace(path: string, namespace?: string): string {
 
 export function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
   return request("/api/overview", { signal });
+}
+
+export function fetchInfo(signal?: AbortSignal): Promise<InfoResponse> {
+  return request("/api/info", { signal });
 }
 
 export interface JobsQueryFilters {
@@ -139,4 +158,8 @@ export function cancelJob(jobId: string, namespace?: string): Promise<CancelJobR
 
 export function getWorkers(signal?: AbortSignal): Promise<WorkersResponse> {
   return request("/api/workers", { signal });
+}
+
+export function drainWorker(sessionId: string): Promise<{ session_id: string; draining: boolean }> {
+  return request(`/api/workers/${encodeURIComponent(sessionId)}/drain`, { method: "POST" });
 }

@@ -433,7 +433,9 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     cooldown_until_ms INTEGER NOT NULL,
     queued INTEGER NOT NULL DEFAULT 0,
     running INTEGER NOT NULL DEFAULT 0,
-    utilization REAL NOT NULL DEFAULT 0
+    utilization REAL NOT NULL DEFAULT 0,
+    token_jti TEXT,
+    token_exp INTEGER
   ) WITHOUT ROWID`,
   `CREATE TABLE IF NOT EXISTS native_jobs (
     scoped_job_id TEXT PRIMARY KEY,
@@ -704,6 +706,7 @@ export class NativeStore {
     connSeq: number;
     queueSeq: bigint;
     freshInit: boolean;
+    authRevocations: { version: number; revoked_jtis: string[] } | null;
   } {
     const { dayUtc, monthUtc } = utcDayAndMonth(nowMs);
     this.dayUtc = dayUtc;
@@ -734,6 +737,9 @@ export class NativeStore {
         this.exec(
           `INSERT OR IGNORE INTO native_runtime_meta (key, value) VALUES ('queue_seq', '0')`,
         );
+        this.exec(
+          `INSERT OR IGNORE INTO native_runtime_meta (key, value) VALUES ('schema_version', '2')`,
+        );
       });
       existingMeta = this.exec<{ key: string; value: string }>(
         `SELECT key, value FROM native_runtime_meta`,
@@ -743,6 +749,8 @@ export class NativeStore {
     let generation = 1n;
     let connSeq = 0;
     let queueSeq = 0n;
+    let schemaVersion = 1;
+    let authRevocations: { version: number; revoked_jtis: string[] } | null = null;
     for (const row of existingMeta) {
       if (row.key === "generation") {
         generation = BigInt(row.value);
@@ -750,7 +758,49 @@ export class NativeStore {
         connSeq = Number(row.value);
       } else if (row.key === "queue_seq") {
         queueSeq = BigInt(row.value);
+      } else if (row.key === "schema_version") {
+        schemaVersion = Number(row.value) || 1;
+      } else if (row.key === "auth_revocations") {
+        try {
+          const parsed = JSON.parse(row.value) as {
+            version?: unknown;
+            revoked_jtis?: unknown;
+          };
+          if (
+            parsed &&
+            typeof parsed.version === "number" &&
+            Number.isFinite(parsed.version) &&
+            Array.isArray(parsed.revoked_jtis)
+          ) {
+            authRevocations = {
+              version: parsed.version,
+              revoked_jtis: parsed.revoked_jtis.filter(
+                (j): j is string => typeof j === "string",
+              ),
+            };
+          }
+        } catch {
+          authRevocations = null;
+        }
       }
+    }
+
+    // Additive migration for pre-v2 DO SQLite databases lacking token_jti/token_exp columns.
+    if (!freshInit && schemaVersion < 2) {
+      const cols = new Set(
+        this.exec<{ name: string }>(`PRAGMA table_info(native_sessions)`).map(
+          (c) => c.name,
+        ),
+      );
+      this.transactionSync(() => {
+        if (!cols.has("token_jti")) {
+          this.exec(`ALTER TABLE native_sessions ADD COLUMN token_jti TEXT`);
+        }
+        if (!cols.has("token_exp")) {
+          this.exec(`ALTER TABLE native_sessions ADD COLUMN token_exp INTEGER`);
+        }
+        this.setMeta("schema_version", "2");
+      });
     }
 
     const meterRow = this.exec<{
@@ -785,7 +835,7 @@ export class NativeStore {
       this.pendingGcHint = true;
     }
 
-    return { generation, connSeq, queueSeq, freshInit };
+    return { generation, connSeq, queueSeq, freshInit, authRevocations };
   }
 
   rolloverQuotaClock(nowMs: number): void {

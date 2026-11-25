@@ -1,6 +1,20 @@
 import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 
-import { AuthenticationError, cancelJob, clearConsoleToken, getJob, getJobs, getOverview, getWorkers, hasConsoleToken, setConsoleToken } from "./api";
+import {
+  AuthenticationError,
+  AuthorizationError,
+  cancelJob,
+  clearConsoleToken,
+  drainWorker,
+  fetchInfo,
+  getJob,
+  getJobs,
+  getOverview,
+  getWorkers,
+  hasConsoleToken,
+  safeHttpUrl,
+  setConsoleToken,
+} from "./api";
 import {
   buildJobStats, buildUrlSearch, DEFAULT_TIME_FILTER, DETAIL_POLL_MS, HISTORY_STATES,
   JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, QUEUE_STATES,
@@ -15,7 +29,7 @@ import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
 import { PoolsPane, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
-import type { JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
+import type { InfoResponse, JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
 import { WorkersPane, type HealthFilter, type WorkerFilterSeed } from "./WorkersPane";
 
@@ -41,6 +55,14 @@ const EMPTY_JOBS: JobsPageState = {
   histogram: null,
   loadingMore: false,
 };
+const EMPTY_FILTERS = {
+  status: "all" as JobStatusFilter,
+  iface: "all",
+  ns: "all",
+  worker: "all",
+  q: "",
+};
+const EMPTY_SCOPE_SELECTION: Record<JobScope, string | null> = { all: null, queue: null, history: null };
 
 function readTheme(): Theme {
   try { const s = localStorage.getItem(THEME_KEY); if (s === "dark" || s === "light") return s; } catch { /* ignore */ }
@@ -100,10 +122,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(() => consumeHashToken() || hasConsoleToken());
+  const [info, setInfo] = useState<InfoResponse | null>(null);
   const [token, setToken] = useState("");
   const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
   const loadMoreAbort = useRef<AbortController | null>(null);
   const navSeedSeq = useRef(0);
+  const authRequiredRef = useRef(false);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -155,6 +179,16 @@ export default function App() {
   useEffect(() => () => loadMoreAbort.current?.abort(), []);
 
   useEffect(() => {
+    const controller = new AbortController();
+    void fetchInfo(controller.signal)
+      .then((next) => {
+        if (!controller.signal.aborted && next) setInfo(next);
+      })
+      .catch(() => {});
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
     const trimmed = filters.q.trim();
     if (trimmed === "") {
       setServerSearch("");
@@ -171,10 +205,26 @@ export default function App() {
     });
   }, []);
 
+  const requireAuth = useCallback(() => {
+    authRequiredRef.current = true;
+    setAuthRequired(true);
+  }, []);
+
+  const clearErrorIfAuthed = useCallback(() => {
+    if (!authRequiredRef.current) setError(null);
+  }, []);
+
   const handleError = useCallback((err: unknown) => {
     setError(asErrorMessage(err));
-    if (err instanceof AuthenticationError) setAuthRequired(true);
-  }, []);
+    if (err instanceof AuthenticationError) requireAuth();
+  }, [requireAuth]);
+
+  const handleOverviewError = useCallback((err: unknown) => {
+    setError(asErrorMessage(err));
+    if (err instanceof AuthenticationError || err instanceof AuthorizationError) {
+      requireAuth();
+    }
+  }, [requireAuth]);
 
   function resetExtraJobs() {
     loadMoreAbort.current?.abort();
@@ -221,7 +271,7 @@ export default function App() {
       }
       setError(null);
     },
-    handleError,
+    handleOverviewError,
     resolvePollMs(activeTab === "overview" || (activeTab === "jobs" && jobScope !== "history") ? OVERVIEW_POLL_MS : 2_000),
     [activeTab, jobScope, manualRefreshSeq],
     polling,
@@ -250,7 +300,7 @@ export default function App() {
               histogram: nextHistogram,
             },
       );
-      setError(null);
+      clearErrorIfAuthed();
     },
     handleError,
     resolvePollMs(jobScope === "history" ? JOBS_HISTORY_POLL_MS : JOBS_ACTIVE_POLL_MS),
@@ -269,7 +319,7 @@ export default function App() {
           : res,
       );
       setWorkers((cur) => (sameWorkers(cur, sorted) ? cur : sorted));
-      setError(null);
+      clearErrorIfAuthed();
     },
     handleError,
     resolvePollMs(WORKERS_POLL_MS),
@@ -295,6 +345,10 @@ export default function App() {
     ns: toSelectOptions([...(overview?.pools?.map((p) => p.namespace) ?? []), ...workers.map((w) => w.namespace).filter(Boolean) as string[], ...loadedJobs.map((j) => j.namespace).filter(Boolean) as string[], ...(filters.ns !== "all" ? [filters.ns] : [])], "All namespaces"),
     worker: toSelectOptions([...knownWorkers, ...(filters.worker !== "all" ? [filters.worker] : [])], "All workers"),
   }), [overview, workers, knownWorkers, loadedJobs, filters.iface, filters.ns, filters.worker]);
+  const namespaceChoices = useMemo(
+    () => filterOptions.ns.filter((o) => o.value !== "all").map((o) => o.value),
+    [filterOptions.ns],
+  );
 
   const visibleJobs = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
@@ -326,7 +380,7 @@ export default function App() {
 
   usePollingEffect(
     (signal) => getJob(activeSelectedJobId!, signal, activeSelectedNs),
-    (next) => { setJobDetail(next); setError(null); },
+    (next) => { setJobDetail(next); clearErrorIfAuthed(); },
     (err) => { setJobDetail(null); handleError(err); },
     resolvePollMs(jobScope === "queue" ? DETAIL_POLL_MS : 2_000),
     [activeTab, jobScope, activeJobKey, manualRefreshSeq],
@@ -418,7 +472,7 @@ export default function App() {
     setActiveTab("jobs");
     const nextPath = routePath("jobs", scope);
     if (window.location.pathname !== nextPath) window.history.pushState(null, "", nextPath);
-  }, [rememberWorkers]);
+  }, [rememberWorkers, lockedTenantNs]);
 
   const openInterface = useCallback((name: string) => {
     setSelectedInterface(name);
@@ -468,30 +522,43 @@ export default function App() {
   }, [activeTab, filters.ns, jobScope, jumpToJobs, openPoolsByTarget]);
 
   const handleDisconnect = useCallback(() => {
+    loadMoreAbort.current?.abort();
+    loadMoreAbort.current = null;
     clearConsoleToken();
     setAuthenticated(false); setOverview(null); setWorkers([]); setWorkersResponse(null);
-    setJobsPage(EMPTY_JOBS); setJobDetail(null); setError(null); setAuthRequired(true);
-  }, []);
+    setKnownWorkers([]); setFilters(EMPTY_FILTERS); setServerSearch("");
+    setSelectedJobByScope(EMPTY_SCOPE_SELECTION); setPinnedJobByScope(EMPTY_SCOPE_SELECTION);
+    setSelectedWorkerId(null);
+    setJobsPage(EMPTY_JOBS); setJobDetail(null); setError(null); requireAuth();
+  }, [requireAuth]);
 
   const handleToggleTheme = useCallback(() => setTheme((c) => (c === "light" ? "dark" : "light")), []);
   const handleRefresh = useCallback(() => setManualRefreshSeq((s) => s + 1), []);
   const handleSelectTab = useCallback((tab: ConsoleTab) => navigateTo(tab), [navigateTo]);
 
+  const loginAuthPortalUrl = safeHttpUrl(info?.auth_portal_url);
+
   if (authRequired) {
     return (
       <main className="auth">
-        <form className="auth__form" onSubmit={(e) => { e.preventDefault(); setConsoleToken(token); setToken(""); setAuthenticated(true); setError(null); setAuthRequired(false); }}>
+        <form className="auth__form" onSubmit={(e) => { e.preventDefault(); setConsoleToken(token); setToken(""); setAuthenticated(true); setError(null); authRequiredRef.current = false; setAuthRequired(false); }}>
           <div className="auth__head"><h1>AnyServe Console</h1><p className="auth__sub">Authenticate with a client token to inspect the control plane.</p></div>
           <label htmlFor="client-token">Client token</label>
           <input id="client-token" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} required />
           {error ? <p className="auth__error" role="alert">{error}</p> : null}
           <button type="submit">Connect</button>
+          {loginAuthPortalUrl ? (
+            <a className="button" href={loginAuthPortalUrl} style={{ marginTop: 8, textAlign: "center" }}>
+              Sign in with GitHub
+            </a>
+          ) : null}
         </form>
       </main>
     );
   }
 
   const jobStats = buildJobStats(jobScope, filters.status, overview);
+  const authPortalUrl = safeHttpUrl(overview?.control_plane?.auth_portal_url) ?? loginAuthPortalUrl;
 
   return (
     <div className="app-shell">
@@ -503,6 +570,7 @@ export default function App() {
         onToggleTheme={handleToggleTheme}
         onRefresh={handleRefresh}
         authenticated={authenticated}
+        authPortalUrl={authPortalUrl}
         onDisconnect={handleDisconnect}
       />
       <div className="workspace">
@@ -535,12 +603,12 @@ export default function App() {
               onOpenInterface={openInterface} onOpenWorker={openWorker} onFilterNamespace={filterJobNamespace}
               statusFilter={filters.status} onStatusFilterChange={handleStatusFilterChange}
               interfaceFilter={filters.iface} interfaceOptions={filterOptions.iface} onInterfaceFilterChange={(iface) => { resetExtraJobs(); setFilters((f) => ({ ...f, iface })); }}
-              namespaceFilter={filters.ns} namespaceOptions={filterOptions.ns} onNamespaceFilterChange={(ns) => { resetExtraJobs(); setFilters((f) => ({ ...f, ns })); }}
+              namespaceFilter={filters.ns} namespaceOptions={filterOptions.ns} namespaceLocked={Boolean(lockedTenantNs)} onNamespaceFilterChange={(ns) => { resetExtraJobs(); setFilters((f) => ({ ...f, ns })); }}
               workerFilter={filters.worker} workerOptions={filterOptions.worker} onWorkerFilterChange={(worker) => { resetExtraJobs(); setFilters((f) => ({ ...f, worker })); }}
               searchQuery={filters.q} onSearchQueryChange={(q) => { if (!q.trim()) { resetExtraJobs(); setServerSearch(""); } setFilters((f) => ({ ...f, q })); }}
               onResetAllFilters={() => {
                 resetExtraJobs();
-                setFilters({ status: "all", iface: "all", ns: "all", worker: "all", q: "" });
+                setFilters({ status: "all", iface: "all", ns: lockedTenantNs ?? "all", worker: "all", q: "" });
                 setServerSearch("");
                 setTimeFilter(DEFAULT_TIME_FILTER);
                 setPinnedJobByScope((c) => ({ ...c, [jobScope]: null }));
@@ -583,12 +651,37 @@ export default function App() {
               onOpenInterface={openInterface}
               onOpenPool={(ns, iface, pool) => openPoolsByTarget({ ns, iface, pool })}
               onOpenConnect={() => setConnectOpen(true)}
+              onDrainWorker={async (sid) => {
+                try {
+                  await drainWorker(sid);
+                  const markDraining = (list: WorkerSummary[]) =>
+                    list.map((w) => (w.session_id === sid ? { ...w, draining: true, healthy: false } : w));
+                  setWorkers((cur) => markDraining(cur));
+                  setWorkersResponse((cur) => {
+                    if (!cur) return cur;
+                    const nextWorkers = markDraining(cur.workers);
+                    return {
+                      ...cur,
+                      workers: nextWorkers,
+                      healthy: nextWorkers.filter((w) => w.healthy).length,
+                      draining: nextWorkers.filter((w) => w.connected && w.draining).length,
+                      disconnected: nextWorkers.filter((w) => !w.connected).length,
+                    };
+                  });
+                  setManualRefreshSeq((s) => s + 1);
+                  setError(null);
+                } catch (err) {
+                  handleError(err);
+                }
+              }}
             />
           ) : null}
           {activeTab === "explore" ? (
             <Suspense fallback={<section className="panel panel--full"><div className="empty">Loading…</div></section>}>
               <ExplorePane
                 journalEnabled={overview ? overview.runtime.journal !== "disabled" : null}
+                lockedNamespace={lockedTenantNs}
+                availableNamespaces={namespaceChoices}
                 onAuthenticationError={handleError}
                 onOpenWorker={openWorker}
                 onOpenInterface={openInterface}

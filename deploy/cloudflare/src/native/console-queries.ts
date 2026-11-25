@@ -503,6 +503,28 @@ export const consoleQueries = {
       .map((s) => this.sessionToConsoleWorker(s));
   },
 
+  drainWorkerForConsole(
+    this: NativeEngine,
+    sessionId: string,
+    scopeNamespace: string | null,
+    nowMs: number,
+  ): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session || (scopeNamespace !== null && session.namespace !== scopeNamespace)) {
+      return false;
+    }
+    this.store.transactionSync(() => {
+      session.draining = true;
+      this.persistSessionRowInTxn(session);
+      this.sendControlMessageToSession(
+        session.sessionId,
+        { msg: { case: "drain", value: {} } },
+        nowMs,
+      );
+    });
+    return true;
+  },
+
   jobMemToConsoleSummary(this: NativeEngine, j: JobMem): ConsoleJobSummaryData {
     return buildJobSummary({
       jobId: j.rawJobId,

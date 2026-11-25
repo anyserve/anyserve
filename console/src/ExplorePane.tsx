@@ -12,6 +12,8 @@ interface Dataset { count: number; bytes: number; limited: boolean; from: number
 interface ExplorePaneProps {
   journalEnabled: boolean | null;
   onAuthenticationError: (error: unknown) => void;
+  lockedNamespace?: string | null;
+  availableNamespaces?: string[];
   onOpenWorker?: (workerId: string) => void;
   onOpenInterface?: (interfaceName: string) => void;
   onFilterNamespace?: (namespace: string) => void;
@@ -21,6 +23,8 @@ interface ExplorePaneProps {
 export default function ExplorePane({
   journalEnabled,
   onAuthenticationError,
+  lockedNamespace,
+  availableNamespaces = [],
   onOpenWorker,
   onOpenInterface,
   onFilterNamespace,
@@ -28,6 +32,13 @@ export default function ExplorePane({
 }: ExplorePaneProps) {
   const [chosenSource, setSource] = useState<AnalyticsSource | null>(null);
   const source = chosenSource ?? (journalEnabled ? "archive" : "retained");
+  const [namespaceFilter, setNamespaceFilter] = useState(lockedNamespace ?? "all");
+  const effectiveNamespace = lockedNamespace ?? (namespaceFilter === "all" ? undefined : namespaceFilter);
+  const nsChoices = useMemo(() => {
+    const set = new Set<string>(["default", ...availableNamespaces]);
+    if (lockedNamespace) set.add(lockedNamespace);
+    return Array.from(set).sort();
+  }, [availableNamespaces, lockedNamespace]);
   const [windowMinutes, setWindowMinutes] = useState("15");
   const [from, setFrom] = useState(() => toDatetimeLocal(Date.now() - 3600_000));
   const [to, setTo] = useState(() => toDatetimeLocal(Date.now()));
@@ -95,7 +106,15 @@ export default function ExplorePane({
       const cursors = new Set<string>();
       do {
         setStatus(`Loading metadata… ${next.count.toLocaleString()} jobs`);
-        const res = await getAnalyticsJobs(source, start, end, Math.min(250, rowLimit - next.count), cursor, c.signal);
+        const res = await getAnalyticsJobs(
+          source,
+          start,
+          end,
+          Math.min(250, rowLimit - next.count),
+          cursor,
+          c.signal,
+          effectiveNamespace,
+        );
         c.signal.throwIfAborted();
         const accepted = [];
         for (const job of res.jobs) {
@@ -182,6 +201,19 @@ export default function ExplorePane({
                 <option value={1_000}>1,000</option><option value={10_000}>10,000</option><option value={100_000}>100,000</option>
               </select>
             </label>
+            <label>Namespace
+              <select
+                aria-label="Namespace"
+                value={lockedNamespace ?? namespaceFilter}
+                onChange={(e) => setNamespaceFilter(e.target.value)}
+                disabled={busy || Boolean(lockedNamespace)}
+              >
+                {lockedNamespace ? null : <option value="all">All namespaces</option>}
+                {nsChoices.map((ns) => (
+                  <option key={ns} value={ns}>{ns}</option>
+                ))}
+              </select>
+            </label>
             <button className="button button--primary" type="submit" disabled={busy || journalEnabled === null}>Load data</button>
             {busy ? <button className="button" type="button" onClick={cancel}>Cancel</button> : null}
           </form>
@@ -209,9 +241,9 @@ export default function ExplorePane({
 
           <details className="explore__schema">
             <summary>Available tables and columns</summary>
-            <p><code>job_id, state, interface_name, source, durability, created_at_ms, updated_at_ms, duration_ms, current_attempt_id, latest_worker_id, attempt_count, last_error, metadata</code></p>
+            <p><code>job_id, state, interface_name, namespace, source, durability, created_at_ms, updated_at_ms, duration_ms, current_attempt_id, latest_worker_id, attempt_count, last_error, metadata</code></p>
             <p>Timestamps are Unix milliseconds. Include <code>job_id</code> in results to open task details.</p>
-            <p>Query tags in <code>job_metadata (job_id, key, value)</code>: <code>SELECT jobs.* FROM jobs JOIN job_metadata USING (job_id) WHERE key = &apos;tag&apos; AND value = &apos;value&apos;</code></p>
+            <p>Query tags in <code>job_metadata (job_id, namespace, key, value)</code>: <code>SELECT jobs.* FROM jobs JOIN job_metadata USING (job_id, namespace) WHERE key = &apos;tag&apos; AND value = &apos;value&apos;</code></p>
           </details>
 
           {error ? <p className="explore__error" role="alert">{error}</p> : null}
@@ -232,11 +264,18 @@ export default function ExplorePane({
                 <table className="table mono">
                   <thead><tr>{jobCol >= 0 ? <th>Task</th> : null}{result.columns.map((c, i) => <th key={i}>{c}</th>)}</tr></thead>
                   <tbody>
-                    {filtered.slice(page * 50, (page + 1) * 50).map((row, idx) => (
-                      <tr key={idx} className={jobCol >= 0 && row[jobCol] === selectedJob?.jobId ? "is-selected" : ""}>
+                    {filtered.slice(page * 50, (page + 1) * 50).map((row, idx) => {
+                      const rowNs = nsCol >= 0 ? (row[nsCol] ?? effectiveNamespace) : effectiveNamespace;
+                      const isRowSelected =
+                        jobCol >= 0 &&
+                        selectedJob !== null &&
+                        row[jobCol] === selectedJob.jobId &&
+                        (rowNs ?? "default") === (selectedJob.namespace ?? "default");
+                      return (
+                      <tr key={idx} className={isRowSelected ? "is-selected" : ""}>
                         {jobCol >= 0 ? (
                           <td>
-                            {row[jobCol] ? <button className="button" onClick={() => setSelectedJob({ jobId: row[jobCol]!, namespace: nsCol >= 0 ? (row[nsCol] ?? undefined) : undefined })}>Inspect</button> : null}
+                            {row[jobCol] ? <button className="button" onClick={() => setSelectedJob({ jobId: row[jobCol]!, namespace: rowNs })}>Inspect</button> : null}
                           </td>
                         ) : null}
                         {row.map((val, col) => {
@@ -258,7 +297,8 @@ export default function ExplorePane({
                           return <td key={col} title={val}>{val}</td>;
                         })}
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
                 {!filtered.length ? <p className="empty-inline" style={{ padding: 12 }}>No matching rows.</p> : null}

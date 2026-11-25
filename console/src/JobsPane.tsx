@@ -33,6 +33,7 @@ interface JobsPaneProps {
   onInterfaceFilterChange: (value: string) => void;
   namespaceFilter: string;
   namespaceOptions: FilterOption[];
+  namespaceLocked?: boolean;
   onNamespaceFilterChange: (value: string) => void;
   workerFilter: string;
   workerOptions: FilterOption[];
@@ -70,7 +71,7 @@ export function JobsPane(props: JobsPaneProps) {
   const isFiltered =
     props.statusFilter !== "all" ||
     props.interfaceFilter !== "all" ||
-    props.namespaceFilter !== "all" ||
+    (!props.namespaceLocked && props.namespaceFilter !== "all") ||
     props.workerFilter !== "all" ||
     props.searchQuery.trim().length > 0 ||
     props.timeFilter.preset !== "all";
@@ -188,7 +189,7 @@ export function JobsPane(props: JobsPaneProps) {
               onChange={(value) => props.onStatusFilterChange(value as JobStatusFilter)}
             />
             <SelectField label="Interface" value={props.interfaceFilter} options={props.interfaceOptions} onChange={props.onInterfaceFilterChange} />
-            <SelectField label="Namespace" value={props.namespaceFilter} options={props.namespaceOptions} onChange={props.onNamespaceFilterChange} />
+            <SelectField label="Namespace" value={props.namespaceFilter} options={props.namespaceOptions} disabled={props.namespaceLocked} onChange={props.onNamespaceFilterChange} />
             <SelectField label="Worker" value={props.workerFilter} options={props.workerOptions} onChange={props.onWorkerFilterChange} />
           </div>
         </div>

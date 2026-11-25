@@ -88,12 +88,13 @@ export function SelectField(props: {
   value: string;
   options: Array<{ value: string; label: string }>;
   onChange: (value: string) => void;
+  disabled?: boolean;
 }) {
   const currentLabel = props.options.find((opt) => opt.value === props.value)?.label ?? props.value;
   return (
     <label className="field">
       <span className="field__label">{props.label}</span>
-      <select className="field__control" value={props.value} title={currentLabel} onChange={(e) => props.onChange(e.target.value)}>
+      <select className="field__control" value={props.value} title={currentLabel} disabled={props.disabled} onChange={(e) => props.onChange(e.target.value)}>
         {props.options.map((opt) => (
           <option key={opt.value} value={opt.value}>{opt.label}</option>
         ))}

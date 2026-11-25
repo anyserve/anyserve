@@ -1,5 +1,6 @@
 import { memo } from "react";
 
+import { safeHttpUrl } from "./api";
 import type { ConsoleTab, Theme } from "./app-constants";
 import { formatNumber, formatShortTime, formatTimestamp } from "./format";
 import {
@@ -25,6 +26,7 @@ interface SidebarProps {
   onToggleTheme: () => void;
   onRefresh?: () => void;
   authenticated: boolean;
+  authPortalUrl?: string | null;
   onDisconnect: () => void;
 }
 
@@ -70,10 +72,12 @@ export const Sidebar = memo(function Sidebar({
   onToggleTheme,
   onRefresh,
   authenticated,
+  authPortalUrl,
   onDisconnect,
 }: SidebarProps) {
   const health = overview?.health;
   const tone = !overview ? "offline" : health && !health.live ? "bad" : health && (!health.ready || health.journal.status === "unavailable") ? "warn" : "ok";
+  const safePortalUrl = safeHttpUrl(authPortalUrl);
 
   return (
     <aside className="sidebar" aria-label="Console navigation">
@@ -145,6 +149,12 @@ export const Sidebar = memo(function Sidebar({
             {theme === "dark" ? <IconSun /> : <IconMoon />}
             <span>{theme === "dark" ? "Light" : "Dark"}</span>
           </button>
+
+          {safePortalUrl ? (
+            <a className="ctrl-pill" href={safePortalUrl} target="_blank" rel="noopener noreferrer">
+              <span>Manage Tokens</span>
+            </a>
+          ) : null}
 
           {authenticated ? (
             <button type="button" className="ctrl-pill ctrl-pill--danger" title="Disconnect" aria-label="Disconnect" onClick={onDisconnect}>

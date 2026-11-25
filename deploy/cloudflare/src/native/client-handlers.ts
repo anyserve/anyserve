@@ -139,6 +139,48 @@ export const clientHandlers = {
     throw GrpcStatusError.invalidArgument("unexpected invocation input message");
   },
 
+  async admitEphemeralJob(
+    this: NativeEngine,
+    namespace: string,
+    start: pb.InvokeStart,
+    nowMs: number,
+  ) {
+    if (!start.spec) {
+      throw GrpcStatusError.invalidArgument("spec is required");
+    }
+    const normalized = this.normalizeJobSpec(start.spec, "ephemeral");
+    const usesLarge = this.specUsesMultiChunkOrR2(
+      normalized.inputs,
+      normalized.params,
+      start.streamingInput,
+    );
+    const estRetained = 4_096 + normalized.totalPayloadBytes;
+    const shedReason = this.store.checkNewJobAdmission(nowMs, estRetained, usesLarge);
+    if (shedReason !== null) {
+      throw GrpcStatusError.resourceExhausted(shedReason);
+    }
+
+    this.checkQueueAndInputBudgets(
+      namespace,
+      normalized.spec.demand.interface,
+      normalized.totalPayloadBytes,
+    );
+
+    const rawJobId = crypto.randomUUID();
+    const scopedJobId = encodeScopedId(namespace, rawJobId);
+    const bundlePlan = await this.store.prepareObjectBundle(
+      normalized.inputs,
+      normalized.params,
+      nowMs,
+    );
+
+    if (usesLarge || bundlePlan.stagedUploads.length > 0) {
+      this.store.recordLargeJob(nowMs);
+    }
+
+    return { rawJobId, scopedJobId, normalized, estRetained, bundlePlan };
+  },
+
   async handleInvokeStart(
     this: NativeEngine,
     ws: NativeWebSocket,
@@ -154,27 +196,8 @@ export const clientHandlers = {
       this.pendingInvokeTraceHeaders.delete(att.connId);
       mergeTraceHeaders(start.spec.metadata, pendingTrace);
     }
-    const normalized = this.normalizeJobSpec(start.spec, "ephemeral");
-    const usesLarge = this.specUsesMultiChunkOrR2(normalized.inputs, normalized.params, start.streamingInput);
-    const estRetained = 4_096 + normalized.totalPayloadBytes;
-    const shedReason = this.store.checkNewJobAdmission(nowMs, estRetained, usesLarge);
-    if (shedReason !== null) {
-      throw GrpcStatusError.resourceExhausted(shedReason);
-    }
-
-    this.checkQueueAndInputBudgets(att.namespace, normalized.spec.demand.interface, normalized.totalPayloadBytes);
-
-    const rawJobId = crypto.randomUUID();
-    const scopedJobId = encodeScopedId(att.namespace, rawJobId);
-    const bundlePlan = await this.store.prepareObjectBundle(
-      normalized.inputs,
-      normalized.params,
-      nowMs,
-    );
-
-    if (usesLarge || bundlePlan.stagedUploads.length > 0) {
-      this.store.recordLargeJob(nowMs);
-    }
+    const { rawJobId, scopedJobId, normalized, estRetained, bundlePlan } =
+      await this.admitEphemeralJob(att.namespace, start, nowMs);
 
     const notifyJobs = new Set<string>([scopedJobId]);
     let committed = false;
@@ -219,6 +242,96 @@ export const clientHandlers = {
       await this.notifyJobFollowers(jid);
     }
     await this.refreshAlarm(nowMs);
+  },
+
+  async handleExecuteRpc(
+    this: NativeEngine,
+    namespace: string,
+    start: pb.InvokeStart,
+    signal: AbortSignal | undefined,
+    nowMs: number,
+  ): Promise<pb.ExecutionEventInput> {
+    const { rawJobId, scopedJobId, normalized, estRetained, bundlePlan } =
+      await this.admitEphemeralJob(namespace, start, nowMs);
+
+    if (signal?.aborted) {
+      await this.store.compensateUnpublishedUploads(bundlePlan.stagedUploads, nowMs);
+      throw GrpcStatusError.unavailable("execution aborted before start");
+    }
+
+    let resolveWaiter!: (event: pb.ExecutionEventInput) => void;
+    let rejectWaiter!: (err: Error) => void;
+    const waitPromise = new Promise<pb.ExecutionEventInput>((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    this.executeWaiters.set(scopedJobId, {
+      resolve: resolveWaiter,
+      reject: rejectWaiter,
+    });
+
+    const notifyJobs = new Set<string>([scopedJobId]);
+    let committed = false;
+    this.store.transactionSync(() => {
+      if (!this.store.claimStagedUploadsInTxn(bundlePlan.stagedUploads)) {
+        return;
+      }
+      this.insertAcceptedJobInTxn({
+        scopedJobId,
+        rawJobId,
+        namespace,
+        durability: "ephemeral",
+        specHash: "",
+        spec: normalized.spec,
+        maxAttempts: normalized.maxAttempts,
+        totalInputBytes: normalized.totalPayloadBytes,
+        retainedBytesEst: estRetained,
+        callerConnId: null,
+        streamingInput: false,
+        bundleRows: bundlePlan.rows,
+        nowMs,
+      });
+      this.dispatchInTxn(nowMs, notifyJobs);
+      committed = true;
+    });
+
+    if (!committed) {
+      this.executeWaiters.delete(scopedJobId);
+      await this.store.compensateUnpublishedUploads(bundlePlan.stagedUploads, nowMs);
+      throw GrpcStatusError.unavailable("failed to commit execute request");
+    }
+
+    const onAbort = () => {
+      const waiter = this.executeWaiters.get(scopedJobId);
+      if (!waiter) return;
+      this.executeWaiters.delete(scopedJobId);
+      const cancelNow = this.host.nowMs();
+      const job = this.jobs.get(scopedJobId);
+      if (job && (job.state === "queued" || job.state === "running")) {
+        const abortNotify = new Set<string>([scopedJobId]);
+        this.store.transactionSync(() => {
+          this.cancelJobInTxn(scopedJobId, "caller disconnected", cancelNow);
+          this.dispatchInTxn(cancelNow, abortNotify);
+        });
+        for (const jid of abortNotify) {
+          void this.notifyJobFollowers(jid);
+        }
+        void this.refreshAlarm(cancelNow);
+      }
+      waiter.reject(GrpcStatusError.unavailable("caller disconnected"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
+    try {
+      for (const jid of notifyJobs) {
+        await this.notifyJobFollowers(jid);
+      }
+      await this.refreshAlarm(nowMs);
+      return await waitPromise;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      this.executeWaiters.delete(scopedJobId);
+    }
   },
 
   async handleWatchSocketMessage(
@@ -628,8 +741,27 @@ export const clientHandlers = {
       capKeyBytes += utf8ByteLen(k);
     }
 
+    const affinityKey = protoSpec.demand.affinityKey ?? "";
+    const fairnessKey = protoSpec.policy?.fairnessKey ?? "";
+    const concurrencyKey = protoSpec.policy?.concurrencyKey ?? "";
+    const affinityBytes = utf8ByteLen(affinityKey);
+    const fairnessBytes = utf8ByteLen(fairnessKey);
+    const concurrencyBytes = utf8ByteLen(concurrencyKey);
+    if (
+      affinityBytes > MAX_IDENTIFIER_BYTES ||
+      fairnessBytes > MAX_IDENTIFIER_BYTES ||
+      concurrencyBytes > MAX_IDENTIFIER_BYTES
+    ) {
+      throw GrpcStatusError.invalidArgument(
+        `routing keys (affinity_key, fairness_key, concurrency_key) must be at most ${MAX_IDENTIFIER_BYTES} bytes`,
+      );
+    }
+
     const totalMeta =
       utf8ByteLen(iface) +
+      affinityBytes +
+      fairnessBytes +
+      concurrencyBytes +
       metadataByteLen(protoSpec.metadata) +
       metadataByteLen(protoSpec.demand.requiredAttributes) +
       metadataByteLen(protoSpec.demand.preferredAttributes) +

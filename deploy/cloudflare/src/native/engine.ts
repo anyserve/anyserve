@@ -142,6 +142,17 @@ export class NativeEngine implements ConsoleBackend {
   readonly socketChains = new Map<number, Promise<void>>();
   readonly pumpingAttempts = new Set<string>();
   readonly pendingInvokeTraceHeaders = new Map<number, Record<string, string>>();
+  readonly pendingSessionAuth = new Map<
+    number,
+    { jti: string | null; exp: number | null }
+  >();
+  readonly executeWaiters = new Map<
+    string,
+    {
+      resolve: (event: pb.ExecutionEventInput) => void;
+      reject: (err: Error) => void;
+    }
+  >();
 
   // Shared runtime byte trackers (for /metrics and /api/overview parity)
   totalInputBytesHeld = 0;
@@ -156,6 +167,7 @@ export class NativeEngine implements ConsoleBackend {
     this.bootId = crypto.randomUUID();
     this.constructorRuns = host.nextConstructorRun ? host.nextConstructorRun() : 1;
     this.auth = AuthPolicy.fromEnv(host.env);
+    this.auth.setClock(() => this.host.nowMs());
     this.isolateBudget = new IsolateMemoryBudget({
       isolateCapBytes: host.overrides?.isolateMemoryCapBytes,
       largeSendCapBytes: host.overrides?.largeSendCapBytes,
@@ -167,6 +179,20 @@ export class NativeEngine implements ConsoleBackend {
       host.r2,
       host.overrides,
     );
+    this.auth.setRevocationListener((snapshot) => {
+      if (this.disposed) return;
+      const nowMs = this.host.nowMs();
+      this.store.transactionSync(() => {
+        this.store.setMeta("auth_revocations", JSON.stringify(snapshot));
+      });
+      const { evicted, notifyJobs } = this.evictRevokedOrExpiredSessionsSync(nowMs);
+      if (evicted > 0) {
+        for (const jid of notifyJobs) {
+          void this.notifyJobFollowers(jid);
+        }
+        void this.refreshAlarm(nowMs);
+      }
+    });
 
     this.rehydrateAfterWake(t0);
     this.constructorDurationMs = Math.max(0, host.nowMs() - t0);
@@ -186,6 +212,12 @@ export class NativeEngine implements ConsoleBackend {
    */
   dispose(): void {
     this.disposed = true;
+    for (const waiter of this.executeWaiters.values()) {
+      waiter.reject(
+        GrpcStatusError.unavailable("execution ended without a terminal event"),
+      );
+    }
+    this.executeWaiters.clear();
   }
 
   // ---------------------------------------------------------------------------
@@ -203,6 +235,9 @@ export class NativeEngine implements ConsoleBackend {
     this.connSeqCeiling = meta.connSeq;
     this.queueSeq = meta.queueSeq;
     this.rng.state = (this.generation ^ 0x5dee_ce66_d1ce_4e5bn) & MASK_64;
+    if (meta.authRevocations) {
+      this.auth.applyRevocations(meta.authRevocations, false);
+    }
 
     // 1. Index all live open WebSockets from host.getWebSockets()
     for (const ws of this.host.getWebSockets()) {
@@ -256,6 +291,8 @@ export class NativeEngine implements ConsoleBackend {
         running: liveAtt ? liveAtt.running : Number(r.running ?? 0),
         utilization: liveAtt ? liveAtt.utilization : Number(r.utilization ?? 0),
         customLoad: {}, // Load.custom is memory-only and empty right after wake until next heartbeat
+        tokenJti: r.token_jti !== null && r.token_jti !== undefined ? String(r.token_jti) : null,
+        tokenExp: r.token_exp !== null && r.token_exp !== undefined ? Number(r.token_exp) : null,
       };
       this.sessions.set(session.sessionId, session);
       this.indexSessionInMemory(session);
@@ -577,6 +614,14 @@ export class NativeEngine implements ConsoleBackend {
       void this.syncPlatformAlarmOnWake();
     }
 
+    const evictResult = this.evictRevokedOrExpiredSessionsSync(nowMs);
+    if (evictResult.evicted > 0) {
+      for (const jid of evictResult.notifyJobs) {
+        void this.notifyJobFollowers(jid);
+      }
+      void this.refreshAlarm(nowMs);
+    }
+
     // Resume server->worker InputData pumping on any live open attempt socket that still has input pending!
     for (const lease of this.leases.values()) {
       if (
@@ -727,8 +772,8 @@ export class NativeEngine implements ConsoleBackend {
     let principal: Principal;
     try {
       principal = isWorker
-        ? this.auth.verifyWorkerHeaders(request.headers)
-        : this.auth.verifyClientHeaders(request.headers);
+        ? await this.auth.verifyWorkerHeaders(request.headers)
+        : await this.auth.verifyClientHeaders(request.headers);
     } catch (err) {
       if (err instanceof GrpcStatusError) {
         return grpcErrorResponse(err);
@@ -804,6 +849,12 @@ export class NativeEngine implements ConsoleBackend {
     writeSocketAttachment(pair.server, att);
     this.host.acceptWebSocket(pair.server, [kind]);
     this.socketsByConnId.set(connId, pair.server);
+    if (kind === "session" && (principal.jti || principal.exp != null)) {
+      this.pendingSessionAuth.set(connId, {
+        jti: principal.jti ?? null,
+        exp: principal.exp ?? null,
+      });
+    }
     if (kind === "invoke") {
       const traceHeaders = extractTraceHeaders(request.headers);
       if (Object.keys(traceHeaders).length > 0) {
@@ -811,10 +862,8 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
 
-    // Worker session/attempt handshakes expire at heartbeatTimeoutMs if Hello/Open never arrives!
-    if (kind === "session" || kind === "attempt") {
-      await this.refreshAlarm(nowMs);
-    }
+    // All WebSocket handshakes (session/attempt/invoke/watch) expire at heartbeatTimeoutMs if initial frame never arrives.
+    await this.refreshAlarm(nowMs);
 
     return pair.toUpgradeResponse();
   }
@@ -849,7 +898,7 @@ export class NativeEngine implements ConsoleBackend {
   ): Promise<Response> {
     let principal: Principal;
     try {
-      principal = this.auth.verifyClientHeaders(request.headers);
+      principal = await this.auth.verifyClientHeaders(request.headers);
     } catch (err) {
       if (err instanceof GrpcStatusError) {
         return grpcErrorResponse(err);
@@ -885,6 +934,24 @@ export class NativeEngine implements ConsoleBackend {
           }
           const resp = await this.handleSubmitRpc(principal.namespace, req, nowMs);
           return this.protoOkResponse(pb.encodeSubmitResponse(resp));
+        }
+        case "/rpc/v2/client/execute": {
+          const start = pb.decodeInvokeStart(rawBody);
+          if (start.streamingInput) {
+            throw GrpcStatusError.invalidArgument(
+              "/rpc/v2/client/execute does not accept streaming_input",
+            );
+          }
+          if (start.spec) {
+            mergeTraceHeaders(start.spec.metadata, extractTraceHeaders(request.headers));
+          }
+          const event = await this.handleExecuteRpc(
+            principal.namespace,
+            start,
+            request.signal,
+            nowMs,
+          );
+          return this.protoOkResponse(pb.encodeExecutionEvent(event));
         }
         case "/rpc/v2/client/get_job": {
           const readShed = this.store.checkReadAdmission(nowMs);
@@ -1081,6 +1148,7 @@ export class NativeEngine implements ConsoleBackend {
       this.socketsByConnId.delete(att.connId);
       this.replayStates.delete(att.connId);
       this.pendingInvokeTraceHeaders.delete(att.connId);
+      this.pendingSessionAuth.delete(att.connId);
     }
 
     // Complete close handshake cleanly for peer 1005 (plain close without reserved status code)
@@ -1149,12 +1217,138 @@ export class NativeEngine implements ConsoleBackend {
   // Alarm & Timer Scheduling (Section 6.3)
   // ---------------------------------------------------------------------------
 
+  credentialInvalidReason(
+    jti: string | null,
+    exp: number | null,
+    nowMs: number,
+  ): string | null {
+    if (jti !== null && this.auth.isJtiRevoked(jti)) {
+      return "worker token revoked";
+    }
+    if (exp !== null && Math.floor(nowMs / 1000) >= exp) {
+      return "worker token expired";
+    }
+    return null;
+  }
+
+  /**
+   * Actively disconnects and fences any worker WebSockets whose signed token has been
+   * revoked or expired. Closes session + attempt sockets immediately with no reconnect grace.
+   */
+  evictRevokedOrExpiredSessionsSync(nowMs: number): {
+    evicted: number;
+    notifyJobs: Set<string>;
+  } {
+    const notifyJobs = new Set<string>();
+    const sessionVictims: Array<{ session: SessionMem; reason: string }> = [];
+    for (const s of this.sessions.values()) {
+      const reason = this.credentialInvalidReason(s.tokenJti, s.tokenExp, nowMs);
+      if (reason !== null) {
+        sessionVictims.push({ session: s, reason });
+      }
+    }
+
+    let evictedPending = 0;
+    for (const [connId, authInfo] of [...this.pendingSessionAuth.entries()]) {
+      const reason = this.credentialInvalidReason(authInfo.jti, authInfo.exp, nowMs);
+      if (reason !== null) {
+        this.pendingSessionAuth.delete(connId);
+        const ws = this.socketsByConnId.get(connId);
+        this.socketsByConnId.delete(connId);
+        if (ws && ws.readyState === WS_READY_STATE_OPEN) {
+          this.sendWsErrorAndClose(ws, GrpcCode.Unauthenticated, reason);
+        }
+        evictedPending += 1;
+      }
+    }
+
+    if (sessionVictims.length === 0) {
+      return { evicted: evictedPending, notifyJobs };
+    }
+
+    const sessionSocketsToClose: Array<{ ws: NativeWebSocket; reason: string }> = [];
+    this.store.transactionSync(() => {
+      for (const { session, reason } of sessionVictims) {
+        if (!this.sessions.has(session.sessionId)) continue;
+        const sessionWs = session.connected
+          ? this.socketsByConnId.get(session.currentConnId)
+          : undefined;
+        if (session.connected) {
+          this.socketsByConnId.delete(session.currentConnId);
+        }
+
+        for (const leaseId of [...session.activeLeases]) {
+          const lease = this.leases.get(leaseId);
+          if (sessionWs && sessionWs.readyState === WS_READY_STATE_OPEN) {
+            try {
+              this.sendWsProtoSync(
+                sessionWs,
+                pb.encodeServerMessage({
+                  msg: { case: "fence", value: { leaseId, reason } },
+                }),
+              );
+            } catch {
+              // ignore
+            }
+          }
+          if (lease && lease.attemptConnId !== null) {
+            const aws = this.socketsByConnId.get(lease.attemptConnId);
+            this.socketsByConnId.delete(lease.attemptConnId);
+            if (aws && aws.readyState === WS_READY_STATE_OPEN) {
+              try {
+                this.sendWsProtoSync(
+                  aws,
+                  pb.encodeAttemptDown({
+                    msg: {
+                      case: "finished",
+                      value: {
+                        status: pb.AttemptFinishedStatus.FENCED,
+                        reason,
+                      },
+                    },
+                  }),
+                );
+                aws.close(1000, "");
+              } catch {
+                // ignore
+              }
+            }
+          }
+          const affected = this.leaseLostInTxn(leaseId, nowMs);
+          if (affected) notifyJobs.add(affected);
+        }
+
+        this.removeSessionInTxn(session.sessionId);
+        if (sessionWs && sessionWs.readyState === WS_READY_STATE_OPEN) {
+          sessionSocketsToClose.push({ ws: sessionWs, reason });
+        }
+      }
+      this.dispatchInTxn(nowMs, notifyJobs);
+    });
+
+    for (const item of sessionSocketsToClose) {
+      this.sendWsErrorAndClose(item.ws, GrpcCode.Unauthenticated, item.reason);
+    }
+
+    return { evicted: evictedPending + sessionVictims.length, notifyJobs };
+  }
+
   async alarm(): Promise<void> {
     const nowMs = this.host.nowMs();
     // Clear in-memory marker FIRST (section 6.3)
     this.armedAlarmMs = null;
     this.store.recordHttpOrAlarmRequest(nowMs);
     this.isolateBudget.refreshSockets();
+
+    // 0. Refresh revocations when signed worker sessions exist and evict revoked/expired sessions
+    const hasTrackedJti =
+      this.auth.hasRevocationPolling() &&
+      ([...this.sessions.values()].some((s) => s.tokenJti !== null) ||
+        [...this.pendingSessionAuth.values()].some((a) => a.jti !== null));
+    if (hasTrackedJti) {
+      await this.auth.maybeSyncRevocations(nowMs);
+    }
+    const evictedResult = this.evictRevokedOrExpiredSessionsSync(nowMs);
 
     // 1. Check live socket attachments for handshake timeouts & silent session heartbeat timeouts
     const silentSessions: Array<{ sessionId: string; connId: number; ws: NativeWebSocket }> = [];
@@ -1167,7 +1361,7 @@ export class NativeEngine implements ConsoleBackend {
       }
       const att = readSocketAttachment(ws);
       if (!att) continue;
-      if (att.handshakeDone === 0 && (att.kind === "session" || att.kind === "attempt")) {
+      if (att.handshakeDone === 0) {
         if (nowMs - att.openedAtMs >= this.config.heartbeatTimeoutMs) {
           expiredHandshakes.push({ ws, kind: att.kind, connId });
         }
@@ -1185,12 +1379,20 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
 
+    const handshakeTimeoutMsg: Record<SocketKind, string> = {
+      session: "no Hello received",
+      attempt: "no Open received",
+      invoke: "no Start received",
+      watch: "no WatchRequest received",
+    };
     for (const h of expiredHandshakes) {
       this.socketsByConnId.delete(h.connId);
+      this.pendingInvokeTraceHeaders.delete(h.connId);
+      this.pendingSessionAuth.delete(h.connId);
       this.sendWsErrorAndClose(
         h.ws,
         GrpcCode.DeadlineExceeded,
-        h.kind === "session" ? "no Hello received" : "no Open received",
+        handshakeTimeoutMsg[h.kind],
       );
     }
 
@@ -1204,7 +1406,7 @@ export class NativeEngine implements ConsoleBackend {
     }
 
     // 2. Process exact business timers + overdue retries + dispatch inside bounded transactionSync
-    const notifyJobs = new Set<string>();
+    const notifyJobs = new Set<string>(evictedResult.notifyJobs);
     this.store.transactionSync(() => {
       for (const s of silentSessions) {
         this.disconnectSessionInTxn(s.sessionId, s.connId, nowMs);
@@ -1358,13 +1560,11 @@ export class NativeEngine implements ConsoleBackend {
     };
 
     // Exact business timers (NEVER bucketed!)
-    for (const [connId, ws] of this.socketsByConnId) {
+    for (const [, ws] of this.socketsByConnId) {
       if (ws.readyState !== WS_READY_STATE_OPEN) continue;
       const att = readSocketAttachment(ws);
-      if (att && att.handshakeDone === 0 && (att.kind === "session" || att.kind === "attempt")) {
+      if (att && att.handshakeDone === 0) {
         considerBusiness(att.openedAtMs + this.config.heartbeatTimeoutMs);
-      } else {
-        void connId;
       }
     }
 
@@ -1374,6 +1574,9 @@ export class NativeEngine implements ConsoleBackend {
       }
       if (s.connected && s.cooldownUntilMs > nowMs) {
         considerBusiness(s.cooldownUntilMs);
+      }
+      if (s.tokenExp !== null) {
+        considerBusiness(s.tokenExp * 1000);
       }
     }
 
@@ -1424,8 +1627,12 @@ export class NativeEngine implements ConsoleBackend {
       }
     };
 
+    let hasSignedWorkerSession = false;
     for (const s of this.sessions.values()) {
       if (s.connected) {
+        if (s.tokenJti !== null) {
+          hasSignedWorkerSession = true;
+        }
         const ws = this.socketsByConnId.get(s.currentConnId);
         const att =
           ws && ws.readyState === WS_READY_STATE_OPEN
@@ -1441,6 +1648,15 @@ export class NativeEngine implements ConsoleBackend {
         } else {
           considerMaintenance(rawTimeoutAt);
         }
+      }
+    }
+
+    if (hasSignedWorkerSession && this.auth.hasRevocationPolling()) {
+      const pollInterval = this.auth.revocationPollIntervalMs();
+      if (pollInterval < b) {
+        considerBusiness(nowMs + pollInterval);
+      } else {
+        considerMaintenance(nowMs + pollInterval);
       }
     }
 
@@ -1547,12 +1763,18 @@ export class NativeEngine implements ConsoleBackend {
     if (!session || !session.connected || session.currentConnId !== att.connId) {
       return;
     }
+    if (this.credentialInvalidReason(session.tokenJti, session.tokenExp, nowMs) !== null) {
+      const { notifyJobs } = this.evictRevokedOrExpiredSessionsSync(nowMs);
+      for (const jid of notifyJobs) void this.notifyJobFollowers(jid);
+      void this.refreshAlarm(nowMs);
+      return;
+    }
     session.lastSeenMs = nowMs;
     if (hb?.load) {
       session.queued = hb.load.queued;
       session.running = hb.load.running;
       session.utilization = Number.isFinite(hb.load.utilization)
-        ? hb.load.utilization
+        ? Math.min(1, Math.max(0, hb.load.utilization))
         : 0;
       const bounded = boundCustomLoad(hb.load.custom);
       session.customLoad = bounded.custom;
@@ -1602,6 +1824,12 @@ export class NativeEngine implements ConsoleBackend {
     const session = this.sessions.get(att.id);
     // Stale connection check: ignore messages from superseded control connections!
     if (!session || !session.connected || session.currentConnId !== att.connId) {
+      return;
+    }
+    if (this.credentialInvalidReason(session.tokenJti, session.tokenExp, nowMs) !== null) {
+      const { notifyJobs } = this.evictRevokedOrExpiredSessionsSync(nowMs);
+      for (const jid of notifyJobs) await this.notifyJobFollowers(jid);
+      await this.refreshAlarm(nowMs);
       return;
     }
 
@@ -1715,6 +1943,17 @@ export class NativeEngine implements ConsoleBackend {
     hello: pb.Hello,
     nowMs: number,
   ): Promise<void> {
+    const authInfo = this.pendingSessionAuth.get(att.connId) ?? null;
+    this.pendingSessionAuth.delete(att.connId);
+    const invalidAuth = this.credentialInvalidReason(
+      authInfo?.jti ?? null,
+      authInfo?.exp ?? null,
+      nowMs,
+    );
+    if (invalidAuth !== null) {
+      throw GrpcStatusError.unauthenticated(invalidAuth);
+    }
+
     if (hello.interfaces.length === 0) {
       throw GrpcStatusError.invalidArgument("Hello.interfaces is required");
     }
@@ -1738,9 +1977,44 @@ export class NativeEngine implements ConsoleBackend {
     if (hello.heldLeaseIds.length > MAX_OBJECTS) {
       throw GrpcStatusError.invalidArgument("too many held leases");
     }
+    if (hello.maxConcurrency > 65_536) {
+      throw GrpcStatusError.invalidArgument(
+        "Hello.max_concurrency must be at most 65536",
+      );
+    }
+    const capacityEntries = Object.entries(hello.totalCapacity);
+    if (capacityEntries.length > MAX_OBJECTS) {
+      throw GrpcStatusError.invalidArgument(
+        `Hello.total_capacity may contain at most ${MAX_OBJECTS} entries`,
+      );
+    }
+    let capacityKeyBytes = 0;
+    for (const [key, value] of capacityEntries) {
+      const keyBytes = utf8ByteLen(key);
+      if (keyBytes === 0 || keyBytes > MAX_IDENTIFIER_BYTES) {
+        throw GrpcStatusError.invalidArgument(
+          `Hello.total_capacity keys must be 1..=${MAX_IDENTIFIER_BYTES} bytes`,
+        );
+      }
+      if (typeof value === "bigint") {
+        if (value < 0n) {
+          throw GrpcStatusError.invalidArgument(
+            "Hello.total_capacity values cannot be negative",
+          );
+        }
+      } else if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        throw GrpcStatusError.invalidArgument(
+          "Hello.total_capacity values must be non-negative finite numbers",
+        );
+      }
+      capacityKeyBytes += keyBytes;
+    }
     const ifaceBytes = hello.interfaces.reduce((s, i) => s + utf8ByteLen(i), 0);
     if (
-      metadataByteLen(hello.attributes) + metadataByteLen(hello.metadata) + ifaceBytes >
+      metadataByteLen(hello.attributes) +
+        metadataByteLen(hello.metadata) +
+        ifaceBytes +
+        capacityKeyBytes >
       MAX_METADATA_BYTES
     ) {
       throw GrpcStatusError.invalidArgument(
@@ -1805,6 +2079,8 @@ export class NativeEngine implements ConsoleBackend {
         session.currentConnId = att.connId;
         session.graceDeadlineMs = null;
         session.lastSeenMs = nowMs;
+        session.tokenJti = authInfo?.jti ?? null;
+        session.tokenExp = authInfo?.exp ?? null;
       } else {
         session = {
           sessionId,
@@ -1833,6 +2109,8 @@ export class NativeEngine implements ConsoleBackend {
           running: 0,
           utilization: 0,
           customLoad: {},
+          tokenJti: authInfo?.jti ?? null,
+          tokenExp: authInfo?.exp ?? null,
         };
         this.sessions.set(sessionId, session);
       }
@@ -3031,7 +3309,7 @@ export class NativeEngine implements ConsoleBackend {
         max_concurrency, reported_free, assigned_since_report,
         draining, connected, current_conn_id, connected_at_ms, last_seen_ms,
         grace_deadline_ms, consecutive_failures, cooldown_until_ms,
-        queued, running, utilization
+        queued, running, utilization, token_jti, token_exp
       ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?,
@@ -3039,7 +3317,7 @@ export class NativeEngine implements ConsoleBackend {
         ?, ?, ?,
         ?, ?, ?, ?, ?,
         ?, ?, ?,
-        ?, ?, ?
+        ?, ?, ?, ?, ?
       )
       ON CONFLICT(session_id) DO UPDATE SET
         pool = excluded.pool,
@@ -3062,7 +3340,9 @@ export class NativeEngine implements ConsoleBackend {
         cooldown_until_ms = excluded.cooldown_until_ms,
         queued = excluded.queued,
         running = excluded.running,
-        utilization = excluded.utilization`,
+        utilization = excluded.utilization,
+        token_jti = excluded.token_jti,
+        token_exp = excluded.token_exp`,
       s.sessionId,
       s.workerId,
       s.namespace,
@@ -3088,6 +3368,8 @@ export class NativeEngine implements ConsoleBackend {
       s.queued,
       s.running,
       s.utilization,
+      s.tokenJti,
+      s.tokenExp,
     );
   }
 

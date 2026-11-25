@@ -2,8 +2,11 @@
 import { afterEach, expect, it, vi } from "vitest";
 import {
   AuthenticationError,
+  AuthorizationError,
   cancelJob,
   clearConsoleToken,
+  drainWorker,
+  fetchInfo,
   getAnalyticsJobs,
   getConsoleToken,
   getJob,
@@ -11,8 +14,11 @@ import {
   getOverview,
   getWorkers,
   hasConsoleToken,
+  safeHttpUrl,
   setConsoleToken,
 } from "./api";
+import { deriveEndpoint } from "./ConnectWorkerModal";
+import type { ControlPlaneSummary } from "./types";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -86,10 +92,86 @@ it("encodes custom job IDs, metadata cursors, and optional filters while preserv
   expect(fetch.mock.calls[7][0]).toBe("/api/jobs/job-def");
 });
 
-it("preserves authentication errors for active requests", async () => {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue(new Response('{"error":"expired"}', { status: 401 })),
-  );
+it("preserves authentication vs authorization errors and info/drain helpers", async () => {
+  const fetchMock = vi
+    .fn()
+    .mockResolvedValueOnce(new Response('{"error":"expired"}', { status: 401 }))
+    .mockResolvedValueOnce(new Response('{"error":"forbidden"}', { status: 403 }))
+    .mockResolvedValueOnce(new Response('{"auth_enabled":true,"grpc_enabled":false}', { status: 200 }))
+    .mockResolvedValueOnce(new Response('{"session_id":"s1","draining":true}', { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
   await expect(getOverview()).rejects.toBeInstanceOf(AuthenticationError);
+  await expect(getOverview()).rejects.toBeInstanceOf(AuthorizationError);
+  const info = await fetchInfo();
+  expect(info.grpc_enabled).toBe(false);
+  const drain = await drainWorker("s/1");
+  expect(drain.draining).toBe(true);
+  expect(fetchMock.mock.calls[3][0]).toBe("/api/workers/s%2F1/drain");
+});
+
+it("safeHttpUrl allows http/https and blocks javascript:/data:/unsafe schemes", () => {
+  expect(safeHttpUrl("https://relay.example.com/tokens")).toBe("https://relay.example.com/tokens");
+  expect(safeHttpUrl("  http://127.0.0.1:8080/tokens  ")).toBe("http://127.0.0.1:8080/tokens");
+  expect(safeHttpUrl("/tokens")).toBe(`${window.location.origin}/tokens`);
+  expect(safeHttpUrl("javascript:alert(1)")).toBeNull();
+  expect(safeHttpUrl("  JaVaScRiPt:alert(1)")).toBeNull();
+  expect(safeHttpUrl("data:text/html,<script>alert(1)</script>")).toBeNull();
+  expect(safeHttpUrl("vbscript:msgbox(1)")).toBeNull();
+  expect(safeHttpUrl("ftp://example.com/file")).toBeNull();
+  expect(safeHttpUrl("")).toBeNull();
+  expect(safeHttpUrl("   ")).toBeNull();
+  expect(safeHttpUrl(null)).toBeNull();
+  expect(safeHttpUrl(undefined)).toBeNull();
+});
+
+it("deriveEndpoint converts http(s) to ws(s) when grpc_enabled is false and handles redacted grpc_listen", () => {
+  const baseCp: ControlPlaneSummary = {
+    grpc_enabled: true,
+    grpc_listen: "127.0.0.1:50052",
+    grpc_tls_enabled: false,
+    console_listen: "0.0.0.0:3001",
+    auth_enabled: true,
+    generation: 1,
+    retained_jobs: 0,
+    sessions: 0,
+    max_sessions: 100,
+    priority_levels: 4,
+    default_max_attempts: 3,
+    heartbeat_interval_ms: 5000,
+    heartbeat_timeout_ms: 15000,
+    reconnect_grace_ms: 3000,
+  };
+
+  // grpc_enabled: false converts https:// public_endpoint -> wss:// and http:// -> ws://
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: false, public_endpoint: "https://relay.example.com" }),
+  ).toBe("wss://relay.example.com");
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: false, public_endpoint: "http://relay.local:3001" }),
+  ).toBe("ws://relay.local:3001");
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: false, public_endpoint: "wss://already.ws.example" }),
+  ).toBe("wss://already.ws.example");
+
+  // grpc_enabled: false without public_endpoint converts window.location.origin to ws(s)://
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: false, public_endpoint: null }),
+  ).toBe(window.location.origin.replace(/^http/, "ws"));
+
+  // grpc_enabled: true with redacted empty grpc_listen falls back cleanly instead of "http://"
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: true, grpc_listen: "" }),
+  ).toBe("http://127.0.0.1:50052");
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: true, grpc_listen: "   ", grpc_tls_enabled: true }),
+  ).toBe("https://127.0.0.1:50052");
+
+  // Wildcard host resolution for 0.0.0.0: and [::]:
+  const host = window.location.hostname || "127.0.0.1";
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: true, grpc_listen: "0.0.0.0:50052" }),
+  ).toBe(`http://${host}:50052`);
+  expect(
+    deriveEndpoint({ ...baseCp, grpc_enabled: true, grpc_listen: "[::]:50052", grpc_tls_enabled: true }),
+  ).toBe(`https://${host}:50052`);
 });

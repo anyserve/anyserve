@@ -25,6 +25,7 @@ interface WorkersPaneProps {
   onOpenInterface: (interfaceName: string) => void;
   onOpenPool: (namespace: string, interfaceName: string | undefined, pool: string) => void;
   onOpenConnect: () => void;
+  onDrainWorker?: (sessionId: string) => Promise<void> | void;
 }
 
 const HEALTH_LABELS: Record<HealthFilter, string> = { all: "All", healthy: "Healthy", draining: "Draining", disconnected: "Disconnected" };
@@ -42,11 +43,13 @@ export function WorkersPane(props: WorkersPaneProps) {
     onOpenInterface,
     onOpenPool,
     onOpenConnect,
+    onDrainWorker,
   } = props;
   const [healthFilter, setHealthFilter] = useState<HealthFilter>("all");
   const [poolFilter, setPoolFilter] = useState("all");
   const [interfaceFilter, setInterfaceFilter] = useState("all");
   const [search, setSearch] = useState("");
+  const [drainingId, setDrainingId] = useState<string | null>(null);
   const prevSelectedWorker = useRef<string | null>(selectedWorkerId);
 
   useEffect(() => {
@@ -85,7 +88,10 @@ export function WorkersPane(props: WorkersPaneProps) {
 
   const activeWorker = filtered.find((w) => w.worker_id === selectedWorkerId) ?? filtered[0] ?? null;
   const publicEndpoint = overview?.control_plane?.public_endpoint?.trim() ?? "";
-  const isWebSocketTransport = publicEndpoint.startsWith("ws://") || publicEndpoint.startsWith("wss://");
+  const isWebSocketTransport =
+    overview?.control_plane?.grpc_enabled === false ||
+    publicEndpoint.startsWith("ws://") ||
+    publicEndpoint.startsWith("wss://");
 
   return (
     <div className="content-grid">
@@ -255,6 +261,24 @@ export function WorkersPane(props: WorkersPaneProps) {
           activeWorker ? (
             <>
               <WorkerStateBadge worker={activeWorker} />
+              {activeWorker.connected && !activeWorker.draining && activeWorker.session_id && onDrainWorker ? (
+                <button
+                  type="button"
+                  className="button"
+                  disabled={drainingId === activeWorker.session_id}
+                  onClick={async () => {
+                    const sid = activeWorker.session_id!;
+                    setDrainingId(sid);
+                    try {
+                      await onDrainWorker(sid);
+                    } finally {
+                      setDrainingId((cur) => (cur === sid ? null : cur));
+                    }
+                  }}
+                >
+                  {drainingId === activeWorker.session_id ? "Draining…" : "Drain"}
+                </button>
+              ) : null}
               <button type="button" className="button button--primary" onClick={() => onViewJobsForWorker(activeWorker.worker_id)}>
                 View Worker Jobs
               </button>

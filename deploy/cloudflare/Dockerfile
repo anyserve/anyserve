@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.85-bookworm AS build
+FROM rust:1.99.1-bookworm AS build
 ARG DEBIAN_MIRROR=http://deb.debian.org
 RUN sed -i "s|http://deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources && \
     apt-get update && \

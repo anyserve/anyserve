@@ -3,8 +3,11 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import App from "./App";
 import {
+  AuthorizationError,
   cancelJob,
   clearConsoleToken,
+  drainWorker,
+  fetchInfo,
   getJob,
   getJobs,
   getOverview,
@@ -14,11 +17,16 @@ import {
 } from "./api";
 import type { JobDetailResponse, JobSummary, OverviewResponse, WorkersResponse } from "./types";
 
-vi.mock("./api", () => {
+vi.mock("./api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>();
   let token: string | null = null;
   return {
-    AuthenticationError: class extends Error {},
+    AuthenticationError: actual.AuthenticationError,
+    AuthorizationError: actual.AuthorizationError,
+    safeHttpUrl: actual.safeHttpUrl,
     cancelJob: vi.fn(),
+    drainWorker: vi.fn(),
+    fetchInfo: vi.fn().mockResolvedValue({ auth_enabled: false, grpc_enabled: true }),
     getJob: vi.fn(),
     getJobs: vi.fn(),
     getOverview: vi.fn(),
@@ -1281,6 +1289,183 @@ it("captures #token= from URL hash, strips the hash, and locks tenant scope UI",
       0,
       expect.any(AbortSignal),
       expect.objectContaining({ namespace: "gh-9001" }),
+    ),
+  );
+});
+
+it("keeps 403 authorization errors inline, locks tenant reset filter, shows auth portal links, and triggers worker drain", async () => {
+  vi.mocked(fetchInfo).mockResolvedValue({
+    auth_enabled: true,
+    auth_portal_url: "https://relay.example.com/tokens",
+    public_endpoint: "https://relay.example.com",
+    grpc_enabled: false,
+  });
+
+  // 1. 401 opens auth gate with Sign in with GitHub link.
+  vi.mocked(getOverview).mockRejectedValueOnce(new (await import("./api")).AuthenticationError("expired"));
+  const { unmount } = render(<App />);
+  const signIn = await screen.findByRole("link", { name: "Sign in with GitHub" });
+  expect(signIn.getAttribute("href")).toBe("https://relay.example.com/tokens");
+  unmount();
+
+  // 2. /api/overview 403 (e.g. worker token pasted) opens auth gate with error and stops polling.
+  vi.useFakeTimers();
+  vi.mocked(getOverview).mockClear();
+  vi.mocked(getOverview).mockRejectedValue(new AuthorizationError("worker token cannot access console API"));
+  const gateView = render(<App />);
+  await act(async () => {});
+  expect(screen.getByRole("button", { name: "Connect" })).toBeTruthy();
+  expect(screen.getByRole("alert").textContent).toContain("worker token cannot access console API");
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  await act(() => vi.advanceTimersByTimeAsync(10_000));
+  expect(getOverview).toHaveBeenCalledTimes(1);
+  gateView.unmount();
+  vi.useRealTimers();
+
+  // 3. Unsafe javascript: auth_portal_url is blocked on login gate.
+  vi.mocked(fetchInfo).mockResolvedValueOnce({
+    auth_enabled: true,
+    auth_portal_url: "javascript:alert(1)",
+    public_endpoint: "https://relay.example.com",
+    grpc_enabled: false,
+  });
+  vi.mocked(getOverview).mockRejectedValueOnce(new (await import("./api")).AuthenticationError("expired"));
+  const xssView = render(<App />);
+  expect(await screen.findByRole("button", { name: "Connect" })).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "Sign in with GitHub" })).toBeNull();
+  xssView.unmount();
+
+  // 4. Logged-in tenant keeps Manage Tokens link, disabled Namespace select, hides Clear filters when only locked,
+  //    keeps cancelJob 403 inline without clearing token, optimistically drains worker, and resets filters.ns on disconnect.
+  setConsoleToken("tenant-tok");
+  vi.mocked(getOverview).mockResolvedValue({
+    ...richOverview(),
+    control_plane: {
+      ...richOverview().control_plane!,
+      grpc_enabled: false,
+      grpc_listen: "",
+      console_listen: "",
+      max_sessions: 0,
+      auth_enabled: true,
+      public_endpoint: "https://relay.example.com",
+      auth_portal_url: "https://relay.example.com/tokens",
+    },
+    scope: { is_operator: false, namespace: "gh-9001", subject: "gh:octocat" },
+  });
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [summary("job-tenant-1", { namespace: "gh-9001", state: "queued" })],
+    next_page_token: null,
+    total: 1,
+  });
+  vi.mocked(getJob).mockResolvedValue(detail("job-tenant-1", { namespace: "gh-9001", state: "queued" }));
+  vi.mocked(getWorkers).mockResolvedValue({
+    total: 1,
+    healthy: 1,
+    draining: 0,
+    disconnected: 0,
+    workers: [
+      {
+        worker_id: "w1",
+        session_id: "sess-1",
+        namespace: "gh-9001",
+        pool: "default",
+        healthy: true,
+        interfaces: ["echo"],
+        attributes: {},
+        total_capacity: { slot: 2 },
+        max_concurrency: 2,
+        free_slots: 2,
+        utilization: 0,
+        connected: true,
+        draining: false,
+        active_leases: 0,
+        last_seen_at_ms: 1_700_000_000_000,
+      },
+    ],
+  });
+  vi.mocked(drainWorker).mockResolvedValue({ session_id: "sess-1", draining: true });
+
+  window.history.replaceState(null, "", "/jobs");
+  render(<App />);
+  const manage = await screen.findByRole("link", { name: "Manage Tokens" });
+  expect(manage.getAttribute("href")).toBe("https://relay.example.com/tokens");
+  expect((screen.getByLabelText("Namespace") as HTMLSelectElement).disabled).toBe(true);
+  // Locked tenant namespace alone should not trigger a no-op "Clear filters" button.
+  expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+
+  // cancelJob 403 stays inline in workspace banner without clearing token or forcing login gate.
+  vi.mocked(cancelJob).mockRejectedValueOnce(new AuthorizationError("cannot cancel"));
+  fireEvent.click(await screen.findByRole("button", { name: "Cancel job" }));
+  expect(await screen.findByRole("alert")).toBeTruthy();
+  expect(screen.getByRole("alert").textContent).toContain("cannot cancel");
+  expect(screen.queryByRole("button", { name: "Connect" })).toBeNull();
+  expect(hasConsoleToken()).toBe(true);
+
+  // Overview omits /0 max_sessions, omits empty console_listen, and shows Disabled for grpc_enabled: false.
+  fireEvent.click(screen.getByRole("button", { name: /^Overview/i }));
+  expect(await screen.findByText("Disabled")).toBeTruthy();
+  expect(screen.queryByText("Console listen")).toBeNull();
+  expect(screen.queryByText(/\/0\b/)).toBeNull();
+
+  // Workers pane shows WebSocket session active when grpc_enabled: false (even with https:// public_endpoint),
+  // and Drain updates worker state optimistically before next poll resolves.
+  let resolveNextWorkers!: (res: WorkersResponse) => void;
+  vi.mocked(getWorkers)
+    .mockResolvedValueOnce({
+      total: 1,
+      healthy: 1,
+      draining: 0,
+      disconnected: 0,
+      workers: [
+        {
+          worker_id: "w1",
+          session_id: "sess-1",
+          namespace: "gh-9001",
+          pool: "default",
+          healthy: true,
+          interfaces: ["echo"],
+          attributes: {},
+          total_capacity: { slot: 2 },
+          max_concurrency: 2,
+          free_slots: 2,
+          utilization: 0,
+          connected: true,
+          draining: false,
+          active_leases: 0,
+          last_seen_at_ms: 1_700_000_000_000,
+        },
+      ],
+    })
+    .mockImplementationOnce(() => new Promise((r) => { resolveNextWorkers = r; }));
+
+  fireEvent.click(screen.getByRole("button", { name: /^Workers/i }));
+  const drainBtn = await screen.findByRole("button", { name: "Drain" });
+  expect(screen.getByText("WebSocket session active")).toBeTruthy();
+  fireEvent.click(drainBtn);
+  await waitFor(() => expect(drainWorker).toHaveBeenCalledWith("sess-1"));
+  // Optimistically marked draining immediately before poll returns.
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Drain" })).toBeNull());
+  expect(screen.getByText(/connected · draining/)).toBeTruthy();
+  resolveNextWorkers({ total: 1, healthy: 0, draining: 1, disconnected: 0, workers: [] });
+
+  // Disconnect resets filters.ns so reconnecting as an operator does not leak "gh-9001".
+  fireEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+  expect(await screen.findByRole("button", { name: "Connect" })).toBeTruthy();
+  vi.mocked(getOverview).mockResolvedValue({
+    ...richOverview(),
+    scope: { is_operator: true, namespace: "default", subject: "operator" },
+  });
+  vi.mocked(getJobs).mockClear();
+  fireEvent.change(screen.getByLabelText("Client token"), { target: { value: "op-token" } });
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  fireEvent.click(await screen.findByRole("button", { name: /^Jobs/i }));
+  await waitFor(() =>
+    expect(getJobs).toHaveBeenCalledWith(
+      expect.any(Array),
+      100,
+      0,
+      expect.any(AbortSignal),
+      expect.objectContaining({ namespace: "all" }),
     ),
   );
 });

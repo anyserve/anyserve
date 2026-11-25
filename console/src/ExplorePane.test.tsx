@@ -6,7 +6,12 @@ import { getAnalyticsJobs, getJob } from "./api";
 import { AnalyticsEngine } from "./analytics-engine";
 import type { AnalyticsJob, AnalyticsResponse } from "./types";
 
-vi.mock("./api", () => ({ AuthenticationError: class extends Error {}, getAnalyticsJobs: vi.fn(), getJob: vi.fn() }));
+vi.mock("./api", () => ({
+  AuthenticationError: class extends Error {},
+  AuthorizationError: class extends Error {},
+  getAnalyticsJobs: vi.fn(),
+  getJob: vi.fn(),
+}));
 vi.mock("./analytics-engine", () => ({ AnalyticsEngine: { create: vi.fn() } }));
 const job: AnalyticsJob = {
   job_id: "A", state: "succeeded", interface_name: "echo", source: null,
@@ -104,4 +109,74 @@ it("loads a five-second custom range without rounding its bounds", async () => {
   expect(vi.mocked(getAnalyticsJobs).mock.calls[0].slice(1, 3)).toEqual([
     new Date("2026-11-01T10:00:03").getTime(), new Date("2026-11-01T10:00:08").getTime(),
   ]);
+});
+
+it("forwards namespace from Explore query rows to inspect and Open in Jobs and locks tenant namespace", async () => {
+  db.query.mockResolvedValueOnce({
+    columns: ["job_id", "namespace", "state"],
+    rows: [["job-ns", "team-alpha", "succeeded"]],
+    elapsedMs: 1,
+    truncated: false,
+    clippedCells: 0,
+  });
+  vi.mocked(getJob).mockResolvedValueOnce({
+    job: { ...job, job_id: "job-ns", namespace: "team-alpha", outputs: [], inputs: [], demand: null, policy: null, params_size_bytes: null, params_preview: null, params_truncated: false, output_preview: null },
+    attempts: [],
+    events: [],
+    history_incomplete: false,
+    latest_worker: null,
+  });
+  const onOpenJobInJobs = vi.fn();
+  const { rerender } = render(
+    <ExplorePane
+      journalEnabled
+      availableNamespaces={["team-alpha", "team-beta"]}
+      onAuthenticationError={vi.fn()}
+      onOpenJobInJobs={onOpenJobInJobs}
+    />,
+  );
+  const nsSelect = screen.getByLabelText("Namespace") as HTMLSelectElement;
+  expect(nsSelect.disabled).toBe(false);
+  fireEvent.change(nsSelect, { target: { value: "team-alpha" } });
+  fireEvent.click(screen.getByRole("button", { name: "Load data" }));
+  await waitFor(() => expect(getAnalyticsJobs).toHaveBeenCalledWith("archive", expect.any(Number), expect.any(Number), 250, null, expect.any(AbortSignal), "team-alpha"));
+  fireEvent.click(screen.getByRole("button", { name: "Inspect" }));
+  await waitFor(() => expect(getJob).toHaveBeenCalledWith("job-ns", expect.any(AbortSignal), "team-alpha"));
+  fireEvent.click(screen.getByRole("button", { name: "Open in Jobs" }));
+  expect(onOpenJobInJobs).toHaveBeenCalledWith("job-ns", "team-alpha");
+
+  rerender(<ExplorePane journalEnabled lockedNamespace="tenant-locked" onAuthenticationError={vi.fn()} />);
+  expect((screen.getByLabelText("Namespace") as HTMLSelectElement).disabled).toBe(true);
+});
+
+it("highlights only the matching (job_id, namespace) row and documents composite JOIN key", async () => {
+  db.query.mockResolvedValueOnce({
+    columns: ["job_id", "namespace", "state"],
+    rows: [
+      ["dup-job", "alpha", "failed"],
+      ["dup-job", "beta", "failed"],
+    ],
+    elapsedMs: 1,
+    truncated: false,
+    clippedCells: 0,
+  });
+  vi.mocked(getJob).mockResolvedValue({
+    job: { ...job, job_id: "dup-job", namespace: "beta", outputs: [], inputs: [], demand: null, policy: null, params_size_bytes: null, params_preview: null, params_truncated: false, output_preview: null },
+    attempts: [],
+    events: [],
+    history_incomplete: false,
+    latest_worker: null,
+  });
+  render(<ExplorePane journalEnabled onAuthenticationError={vi.fn()} />);
+  expect(screen.getByText(/USING \(job_id, namespace\)/)).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Load data" }));
+  const inspectButtons = await screen.findAllByRole("button", { name: "Inspect" });
+  expect(inspectButtons).toHaveLength(2);
+  fireEvent.click(inspectButtons[1]);
+  await waitFor(() => expect(getJob).toHaveBeenCalledWith("dup-job", expect.any(AbortSignal), "beta"));
+
+  const rows = document.querySelectorAll(".explore__table tbody tr");
+  expect(rows[0]?.classList.contains("is-selected")).toBe(false);
+  expect(rows[1]?.classList.contains("is-selected")).toBe(true);
 });

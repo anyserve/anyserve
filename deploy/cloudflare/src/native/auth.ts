@@ -7,14 +7,177 @@
  * with zero host-specific runtime imports.
  */
 
-import { DEFAULT_NAMESPACE } from "./identity";
+import { DEFAULT_NAMESPACE, sha256Hex } from "./identity";
 
 export { DEFAULT_NAMESPACE };
 export const NAMESPACE_HEADER = "x-anyserve-namespace";
 export const GRPC_CODE_HEADER = "x-anyserve-grpc-code";
+export const SIGNED_TOKEN_PREFIX = "asv1.";
 
 const utf8Encoder = new TextEncoder();
+const utf8Decoder = new TextDecoder();
 const NODE_INSPECT_CUSTOM = Symbol.for("nodejs.util.inspect.custom");
+
+export interface SignedTokenClaims {
+  jti: string;
+  ns: string;
+  role: string;
+  sub: string;
+  iat: number;
+  exp?: number | null;
+  fp?: string | null;
+}
+
+export interface RevocationSnapshot {
+  version: number;
+  revoked_jtis: string[];
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]!);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecode(str: string): Uint8Array | null {
+  if (!str || /[^A-Za-z0-9\-_]/.test(str)) {
+    return null;
+  }
+  const padded = str.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((str.length + 3) % 4);
+  try {
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// Imported once per key buffer: a policy's signing keys verify every signed request.
+const hmacKeys = new WeakMap<Uint8Array, Promise<CryptoKey>>();
+
+async function hmacSha256(keyBytes: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+  let key = hmacKeys.get(keyBytes);
+  if (key === undefined) {
+    key = crypto.subtle.importKey(
+      "raw",
+      Uint8Array.from(keyBytes),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    hmacKeys.set(keyBytes, key);
+  }
+  const sig = await crypto.subtle.sign("HMAC", await key, Uint8Array.from(data));
+  return new Uint8Array(sig);
+}
+
+export function internalRevocationBearer(signingKeyBytes: Uint8Array): string {
+  const prefix = utf8Encoder.encode("anyserve-internal-revocations:");
+  const input = new Uint8Array(prefix.byteLength + signingKeyBytes.byteLength);
+  input.set(prefix, 0);
+  input.set(signingKeyBytes, prefix.byteLength);
+  return sha256Hex(input);
+}
+
+export async function signToken(
+  keyBytes: Uint8Array,
+  claims: SignedTokenClaims,
+): Promise<string> {
+  if (keyBytes.byteLength === 0) {
+    throw new Error("signing key must not be empty");
+  }
+  if (!claims.jti || claims.jti.trim().length === 0) {
+    throw new Error("token jti must not be empty");
+  }
+  validateNamespace(claims.ns);
+  if (claims.role !== Role.Client && claims.role !== Role.Worker) {
+    throw new Error("token role must be 'client' or 'worker'");
+  }
+  const payload = base64UrlEncode(utf8Encoder.encode(JSON.stringify(claims)));
+  const signingInput = `${SIGNED_TOKEN_PREFIX}${payload}`;
+  const mac = await hmacSha256(keyBytes, utf8Encoder.encode(signingInput));
+  return `${signingInput}.${base64UrlEncode(mac)}`;
+}
+
+export async function verifySignedToken(
+  token: string,
+  keys: readonly Uint8Array[],
+  nowSecs = Math.floor(Date.now() / 1000),
+): Promise<SignedTokenClaims | null> {
+  if (keys.length === 0 || !token.startsWith(SIGNED_TOKEN_PREFIX)) {
+    return null;
+  }
+  const body = token.slice(SIGNED_TOKEN_PREFIX.length);
+  const dotIdx = body.indexOf(".");
+  if (dotIdx <= 0) {
+    return null;
+  }
+  const payloadB64 = body.slice(0, dotIdx);
+  const sigB64 = body.slice(dotIdx + 1);
+  if (sigB64.includes(".")) {
+    return null;
+  }
+  const sig = base64UrlDecode(sigB64);
+  if (sig === null || sig.byteLength !== 32) {
+    return null;
+  }
+  const signingBytes = utf8Encoder.encode(`${SIGNED_TOKEN_PREFIX}${payloadB64}`);
+  let verified = false;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!;
+    if (key.byteLength === 0) continue;
+    const expected = await hmacSha256(key, signingBytes);
+    if (constantTimeEqualBytes(expected, sig)) {
+      verified = true;
+    }
+  }
+  if (!verified) {
+    return null;
+  }
+  const rawClaims = base64UrlDecode(payloadB64);
+  if (rawClaims === null) {
+    return null;
+  }
+  let claims: SignedTokenClaims;
+  try {
+    claims = JSON.parse(utf8Decoder.decode(rawClaims)) as SignedTokenClaims;
+  } catch {
+    return null;
+  }
+  if (
+    typeof claims?.jti !== "string" ||
+    claims.jti.trim().length === 0 ||
+    typeof claims.ns !== "string" ||
+    (claims.role !== Role.Client && claims.role !== Role.Worker) ||
+    typeof claims.sub !== "string"
+  ) {
+    return null;
+  }
+  try {
+    validateNamespace(claims.ns);
+  } catch {
+    return null;
+  }
+  if (claims.fp != null && typeof claims.fp !== "string") {
+    return null;
+  }
+  if (claims.exp != null) {
+    if (
+      typeof claims.exp !== "number" ||
+      !Number.isFinite(claims.exp) ||
+      nowSecs >= claims.exp
+    ) {
+      return null;
+    }
+  }
+  return claims;
+}
 
 // ---------- gRPC Status Codes & HTTP Mapping ----------
 
@@ -232,6 +395,8 @@ export interface Principal {
   subject: string;
   forcedPool: string | null;
   isOperator: boolean;
+  jti?: string | null;
+  exp?: number | null;
 }
 
 export function defaultPrincipal(): Principal {
@@ -316,6 +481,9 @@ export interface AuthEnvLike {
   ANYSERVE_CLIENT_TOKENS?: string;
   ANYSERVE_WORKER_TOKENS?: string;
   ANYSERVE_SCOPED_TOKENS?: string;
+  ANYSERVE_TOKEN_SIGNING_KEY?: string;
+  ANYSERVE_AUTH_REVOCATION_URL?: string;
+  ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS?: string;
 }
 
 export type HeaderBag =
@@ -396,15 +564,31 @@ export interface AuthPolicyRedactedJSON {
   scopedTokens: ScopedTokenRedactedJSON[];
 }
 
+export interface AuthPolicyOptions {
+  signingKeys?: Iterable<string | Uint8Array>;
+  revocationUrl?: string | null;
+  revocationPollIntervalMs?: number;
+}
+
 export class AuthPolicy {
   #clientTokens: readonly Uint8Array[];
   #workerTokens: readonly Uint8Array[];
   #scopedTokens: readonly ScopedToken[];
+  #signingKeys: readonly Uint8Array[];
+  #revocationUrl: string | null;
+  #revocationPollIntervalMs: number;
+  #revokedJtis = new Set<string>();
+  #revocationVersion = 0;
+  #lastRevocationSyncAtMs = Number.NEGATIVE_INFINITY;
+  #revocationSyncInFlight: Promise<boolean> | null = null;
+  #nowMs: () => number = () => Date.now();
+  #onRevocationsUpdated: ((snapshot: RevocationSnapshot) => void) | null = null;
 
   constructor(
     clientTokens: Iterable<string> = [],
     workerTokens: Iterable<string> = [],
     scopedTokens: Iterable<ScopedToken | ScopedTokenInit> = [],
+    options: AuthPolicyOptions = {},
   ) {
     this.#clientTokens = dedupeToEncodedTokens(clientTokens);
     this.#workerTokens = dedupeToEncodedTokens(workerTokens);
@@ -416,6 +600,18 @@ export class AuthPolicy {
       }
     }
     this.#scopedTokens = normalizedScoped;
+    const keys: Uint8Array[] = [];
+    for (const k of options.signingKeys ?? []) {
+      const bytes = typeof k === "string" ? utf8Encoder.encode(k.trim()) : k;
+      if (bytes.byteLength > 0) keys.push(bytes);
+    }
+    this.#signingKeys = keys;
+    const rawRevUrl = options.revocationUrl?.trim() ?? "";
+    this.#revocationUrl = rawRevUrl.length > 0 ? rawRevUrl : null;
+    this.#revocationPollIntervalMs = Math.max(
+      250,
+      options.revocationPollIntervalMs ?? 2_000,
+    );
   }
 
   static empty(): AuthPolicy {
@@ -493,26 +689,137 @@ export class AuthPolicy {
       }
     }
 
-    return new AuthPolicy(clientTokens, workerTokens, scoped);
+    const signingKeys = parseCommaTokens(env.ANYSERVE_TOKEN_SIGNING_KEY);
+    const revocationUrl = env.ANYSERVE_AUTH_REVOCATION_URL?.trim() || null;
+    const pollRaw = Number(env.ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS);
+    const revocationPollIntervalMs =
+      Number.isFinite(pollRaw) && pollRaw > 0 ? pollRaw : 2_000;
+
+    return new AuthPolicy(clientTokens, workerTokens, scoped, {
+      signingKeys,
+      revocationUrl,
+      revocationPollIntervalMs,
+    });
   }
 
   withScopedTokens(
     tokens: Iterable<ScopedToken | ScopedTokenInit>,
   ): AuthPolicy {
     const next = new AuthPolicy([], [], tokens);
-    const out = new AuthPolicy();
+    const out = new AuthPolicy([], [], [], {
+      signingKeys: this.#signingKeys,
+      revocationUrl: this.#revocationUrl,
+      revocationPollIntervalMs: this.#revocationPollIntervalMs,
+    });
     out.#clientTokens = this.#clientTokens;
     out.#workerTokens = this.#workerTokens;
     out.#scopedTokens = next.#scopedTokens;
+    out.#revokedJtis = new Set(this.#revokedJtis);
+    out.#revocationVersion = this.#revocationVersion;
+    out.#lastRevocationSyncAtMs = this.#lastRevocationSyncAtMs;
+    out.#nowMs = this.#nowMs;
+    out.#onRevocationsUpdated = this.#onRevocationsUpdated;
     return out;
+  }
+
+  setClock(nowMs: () => number): void {
+    this.#nowMs = nowMs;
+  }
+
+  setRevocationListener(
+    listener: ((snapshot: RevocationSnapshot) => void) | null,
+  ): void {
+    this.#onRevocationsUpdated = listener;
+  }
+
+  hasRevocationPolling(): boolean {
+    return this.#revocationUrl !== null && this.#signingKeys.length > 0;
+  }
+
+  revocationPollIntervalMs(): number {
+    return this.#revocationPollIntervalMs;
+  }
+
+  isJtiRevoked(jti: string): boolean {
+    return this.#revokedJtis.has(jti);
+  }
+
+  revocationSnapshot(): RevocationSnapshot {
+    return {
+      version: this.#revocationVersion,
+      revoked_jtis: [...this.#revokedJtis],
+    };
   }
 
   isEnabled(): boolean {
     return (
       this.#clientTokens.length > 0 ||
       this.#workerTokens.length > 0 ||
-      this.#scopedTokens.length > 0
+      this.#scopedTokens.length > 0 ||
+      this.#signingKeys.length > 0
     );
+  }
+
+  applyRevocations(snapshot: RevocationSnapshot, notify = true): boolean {
+    if (
+      !snapshot ||
+      typeof snapshot.version !== "number" ||
+      !Number.isFinite(snapshot.version) ||
+      snapshot.version < this.#revocationVersion
+    ) {
+      return false;
+    }
+    const nextJtis = new Set(
+      Array.isArray(snapshot.revoked_jtis)
+        ? snapshot.revoked_jtis.filter((j): j is string => typeof j === "string")
+        : [],
+    );
+    const changed =
+      snapshot.version !== this.#revocationVersion ||
+      nextJtis.size !== this.#revokedJtis.size ||
+      [...nextJtis].some((j) => !this.#revokedJtis.has(j));
+    this.#revocationVersion = snapshot.version;
+    this.#revokedJtis = nextJtis;
+    if (changed && notify) {
+      this.#onRevocationsUpdated?.(this.revocationSnapshot());
+    }
+    return changed;
+  }
+
+  async maybeSyncRevocations(nowMs = this.#nowMs()): Promise<boolean> {
+    if (!this.#revocationUrl || this.#signingKeys.length === 0) {
+      return false;
+    }
+    if (this.#revocationSyncInFlight !== null) {
+      return await this.#revocationSyncInFlight;
+    }
+    if (nowMs - this.#lastRevocationSyncAtMs < this.#revocationPollIntervalMs) {
+      return false;
+    }
+    const syncPromise = (async (): Promise<boolean> => {
+      let updated = false;
+      try {
+        const sep = this.#revocationUrl!.includes("?") ? "&" : "?";
+        const url = `${this.#revocationUrl}${sep}since_version=${this.#revocationVersion}`;
+        const bearer = internalRevocationBearer(this.#signingKeys[0]!);
+        const resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${bearer}` },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (resp.status === 200) {
+          const snap = (await resp.json()) as RevocationSnapshot;
+          updated = this.applyRevocations(snap);
+        }
+      } catch {
+        // Best-effort cached polling; retain previous snapshot on transient errors.
+      } finally {
+        this.#lastRevocationSyncAtMs = nowMs;
+        this.#revocationSyncInFlight = null;
+      }
+      return updated;
+    })();
+    this.#revocationSyncInFlight = syncPromise;
+    return await syncPromise;
   }
 
   roleForToken(candidate: string): Role | null {
@@ -573,6 +880,37 @@ export class AuthPolicy {
     return matched;
   }
 
+  async principalForTokenAsync(
+    candidate: string,
+    nowSecs = Math.floor(this.#nowMs() / 1000),
+  ): Promise<Principal | null> {
+    const staticPrincipal = this.principalForToken(candidate);
+    if (staticPrincipal !== null) {
+      return staticPrincipal;
+    }
+    if (!candidate.startsWith(SIGNED_TOKEN_PREFIX) || this.#signingKeys.length === 0) {
+      return null;
+    }
+    // Only a correctly signed token may trigger a revocation refresh.
+    const claims = await verifySignedToken(candidate, this.#signingKeys, nowSecs);
+    if (claims === null) {
+      return null;
+    }
+    await this.maybeSyncRevocations(nowSecs * 1000);
+    if (this.#revokedJtis.has(claims.jti)) {
+      return null;
+    }
+    return {
+      namespace: claims.ns,
+      role: claims.role as Role,
+      subject: claims.sub,
+      forcedPool: claims.fp ?? null,
+      isOperator: false,
+      jti: claims.jti,
+      exp: claims.exp ?? null,
+    };
+  }
+
   #unauthenticatedPrincipal(role: Role, headers: HeaderBag): Principal {
     const rawNs = getHeader(headers, NAMESPACE_HEADER)?.trim();
     const namespace =
@@ -586,58 +924,54 @@ export class AuthPolicy {
     };
   }
 
-  #verifyRoleHeaders(headers: HeaderBag, expected: Role): Principal {
+  /**
+   * Resolves the bearer principal (static or `asv1.` signed token) and lets `deny`
+   * reject it with a 403 reason. Anonymous mode returns the `anonymousRole`
+   * principal honouring `x-anyserve-namespace` (400/3 if malformed); a missing or
+   * unknown token is 401/16.
+   */
+  async #authorize(
+    headers: HeaderBag,
+    anonymousRole: Role,
+    deny: (principal: Principal) => string | null,
+  ): Promise<Principal> {
     if (!this.isEnabled()) {
-      return this.#unauthenticatedPrincipal(expected, headers);
+      return this.#unauthenticatedPrincipal(anonymousRole, headers);
     }
     const token = extractBearerToken(headers);
-    const principal = token !== null ? this.principalForToken(token) : null;
+    const principal = token === null ? null : await this.principalForTokenAsync(token);
     if (principal === null) {
       throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
     }
-    if (principal.role !== expected) {
-      throw GrpcStatusError.permissionDenied(
-        expected === Role.Client
-          ? "worker token cannot be used for client requests"
-          : "client token cannot be used for worker requests",
-      );
+    const reason = deny(principal);
+    if (reason !== null) {
+      throw GrpcStatusError.permissionDenied(reason);
     }
     return principal;
   }
 
-  verifyClientHeaders(headers: HeaderBag): Principal {
-    return this.#verifyRoleHeaders(headers, Role.Client);
+  verifyClientHeaders(headers: HeaderBag): Promise<Principal> {
+    return this.#authorize(headers, Role.Client, (p) =>
+      p.role === Role.Client ? null : "worker token cannot be used for client requests",
+    );
   }
 
-  verifyWorkerHeaders(headers: HeaderBag): Principal {
-    return this.#verifyRoleHeaders(headers, Role.Worker);
+  verifyWorkerHeaders(headers: HeaderBag): Promise<Principal> {
+    return this.#authorize(headers, Role.Worker, (p) =>
+      p.role === Role.Worker ? null : "client token cannot be used for worker requests",
+    );
   }
 
   /**
-   * Verifies management/operator HTTP access (`/api/*`):
-   * - In anonymous mode (no tokens configured), returns an operator `Principal`
-   *   honouring `x-anyserve-namespace` (throwing 400/3 if malformed).
-   * - When auth is enabled, requires an operator-level client token (`client_tokens`);
-   *   missing/unknown tokens throw 401/16, while worker and tenant-scoped tokens
-   *   (even in `"default"`) throw 403/7.
+   * Verifies management/operator HTTP access (`/api/*`): when auth is enabled it
+   * requires an operator-level client token (`client_tokens`); worker and
+   * tenant-scoped tokens (even in `"default"`) throw 403/7.
    */
-  authorizeOperatorHeaders(headers: HeaderBag): Principal {
-    if (!this.isEnabled()) {
-      return this.#unauthenticatedPrincipal(Role.Client, headers);
-    }
-    const token = extractBearerToken(headers);
-    if (token === null) {
-      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
-    }
-    const principal = this.principalForToken(token);
-    if (principal === null) {
-      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
-    }
-    if (principal.role === Role.Client && principal.isOperator) {
-      return principal;
-    }
-    throw GrpcStatusError.permissionDenied(
-      "management API requires an operator client token",
+  authorizeOperatorHeaders(headers: HeaderBag): Promise<Principal> {
+    return this.#authorize(headers, Role.Client, (p) =>
+      p.role === Role.Client && p.isOperator
+        ? null
+        : "management API requires an operator client token",
     );
   }
 
@@ -646,23 +980,9 @@ export class AuthPolicy {
    * tenant-scoped client tokens, returning `Principal` so handlers enforce
    * namespace isolation.
    */
-  authorizeConsoleHeaders(headers: HeaderBag): Principal {
-    if (!this.isEnabled()) {
-      return this.#unauthenticatedPrincipal(Role.Client, headers);
-    }
-    const token = extractBearerToken(headers);
-    if (token === null) {
-      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
-    }
-    const principal = this.principalForToken(token);
-    if (principal === null) {
-      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
-    }
-    if (principal.role === Role.Client) {
-      return principal;
-    }
-    throw GrpcStatusError.permissionDenied(
-      "worker token cannot access console API",
+  authorizeConsoleHeaders(headers: HeaderBag): Promise<Principal> {
+    return this.#authorize(headers, Role.Client, (p) =>
+      p.role === Role.Client ? null : "worker token cannot access console API",
     );
   }
 

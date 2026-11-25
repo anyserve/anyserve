@@ -14,21 +14,32 @@ function parseDurationMs(raw: string | undefined, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : fallback;
 }
 
-function buildContainerEnvVars(env: Env): Record<string, string> {
+const CONTAINER_PASSTHROUGH_ENV_KEYS = [
+  "ANYSERVE_PUBLIC_ENDPOINT",
+  "ANYSERVE_SCOPED_TOKENS",
+  "ANYSERVE_TOKEN_SIGNING_KEY",
+  "ANYSERVE_AUTH_REVOCATION_URL",
+  "ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS",
+  "ANYSERVE_CONSOLE_AUTH_PORTAL_URL",
+  "ANYSERVE_MEMORY_LIMIT_MB",
+  "RUST_LOG",
+] as const;
+
+export function buildContainerEnvVars(env: Env): Record<string, string> {
   const vars: Record<string, string> = {
     ANYSERVE_CLIENT_TOKENS: env.ANYSERVE_CLIENT_TOKENS ?? "",
     ANYSERVE_WORKER_TOKENS: env.ANYSERVE_WORKER_TOKENS ?? "",
   };
-  if (env.ANYSERVE_PUBLIC_ENDPOINT) {
-    vars.ANYSERVE_PUBLIC_ENDPOINT = env.ANYSERVE_PUBLIC_ENDPOINT;
+  for (const key of CONTAINER_PASSTHROUGH_ENV_KEYS) {
+    const val = env[key];
+    if (val) {
+      vars[key] = val;
+    }
   }
   const journalToken =
     env.JOURNAL_INTERNAL_SECRET ?? env.ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN;
   if (journalToken) {
     vars.ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN = journalToken;
-  }
-  if (env.RUST_LOG) {
-    vars.RUST_LOG = env.RUST_LOG;
   }
   return vars;
 }

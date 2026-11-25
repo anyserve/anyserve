@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
-import { GrpcCode } from "../src/native/auth";
+import { GrpcCode, signToken } from "../src/native/auth";
 import { CONN_SEQ_BLOCK, NativeEngine, RUNTIME_CODES, rendezvousHash64 } from "../src/native/engine";
 import { utf8ByteLen } from "../src/native/utf8";
 import { parseSpecJson, serializeSpecJson } from "../src/native/store";
@@ -4677,5 +4677,407 @@ describe("interface name 1..=64 byte bound on Hello, Submit, Invoke, and Console
       new Request(`https://anyserve.example.com/api/jobs?interface=${encodeURIComponent(over65)}`),
     );
     expect(badConsoleRes.status).toBe(400);
+  });
+});
+
+describe("Phase 3 & 4 parity: /api/info, worker drain, tenant redaction, /rpc/v2/client/execute, eviction, and Wave 1 validation", () => {
+  it("serves unauthenticated /api/info, redacts tenant /api/overview, and enforces tenant-scoped worker drain", async () => {
+    const platform = new SimulatedNativePlatform({
+      env: {
+        ANYSERVE_CLIENT_TOKENS: "op-secret",
+        ANYSERVE_SCOPED_TOKENS: JSON.stringify([
+          { token: "c-alpha", role: "client", namespace: "alpha", subject: "user:a" },
+          { token: "w-alpha", role: "worker", namespace: "alpha", subject: "bot:a" },
+          { token: "w-beta", role: "worker", namespace: "beta", subject: "bot:b" },
+        ]),
+        ANYSERVE_CONSOLE_AUTH_PORTAL_URL: "https://relay.example.com/tokens",
+        ANYSERVE_PUBLIC_ENDPOINT: "https://relay.example.com",
+      },
+      overrides: {
+        interfaces: {
+          "echo.v1": {
+            maxQueue: 50,
+            queueTimeoutMs: 10_000,
+            maxInFlightPerKey: 2,
+            poolTiers: [],
+          },
+        },
+      },
+    });
+
+    // 1. Unauthenticated GET /api/info returns sanitized portal URL + grpc_enabled: false
+    const infoRes = await platform.engine.fetch(
+      new Request("https://relay.example.com/api/info"),
+    );
+    expect(infoRes.status).toBe(200);
+    expect(await infoRes.json()).toEqual({
+      auth_enabled: true,
+      auth_portal_url: "https://relay.example.com/tokens",
+      public_endpoint: "https://relay.example.com",
+      grpc_enabled: false,
+    });
+
+    // Unsafe javascript: auth_portal_url is redacted to null
+    const xssPlatform = new SimulatedNativePlatform({
+      env: {
+        ANYSERVE_CONSOLE_AUTH_PORTAL_URL: "javascript:alert(1)",
+      },
+    });
+    const xssInfo = (await (
+      await xssPlatform.engine.fetch(new Request("https://relay.example.com/api/info"))
+    ).json()) as Record<string, unknown>;
+    expect(xssInfo.auth_portal_url).toBeNull();
+
+    // Connect workers in alpha and beta
+    const { ws: waWs, welcome: waWelcome } = await connectWorkerSession(platform, {
+      workerId: "wa-1",
+      interfaces: ["echo.v1"],
+      maxConcurrency: 2,
+      headers: { Authorization: "Bearer w-alpha" },
+    });
+    const { ws: wbWs, welcome: wbWelcome } = await connectWorkerSession(platform, {
+      workerId: "wb-1",
+      interfaces: ["echo.v1"],
+      maxConcurrency: 2,
+      headers: { Authorization: "Bearer w-beta" },
+    });
+
+    // 2. Tenant /api/overview redacts internal listeners, max_sessions, boot_id, constructor_runs, policy, and journal message
+    const tenantOvRes = await platform.engine.fetch(
+      new Request("https://relay.example.com/api/overview", {
+        headers: { Authorization: "Bearer c-alpha" },
+      }),
+    );
+    expect(tenantOvRes.status).toBe(200);
+    const tenantOv = (await tenantOvRes.json()) as Record<string, any>;
+    expect(tenantOv.control_plane.grpc_enabled).toBe(false);
+    expect(tenantOv.control_plane.grpc_listen).toBe("");
+    expect(tenantOv.control_plane.console_listen).toBe("");
+    expect(tenantOv.control_plane.max_sessions).toBe(0);
+    expect(tenantOv.control_plane.boot_id).toBe("");
+    expect(tenantOv.control_plane.constructor_runs).toBe(0);
+    expect(tenantOv.control_plane.auth_portal_url).toBe("https://relay.example.com/tokens");
+    expect(tenantOv.health.journal.message).toBeNull();
+    expect(tenantOv.interfaces).toHaveLength(1);
+    expect(tenantOv.interfaces[0].policy).toBeNull();
+
+    // Operator /api/overview keeps internal fields & policy
+    const opOv = (await (
+      await platform.engine.fetch(
+        new Request("https://relay.example.com/api/overview", {
+          headers: { Authorization: "Bearer op-secret" },
+        }),
+      )
+    ).json()) as Record<string, any>;
+    expect(opOv.control_plane.grpc_enabled).toBe(false);
+    expect(opOv.control_plane.grpc_listen).toBe("disabled");
+    expect(opOv.control_plane.console_listen).toBe("cloudflare-native-do");
+    expect(opOv.control_plane.max_sessions).toBeGreaterThan(0);
+    expect(opOv.control_plane.boot_id).not.toBe("");
+    expect(opOv.control_plane.constructor_runs).toBe(1);
+    expect(opOv.interfaces[0].policy).toMatchObject({ max_queue: 50 });
+
+    // 3. Cross-tenant drain returns 404; own-namespace drain returns 200 and sends ServerMessage::Drain over WS
+    const crossDrain = await platform.engine.fetch(
+      new Request(`https://relay.example.com/api/workers/${wbWelcome.sessionId}/drain`, {
+        method: "POST",
+        headers: { Authorization: "Bearer c-alpha" },
+      }),
+    );
+    expect(crossDrain.status).toBe(404);
+    expect(wbWs.popDecodedFrames()).toHaveLength(0);
+
+    const missingDrain = await platform.engine.fetch(
+      new Request("https://relay.example.com/api/workers/nonexistent/drain", {
+        method: "POST",
+        headers: { Authorization: "Bearer op-secret" },
+      }),
+    );
+    expect(missingDrain.status).toBe(404);
+
+    const ownDrain = await platform.engine.fetch(
+      new Request(`https://relay.example.com/api/workers/${waWelcome.sessionId}/drain`, {
+        method: "POST",
+        headers: { Authorization: "Bearer c-alpha" },
+      }),
+    );
+    expect(ownDrain.status).toBe(200);
+    expect(await ownDrain.json()).toEqual({
+      session_id: waWelcome.sessionId,
+      draining: true,
+    });
+    const waFrames = waWs.popDecodedFrames();
+    expect(waFrames).toHaveLength(1);
+    expect(waFrames[0]!.kind).toBe("data");
+    if (waFrames[0]!.kind === "data") {
+      expect(pb.decodeServerMessage(waFrames[0]!.payload).msg?.case).toBe("drain");
+    }
+
+    // Operator can drain beta's session too
+    const opDrain = await platform.engine.fetch(
+      new Request(`https://relay.example.com/api/workers/${wbWelcome.sessionId}/drain`, {
+        method: "POST",
+        headers: { Authorization: "Bearer op-secret" },
+      }),
+    );
+    expect(opDrain.status).toBe(200);
+    const wbFrames = wbWs.popDecodedFrames();
+    expect(wbFrames).toHaveLength(1);
+    if (wbFrames[0]!.kind === "data") {
+      expect(pb.decodeServerMessage(wbFrames[0]!.payload).msg?.case).toBe("drain");
+    }
+  });
+
+  it("executes ephemeral jobs via unary POST /rpc/v2/client/execute and rejects streaming_input", async () => {
+    const platform = new SimulatedNativePlatform();
+    const { ws: workerWs } = await connectWorkerSession(platform, {
+      workerId: "w-exec-1",
+      interfaces: ["fast.echo"],
+      maxConcurrency: 2,
+    });
+
+    // streaming_input=true is rejected with InvalidArgument (3)
+    const badStream = await platform.unaryPost(
+      "/rpc/v2/client/execute",
+      pb.encodeInvokeStart({
+        streamingInput: true,
+        spec: { demand: { interface: "fast.echo" }, inputs: [], params: new Uint8Array(0), metadata: {} },
+      }),
+    );
+    expect(badStream.status).toBe(400);
+    expect(badStream.grpcCode).toBe(GrpcCode.InvalidArgument);
+
+    // Start unary execute concurrently while worker completes the attempt
+    const execPromise = platform.unaryPost(
+      "/rpc/v2/client/execute",
+      pb.encodeInvokeStart({
+        streamingInput: false,
+        spec: {
+          demand: { interface: "fast.echo" },
+          inputs: [{ body: { case: "inline", value: utf8Encoder.encode("ping") }, metadata: {} }],
+          params: new Uint8Array(0),
+          metadata: {},
+        },
+      }),
+    );
+
+    // Wait a microtask for dispatch -> Assign on workerWs
+    await new Promise((r) => setTimeout(r, 1));
+    const assigns = extractAssigns(workerWs);
+    expect(assigns).toHaveLength(1);
+    const assign = assigns[0]!;
+
+    const attWs = (await platform.openWs("/ws/v2/worker/attempt")).client!;
+    await attWs.sendBinary(
+      pb.encodeAttemptUp({
+        msg: { case: "open", value: { leaseId: assign.leaseId, generation: assign.generation } },
+      }),
+    );
+    await attWs.sendBinary(
+      pb.encodeAttemptUp({
+        msg: {
+          case: "result",
+          value: { index: 0, data: utf8Encoder.encode("pong"), last: true, metadata: { k: "v" } },
+        },
+      }),
+    );
+    await attWs.sendBinary(
+      pb.encodeAttemptUp({
+        msg: { case: "finish", value: { outcome: { case: "succeeded", value: {} } } },
+      }),
+    );
+
+    const execRes = await execPromise;
+    expect(execRes.status).toBe(200);
+    const finishedEv = pb.decodeExecutionEvent(execRes.bytes);
+    expect(finishedEv.jobId).toBe(assign.jobId);
+    expect(finishedEv.event?.case).toBe("finished");
+    if (finishedEv.event?.case === "finished") {
+      expect(finishedEv.event.value.state).toBe(pb.JobState.SUCCEEDED);
+      expect(finishedEv.event.value.outputs).toHaveLength(1);
+      expect(finishedEv.event.value.outputs[0]!.body).toEqual({
+        case: "inline",
+        value: utf8Encoder.encode("pong"),
+      });
+      expect(finishedEv.event.value.outputs[0]!.metadata).toEqual({ k: "v" });
+    }
+  });
+
+  it("persists revocations across hibernation and actively disconnects + fences revoked and expired worker sessions", async () => {
+    const signingKey = "test-eviction-signing-key-0123456789abcdef";
+    const keyBytes = utf8Encoder.encode(signingKey);
+    const startMs = 1_700_000_000_000;
+    const nowSecs = Math.floor(startMs / 1000);
+
+    const platform = new SimulatedNativePlatform({
+      startMs,
+      env: {
+        ANYSERVE_CLIENT_TOKENS: "op-tok",
+        ANYSERVE_TOKEN_SIGNING_KEY: signingKey,
+      },
+      overrides: {
+        heartbeatTimeoutMs: 60_000,
+      },
+    });
+
+    const tokRevoke = await signToken(keyBytes, {
+      jti: "jti-worker-revoke",
+      ns: "tenant-e",
+      role: "worker",
+      sub: "bot:rev",
+      iat: nowSecs,
+      exp: nowSecs + 600,
+    });
+    const tokExpire = await signToken(keyBytes, {
+      jti: "jti-worker-expire",
+      ns: "tenant-e",
+      role: "worker",
+      sub: "bot:exp",
+      iat: nowSecs,
+      exp: nowSecs + 10,
+    });
+    const tokClient = await signToken(keyBytes, {
+      jti: "jti-client-e",
+      ns: "tenant-e",
+      role: "client",
+      sub: "user:e",
+      iat: nowSecs,
+      exp: nowSecs + 600,
+    });
+
+    // Connect worker A (to be revoked) and assign a job so it holds an active lease + attempt WS
+    const { ws: wRevWs } = await connectWorkerSession(platform, {
+      workerId: "w-rev",
+      interfaces: ["evict.v1"],
+      maxConcurrency: 1,
+      headers: { Authorization: `Bearer ${tokRevoke}` },
+    });
+    const sub = await platform.unaryPost(
+      "/rpc/v2/client/submit",
+      pb.encodeSubmitRequest({
+        jobId: "job-evict-1",
+        spec: {
+          demand: { interface: "evict.v1" },
+          inputs: [],
+          params: new Uint8Array(0),
+          metadata: {},
+        },
+        conflictPolicy: pb.ConflictPolicy.FAIL,
+      }),
+      { Authorization: `Bearer ${tokClient}` },
+    );
+    expect(sub.status).toBe(200);
+    const assign = extractAssigns(wRevWs)[0]!;
+    const attWs = (await platform.openWs("/ws/v2/worker/attempt", {
+      Authorization: `Bearer ${tokRevoke}`,
+    })).client!;
+    await attWs.sendBinary(
+      pb.encodeAttemptUp({
+        msg: { case: "open", value: { leaseId: assign.leaseId, generation: assign.generation } },
+      }),
+    );
+    attWs.popDecodedFrames();
+
+    // Apply revocation -> worker session + attempt socket are immediately fenced & closed!
+    platform.engine.auth.applyRevocations({ version: 1, revoked_jtis: ["jti-worker-revoke"] });
+    expect(wRevWs.readyState).toBe(WS_READY_STATE_CLOSED);
+    const revFrames = wRevWs.popDecodedFrames();
+    expect(revFrames.some((f) => f.kind === "data" && pb.decodeServerMessage(f.payload).msg?.case === "fence")).toBe(true);
+    expect(revFrames.some((f) => f.kind === "error" && f.code === GrpcCode.Unauthenticated)).toBe(true);
+    expect(attWs.readyState).toBe(WS_READY_STATE_CLOSED);
+    const attFrames = attWs.popDecodedFrames();
+    expect(attFrames.some((f) => f.kind === "data" && pb.decodeAttemptDown(f.payload).msg?.case === "finished")).toBe(true);
+
+    // Hibernation retains the persisted revocation snapshot immediately before any poll!
+    platform.simulateHibernation();
+    const reAuth = await platform.openWs("/ws/v2/worker/session", {
+      Authorization: `Bearer ${tokRevoke}`,
+    });
+    expect(reAuth.status).toBe(401);
+
+    // Connect worker B (expiring in 10s), hibernate to verify token_exp survives SQLite wake, then advance past exp
+    const { ws: wExpWs } = await connectWorkerSession(platform, {
+      workerId: "w-exp",
+      interfaces: ["evict.v1"],
+      maxConcurrency: 1,
+      headers: { Authorization: `Bearer ${tokExpire}` },
+    });
+    wExpWs.popDecodedFrames();
+    platform.simulateHibernation();
+    await platform.advanceAndFireAlarms(11_000);
+    expect(wExpWs.readyState).toBe(WS_READY_STATE_CLOSED);
+    const expFrames = wExpWs.popDecodedFrames();
+    expect(expFrames.some((f) => f.kind === "error" && f.code === GrpcCode.Unauthenticated)).toBe(true);
+  });
+
+  it("enforces Wave 1 protocol parity: invoke/watch handshake timeouts, Hello bounds, routing key bounds, and utilization clamping", async () => {
+    const platform = new SimulatedNativePlatform({
+      overrides: { heartbeatTimeoutMs: 5_000 },
+    });
+
+    // 1. Invoke and Watch sockets expire at heartbeatTimeoutMs if Start / WatchRequest never arrives
+    const invWs = (await platform.openWs("/ws/v2/client/invoke")).client!;
+    const watchWs = (await platform.openWs("/ws/v2/client/watch")).client!;
+    await platform.advanceAndFireAlarms(5_000);
+    expect(invWs.readyState).toBe(WS_READY_STATE_CLOSED);
+    expect(watchWs.readyState).toBe(WS_READY_STATE_CLOSED);
+    expect(invWs.popDecodedFrames()[0]).toMatchObject({
+      kind: "error",
+      code: GrpcCode.DeadlineExceeded,
+      message: "no Start received",
+    });
+    expect(watchWs.popDecodedFrames()[0]).toMatchObject({
+      kind: "error",
+      code: GrpcCode.DeadlineExceeded,
+      message: "no WatchRequest received",
+    });
+
+    // 2. Hello maxConcurrency > 65_536 and invalid totalCapacity rejected
+    for (const badHello of [
+      { workerId: "w-hi", interfaces: ["p.v1"], maxConcurrency: 65_537 },
+      { workerId: "w-neg", interfaces: ["p.v1"], maxConcurrency: 1, totalCapacity: { gpu: -1n } },
+      { workerId: "w-key", interfaces: ["p.v1"], maxConcurrency: 1, totalCapacity: { ["k".repeat(257)]: 1n } },
+    ]) {
+      const ws = (await platform.openWs("/ws/v2/worker/session")).client!;
+      await ws.sendBinary(pb.encodeWorkerMessage({ msg: { case: "hello", value: badHello } }));
+      expect(ws.popDecodedFrames()[0]).toMatchObject({
+        kind: "error",
+        code: GrpcCode.InvalidArgument,
+      });
+      expect(ws.readyState).toBe(WS_READY_STATE_CLOSED);
+    }
+
+    // 3. normalizeJobSpec rejects affinityKey / fairnessKey / concurrencyKey > 256 bytes
+    const over256 = "k".repeat(257);
+    for (const badSpec of [
+      { demand: { interface: "p.v1", affinityKey: over256 }, inputs: [], params: new Uint8Array(0), metadata: {} },
+      { demand: { interface: "p.v1" }, policy: { fairnessKey: over256 }, inputs: [], params: new Uint8Array(0), metadata: {} },
+      { demand: { interface: "p.v1" }, policy: { concurrencyKey: over256 }, inputs: [], params: new Uint8Array(0), metadata: {} },
+    ]) {
+      const res = await platform.unaryPost(
+        "/rpc/v2/client/submit",
+        pb.encodeSubmitRequest({ jobId: "", spec: badSpec, conflictPolicy: pb.ConflictPolicy.FAIL }),
+      );
+      expect(res.grpcCode).toBe(GrpcCode.InvalidArgument);
+    }
+
+    // 4. Heartbeat utilization is clamped to [0.0, 1.0]
+    const { ws: clampWs, welcome } = await connectWorkerSession(platform, {
+      workerId: "w-clamp",
+      interfaces: ["p.v1"],
+      maxConcurrency: 2,
+    });
+    await clampWs.sendBinary(
+      pb.encodeWorkerMessage({
+        msg: { case: "heartbeat", value: { load: { queued: 0, running: 1, utilization: 2.5, custom: {} } } },
+      }),
+    );
+    expect(platform.engine.sessions.get(welcome.sessionId)?.utilization).toBe(1);
+    await clampWs.sendBinary(
+      pb.encodeWorkerMessage({
+        msg: { case: "heartbeat", value: { load: { queued: 0, running: 0, utilization: -0.4, custom: {} } } },
+      }),
+    );
+    expect(platform.engine.sessions.get(welcome.sessionId)?.utilization).toBe(0);
   });
 });

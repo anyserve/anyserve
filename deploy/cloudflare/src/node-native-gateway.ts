@@ -215,7 +215,10 @@ export class NodeNativeSqliteStorage implements NativeDurableStorage {
     const upper = trimmed.toUpperCase();
     const isSelect = upper.startsWith("SELECT") || upper.startsWith("PRAGMA");
     const isReturning = /\bRETURNING\b/i.test(trimmed);
-    const isDdl = upper.startsWith("CREATE ") || upper.startsWith("DROP ");
+    const isDdl =
+      upper.startsWith("CREATE ") ||
+      upper.startsWith("DROP ") ||
+      upper.startsWith("ALTER ");
 
     if (isDdl) {
       this.db.exec(query);
@@ -1587,6 +1590,13 @@ export async function startNodeNativeGatewayServer(
     ANYSERVE_CLIENT_TOKENS: process.env.ANYSERVE_CLIENT_TOKENS,
     ANYSERVE_WORKER_TOKENS: process.env.ANYSERVE_WORKER_TOKENS,
     ANYSERVE_SCOPED_TOKENS: process.env.ANYSERVE_SCOPED_TOKENS,
+    ANYSERVE_TOKEN_SIGNING_KEY: process.env.ANYSERVE_TOKEN_SIGNING_KEY,
+    ANYSERVE_AUTH_REVOCATION_URL: process.env.ANYSERVE_AUTH_REVOCATION_URL,
+    ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS:
+      process.env.ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS,
+    ANYSERVE_CONSOLE_AUTH_PORTAL_URL:
+      process.env.ANYSERVE_CONSOLE_AUTH_PORTAL_URL,
+    ANYSERVE_MEMORY_LIMIT_MB: process.env.ANYSERVE_MEMORY_LIMIT_MB,
     ANYSERVE_PUBLIC_ENDPOINT: process.env.ANYSERVE_PUBLIC_ENDPOINT,
     ANYSERVE_CONSOLE_POLL_MS: process.env.ANYSERVE_CONSOLE_POLL_MS,
     ANYSERVE_ALLOWED_ORIGINS: process.env.ANYSERVE_ALLOWED_ORIGINS,

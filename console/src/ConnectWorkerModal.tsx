@@ -20,17 +20,31 @@ const TABS: Array<{ id: OnboardingTab; label: string }> = [
   { id: "linux", label: "Linux Install" },
 ];
 
+function resolveWildcardHost(listen: string, host: string): string {
+  if (listen.startsWith("0.0.0.0:")) return `${host}:${listen.slice("0.0.0.0:".length)}`;
+  if (listen.startsWith("[::]:")) return `${host}:${listen.slice("[::]:".length)}`;
+  return listen;
+}
+
+function toWebSocketUrl(url: string): string {
+  if (/^https:\/\//i.test(url)) return `wss://${url.slice(8)}`;
+  if (/^http:\/\//i.test(url)) return `ws://${url.slice(7)}`;
+  return url;
+}
+
 export function deriveEndpoint(controlPlane?: ControlPlaneSummary): string {
   const explicit = controlPlane?.public_endpoint?.trim() || import.meta.env.VITE_PUBLIC_ENDPOINT?.trim();
-  if (explicit) return explicit;
-  const listen = controlPlane?.grpc_listen ?? "127.0.0.1:50052";
   const host = typeof window !== "undefined" && window.location.hostname ? window.location.hostname : "127.0.0.1";
-  const resolved = listen.startsWith("0.0.0.0:")
-    ? `${host}:${listen.slice("0.0.0.0:".length)}`
-    : listen.startsWith("[::]:")
-      ? `${host}:${listen.slice("[::]:".length)}`
-      : listen;
-  return `${controlPlane?.grpc_tls_enabled ? "https" : "http"}://${resolved}`;
+  if (controlPlane?.grpc_enabled === false) {
+    if (explicit) return toWebSocketUrl(explicit);
+    const origin = typeof window !== "undefined" ? window.location.origin : "";
+    if (origin && origin !== "null") return toWebSocketUrl(origin);
+    const listen = controlPlane.console_listen?.trim() || `${host}:3001`;
+    return `ws://${resolveWildcardHost(listen, host)}`;
+  }
+  if (explicit) return explicit;
+  const listen = controlPlane?.grpc_listen?.trim() || "127.0.0.1:50052";
+  return `${controlPlane?.grpc_tls_enabled ? "https" : "http"}://${resolveWildcardHost(listen, host)}`;
 }
 
 function CopyableBlock({ title, code }: { title: string; code: string }) {
@@ -60,9 +74,11 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
   if (!open) return null;
 
   const endpoint = deriveEndpoint(controlPlane);
-  const isWebSocket = endpoint.startsWith("wss://") || endpoint.startsWith("ws://");
+  const grpcDisabled = controlPlane?.grpc_enabled === false;
+  const isWebSocket = grpcDisabled || endpoint.startsWith("wss://") || endpoint.startsWith("ws://");
   const authEnabled = Boolean(controlPlane?.auth_enabled);
   const tokenLine = authEnabled ? 'export ANYSERVE_TOKEN="<worker-token>"\n' : "";
+  const clientTokenLine = authEnabled ? 'export ANYSERVE_TOKEN="<client-token>"\n' : "";
 
   return (
     <div
@@ -77,7 +93,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
           <div>
             <h2 id="connect-worker-title">Connect Worker</h2>
             <p className="modal__sub">
-              Workers open outbound {isWebSocket ? "WebSocket" : "gRPC"} streams to <code className="mono">{endpoint}</code> (no inbound port required).
+              Workers open outbound {isWebSocket ? "WebSocket" : "gRPC"} streams to <code className="mono">{endpoint}</code> (no inbound port required{grpcDisabled ? "; gRPC listener disabled" : ""}).
             </p>
           </div>
           <button type="button" className="icon-btn" aria-label="Close modal" onClick={onClose}>
@@ -87,6 +103,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
 
         <div className="modal__meta">
           <span className="tag mono">Endpoint: {endpoint}</span>
+          {grpcDisabled ? <span className="tag">HTTP/WS transport (gRPC disabled)</span> : null}
           <span className={`tag ${authEnabled ? "tag--warn" : ""}`}>
             {authEnabled ? "Worker token required (ANYSERVE_TOKEN)" : "Auth disabled (local mode)"}
           </span>
@@ -111,7 +128,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
           {tab === "python" ? (
             <>
               <CopyableBlock
-                title="1. Install Python SDK (Python 3.12+)"
+                title="1. Install Python SDK (Python 3.10+)"
                 code={`python3 -m venv .venv && . .venv/bin/activate\npip install anyserve-runtime`}
               />
               <CopyableBlock
@@ -168,7 +185,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
               />
               <CopyableBlock
                 title="2. Provision Python runtime & verify control plane"
-                code={`python3 -m venv ~/.anyserve-venv && ~/.anyserve-venv/bin/pip install anyserve-runtime\n${tokenLine}ANYSERVE_ENDPOINT="${endpoint}" anyserve job ls`}
+                code={`python3 -m venv ~/.anyserve-venv && ~/.anyserve-venv/bin/pip install anyserve-runtime\n${clientTokenLine}ANYSERVE_ENDPOINT="${endpoint}" anyserve job ls`}
               />
             </>
           ) : null}

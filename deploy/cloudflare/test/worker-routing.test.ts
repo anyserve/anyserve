@@ -648,4 +648,26 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
 
     db.close();
   });
+
+  it("buildContainerEnvVars forwards portal URL, memory limit, signing key, and revocation settings", async () => {
+    const { buildContainerEnvVars } = await import("../src/journal-do");
+    const vars = buildContainerEnvVars({
+      ANYSERVE_CLIENT_TOKENS: "c1",
+      ANYSERVE_WORKER_TOKENS: "w1",
+      ANYSERVE_TOKEN_SIGNING_KEY: "sign-key",
+      ANYSERVE_AUTH_REVOCATION_URL: "https://rev.internal/list",
+      ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS: "1500",
+      ANYSERVE_CONSOLE_AUTH_PORTAL_URL: "https://relay.example.com/tokens",
+      ANYSERVE_MEMORY_LIMIT_MB: "192",
+    } as Parameters<typeof buildContainerEnvVars>[0]);
+    expect(vars).toMatchObject({
+      ANYSERVE_CLIENT_TOKENS: "c1",
+      ANYSERVE_WORKER_TOKENS: "w1",
+      ANYSERVE_TOKEN_SIGNING_KEY: "sign-key",
+      ANYSERVE_AUTH_REVOCATION_URL: "https://rev.internal/list",
+      ANYSERVE_AUTH_REVOCATION_POLL_INTERVAL_MS: "1500",
+      ANYSERVE_CONSOLE_AUTH_PORTAL_URL: "https://relay.example.com/tokens",
+      ANYSERVE_MEMORY_LIMIT_MB: "192",
+    });
+  });
 });
