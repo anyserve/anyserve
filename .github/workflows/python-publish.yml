@@ -102,6 +102,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+
       - name: Package release archive
         shell: bash
         run: |

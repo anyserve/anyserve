@@ -12,6 +12,12 @@ data:
 
     [console]
     listen = "0.0.0.0:{{ .Values.service.httpPort }}"
+    {{- with .Values.console.publicEndpoint }}
+    public_endpoint = {{ . | quote }}
+    {{- end }}
+    {{- with .Values.console.authPortalUrl }}
+    auth_portal_url = {{ . | quote }}
+    {{- end }}
 
     [journal]
     enabled = {{ .Values.journal.enabled }}
@@ -24,17 +30,46 @@ data:
     max_connections = {{ .Values.journal.postgres.maxConnections }}
     {{- else }}
     path = "/data/journal.sqlite"
+    {{- if .Values.journal.maxBytes }}
+    max_bytes = {{ .Values.journal.maxBytes | int64 }}
     {{- end }}
-    {{- if include "anyserve.authEnabled" . }}
+    {{- end }}
+    {{- if and (not .Values.auth.existingSecret) (or .Values.auth.clientTokens .Values.auth.workerTokens) }}
 
     [auth]
+    {{- if .Values.auth.clientTokens }}
     client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
+    {{- end }}
+    {{- if .Values.auth.workerTokens }}
     worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
     {{- end }}
-    {{- with .Values.runtime }}
+    {{- end }}
+    {{- $runtimeScalars := dict }}
+    {{- $tenantQuotas := dict }}
+    {{- range $key, $value := (.Values.runtime | default dict) }}
+      {{- if or (eq $key "tenantQuotas") (eq $key "tenant_quotas") }}
+        {{- if kindIs "map" $value }}
+          {{- range $qk, $qv := $value }}
+            {{- if not (kindIs "invalid" $qv) }}
+              {{- $_ := set $tenantQuotas $qk $qv }}
+            {{- end }}
+          {{- end }}
+        {{- end }}
+      {{- else if not (kindIs "map" $value) }}
+        {{- $_ := set $runtimeScalars $key $value }}
+      {{- end }}
+    {{- end }}
+    {{- if $runtimeScalars }}
 
     [runtime]
-    {{- range $key, $value := . }}
+    {{- range $key, $value := $runtimeScalars }}
+    {{ $key }} = {{ $value | toJson }}
+    {{- end }}
+    {{- end }}
+    {{- if $tenantQuotas }}
+
+    [runtime.tenant_quotas]
+    {{- range $key, $value := $tenantQuotas }}
     {{ $key }} = {{ $value | toJson }}
     {{- end }}
     {{- end }}

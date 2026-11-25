@@ -19,6 +19,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release -p anyserve --features embed-console && cp target/release/anyserve /usr/local/bin/anyserve
 
 FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin anyserve && \
+    mkdir -p /data && chown 10001:10001 /data
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /usr/local/bin/anyserve /usr/local/bin/anyserve
+USER anyserve
 ENTRYPOINT ["anyserve"]

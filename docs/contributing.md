@@ -1,7 +1,7 @@
 # Contributing
 
 Use the Rust version in [rust-toolchain.toml](../rust-toolchain.toml), `protoc`,
-Python 3.12+ and Node.js 24+. Run commands from the repository root.
+Python 3.10+ and Node.js 24+. Run commands from the repository root.
 
 ## Checks
 
@@ -16,9 +16,12 @@ python3 -m venv .venv
 pip install --force-reinstall ./clients/python
 python -m unittest discover -s clients/python/tests -p 'test_*.py' -v
 python clients/python/tests/sdk_e2e.py -v
+python clients/python/tests/native_do_e2e.py -v
 npm --prefix console ci
 npm --prefix console test
 npm --prefix console run build
+npm --prefix deploy/cloudflare ci
+npm --prefix deploy/cloudflare run typecheck
 npm --prefix deploy/cloudflare test
 python scripts/check-doc-links.py
 python scripts/check-release-version.py

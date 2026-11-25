@@ -1,12 +1,14 @@
 {$ANYSERVE_DOMAIN} {
+	encode zstd gzip
+
 	# Block Prometheus metrics and internal plugin endpoints from the public internet.
 	@blocked path /metrics /metrics/* /internal /internal/*
 	handle @blocked {
 		respond 403
 	}
 
-	# Optional GitHub Login token portal plugin (/tokens, /auth/*).
-	@auth_github path /tokens /auth/*
+	# Optional GitHub Login token portal plugin (/tokens, /tokens/*, /auth/*).
+	@auth_github path /tokens /tokens/* /auth/*
 	handle @auth_github {
 		reverse_proxy auth-github:3002
 	}

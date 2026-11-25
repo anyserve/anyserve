@@ -12,12 +12,12 @@ Clients ── gRPC / WSS ──▶ Control plane (leader or Cloudflare DO) ◀�
 
 - **Execution**: `Invoke` (ephemeral, optional full-duplex streaming; drop cancels) and `Submit` (durable by default, crash recovery, `job_id` idempotency, bounded at-least-once retries; exposed streamed output never silently switches attempts).
 - **Placement & backpressure**: Interface matching, `namespace` isolation, `pool` tiers with spillover, `affinity_key` sticky routing, priority + `fairness_key` queueing, `concurrency_key` serialization, required/preferred attributes, resource capacity, worker credits, and bounded memory budgets.
-- **Outbound SDKs**: Python 3.12+ and Rust SDKs over gRPC (`http(s)://`) or WebSocket (`ws(s)://`)—workers dial out and need no inbound port. Ready-made inference connectors (vLLM, Ollama, Triton, YOLO, VLA) live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
-- **Operations**: Client/worker/scoped-tenant bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job ls|inspect|cancel`), and a React Console with W3C Trace Waterfall and DuckDB-WASM Explore (embedded by default in the official Docker image; optional in local builds via `--features embed-console`).
+- **Outbound SDKs**: Python 3.10+ and Rust SDKs over gRPC (`http(s)://`) or WebSocket (`ws(s)://`)—workers dial out and need no inbound port. Ready-made inference connectors (vLLM, Ollama, Triton, YOLO, VLA) live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
+- **Operations**: Client/worker/scoped/signed bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job`, `token`, `invoke`, `doctor`), and a React Console with W3C Trace Waterfall and DuckDB-WASM Explore (embedded by default in the official Docker image; optional in local builds via `--features embed-console`).
 
 ## Quick start
 
-Requires Rust ([rust-toolchain.toml](rust-toolchain.toml)), `protoc`, and Python 3.12+. From the repository root:
+Requires Rust ([rust-toolchain.toml](rust-toolchain.toml)), `protoc`, and Python 3.10+. From the repository root:
 
 ```bash
 # Terminal 1 — control plane (gRPC :50052, HTTP API :3001, SQLite .anyserve/journal.sqlite)
@@ -57,7 +57,7 @@ python examples/python/submit.py
 - `crates/anyserve-core` — scheduler state machine, journal backends, auth, gRPC and HTTP/WS services
 - `crates/anyserve-proto` — native Client/Worker protobuf protocol
 - `crates/anyserve-client` — Rust clients and bounded worker transport
-- `crates/anyserve-cli` — `anyserve` binary (`serve`, `job` CLI, management API)
+- `crates/anyserve-cli` — `anyserve` binary (`serve`, `job`, `token`, `invoke`, `doctor` CLI, management API)
 - `clients/python` — Python SDK (`anyserve-runtime`)
 - `console` — React Console and DuckDB-WASM Explore
 - `deploy/vps`, `deploy/fly` — 1-minute Docker Compose + Caddy and Fly.io relay templates

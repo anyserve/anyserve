@@ -7,23 +7,35 @@ grpc_port = 50052
 [console]
 enabled = true
 listen = "0.0.0.0:3001"
+# Set ANYSERVE_CONSOLE_AUTH_PORTAL_URL (or uncomment below) when using GitHub Login:
+# auth_portal_url = "https://relay.example.com/tokens"
 
 [auth]
-client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
-worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+# Leave *_env unset here so ANYSERVE_CLIENT_TOKENS / ANYSERVE_WORKER_TOKENS /
+# ANYSERVE_TOKEN_SIGNING_KEY / ANYSERVE_SCOPED_TOKENS remain optional when using
+# GitHub Login alone.
 
 [journal]
 enabled = true
 backend = "sqlite"
 path = "/data/journal.sqlite"
 retention_secs = 86400
+# SQLite database byte cap (hard PRAGMA max_page_count + size-based terminal purge):
+max_bytes = 536870912
 
 [runtime]
 max_queue = 500
 max_pending_jobs = 2000
 max_terminal_jobs = 1000
-max_pending_bytes = 268435456
-max_result_bytes = 268435456
-max_event_bytes = 67108864
+# Pending/result/event byte budgets scale automatically from ANYSERVE_MEMORY_LIMIT_MB
+# (default 1024 in docker-compose.yml). Uncomment to pin explicit byte limits instead:
+# max_pending_bytes = 268435456
+# max_result_bytes = 268435456
+# max_event_bytes = 67108864
 max_inline_object_bytes = 8388608
 max_inline_total_bytes = 25165824
+
+[runtime.tenant_quotas]
+max_sessions_per_namespace = 32
+max_pending_jobs_per_namespace = 200
+max_interfaces_per_namespace = 32

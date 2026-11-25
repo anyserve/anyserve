@@ -1,6 +1,6 @@
 # Python SDK
 
-Python 3.12+ is required. Install `anyserve-runtime` from the same release as the
+Python 3.10+ is required. Install `anyserve-runtime` from the same release as the
 server, or `pip install ./clients/python` from this checkout.
 
 ## Client
@@ -177,9 +177,10 @@ containing `data`, `object_index`, `uri`, `metadata`, `parameter_chunk` and
 `object_end`. They arrive before input is complete; JSON decoding is then the
 handler's responsibility.
 
-Raise `WorkerError(message, retryable=True)` for a failure that can safely retry
-elsewhere. Its default is `retryable=False`; other exceptions also fail without
-retry. Runtime execution retries may run the backend again, so make external
+Raise `WorkerError(message, retryable=True, code="worker_failed")` for a failure
+that can safely retry elsewhere (defaults: `retryable=False`, `code="worker_failed"`).
+Unhandled exceptions also fail without retry using error code `"worker_failed"`.
+Runtime execution retries may run the backend again, so make external
 side effects idempotent. SDK result-delivery retries do not rerun the handler.
 Delivery retries use exponential backoff and jitter, bounded by four negotiated
 heartbeat timeouts per open/commit operation. Job deadlines remain enforced by

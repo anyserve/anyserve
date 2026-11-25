@@ -21,6 +21,8 @@ fly secrets set -c deploy/fly/fly.toml \
 fly deploy -c deploy/fly/fly.toml
 ```
 
+> **Non-root volume ownership:** The container runs as UID/GID `10001` (`anyserve`). If Fly mounts a newly created volume owned by `root`, fix `/data` ownership once (or via a one-off root console): `chown -R 10001:10001 /data`.
+
 ## Connect
 
 - **Native gRPC (recommended)**: `ANYSERVE_ENDPOINT="https://<app>.fly.dev:50052"`

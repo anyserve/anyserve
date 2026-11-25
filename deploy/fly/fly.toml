@@ -11,6 +11,12 @@ primary_region = "sin"
 [processes]
   app = "serve --grpc-host 0.0.0.0 --grpc-port 50052 --console-listen 0.0.0.0:3001 --journal /data/journal.sqlite"
 
+[env]
+  ANYSERVE_MEMORY_LIMIT_MB = "400"
+  ANYSERVE_JOURNAL_MAX_BYTES = "268435456"
+
+# Container runs as non-root UID/GID 10001 (`anyserve`). If a fresh Fly volume
+# is created root-owned, fix ownership once via `fly ssh console -C "chown -R 10001:10001 /data"`.
 [mounts]
   source = "anyserve_data"
   destination = "/data"

@@ -31,6 +31,7 @@ worker_tokens = []
 # client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
 # worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
 # Optional scoped tokens binding role + tenant namespace (+ worker forced_pool):
+# (or JSON array via ANYSERVE_SCOPED_TOKENS env var)
 # [[auth.scoped_tokens]]
 # token_env = "ANYSERVE_ROBOT_A_WORKER_TOKEN"
 # role = "worker"
@@ -46,6 +47,8 @@ worker_tokens = []
 enabled = true
 listen = "127.0.0.1:3001"
 allowed_origins = []
+# Optional auth portal URL shown on the Console login gate and Sidebar (or ANYSERVE_CONSOLE_AUTH_PORTAL_URL):
+# auth_portal_url = "https://relay.example.com/tokens"
 
 [journal]
 enabled = true
@@ -55,6 +58,9 @@ full_sync = true
 queue_capacity = 4096
 max_batch = 256
 retention_secs = 604800
+# Optional SQLite database byte cap (hard PRAGMA max_page_count ceiling + size-based
+# terminal purge; or --journal-max-bytes / ANYSERVE_JOURNAL_MAX_BYTES):
+# max_bytes = 536870912
 
 [runtime]
 heartbeat_interval_ms = 5000
@@ -74,6 +80,12 @@ terminal_retention_secs = 600
 max_terminal_jobs = 10000
 event_log_max_events = 8192
 event_log_max_bytes = 8388608
+
+# Optional per-tenant fairness/noisy-neighbor caps:
+# [runtime.tenant_quotas]
+# max_sessions_per_namespace = 32
+# max_pending_jobs_per_namespace = 200
+# max_interfaces_per_namespace = 32
 
 # Optional per-interface overrides; quote names containing dots.
 # [runtime.interfaces."demo.echo.v1"]
@@ -168,17 +180,17 @@ inactive panes and completed job details do not poll.
 Opening an older SQLite journal can build missing preview/history indexes;
 allow for startup time proportional to retained data.
 
-Compiled protocol limits are 16 MiB per inline object, 32 MiB per job's input or
-attempt result (including associated metadata), 32 KiB metadata, 1,024 objects,
-64-byte interface names (`1..=64` bytes with no ASCII whitespace or control
-characters), 256-byte job/worker/session/pool identifiers, 64 KiB chunks and a
-4 MiB unacknowledged attempt window. The gRPC message cap is 64 MiB including
+Default protocol limits are 16 MiB per inline object (`[runtime].max_inline_object_bytes`),
+32 MiB per job's input or attempt result including metadata (`[runtime].max_inline_total_bytes`),
+32 KiB metadata, 1,024 objects, 64-byte interface names (`1..=64` bytes with no ASCII
+whitespace or control characters), 256-byte job/worker/session/pool identifiers, 64 KiB
+chunks and a 4 MiB unacknowledged attempt window. The gRPC message cap is 64 MiB including
 protobuf overhead. URI objects are opaque references; applications fetch them.
 
 ## Console Explore
 
 Explore manually loads metadata into a local DuckDB-WASM database in a dedicated
-Worker. `jobs` contains summary columns; `job_metadata(job_id, key, value)`
+Worker. `jobs` contains summary columns (including `namespace`); `job_metadata(job_id, namespace, key, value)`
 supports tag filters and joins. Durations include queue time. Request/result
 bodies and media are excluded.
 
@@ -205,21 +217,25 @@ needs no cross-origin isolation headers. See
 
 ## CLI
 
-Global flags: `--endpoint URL` (`job` commands; default
+Global flags: `--endpoint URL` (CLI flag, else `ANYSERVE_ENDPOINT`, else default
 `http://127.0.0.1:50052`, accepts comma-separated URLs for sequential leader
-discovery), `--log-level LEVEL` (default `info`), `-v/--verbose` (`debug`),
-`-h/--help` and `-V/--version`. `RUST_LOG` takes precedence over the logging
-flags. `job` commands read `ANYSERVE_TOKEN` and `ANYSERVE_NAMESPACE`.
+discovery), `--log-level LEVEL` (default `info`), `--log-format text|json`
+(default `text`), `-v/--verbose` (`debug`), `-h/--help` and `-V/--version`.
+`RUST_LOG` takes precedence over the logging level flags.
 
 | Command | Flags / arguments |
 |---|---|
-| `serve` | `--config PATH`, `--grpc-host HOST`, `--grpc-port PORT`, `--no-grpc`, `--grpc-tls-enabled[=true\|false]`, `--grpc-cert-file PATH`, `--grpc-key-file PATH`, `--journal PATH`, `--ephemeral`, `--console-listen ADDR`, `--public-endpoint URL`, `--client-token TOKEN`, `--worker-token TOKEN`, `--auto-token` |
+| `serve` | `--config PATH`, `--grpc-host HOST`, `--grpc-port PORT`, `--no-grpc`, `--grpc-tls-enabled[=true\|false]`, `--grpc-cert-file PATH`, `--grpc-key-file PATH`, `--journal PATH`, `--journal-max-bytes BYTES`, `--memory-limit MB`, `--ephemeral`, `--console-listen ADDR`, `--public-endpoint URL`, `--client-token TOKEN`, `--worker-token TOKEN`, `--auto-token` |
 | `job ls` (alias `list`) | Repeatable `--state queued\|running\|succeeded\|failed\|cancelled`, `--limit N` (100), `--page-token TOKEN` |
 | `job inspect` | `JOB_ID` |
 | `job cancel` | One or more `JOB_ID` arguments, or `--stdin` for IDs from standard input |
+| `token mint` | `--namespace NS`, `--role client\|worker`, `--subject SUB`, `--ttl-secs SECS`, `--forced-pool POOL`, `--jti ID`, `--signing-key KEY`, `--json` |
+| `token inspect` | `TOKEN`, optional `--signing-key KEY` (`ANYSERVE_TOKEN_SIGNING_KEY`) |
+| `invoke` | `INTERFACE`, `--input TEXT\|-\|@PATH`, `--json`, `--token TOKEN`, `--namespace NS`, `--stream`, `--timeout-secs SECS` |
+| `doctor` | Optional `--token TOKEN`, `--json` (probes `/healthz`, `/readyz`, `/api/info`, and `/api/overview`) |
 
-All `job` commands accept `-o/--output text|json` (default `text`) and have no
-`--token` flag (use `ANYSERVE_TOKEN`). `--journal` and `--ephemeral` are
+All `job` commands accept `-o/--output text|json` (default `text`) and read
+`ANYSERVE_TOKEN` / `ANYSERVE_NAMESPACE`. `--journal` and `--ephemeral` are
 mutually exclusive. Use each command's `--help` for accepted values.
 
 ### Zero-TOML `serve` flags and environment fallbacks
@@ -228,10 +244,16 @@ mutually exclusive. Use each command's `--help` for accepted values.
 |---|---|---|
 | `--client-token TOKEN` | `ANYSERVE_CLIENT_TOKENS` | Repeatable; comma-separated values are split and trimmed. Combined with TOML tokens. Env fallback applies automatically whenever `[auth].client_tokens_env` is not set. |
 | `--worker-token TOKEN` | `ANYSERVE_WORKER_TOKENS` | Repeatable; comma-separated values are split and trimmed. Combined with TOML tokens. Env fallback applies automatically whenever `[auth].worker_tokens_env` is not set. |
+| — | `ANYSERVE_SCOPED_TOKENS` | Optional JSON array of `{ token, role, namespace, subject?, forced_pool? }` combined with `[[auth.scoped_tokens]]`. |
+| — | `ANYSERVE_TOKEN_SIGNING_KEY` | Comma-separated HMAC signing secret(s) (newest first for key rotation) verifying `asv1.` stateless tokens; overrides omitted `[auth].signing_keys_env`. |
+| — | `ANYSERVE_AUTH_REVOCATION_URL` | Optional internal revocation snapshot URL polled when signing keys are configured; falls back when `[auth].revocation_url` is unset. |
 | `--console-listen ADDR` | — | Enables the management HTTP, WebSocket (`/ws/v2/*`), and embedded Console listener (e.g. `127.0.0.1:3001` or `0.0.0.0:3001`) without a TOML file; overrides `[console].listen`. |
 | `--public-endpoint URL` | `ANYSERVE_PUBLIC_ENDPOINT` | Advertised endpoint for `/api/overview` and the Console "Connect worker" dialog. Precedence: `--public-endpoint` > `ANYSERVE_PUBLIC_ENDPOINT` > `[console].public_endpoint`. |
+| — | `ANYSERVE_CONSOLE_AUTH_PORTAL_URL` | Optional portal URL exposed via unauthenticated `/api/info` and Console links ("Sign in with GitHub" / "Manage Tokens"); overrides `[console].auth_portal_url`. |
+| `--memory-limit MB` | `ANYSERVE_MEMORY_LIMIT_MB` | Scales unspecified `max_pending_bytes` (25%), `max_result_bytes` (25%), and `max_event_bytes` (10%) from a total RAM budget while preserving explicit TOML limits. |
+| `--journal-max-bytes BYTES` | `ANYSERVE_JOURNAL_MAX_BYTES` | Sets the SQLite database byte cap (hard `PRAGMA max_page_count` ceiling + size-based terminal purge during maintenance/backpressure); overrides `[journal].max_bytes`. |
 | `--no-grpc` | — | Disables the gRPC listener without a TOML file. Requires management HTTP (`--console-listen` or `[console].enabled = true`). |
-| `--auto-token` | — | If no client, worker, or scoped tokens are configured from TOML, CLI, or env, generates random `as_c_*` (client) and `as_w_*` (worker) tokens and prints a ready-to-copy startup card. Persisted to `<journal_dir>/tokens.env` (`0600` on Unix) and reloaded on restart when durable SQLite is enabled; memory-only with `--ephemeral`. No-op if any tokens are already configured. |
+| `--auto-token` | — | If no static, scoped, or signing-key (`ANYSERVE_TOKEN_SIGNING_KEY`) auth is configured from TOML, CLI, or env, generates random `as_c_*` (client) and `as_w_*` (worker) tokens and prints a ready-to-copy startup card. Persisted to `<journal_dir>/tokens.env` (`0600` on Unix) and reloaded on restart when durable SQLite is enabled; memory-only with `--ephemeral`. No-op if any auth mechanism (including `ANYSERVE_TOKEN_SIGNING_KEY`) is already configured. |
 
 At startup, `anyserve serve` prints a concise summary card showing active
 listeners, embedded Console status, advertised public endpoint, and auth state
@@ -242,7 +264,9 @@ commands).
 ## Embedded Rust Runtime
 
 The [Rust API](../crates/anyserve-core/src/runtime/api.rs) also exposes priority
-levels, retry backoff, the attempt ceiling, protocol `Limits` and a journal size
-cap (`JournalConfig.max_bytes`). These are compiled defaults in the CLI and are
+levels, retry backoff, the attempt ceiling, and compiled protocol `Limits`
+(metadata, object count, identifier, chunk, and window caps; only
+`max_inline_object_bytes` and `max_inline_total_bytes` are accepted under
+`[runtime]`). Those remaining fields are compiled defaults in the CLI and are
 not accepted TOML keys. An embedded `RuntimeConfig::default()` has no journal;
-the CLI enables one by default.
+the CLI enables SQLite by default.

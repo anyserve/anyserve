@@ -1,4 +1,6 @@
 {$ANYSERVE_DOMAIN} {
+	encode zstd gzip
+
 	# Block Prometheus metrics from the public internet.
 	@metrics path /metrics /metrics/*
 	handle @metrics {

@@ -2,7 +2,7 @@ Control plane: {{ include "anyserve.fullname" . }}.{{ .Release.Namespace }}.svc
   gRPC (clients and workers)  http://{{ include "anyserve.fullname" . }}:{{ .Values.service.grpcPort }}
   management API and metrics  http://{{ include "anyserve.fullname" . }}:{{ .Values.service.httpPort }}
 {{- if include "anyserve.authEnabled" . }}
-Tokens: Secret {{ include "anyserve.secretName" . }} (ANYSERVE_CLIENT_TOKENS, ANYSERVE_WORKER_TOKENS, ANYSERVE_WORKER_TOKEN).
+Tokens: Secret {{ include "anyserve.secretName" . }} (static, scoped, or signing-key auth env vars; plus ANYSERVE_WORKER_TOKEN when workers are enabled).
 Clients set ANYSERVE_TOKEN to a client token; workers to a worker token.
 {{- else }}
 Authentication is off: set auth.clientTokens and auth.workerTokens before exposing the service.

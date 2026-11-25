@@ -35,8 +35,13 @@ mkdir -p "${STAGING_DIR}"
 
 pushd "${REPO_ROOT}" >/dev/null
 
+if [[ "${SKIP_CONSOLE_BUILD:-0}" != "1" ]]; then
+  rm -rf "${REPO_ROOT}/console/dist"
+  (cd "${REPO_ROOT}/console" && npm ci && npm run build)
+fi
+
 rustup target add "${TARGET_TRIPLE}"
-cargo build --locked --release -p anyserve --target "${TARGET_TRIPLE}"
+cargo build --locked --release -p anyserve --features embed-console --target "${TARGET_TRIPLE}"
 
 cp "target/${TARGET_TRIPLE}/release/${BINARY_NAME}" "${STAGING_DIR}/${BINARY_NAME}"
 cp LICENSE README.md "${STAGING_DIR}/"

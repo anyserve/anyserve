@@ -34,6 +34,7 @@ Create a GitHub OAuth App with callback URL `https://relay.example.com/auth/gith
 ```bash
 cat >> .env <<EOF
 ANYSERVE_CADDYFILE=./Caddyfile.auth-github
+ANYSERVE_CONSOLE_AUTH_PORTAL_URL=https://relay.example.com/tokens
 ANYSERVE_TOKEN_SIGNING_KEY=$(openssl rand -hex 32)
 ANYSERVE_AUTH_REVOCATION_URL=http://auth-github:3002/internal/revocations
 GITHUB_CLIENT_ID=<your-client-id>
@@ -44,6 +45,14 @@ docker compose --profile auth-github up -d --build
 ```
 
 Users visit `https://relay.example.com/tokens` to sign in with GitHub, mint/revoke `client` and `worker` tokens scoped strictly to their isolated `gh-<id>` namespace, and open the Console directly via **Open in Console**. Operator tokens in `ANYSERVE_CLIENT_TOKENS` retain full cluster access and `/metrics`.
+
+## Upgrading from older root-owned `/data` volumes
+
+The `anyserve` container runs as non-root `anyserve` (`10001:10001`). Fresh volumes inherit `/data` ownership automatically; when upgrading an existing root-owned `anyserve_data` volume (or bind mount), update ownership once before starting:
+
+```bash
+docker compose run --rm --user 0 --entrypoint chown anyserve -R 10001:10001 /data
+```
 
 ## Connect
 

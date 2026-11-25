@@ -4,27 +4,34 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
-# Bearer tokens for the two roles. With both lists empty the control plane
-# accepts any caller; do that only on a trusted network. Set existingSecret to
-# a Secret that carries ANYSERVE_CLIENT_TOKENS and ANYSERVE_WORKER_TOKENS
-# (comma-separated) and ANYSERVE_WORKER_TOKEN (the token the worker fleet
-# uses) instead of putting tokens in values.
+# Bearer tokens / auth secrets. With all lists and existingSecret empty, the
+# control plane accepts any caller (trusted networks only). Set existingSecret
+# to a Secret carrying any supported env vars (ANYSERVE_CLIENT_TOKENS,
+# ANYSERVE_WORKER_TOKENS, ANYSERVE_SCOPED_TOKENS, ANYSERVE_TOKEN_SIGNING_KEY,
+# ANYSERVE_AUTH_REVOCATION_URL, plus ANYSERVE_WORKER_TOKEN when worker.enabled).
 auth:
   clientTokens: []
   workerTokens: []
   existingSecret: ""
 
+# Optional [console] endpoints written into server.toml.
+console:
+  publicEndpoint: ""
+  authPortalUrl: ""
+
 # PostgreSQL supports 1 active leader plus standby replicas (/readyz gates routing). SQLite requires 1.
 replicaCount: 1
 
 # SQLite uses a PersistentVolumeClaim; PostgreSQL uses an external database.
-# Disabling the journal keeps
-# execution in memory: durable Submit is rejected and nothing survives restart.
+# Disabling the journal keeps execution in memory: durable Submit is rejected
+# and nothing survives restart.
 journal:
   enabled: true
   backend: sqlite
   size: 1Gi
   storageClass: ""
+  # Optional SQLite database byte cap (PRAGMA max_page_count + size-based purge).
+  maxBytes: null
   postgres:
     # Existing Secret containing the connection URL. No database is installed.
     existingSecret: ""
@@ -34,14 +41,29 @@ journal:
     pollIntervalMs: 100
     maxConnections: 8
 
-# Scalar [runtime] keys written into server.toml, for example
-# max_attempts: 5 or consumer_stall_timeout_ms: 10000.
-runtime: {}
+# [runtime] overrides written into server.toml (e.g. max_attempts: 5).
+# Nested `tenantQuotas` renders as `[runtime.tenant_quotas]` (supports
+# max_sessions_per_namespace, max_pending_jobs_per_namespace, max_interfaces_per_namespace).
+runtime:
+  tenantQuotas: {}
 
 service:
   type: ClusterIP
   grpcPort: 50052
   httpPort: 3001
+
+podSecurityContext:
+  fsGroup: 10001
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
 
 resources: {}
 nodeSelector: {}

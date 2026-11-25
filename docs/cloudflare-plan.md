@@ -193,7 +193,7 @@ flowchart LR
 ```
 
 #### [NEW] `deploy/cloudflare/Dockerfile` & `deploy/cloudflare/server.toml`
-* 参考仓库根目录 [`Dockerfile`](../Dockerfile)，使用公网稳定基础镜像 `FROM rust:1.85-bookworm AS build` 编译发布版 `anyserve`。
+* 参考仓库根目录 [`Dockerfile`](../Dockerfile)，使用公网稳定基础镜像 `FROM rust:1.99.1-bookworm AS build` 编译发布版 `anyserve`。
 * `deploy/cloudflare/server.toml` 核心配置（针对 `lite` 256 MiB 容器优化防 OOM）：
   ```toml
   [server]

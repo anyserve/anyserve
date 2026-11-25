@@ -6,11 +6,20 @@ services:
     restart: unless-stopped
     command: ["serve", "--config", "/etc/anyserve/server.toml"]
     environment:
-      - ANYSERVE_CLIENT_TOKENS
-      - ANYSERVE_WORKER_TOKENS
+      - ANYSERVE_CLIENT_TOKENS=${ANYSERVE_CLIENT_TOKENS:-}
+      - ANYSERVE_WORKER_TOKENS=${ANYSERVE_WORKER_TOKENS:-}
+      - ANYSERVE_SCOPED_TOKENS=${ANYSERVE_SCOPED_TOKENS:-}
       - ANYSERVE_PUBLIC_ENDPOINT
+      - ANYSERVE_CONSOLE_AUTH_PORTAL_URL=${ANYSERVE_CONSOLE_AUTH_PORTAL_URL:-}
+      - ANYSERVE_MEMORY_LIMIT_MB=${ANYSERVE_MEMORY_LIMIT_MB:-1024}
       - ANYSERVE_TOKEN_SIGNING_KEY=${ANYSERVE_TOKEN_SIGNING_KEY:-}
       - ANYSERVE_AUTH_REVOCATION_URL=${ANYSERVE_AUTH_REVOCATION_URL:-}
+    healthcheck:
+      test: ["CMD", "anyserve", "doctor", "--endpoint", "http://127.0.0.1:3001"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     volumes:
       - anyserve_data:/data
       - ./server.toml:/etc/anyserve/server.toml:ro
@@ -52,6 +61,13 @@ services:
       - ANYSERVE_AUTH_ALLOWED_USERS=${ANYSERVE_AUTH_ALLOWED_USERS:-}
       - ANYSERVE_AUTH_MIN_ACCOUNT_AGE_DAYS=${ANYSERVE_AUTH_MIN_ACCOUNT_AGE_DAYS:-0}
       - ANYSERVE_AUTH_TOKEN_TTL_DAYS=${ANYSERVE_AUTH_TOKEN_TTL_DAYS:-30}
+      - ANYSERVE_AUTH_MAX_TOKENS_PER_USER=${ANYSERVE_AUTH_MAX_TOKENS_PER_USER:-20}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3002 && printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q ' 204 ' <&3"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     volumes:
       - anyserve_auth_data:/data
 

@@ -47,9 +47,19 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace
+      - name: Verify embedded console build
+        run: |
+          npm --prefix console ci && npm --prefix console run build
+          cargo clippy --locked -p anyserve --features embed-console --all-targets -- -D warnings
+          cargo test --locked -p anyserve --features embed-console serve_console
       - name: Test PostgreSQL leader-standby integration
         run: cargo test --locked -p anyserve-core postgres_ -- --ignored --test-threads=1
         env:
@@ -61,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.14"]
+        python: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -74,6 +84,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
       - run: cargo build --locked -p anyserve
       - run: python -m pip install build twine
       - run: python -m build clients/python --sdist --outdir dist
@@ -81,6 +94,7 @@ jobs:
       - run: python -m pip install dist/*.tar.gz
       - run: python -m unittest discover -s clients/python/tests -p 'test_*.py'
       - run: python clients/python/tests/sdk_e2e.py
+      - run: python clients/python/tests/native_do_e2e.py
 
   console:
     runs-on: ubuntu-latest
@@ -100,6 +114,22 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+
+  cloudflare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: deploy/cloudflare/package-lock.json
+      - run: npm --prefix deploy/cloudflare ci
+      - run: npm --prefix deploy/cloudflare run typecheck
+      - run: npm --prefix deploy/cloudflare test
 
   bench:
     runs-on: ubuntu-latest
@@ -149,7 +179,8 @@ jobs:
       - name: Check container startup
         run: |
           docker run --rm anyserve:ci --version
-          mkdir -p "$RUNNER_TEMP/anyserve-smoke"
+          mkdir -p "$RUNNER_TEMP/anyserve-smoke/data"
+          sudo chown -R 10001:10001 "$RUNNER_TEMP/anyserve-smoke/data"
           cat > "$RUNNER_TEMP/anyserve-smoke/server.toml" <<'TOML'
           [server]
           grpc_host = "0.0.0.0"
@@ -160,10 +191,12 @@ jobs:
           TOML
           trap 'docker logs anyserve-ci; docker rm -f anyserve-ci' EXIT
           docker run -d --name anyserve-ci -p 127.0.0.1:3001:3001 \
+            -v "$RUNNER_TEMP/anyserve-smoke/data:/data" \
             -v "$RUNNER_TEMP/anyserve-smoke/server.toml:/etc/anyserve/server.toml:ro" \
             anyserve:ci serve --config /etc/anyserve/server.toml
           curl --fail --max-time 5 --retry 15 --retry-delay 1 --retry-max-time 60 \
             --retry-all-errors http://127.0.0.1:3001/readyz
+          docker exec anyserve-ci anyserve doctor --endpoint http://127.0.0.1:3001
           ui_headers="$RUNNER_TEMP/anyserve-smoke/ui.headers"
           ui_body="$RUNNER_TEMP/anyserve-smoke/ui.html"
           ui_status=$(curl --silent --show-error --max-time 5 \
@@ -177,6 +210,31 @@ jobs:
           fi
           grep -qi '^content-type:.*text/html' "$ui_headers"
           grep -Fq '<div id="root">' "$ui_body"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: plugins/anyserve-auth-github/Dockerfile
+          push: false
+          load: true
+          tags: anyserve-auth-github:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Check auth-github container startup
+        run: |
+          mkdir -p "$RUNNER_TEMP/anyserve-auth-smoke/data"
+          sudo chown -R 10001:10001 "$RUNNER_TEMP/anyserve-auth-smoke/data"
+          trap 'docker logs anyserve-auth-ci; docker rm -f anyserve-auth-ci' EXIT
+          docker run -d --name anyserve-auth-ci -p 127.0.0.1:3002:3002 \
+            -v "$RUNNER_TEMP/anyserve-auth-smoke/data:/data" \
+            -e ANYSERVE_AUTH_LISTEN=0.0.0.0:3002 \
+            -e ANYSERVE_AUTH_DB=/data/auth-github.sqlite \
+            -e ANYSERVE_TOKEN_SIGNING_KEY=ci-smoke-signing-key-0123456789abcdef \
+            -e GITHUB_CLIENT_ID=ci-client-id \
+            -e GITHUB_CLIENT_SECRET=ci-client-secret \
+            anyserve-auth-github:ci
+          curl --fail --max-time 5 --retry 15 --retry-delay 1 --retry-max-time 60 \
+            --retry-all-errors http://127.0.0.1:3002/healthz
+          docker exec anyserve-auth-ci bash -c 'exec 3<>/dev/tcp/127.0.0.1/3002 && printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && grep -q " 204 " <&3'
 
   helm:
     runs-on: ubuntu-latest
@@ -189,6 +247,7 @@ jobs:
       - run: helm lint deploy/helm/anyserve
       - run: helm template anyserve deploy/helm/anyserve --set worker.enabled=true --set worker.image=example/worker --set 'auth.clientTokens[0]=c' --set 'auth.workerTokens[0]=w' > /dev/null
       - run: helm template anyserve deploy/helm/anyserve --set journal.enabled=false --set auth.existingSecret=tokens > /dev/null
+      - run: helm template anyserve deploy/helm/anyserve --set runtime.tenantQuotas.max_sessions_per_namespace=32 --set journal.maxBytes=536870912 > /dev/null
 
   docs:
     runs-on: ubuntu-latest

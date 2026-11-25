@@ -21,7 +21,7 @@ cloudflared tunnel --url http://127.0.0.1:3001
 
 `deploy/vps` provides a 1-minute single-domain Compose stack with Caddy automatic HTTPS: gRPC (`/anyserve.v2.*`, `/grpc.health.*`, `/grpc.reflection.*`) proxies to `h2c://anyserve:50052`, `/metrics` is blocked (`403`), and Console/WSS proxy to `:3001`.
 
-For public multi-user betas where anyone signs in with **GitHub Login** to mint and revoke isolated `client`/`worker` tokens (`gh-<id>` namespace) and inspect their own jobs in the Console, enable the optional [anyserve-auth-github](../plugins/anyserve-auth-github/README.md) Compose profile (`ANYSERVE_CADDYFILE=./Caddyfile.auth-github docker compose --profile auth-github up -d`). See [deploy/vps/README.md](../deploy/vps/README.md).
+For public multi-user betas where anyone signs in with **GitHub Login** to mint and revoke isolated `client`/`worker` tokens (`gh-<id>` namespace) and inspect their own jobs in the Console (or drain workers in their namespace via `POST /api/workers/:session_id/drain`), enable the optional [anyserve-auth-github](../plugins/anyserve-auth-github/README.md) Compose profile (`ANYSERVE_CADDYFILE=./Caddyfile.auth-github ANYSERVE_CONSOLE_AUTH_PORTAL_URL=https://relay.example.com/tokens docker compose --profile auth-github up -d`). See [deploy/vps/README.md](../deploy/vps/README.md).
 
 ## Fly.io (`deploy/fly`)
 
@@ -95,10 +95,7 @@ site-rack or cloud worker pool rather than operating multi-node PG HA on the edg
 
 ## Containers
 
-Release images are `ghcr.io/anyserve/anyserve:vVERSION` (Linux amd64). The
-official `Dockerfile` embeds the React Console UI out of the box
-(`--features embed-console`), so a single container serves gRPC, HTTP/WS, and
-the Web Console.
+The official `Dockerfile` runs as non-root `anyserve` (`10001:10001`) and embeds the React Console UI out of the box (`--features embed-console`), so a single container serves gRPC, HTTP/WS, and the Web Console. Release images are published to `ghcr.io/anyserve/anyserve:vVERSION` (Linux amd64). If mounting an existing root-owned `/data` host directory or volume, fix ownership once with `chown -R 10001:10001 /data`.
 
 To build and run a local demo with the embedded Console on `http://127.0.0.1:3001`:
 
@@ -154,11 +151,15 @@ helm install anyserve deploy/helm/anyserve \
   --set auth.existingSecret=anyserve-tokens
 ```
 
-The existing Secret must contain `ANYSERVE_CLIENT_TOKENS` and
-`ANYSERVE_WORKER_TOKENS` (comma-separated token lists), plus
-`ANYSERVE_WORKER_TOKEN` (one worker token when the worker fleet is enabled).
-Alternatively, supply `auth.clientTokens` and `auth.workerTokens` as lists in a
-private values file; the chart generates the Secret.
+The existing Secret is mounted via `envFrom` and can supply any supported auth
+env vars (`ANYSERVE_CLIENT_TOKENS`, `ANYSERVE_WORKER_TOKENS`,
+`ANYSERVE_SCOPED_TOKENS`, `ANYSERVE_TOKEN_SIGNING_KEY`,
+`ANYSERVE_AUTH_REVOCATION_URL`), plus `ANYSERVE_WORKER_TOKEN` when the worker
+fleet is enabled. Alternatively, supply `auth.clientTokens` and
+`auth.workerTokens` as lists in a private values file; the chart generates the
+Secret. The StatefulSet sets `podSecurityContext.fsGroup=10001` and runs the
+container as non-root `10001:10001` (`anyserve`) so the SQLite PVC is writable
+out of the box.
 
 To validate the local images above in an isolated kind cluster:
 
@@ -174,12 +175,14 @@ helm install anyserve deploy/helm/anyserve \
 | Values | Default / purpose |
 |---|---|
 | `image.repository`, `image.tag`, `image.pullPolicy` | GHCR repository, chart `appVersion` tag, `IfNotPresent` |
-| `auth.existingSecret`, `auth.clientTokens`, `auth.workerTokens` | Empty; both token lists empty disables auth |
-| `journal.enabled`, `journal.size`, `journal.storageClass` | `true`, `1Gi`, cluster default storage class |
+| `auth.existingSecret`, `auth.clientTokens`, `auth.workerTokens` | Empty; all empty disables auth |
+| `console.publicEndpoint`, `console.authPortalUrl` | Optional `[console].public_endpoint` / `auth_portal_url` |
+| `journal.enabled`, `journal.size`, `journal.storageClass`, `journal.maxBytes` | `true`, `1Gi`, default storage class, optional SQLite byte cap |
 | `journal.backend`, `replicaCount` | `sqlite`, `1`; `replicaCount > 1` runs leader + standby on `postgres` |
 | `journal.postgres.existingSecret`, `journal.postgres.secretKey` | Existing database URL Secret, `ANYSERVE_DATABASE_URL` |
 | `journal.postgres.schema`, `leaseDurationMs`, `pollIntervalMs`, `maxConnections` | `anyserve`, `5000`, `100`, `8` |
-| `runtime` | Scalar `[runtime]` overrides; empty map |
+| `runtime`, `runtime.tenantQuotas` | Scalar `[runtime]` keys and nested `[runtime.tenant_quotas]` |
+| `podSecurityContext`, `securityContext` | Non-root UID/GID `10001`, `fsGroup: 10001`, `drop: ["ALL"]` |
 | `service.type`, `service.grpcPort`, `service.httpPort` | `ClusterIP`, `50052`, `3001` |
 | `resources`, `nodeSelector`, `tolerations`, `affinity` | Control-plane pod scheduling and resources; unset |
 | `worker.enabled`, `worker.replicas`, `worker.image` | `false`, `1`, required image when enabled |
@@ -214,9 +217,11 @@ origin. For single-binary deployments without a separate web server, build with
 For a separate API origin, set `VITE_CONSOLE_API_BASE_URL` at build time
 and include the frontend origin in `[console].allowed_origins`.
 
-Use an operator token from `[auth].client_tokens` at the Console sign-in prompt
-(scoped tenant tokens receive `403 Forbidden`). Enable compression and
-immutable caching for hashed assets, including the Explore WASM and Worker.
+Sign in at the Console prompt with either an operator token from
+`[auth].client_tokens` (global cluster view) or a scoped/signed tenant `client`
+token (strictly restricted to that tenant's namespace, with operator-only fields
+redacted; cross-namespace requests receive `403 Forbidden`). Enable compression
+and immutable caching for hashed assets, including the Explore WASM and Worker.
 See [Explore limits](configuration.md#console-explore); a partial metadata load
 does not represent the whole task history.
 
@@ -278,11 +283,15 @@ do not recover through the journal.
 ## Operations
 
 The optional management listener serves `/healthz` (liveness), `/readyz`
-(Runtime admission/journal readiness), `/metrics`, and `/api/overview`,
-`/api/jobs`, `/api/workers`. Probes are public; management reads and metrics
-require an operator token from `[auth].client_tokens` when auth is enabled (`403 Forbidden`
-for scoped tenant tokens or worker tokens). TLS for this HTTP listener belongs
-at the deployment's ingress or proxy.
+(Runtime admission/journal readiness), `/api/info` (public auth/portal
+metadata), `/metrics`, and `/api/*` (`/api/overview`, `/api/jobs`,
+`/api/workers`, `/api/analytics/jobs`). When auth is enabled:
+
+- `/healthz`, `/readyz`, and `/api/info` are unauthenticated.
+- `/metrics` strictly requires an operator token from `[auth].client_tokens` (`403 Forbidden` for tenant or worker tokens).
+- `/api/*` accepts both operator tokens (global cluster view) and scoped/signed tenant `client` tokens (restricted to the token's namespace with operator-only fields redacted; worker tokens receive `403 Forbidden`).
+
+Terminate management HTTP TLS at your ingress or proxy.
 
 | Signal | Next check |
 |---|---|
@@ -294,9 +303,13 @@ at the deployment's ingress or proxy.
 | PG leader exits after lease loss | Check database connectivity and restart policy; standby takes over once lease expires |
 | Cursor expired | Event history was evicted or belongs to a prior generation; read current state by ID |
 
-Metrics cover Runtime jobs, interfaces, workers, byte budgets and journal.
-Job-state gauges count retained jobs, not cumulative completions. Per-request
-latency histograms and distributed trace export require application instrumentation.
+`/metrics` exposes Runtime gauges (retained jobs by state, interfaces, pools,
+workers, byte budgets, journal) alongside cumulative lifecycle and auth
+metrics: `anyserve_jobs_submitted_total`, `anyserve_jobs_completed_total`,
+`anyserve_attempts_started_total`, `anyserve_auth_rejections_total`,
+`anyserve_auth_revocation_sync_ok`, and
+`anyserve_auth_revocation_last_sync_age_seconds`. Per-request latency
+histograms and distributed trace export require application instrumentation.
 
 ## Cloudflare Deployment (`deploy/cloudflare`)
 
@@ -344,6 +357,8 @@ npx --prefix deploy/cloudflare wrangler secret put ANYSERVE_WORKER_TOKENS \
 Optional environment variables / secrets:
 
 - `ANYSERVE_SCOPED_TOKENS`: JSON array of `{ "token", "role", "namespace", "subject", "forced_pool" }` entries for multi-tenant isolation.
+- `ANYSERVE_TOKEN_SIGNING_KEY`: comma-separated HMAC signing secret(s) (newest first for key rotation) verifying `asv1.` stateless tokens.
+- `ANYSERVE_AUTH_REVOCATION_URL`: optional revocation snapshot URL polled alongside `ANYSERVE_TOKEN_SIGNING_KEY`.
 - `ANYSERVE_PUBLIC_ENDPOINT`: explicit `wss://...` endpoint advertised in `/api/overview` (defaults to `wss://<request host>`).
 - `ANYSERVE_CONSOLE_POLL_MS`: Console polling interval in milliseconds (`10000` default in Free mode; `0` disables automatic polling in favor of manual `Refresh`).
 
@@ -441,7 +456,8 @@ npx --prefix deploy/cloudflare wrangler secret put JOURNAL_INTERNAL_SECRET \
 ```
 
 `AnyserveControlPlaneDO` forwards `ANYSERVE_CLIENT_TOKENS`,
-`ANYSERVE_WORKER_TOKENS`, `ANYSERVE_PUBLIC_ENDPOINT`, and
+`ANYSERVE_WORKER_TOKENS`, `ANYSERVE_SCOPED_TOKENS`, `ANYSERVE_TOKEN_SIGNING_KEY`,
+`ANYSERVE_AUTH_REVOCATION_URL`, `ANYSERVE_PUBLIC_ENDPOINT`, and
 `JOURNAL_INTERNAL_SECRET` (as `ANYSERVE_CLOUDFLARE_JOURNAL_TOKEN`) into the
 container environment at startup.
 
