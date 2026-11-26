@@ -42,12 +42,10 @@ pub fn redact_direct_uri(uri: &str) -> String {
         Some(idx) => (&without_frag[..idx], Some(&without_frag[idx + 1..])),
         None => (without_frag, None),
     };
-    let Some((authority, path)) = authority_and_path.split_once('/') else {
-        return uri.to_owned();
+    let redacted_authority_path = match authority_and_path.split_once('/') {
+        Some((authority, path)) if !path.is_empty() => format!("{authority}/[redacted]"),
+        _ => authority_and_path.to_owned(),
     };
-    if path.is_empty() {
-        return uri.to_owned();
-    }
     let redacted_query = query.map(|q| {
         q.split('&')
             .map(|pair| {
@@ -62,9 +60,9 @@ pub fn redact_direct_uri(uri: &str) -> String {
     });
     match redacted_query {
         Some(q) if !q.is_empty() => {
-            format!("anyserve+iroh://{authority}/[redacted]?{q}{frag}")
+            format!("anyserve+iroh://{redacted_authority_path}?{q}{frag}")
         }
-        _ => format!("anyserve+iroh://{authority}/[redacted]{frag}"),
+        _ => format!("anyserve+iroh://{redacted_authority_path}{frag}"),
     }
 }
 

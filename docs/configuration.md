@@ -214,9 +214,13 @@ excluded from v1.
     created with `0600` permissions on Unix; logs only the public `EndpointId`,
     never key bytes): `iroh`'s Ed25519 TLS handshake cryptographically rejects
     any peer outside the allowlist, including the control-plane operator.
-- *Redaction, journal retention, & IP privacy*: SDK logs/debug formatting and
-  Console UI redact both `<token>` and `addr=` values
+- *Redaction, journal retention, & IP privacy*: Rust SDK logging/debug
+  formatting (`redact_direct_uri`) and the Console UI display layer
+  (`redactDirectUri`) both redact `<token>` and `addr=` values
   (`anyserve+iroh://<endpoint-id>/[redacted]?relay=...&addr=[redacted]`).
+  Console redaction is **display-layer only** — raw `/api/jobs` management API
+  responses still return the full URI (do not treat Console UI redaction as an
+  API-level confidentiality boundary).
   Ephemeral `Invoke` URIs are never written to the journal (retained only in
   memory up to `terminal_retention`); if explicitly opted into durable `Submit`,
   the URI persists in the journal until `journal.retention` (default `24 h`) and

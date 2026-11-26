@@ -566,6 +566,10 @@ async fn direct_uri_redaction_and_advertise_direct_addrs_option() {
         "anyserve+iroh://abc123endpoint/[redacted]"
     );
     assert_eq!(
+        redact_direct_uri("anyserve+iroh://abc123endpoint?addr=1.2.3.4:5"),
+        "anyserve+iroh://abc123endpoint?addr=[redacted]"
+    );
+    assert_eq!(
         redact_direct_uri("s3://bucket/key?X-Amz-Sig=1"),
         "s3://bucket/key?X-Amz-Sig=1"
     );

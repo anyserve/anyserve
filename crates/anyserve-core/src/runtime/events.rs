@@ -252,11 +252,15 @@ impl JobLog {
     /// at most 2N + 1 of them: Accepted, Finished, one Assigned per attempt
     /// and one AttemptRestarted per retried attempt. Only unfinished and
     /// retained terminal jobs have logs, so with M = `max_attempts_limit` the
-    /// allowance stays below `(max_pending_jobs + max_terminal_jobs) ×
-    /// (2M + 1) × EVENT_OVERHEAD`: 110 000 × 41 × 96 B ≈ 433 MB with the
-    /// defaults, under the default `max_event_bytes`. Outputs carried by
-    /// `Finished` share their buffers with the job's result, which the result
-    /// budget covers.
+    /// `event_bytes` allowance stays below `(max_pending_jobs + max_terminal_jobs)
+    /// × (2M + 1) × EVENT_OVERHEAD`: 110 000 × 41 × 96 B ≈ 433 MB with the
+    /// defaults, under the default `max_event_bytes`. Pre-`Finished` events are
+    /// also cloned into `inner.lifecycle` (kept outside `event_bytes` compaction
+    /// so inspection still reconstructs attempts after `compact_finished`), which
+    /// adds at most `2M` tiny zero-payload `ExecutionEvent` structs per retained
+    /// job (`<= (max_pending_jobs + max_terminal_jobs) × 2M` structs total).
+    /// Outputs carried by `Finished` share their buffers with the job's result,
+    /// which the result budget covers.
     pub(crate) fn append(&self, attempt_id: Option<String>, kind: EventKind, at_ms: u64) -> u64 {
         let mut inner = self.lock();
         if inner.finished {

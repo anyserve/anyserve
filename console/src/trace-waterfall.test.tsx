@@ -286,6 +286,9 @@ describe("ExecutionWaterfall component", () => {
       "anyserve+iroh://ep123node/[redacted]?relay=https://r.example/&addr=[redacted]&addr=[redacted]",
     );
     expect(redactDirectUri(rawOut)).toBe("anyserve+iroh://ep456node/[redacted]?addr=[redacted]");
+    expect(redactDirectUri("anyserve+iroh://ep789node?addr=10.0.0.9:5555")).toBe(
+      "anyserve+iroh://ep789node?addr=[redacted]",
+    );
     expect(redactDirectUri("s3://my-bucket/obj?sig=1")).toBe("s3://my-bucket/obj?sig=1");
 
     const directDetail = makeDetail();

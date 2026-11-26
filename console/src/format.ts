@@ -203,8 +203,10 @@ export function redactDirectUri(uri: string): string {
   const authorityAndPath = queryIdx >= 0 ? withoutFrag.slice(0, queryIdx) : withoutFrag;
   const query = queryIdx >= 0 ? withoutFrag.slice(queryIdx + 1) : null;
   const slashIdx = authorityAndPath.indexOf("/");
-  if (slashIdx < 0 || slashIdx === authorityAndPath.length - 1) return uri;
-  const authority = authorityAndPath.slice(0, slashIdx);
+  const redactedAuthorityPath =
+    slashIdx >= 0 && slashIdx < authorityAndPath.length - 1
+      ? `${authorityAndPath.slice(0, slashIdx)}/[redacted]`
+      : authorityAndPath;
   const redactedQuery = query
     ? query
         .split("&")
@@ -212,8 +214,8 @@ export function redactDirectUri(uri: string): string {
         .join("&")
     : null;
   return redactedQuery
-    ? `anyserve+iroh://${authority}/[redacted]?${redactedQuery}${frag}`
-    : `anyserve+iroh://${authority}/[redacted]${frag}`;
+    ? `anyserve+iroh://${redactedAuthorityPath}?${redactedQuery}${frag}`
+    : `anyserve+iroh://${redactedAuthorityPath}${frag}`;
 }
 
 /** Compact primitive JSON arrays inline with spaces so long vectors wrap cleanly at commas. */
