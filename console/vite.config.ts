@@ -72,15 +72,32 @@ function gzipDuckdbWasmPlugin(): Plugin {
   };
 }
 
+const consoleDir = path.dirname(fileURLToPath(import.meta.url));
+const protoCandidates = [
+  path.resolve(consoleDir, "../deploy/cloudflare/src/native/proto.ts"),
+  path.resolve(consoleDir, "../src/native/proto.ts"),
+];
+const anyserveProtoPath = protoCandidates.find((p) => fs.existsSync(p)) ?? protoCandidates[0]!;
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "");
   const target = env.ANYSERVE_CONSOLE_PROXY_TARGET || "http://127.0.0.1:3001";
   return {
     plugins: process.env.ANYSERVE_BUNDLE_GZIP_WASM === "0" ? [react()] : [react(), gzipDuckdbWasmPlugin()],
+    resolve: {
+      alias: {
+        "@anyserve/proto": anyserveProtoPath,
+      },
+    },
+    worker: {
+      format: "es",
+    },
     server: {
       proxy: {
         "/api": target,
         "/healthz": target,
+        "/rpc": target,
+        "/ws": { target, ws: true },
       },
     },
   };

@@ -6,7 +6,14 @@ console/dist
 console/.env.local
 console/*.tsbuildinfo
 docs
-deploy
+deploy/*
+!deploy/cloudflare
+deploy/cloudflare/*
+!deploy/cloudflare/src
+deploy/cloudflare/src/*
+!deploy/cloudflare/src/native
+deploy/cloudflare/src/native/*
+!deploy/cloudflare/src/native/proto.ts
 deploy/cloudflare/node_modules
 scripts
 clients/python/dist

@@ -77,6 +77,12 @@ export const IconExplore = (p: IconProps) => (
   </IconFrame>
 );
 
+export const IconPlayground = (p: IconProps) => (
+  <IconFrame {...p}>
+    <path d="M5.25 3.25 12.75 8l-7.5 4.75V3.25Z" />
+  </IconFrame>
+);
+
 export const IconSun = (p: IconProps) => (
   <IconFrame {...p}>
     <circle cx={8} cy={8} r={2.75} />

@@ -12,6 +12,7 @@ import {
   IconKey,
   IconMoon,
   IconOverview,
+  IconPlayground,
   IconPools,
   IconRefresh,
   IconSun,
@@ -23,6 +24,7 @@ interface SidebarProps {
   activeTab: ConsoleTab;
   onSelectTab: (tab: ConsoleTab) => void;
   overview: OverviewResponse | null;
+  browserWorkersLive?: number;
   theme: Theme;
   onToggleTheme: () => void;
   onRefresh?: () => void;
@@ -52,11 +54,15 @@ const NAV_GROUPS: Array<{
   },
   {
     label: "Analytics",
-    items: [{ tab: "explore", label: "Explore", Icon: IconExplore }],
+    items: [
+      { tab: "explore", label: "Explore", Icon: IconExplore },
+      { tab: "playground", label: "Playground", Icon: IconPlayground },
+    ],
   },
 ];
 
-function badgeForTab(tab: ConsoleTab, overview: OverviewResponse | null): string | null {
+function badgeForTab(tab: ConsoleTab, overview: OverviewResponse | null, browserWorkersLive = 0): string | null {
+  if (tab === "playground") return browserWorkersLive > 0 ? `${browserWorkersLive} live` : null;
   if (!overview) return null;
   if (tab === "jobs") return overview.queue.active > 0 ? formatNumber(overview.queue.active) : null;
   if (tab === "interfaces") return overview.interfaces.length > 0 ? formatNumber(overview.interfaces.length) : null;
@@ -69,6 +75,7 @@ export const Sidebar = memo(function Sidebar({
   activeTab,
   onSelectTab,
   overview,
+  browserWorkersLive = 0,
   theme,
   onToggleTheme,
   onRefresh,
@@ -106,7 +113,7 @@ export const Sidebar = memo(function Sidebar({
             <div key={group.label} className="sidebar__group">
               <div className="sidebar__group-label">{group.label}</div>
               {group.items.map(({ tab, label, Icon }) => {
-                const badge = badgeForTab(tab, overview);
+                const badge = badgeForTab(tab, overview, browserWorkersLive);
                 const isActive = activeTab === tab;
                 return (
                   <button

@@ -16,7 +16,11 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
-    "jsx": "react-jsx"
+    "jsx": "react-jsx",
+    "baseUrl": ".",
+    "paths": {
+      "@anyserve/proto": ["../deploy/cloudflare/src/native/proto.ts"]
+    }
   },
   "include": ["src"]
 }

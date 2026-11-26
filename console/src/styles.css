@@ -529,6 +529,46 @@ td.ellipsis, th.ellipsis { display: table-cell; }
 .explore__inspector-bar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .explore__inspector > .panel { min-height: 0; flex: 1; }
 
+/* ---- Browser Worker Playground ---- */
+.pg-body { flex: 1; min-height: 0; overflow: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 14px; }
+.pg-auth-strip { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card-2); }
+.pg-auth-strip__field { flex: 1 1 280px; display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--muted); }
+.pg-auth-strip__field input { padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--card); }
+.pg-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
+.pg-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.pg-section-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; }
+.pg-section-head p { margin: 4px 0 0; font-size: 12px; line-height: 1.5; }
+.pg-workers-list { display: flex; flex-direction: column; gap: 10px; }
+.pg-worker-card { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card-2); }
+.pg-worker-card__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.pg-worker-card__id { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-weight: 600; }
+.pg-worker-card__id .status-dot { margin-top: 0; }
+.pg-worker-card__actions { display: flex; align-items: center; gap: 6px; }
+.pg-worker-card__meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11.5px; color: var(--muted); }
+.pg-worker-card__tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pg-worker-card__model { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; border-top: 1px solid var(--line-2); }
+.pg-worker-card__model-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pg-progress { display: flex; flex-direction: column; gap: 4px; font-size: 11px; }
+.pg-progress__track { height: 6px; border-radius: 999px; background: var(--pill); overflow: hidden; border: 1px solid var(--line-2); }
+.pg-progress__fill { height: 100%; background: var(--accent); transition: width 150ms ease; }
+.pg-inline-err { padding: 7px 10px; border-radius: 7px; background: var(--red-soft); color: var(--red); font-size: 12px; overflow-wrap: anywhere; }
+.pg-prompt-label { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--muted); }
+.pg-prompt-label textarea { width: 100%; resize: vertical; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-2); font-family: var(--font); line-height: 1.5; }
+.pg-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pg-note { margin: 0; font-size: 11.5px; line-height: 1.5; }
+.pg-output-card { display: flex; flex-direction: column; gap: 7px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card-2); }
+.pg-output-card__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 12px; font-weight: 550; }
+.pg-output-card__badges { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pg-progress-note { font-size: 11px; color: var(--accent); }
+.pg-output-pre { min-height: 84px; max-height: 220px; background: var(--card); }
+.pg-logs, .pg-timeline { display: flex; flex-direction: column; gap: 5px; }
+.pg-logs__title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+.pg-timeline__list { list-style: none; margin: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card-2); display: flex; flex-direction: column; gap: 5px; max-height: 190px; overflow: auto; }
+.pg-timeline__item { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 11.5px; }
+.pg-timeline__item--attempt_restarted .tag { background: var(--amber-soft); color: var(--amber); }
+.pg-timeline__item--finished .tag { background: var(--green-soft); color: var(--green); }
+@media (max-width: 960px) { .pg-grid { grid-template-columns: 1fr; } }
+
 /* ---- Responsive ---- */
 @media (max-width: 1180px) {
   html, body, #root { height: auto; min-height: 100%; }

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import {
   AuthenticationError,
@@ -20,6 +20,7 @@ import {
   JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, QUEUE_STATES,
   resolveEffectiveStates, routePath, scopeMap, WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type Theme, type TimeFilterState,
 } from "./app-constants";
+import { browserWorkerManager } from "./browser-worker/manager";
 import { ConnectWorkerModal } from "./ConnectWorkerModal";
 import { asErrorMessage, formatPool, poolKey, sameHistogram, sameJobs, sameWorkers, sortJobs, sortWorkers, toSelectOptions } from "./format";
 import { InterfacesPane } from "./InterfacesPane";
@@ -27,6 +28,7 @@ import { TIME_PRESET_MS } from "./JobsHistogram";
 import { JobsPane } from "./JobsPane";
 import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
+import { PlaygroundPane } from "./PlaygroundPane";
 import { PoolsPane, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
 import type { InfoResponse, JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
@@ -522,6 +524,7 @@ export default function App() {
   }, [activeTab, filters.ns, jobScope, jumpToJobs, openPoolsByTarget]);
 
   const handleDisconnect = useCallback(() => {
+    browserWorkerManager.stopAll();
     loadMoreAbort.current?.abort();
     loadMoreAbort.current = null;
     clearConsoleToken();
@@ -531,6 +534,15 @@ export default function App() {
     setSelectedWorkerId(null);
     setJobsPage(EMPTY_JOBS); setJobDetail(null); setError(null); requireAuth();
   }, [requireAuth]);
+
+  const browserWorkerSnap = useSyncExternalStore(
+    browserWorkerManager.subscribe,
+    browserWorkerManager.getSnapshot,
+    browserWorkerManager.getSnapshot,
+  );
+  const browserWorkersLive = Object.values(browserWorkerSnap.slots).filter(
+    (s) => s.status === "online" || s.status === "busy",
+  ).length;
 
   const handleToggleTheme = useCallback(() => setTheme((c) => (c === "light" ? "dark" : "light")), []);
   const handleRefresh = useCallback(() => setManualRefreshSeq((s) => s + 1), []);
@@ -566,6 +578,7 @@ export default function App() {
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
         overview={overview}
+        browserWorkersLive={browserWorkersLive}
         theme={theme}
         onToggleTheme={handleToggleTheme}
         onRefresh={handleRefresh}
@@ -689,6 +702,16 @@ export default function App() {
                 onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
               />
             </Suspense>
+          ) : null}
+          {activeTab === "playground" ? (
+            <PlaygroundPane
+              controlPlane={overview?.control_plane}
+              authPortalUrl={authPortalUrl}
+              lockedNamespace={lockedTenantNs}
+              onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
+              onOpenWorkers={() => navigateTo("workers")}
+              onRefresh={handleRefresh}
+            />
           ) : null}
         </main>
       </div>

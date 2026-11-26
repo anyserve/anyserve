@@ -1,6 +1,6 @@
 import type { JobState, OverviewResponse } from "./types";
 
-export type ConsoleTab = "overview" | "jobs" | "interfaces" | "pools" | "workers" | "explore";
+export type ConsoleTab = "overview" | "jobs" | "interfaces" | "pools" | "workers" | "explore" | "playground";
 export type JobScope = "all" | "queue" | "history";
 export type JobStatusFilter = "all" | JobState;
 export type TimePreset = "all" | "5m" | "15m" | "1h" | "6h" | "24h" | "custom";
@@ -34,6 +34,7 @@ export const TAB_PATHS: Record<ConsoleTab, string> = {
   pools: "/pools",
   workers: "/workers",
   explore: "/explore",
+  playground: "/playground",
 };
 
 export const JOB_SCOPE_PATHS: Record<JobScope, string> = {
