@@ -372,7 +372,7 @@ async function handleAssign(assign: pb.Assign): Promise<void> {
       await sleepMs(prefillMs, abortCtrl.signal);
     }
 
-    const benchChunks = Math.min(256, Math.max(0, Number(assign.metadata["demo.bench_chunks"] ?? "0") || 0));
+    const benchChunks = Math.min(2_048, Math.max(0, Number(assign.metadata["demo.bench_chunks"] ?? "0") || 0));
     const benchChunkBytes = Math.min(
       65_536,
       Math.max(1_024, Number(assign.metadata["demo.bench_chunk_bytes"] ?? "16384") || 16_384),
@@ -635,7 +635,7 @@ async function handleWebRtcAttempt(
                 mode: "fallback",
                 reason: sig.reason,
                 prompt: sig.prompt,
-                benchChunks: Math.min(256, Math.max(0, sig.benchChunks ?? 0)),
+                benchChunks: Math.min(2_048, Math.max(0, sig.benchChunks ?? 0)),
                 benchChunkBytes: Math.min(65_536, Math.max(1_024, sig.benchChunkBytes ?? 16_384)),
               });
             } else if (sig.t === "offer" || sig.t === "ice" || sig.t === "ice_end") {
@@ -658,7 +658,7 @@ async function handleWebRtcAttempt(
     const handlerStart = performance.now();
 
     if (decision.mode === "p2p") {
-      const benchChunks = Math.min(256, Math.max(0, decision.req.benchChunks ?? 0));
+      const benchChunks = Math.min(2_048, Math.max(0, decision.req.benchChunks ?? 0));
       const benchChunkBytes = Math.min(65_536, Math.max(1_024, decision.req.benchChunkBytes ?? 16_384));
       const stats = await executePayloadHandler({
         interfaceName: assign.interface,
@@ -678,11 +678,11 @@ async function handleWebRtcAttempt(
         payload: { t: "done", handlerMs, p2pBytes: stats.bytes, frames: stats.frames },
       });
 
-      // Wait briefly for peer DataChannel ack so every P2P frame is guaranteed
+      // Wait for peer DataChannel ack so every P2P frame is guaranteed
       // delivered before ExecutionEvent::finished tears down the channel.
       await Promise.race([
         ackPromise,
-        new Promise<void>((res) => setTimeout(res, 5_000)),
+        new Promise<void>((res) => setTimeout(res, 30_000)),
       ]);
 
       // Report lightweight transport & byte observability metadata to control plane (zero proto change).

@@ -503,10 +503,10 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
             {transport?.actual === "p2p" ? (
               <span
                 className="waterfall__metric waterfall__metric--p2p"
-                title={`WebRTC P2P direct DataChannel transfer (${transport.p2pBytes != null ? formatByteCount(transport.p2pBytes) : "direct"}, ${transport.relayedPayloadBytes ?? 0} B relayed via control plane${transport.iceMs != null ? `, ICE ${formatDuration(transport.iceMs)}` : ""})`}
+                title={`Worker-reported WebRTC P2P DataChannel transfer (${transport.p2pBytes != null ? formatByteCount(transport.p2pBytes) : "direct"}, ${transport.relayedPayloadBytes ?? 0} B payload relayed; worker-reported metadata, not server-audited${transport.iceMs != null ? `, ICE ${formatDuration(transport.iceMs)}` : ""})`}
               >
                 Data plane <strong>WebRTC P2P</strong>
-                {transport.p2pBytes != null ? ` · ${formatByteCount(transport.p2pBytes)} (0 B relayed)` : ""}
+                {transport.p2pBytes != null ? ` · ${formatByteCount(transport.p2pBytes)} (worker-reported)` : ""}
                 {transport.iceMs != null ? ` · ICE ${formatDuration(transport.iceMs)}` : ""}
               </span>
             ) : null}

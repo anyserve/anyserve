@@ -313,9 +313,9 @@ describe("BrowserWorkerManager & PlaygroundPane", () => {
       fallbackReason: null,
       iceMs: null,
       p2pBytes: 0,
-      relayedPayloadBytes: 524_288,
-      streamDurationMs: 28,
-      framesReceived: 32,
+      relayedPayloadBytes: 16_777_216,
+      streamDurationMs: 280,
+      framesReceived: 1_024,
       timeline: [],
     });
     const invokeWebRtc = vi.fn().mockResolvedValue({
@@ -328,14 +328,14 @@ describe("BrowserWorkerManager & PlaygroundPane", () => {
       restarted: false,
       failoverMs: null,
       ttftMs: 75,
-      totalMs: 92,
+      totalMs: 392,
       transportActual: "p2p",
       fallbackReason: null,
       iceMs: 68,
-      p2pBytes: 524_288,
+      p2pBytes: 16_777_216,
       relayedPayloadBytes: 0,
-      streamDurationMs: 12,
-      framesReceived: 32,
+      streamDurationMs: 310,
+      framesReceived: 1_024,
       timeline: [],
     });
 
@@ -353,9 +353,9 @@ describe("BrowserWorkerManager & PlaygroundPane", () => {
     fireEvent.click(screen.getByRole("button", { name: /Benchmark: Relay vs P2P/i }));
     await waitFor(() => expect(screen.getByLabelText(/Relay vs WebRTC P2P benchmark/i)).toBeTruthy());
 
-    expect(invokeRelay).toHaveBeenCalledWith(expect.objectContaining({ benchChunks: 32, benchChunkBytes: 16_384 }));
-    expect(invokeWebRtc).toHaveBeenCalledWith(expect.objectContaining({ benchChunks: 32, benchChunkBytes: 16_384 }));
-    expect(screen.getByText("512.0 KB")).toBeTruthy();
+    expect(invokeRelay).toHaveBeenCalledWith(expect.objectContaining({ benchChunks: 1_024, benchChunkBytes: 16_384 }));
+    expect(invokeWebRtc).toHaveBeenCalledWith(expect.objectContaining({ benchChunks: 1_024, benchChunkBytes: 16_384 }));
+    expect(screen.getByText("16.00 MB")).toBeTruthy();
     expect(screen.getAllByText("0 B").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("68 ms")).toBeTruthy();
 

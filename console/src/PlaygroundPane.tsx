@@ -42,7 +42,7 @@ interface BenchmarkComparison {
   webrtc: StreamingInvokeResult;
 }
 
-const BENCH_CHUNKS = 32;
+const BENCH_CHUNKS = 1_024;
 const BENCH_CHUNK_BYTES = 16_384;
 const DEFAULT_ECHO_PROMPT = "Schedule this prompt from the browser and stream every word back with waterfall tracing.";
 const DEFAULT_LLM_PROMPT = "Explain in two short sentences why outbound workers help when a GPU sits behind NAT.";
@@ -380,7 +380,7 @@ export function PlaygroundPane({
         prompt: "bench-relay",
         benchChunks: BENCH_CHUNKS,
         benchChunkBytes: BENCH_CHUNK_BYTES,
-        metadata: { "demo.scenario": "bench-relay-512kb" },
+        metadata: { "demo.scenario": "bench-relay-16mb" },
         maxAttempts: 1,
         signal: controller.signal,
         onJobAccepted: (jid) => setActiveJobId(jid),
@@ -396,7 +396,7 @@ export function PlaygroundPane({
         prompt: "bench-p2p",
         benchChunks: BENCH_CHUNKS,
         benchChunkBytes: BENCH_CHUNK_BYTES,
-        metadata: { "demo.scenario": "bench-p2p-512kb" },
+        metadata: { "demo.scenario": "bench-p2p-16mb" },
         signal: controller.signal,
         onJobAccepted: (jid) => setActiveJobId(jid),
         onProgress: (msg) => setLiveProgress(msg),
@@ -407,7 +407,7 @@ export function PlaygroundPane({
       setActiveJobId(webrtc.jobId ?? relay.jobId);
       setLiveProgress(
         webrtc.transportActual === "p2p"
-          ? `Benchmark done: Relay transferred ${formatByteCount(relay.relayedPayloadBytes ?? totalBytes)} through server; WebRTC P2P transferred ${formatByteCount(webrtc.p2pBytes ?? totalBytes)} directly (0 B relayed).`
+          ? `Benchmark done: Relay client-counted ${formatByteCount(relay.relayedPayloadBytes ?? totalBytes)} relayed; WebRTC P2P received ${formatByteCount(webrtc.p2pBytes ?? totalBytes)} over DataChannel (0 B client-counted relayed payload).`
           : `Benchmark done: WebRTC fell back to WS Relay (${webrtc.fallbackReason ?? "unavailable"}).`,
       );
       onRefresh?.();
@@ -691,7 +691,7 @@ export function PlaygroundPane({
                     {transportMode === "webrtc" ? "Run WebRTC P2P Invoke" : "Run Streaming Invoke"}
                   </button>
                   <button type="button" className="btn" onClick={() => void runBenchmark()}>
-                    Benchmark: Relay vs P2P (512 KB)
+                    Benchmark: Relay vs P2P (16 MB)
                   </button>
                   <button type="button" className="btn" onClick={() => void runInvoke(true)}>
                     Kill worker &amp; test failover
@@ -706,8 +706,8 @@ export function PlaygroundPane({
                 sees scheduling, lease health, and worker-reported metadata (it cannot verify or replay payload bytes).
                 Pre-output peer drops re-schedule automatically; post-output drops fail fast with{" "}
                 <code>output_interrupted</code>. Plain-text token streams pay cold ICE setup (~50–200 ms) for little
-                latency gain — use <strong>Benchmark: Relay vs P2P (512 KB)</strong> to measure real large-payload
-                throughput &amp; <code>0 B</code> relayed egress.
+                latency gain — use <strong>Benchmark: Relay vs P2P (16 MB)</strong> to measure sustained large-payload
+                throughput &amp; client-counted relayed payload bytes.
               </p>
             ) : null}
 
@@ -741,8 +741,11 @@ export function PlaygroundPane({
                         {lastResult.state}
                       </span>
                       {lastResult.transportActual === "p2p" ? (
-                        <span className="tag tag--ok mono">
-                          WebRTC P2P · {lastResult.iceMs != null ? `cold ICE ${formatDuration(lastResult.iceMs)} · ` : ""}0 B relayed
+                        <span
+                          className="tag tag--ok mono"
+                          title="Client-counted payload bytes received via WebSocket relay (excludes WebRTC signaling frames)"
+                        >
+                          WebRTC P2P · {lastResult.iceMs != null ? `cold ICE ${formatDuration(lastResult.iceMs)} · ` : ""}0 B relayed (client)
                         </span>
                       ) : lastResult.fallbackReason ? (
                         <span className="tag tag--warn mono">
@@ -798,7 +801,9 @@ export function PlaygroundPane({
                       <th>Path</th>
                       <th>Cold ICE</th>
                       <th>TTFT / Throughput</th>
-                      <th>Server Relayed Payload</th>
+                      <th title="Measured by caller SDK on /ws/v2/client/invoke (non-progress output payload bytes; excludes WebRTC signaling frames and is not server-audited)">
+                        Relayed Payload (Client-Counted)
+                      </th>
                       <th>Trace</th>
                     </tr>
                   </thead>
@@ -876,11 +881,12 @@ export function PlaygroundPane({
                   </tbody>
                 </table>
                 <p className="pg-note muted">
-                  <strong>Honest trade-off:</strong> large binary streams (images, audio, video frames, tensors) bypass
-                  control-plane egress completely (<code>0 B</code> relayed), whereas short text prompts pay cold ICE
-                  setup (~50–200 ms) with negligible speedup. Public STUN only (no TURN): symmetric NATs / corporate
-                  firewalls fall back to WS Relay after 3.5 s. EPHEMERAL Invoke only — payload bytes &amp; metrics in
-                  P2P mode are worker-reported (not server-audited or replayable).
+                  <strong>Honest trade-off &amp; metering:</strong> large binary streams (images, audio, video frames,
+                  tensors) bypass control-plane payload relay (<code>0 B</code> client-counted payload on{" "}
+                  <code>/ws/v2/client/invoke</code>; only SDP/ICE signaling + summary metadata cross the server),
+                  whereas short text prompts pay cold ICE setup (~50–200 ms) with negligible speedup. Public STUN only
+                  (no TURN): symmetric NATs / corporate firewalls fall back to WS Relay after 3.5 s. EPHEMERAL Invoke
+                  only — P2P byte counts are client/worker-reported (not server-audited or replayable).
                 </p>
               </div>
             ) : null}

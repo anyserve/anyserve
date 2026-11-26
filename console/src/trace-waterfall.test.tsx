@@ -246,7 +246,7 @@ describe("ExecutionWaterfall component", () => {
     });
     render(<ExecutionWaterfall detail={p2pDetail} />);
     expect(screen.getByText("WebRTC P2P")).toBeTruthy();
-    expect(screen.getByText(/512\.0 KB \(0 B relayed\) · ICE 84 ms/)).toBeTruthy();
+    expect(screen.getByText(/512\.0 KB \(worker-reported\) · ICE 84 ms/)).toBeTruthy();
 
     cleanup();
     const fallbackDetail = makeDetail();

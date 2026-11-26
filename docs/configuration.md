@@ -144,9 +144,11 @@ depends on WebRTC. Callers may opt in per job with metadata
 requests only — durable and `Submit` jobs reject or fall back to relay because
 the control plane must persist and replay durable outputs.
 - *Trust boundary*: in P2P mode, payload bytes flow directly over
-  `RTCDataChannel` (`0 B` payload relayed); the control plane only sees
-  scheduling, lease liveness, and worker-reported summary metadata
-  (`anyserve.transport_actual`, `anyserve.p2p_bytes`, `anyserve.ice_ms`).
+  `RTCDataChannel` (client-counted `0 B` payload relayed over `/ws/v2/client/invoke`;
+  SDP/ICE signaling and summary metadata still traverse the control plane); the
+  control plane only sees scheduling, lease liveness, and worker-reported summary
+  metadata (`anyserve.transport_actual`, `anyserve.p2p_bytes`, `anyserve.ice_ms`),
+  which are not server-audited or replayable.
 - *NAT & fallback*: public STUN only (`stun.l.google.com:19302`,
   `stun.cloudflare.com:3478`), **no TURN** — symmetric NATs and restrictive
   corporate firewalls automatically fall back to WebSocket relay after 3.5 s.
