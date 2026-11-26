@@ -1,10 +1,12 @@
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyserve_core::auth::{SignedTokenClaims, constant_time_eq, sign_token};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::header::{
-    CACHE_CONTROL, CONTENT_TYPE, HeaderName, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
+    CACHE_CONTROL, CONTENT_TYPE, HeaderName, RETRY_AFTER, SET_COOKIE, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -25,6 +27,103 @@ use crate::store::{SqliteStore, TokenRecord, make_token_preview};
 
 const PORTAL_HTML: &str = include_str!("portal.html");
 const PORTAL_CSP: &str = "default-src 'self'; img-src 'self' https:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'self'";
+const GUEST_PER_IP_WINDOW: Duration = Duration::from_secs(600);
+const GUEST_GLOBAL_WINDOW: Duration = Duration::from_secs(60);
+const GUEST_MAX_TRACKED_IPS: usize = 4_096;
+
+#[derive(Default)]
+struct GuestRateLimiterInner {
+    global: VecDeque<Instant>,
+    per_ip: HashMap<String, VecDeque<Instant>>,
+}
+
+pub struct GuestRateLimiter {
+    per_ip_limit: usize,
+    global_limit: usize,
+    inner: Mutex<GuestRateLimiterInner>,
+}
+
+impl GuestRateLimiter {
+    fn new(per_ip_limit: u32, global_limit: u32) -> Self {
+        Self {
+            per_ip_limit: per_ip_limit.max(1) as usize,
+            global_limit: global_limit.max(1) as usize,
+            inner: Mutex::new(GuestRateLimiterInner::default()),
+        }
+    }
+
+    fn check_and_record(&self, ip: &str, now: Instant) -> Result<(), u64> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while guard
+            .global
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= GUEST_GLOBAL_WINDOW)
+        {
+            guard.global.pop_front();
+        }
+        if guard.global.len() >= self.global_limit {
+            let wait = guard
+                .global
+                .front()
+                .map(|t| {
+                    GUEST_GLOBAL_WINDOW
+                        .saturating_sub(now.saturating_duration_since(*t))
+                        .as_secs()
+                        .max(1)
+                })
+                .unwrap_or(1);
+            return Err(wait);
+        }
+
+        if let Some(bucket) = guard.per_ip.get_mut(ip) {
+            while bucket
+                .front()
+                .is_some_and(|t| now.saturating_duration_since(*t) >= GUEST_PER_IP_WINDOW)
+            {
+                bucket.pop_front();
+            }
+            if bucket.len() >= self.per_ip_limit {
+                let wait = bucket
+                    .front()
+                    .map(|t| {
+                        GUEST_PER_IP_WINDOW
+                            .saturating_sub(now.saturating_duration_since(*t))
+                            .as_secs()
+                            .max(1)
+                    })
+                    .unwrap_or(1);
+                return Err(wait);
+            }
+        } else if guard.per_ip.len() >= GUEST_MAX_TRACKED_IPS {
+            guard.per_ip.retain(|_, q| {
+                while q
+                    .front()
+                    .is_some_and(|t| now.saturating_duration_since(*t) >= GUEST_PER_IP_WINDOW)
+                {
+                    q.pop_front();
+                }
+                !q.is_empty()
+            });
+            if guard.per_ip.len() >= GUEST_MAX_TRACKED_IPS
+                && let Some(oldest_ip) = guard
+                    .per_ip
+                    .iter()
+                    .min_by_key(|(_, q)| q.back().copied())
+                    .map(|(k, _)| k.clone())
+            {
+                guard.per_ip.remove(&oldest_ip);
+            }
+        }
+
+        guard.global.push_back(now);
+        guard
+            .per_ip
+            .entry(ip.to_owned())
+            .or_default()
+            .push_back(now);
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -32,6 +131,7 @@ pub struct AppState {
     pub store: SqliteStore,
     pub github: GitHubClient,
     pub cookie_keys: Vec<[u8; 32]>,
+    pub guest_limiter: Arc<GuestRateLimiter>,
 }
 
 impl AppState {
@@ -48,11 +148,16 @@ impl AppState {
             .iter()
             .map(|k| derive_cookie_key(k))
             .collect();
+        let guest_limiter = Arc::new(GuestRateLimiter::new(
+            config.guest_rate_limit_per_ip,
+            config.guest_rate_limit_global,
+        ));
         Ok(Self {
             config: Arc::new(config),
             store,
             github,
             cookie_keys,
+            guest_limiter,
         })
     }
 
@@ -87,6 +192,7 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/github/callback", get(oauth_callback))
         .route("/auth/logout", post(logout))
         .route("/auth/api/me", get(api_me))
+        .route("/auth/api/guest", post(api_guest))
         .route("/auth/api/tokens", post(api_mint_token))
         .route("/auth/api/tokens/:jti/revoke", post(api_revoke_token))
         .route("/auth/api/tokens/revoke-all", post(api_revoke_all_tokens))
@@ -377,11 +483,18 @@ struct PortalConfigDto<'a> {
     console_url: Option<&'a str>,
     token_ttl_days: u64,
     max_tokens_per_user: u64,
+    guest_enabled: bool,
+    guest_ttl_secs: u64,
 }
 
 async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let Some(user) = authenticated_user(&state, &headers) else {
-        return Json(serde_json::json!({ "authenticated": false })).into_response();
+        return Json(serde_json::json!({
+            "authenticated": false,
+            "guest_enabled": state.config.guest_enabled,
+            "guest_ttl_secs": state.config.guest_ttl_secs,
+        }))
+        .into_response();
     };
     let tokens = match state.store.list_user_tokens(user.github_id).await {
         Ok(list) => list,
@@ -389,6 +502,8 @@ async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     };
     Json(serde_json::json!({
         "authenticated": true,
+        "guest_enabled": state.config.guest_enabled,
+        "guest_ttl_secs": state.config.guest_ttl_secs,
         "user": PortalUserDto {
             github_id: user.github_id,
             login: user.login,
@@ -401,10 +516,106 @@ async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
             console_url: state.config.console_url.as_deref(),
             token_ttl_days: state.config.token_ttl_days,
             max_tokens_per_user: state.config.max_tokens_per_user,
+            guest_enabled: state.config.guest_enabled,
+            guest_ttl_secs: state.config.guest_ttl_secs,
         },
         "tokens": tokens,
     }))
     .into_response()
+}
+
+fn extract_client_ip(req: &Request, trust_proxy: bool) -> String {
+    if trust_proxy
+        && let Some(xff) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+    {
+        // Only trust the rightmost hop written by our reverse proxy (e.g. Caddy);
+        // client-supplied leftmost X-Forwarded-For entries are untrusted and ignored.
+        if let Some(last) = xff.rsplit(',').map(str::trim).find(|part| !part.is_empty()) {
+            return last.to_owned();
+        }
+    }
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+        return addr.ip().to_string();
+    }
+    "direct".to_owned()
+}
+
+/// Mints a short-lived, stateless, isolated `guest-<12hex>` client+worker token pair
+/// with zero writes to `auth-github.sqlite`. Disabled unless `ANYSERVE_AUTH_GUEST_ENABLED=true`.
+async fn api_guest(State(state): State<AppState>, req: Request) -> Response {
+    if !state.config.guest_enabled {
+        return json_error(StatusCode::NOT_FOUND, "guest sandbox is disabled");
+    }
+    if let Err(msg) = require_csrf_header(req.headers()) {
+        return json_error(StatusCode::FORBIDDEN, msg);
+    }
+    let client_ip = extract_client_ip(&req, state.config.trust_proxy);
+    if let Err(retry_after_secs) = state
+        .guest_limiter
+        .check_and_record(&client_ip, Instant::now())
+    {
+        let mut resp = json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("guest sandbox rate limit reached; retry in {retry_after_secs}s"),
+        );
+        if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+            resp.headers_mut().insert(RETRY_AFTER, val);
+        }
+        return resp;
+    }
+
+    let now = now_secs();
+    let ttl_secs = state.config.guest_ttl_secs;
+    let exp = now.saturating_add(ttl_secs);
+    let hex = Uuid::new_v4().simple().to_string();
+    let namespace = format!("guest-{}", &hex[..12]);
+    let sub = format!("guest:{namespace}");
+
+    let client_claims = SignedTokenClaims {
+        jti: format!("jti_gc_{}", Uuid::new_v4().simple()),
+        ns: namespace.clone(),
+        role: "client".to_string(),
+        sub: sub.clone(),
+        iat: now,
+        exp: Some(exp),
+        fp: None,
+    };
+    let worker_claims = SignedTokenClaims {
+        jti: format!("jti_gw_{}", Uuid::new_v4().simple()),
+        ns: namespace.clone(),
+        role: "worker".to_string(),
+        sub,
+        iat: now,
+        exp: Some(exp),
+        fp: None,
+    };
+    let key = state.config.primary_signing_key();
+    let client_token = match sign_token(key, &client_claims) {
+        Ok(t) => t,
+        Err(err) => return internal_error("sign guest client token", err),
+    };
+    let worker_token = match sign_token(key, &worker_claims) {
+        Ok(t) => t,
+        Err(err) => return internal_error("sign guest worker token", err),
+    };
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "namespace": namespace,
+            "client_token": client_token,
+            "worker_token": worker_token,
+            "expires_at": exp,
+            "ttl_secs": ttl_secs,
+            "grpc_endpoint": state.config.grpc_endpoint,
+            "ws_endpoint": state.config.ws_endpoint,
+            "console_url": state.config.console_url,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -636,11 +847,15 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn spawn_plugin(
+    async fn spawn_plugin_with_guest(
         mock_gh: &str,
         min_age_days: u64,
         allowed: Vec<String>,
-    ) -> (String, Config) {
+        guest_enabled: bool,
+        guest_per_ip: u32,
+        guest_global: u32,
+        trust_proxy: bool,
+    ) -> (String, Config, SqliteStore) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
@@ -666,12 +881,31 @@ mod tests {
             allowed_users: allowed.into_iter().collect(),
             github_oauth_base: mock_gh.to_owned(),
             github_api_base: mock_gh.to_owned(),
+            guest_enabled,
+            guest_ttl_secs: 1_800,
+            guest_rate_limit_per_ip: guest_per_ip,
+            guest_rate_limit_global: guest_global,
+            trust_proxy,
         };
         let store = SqliteStore::open_in_memory().await.unwrap();
-        let state = AppState::new(cfg.clone(), store).unwrap();
+        let state = AppState::new(cfg.clone(), store.clone()).unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app(state)).await;
+            let _ = axum::serve(
+                listener,
+                app(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
         });
+        (base_url, cfg, store)
+    }
+
+    async fn spawn_plugin(
+        mock_gh: &str,
+        min_age_days: u64,
+        allowed: Vec<String>,
+    ) -> (String, Config) {
+        let (base_url, cfg, _store) =
+            spawn_plugin_with_guest(mock_gh, min_age_days, allowed, false, 10, 120, false).await;
         (base_url, cfg)
     }
 
@@ -1051,6 +1285,11 @@ mod tests {
             allowed_users: Default::default(),
             github_oauth_base: mock_gh.clone(),
             github_api_base: mock_gh,
+            guest_enabled: false,
+            guest_ttl_secs: 1_800,
+            guest_rate_limit_per_ip: 10,
+            guest_rate_limit_global: 120,
+            trust_proxy: false,
         };
         assert!(cfg.cookie_secure());
         let store = SqliteStore::open_in_memory().await.unwrap();
@@ -1131,5 +1370,171 @@ mod tests {
         assert!(!loc.contains("phishing"));
         assert!(!loc.contains("evil.example"));
         assert!(loc.contains("error="));
+    }
+
+    #[tokio::test]
+    async fn guest_endpoint_disabled_by_default_returns_404() {
+        let mock_gh = spawn_mock_github(1, "nobody", "2020-01-01T00:00:00Z").await;
+        let (base, _cfg) = spawn_plugin(&mock_gh, 0, Vec::new()).await;
+        let client = reqwest::Client::new();
+
+        let me: serde_json::Value = client
+            .get(format!("{base}/auth/api/me"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(me["authenticated"], false);
+        assert_eq!(me["guest_enabled"], false);
+
+        let resp = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn guest_sandbox_mints_stateless_pair_zero_sqlite_writes_and_enforces_rate_limits() {
+        let mock_gh = spawn_mock_github(2, "nobody", "2020-01-01T00:00:00Z").await;
+        let (base, cfg, store) =
+            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 100, true).await;
+        let client = reqwest::Client::new();
+
+        // /auth/api/me advertises guest sandbox availability.
+        let me: serde_json::Value = client
+            .get(format!("{base}/auth/api/me"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(me["guest_enabled"], true);
+        assert_eq!(me["guest_ttl_secs"], 1800);
+
+        // Missing CSRF header is rejected with 403.
+        let no_csrf = client
+            .post(format!("{base}/auth/api/guest"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+        // With trust_proxy=true (behind Caddy), spoofed leftmost X-Forwarded-For hops
+        // cannot bypass the per-IP limit; only the rightmost Caddy-appended hop counts.
+        let r1 = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "1.1.1.1, 203.0.113.9")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::CREATED);
+        let b1: serde_json::Value = r1.json().await.unwrap();
+        let ns1 = b1["namespace"].as_str().unwrap();
+        assert!(ns1.starts_with("guest-") && ns1.len() == 18, "ns={ns1}");
+        assert_eq!(b1["ttl_secs"], 1800);
+
+        let r2 = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "2.2.2.2, 203.0.113.9")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::CREATED);
+        let b2: serde_json::Value = r2.json().await.unwrap();
+        assert_ne!(ns1, b2["namespace"].as_str().unwrap());
+
+        // 3rd request from the same rightmost IP hits per-IP 429 + Retry-After.
+        let r3 = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "3.3.3.3, 203.0.113.9")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(r3.headers().contains_key(RETRY_AFTER));
+
+        // A genuinely different rightmost Caddy-appended IP still succeeds.
+        let r_other = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "3.3.3.3, 198.51.100.7")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_other.status(), StatusCode::CREATED);
+
+        // Verify both tokens with AuthPolicy: isolated namespace, finite expiry, non-operator, exact roles.
+        let policy = AuthPolicy::default().with_signing_keys(cfg.signing_keys.clone());
+        let mut ch = HeaderMap::new();
+        ch.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", b1["client_token"].as_str().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let cp = policy.authorize_console_headers(&ch).unwrap();
+        assert_eq!(cp.namespace, ns1);
+        assert_eq!(cp.role, Role::Client);
+        assert!(!cp.is_operator);
+        assert_eq!(
+            policy.authorize_operator_headers(&ch).unwrap_err().code() as i32,
+            7
+        );
+
+        let mut wh = HeaderMap::new();
+        wh.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", b1["worker_token"].as_str().unwrap())
+                .parse()
+                .unwrap(),
+        );
+        let wp = policy.verify_worker_headers(&wh).unwrap();
+        assert_eq!(wp.namespace, ns1);
+        assert_eq!(wp.role, Role::Worker);
+        assert!(!wp.is_operator);
+        // Worker token must be rejected by Console API.
+        assert!(policy.authorize_console_headers(&wh).is_err());
+
+        // Zero SQLite writes occurred in auth-github.sqlite.
+        assert_eq!(store.count_users_and_tokens().await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn guest_rate_limit_ignores_spoofed_xff_when_trust_proxy_disabled() {
+        let mock_gh = spawn_mock_github(3, "nobody", "2020-01-01T00:00:00Z").await;
+        // trust_proxy=false (fail-closed default): X-Forwarded-For must be ignored completely.
+        let (base, _cfg, _store) =
+            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 100, false).await;
+        let client = reqwest::Client::new();
+
+        for spoof in ["198.51.100.1", "198.51.100.2"] {
+            let resp = client
+                .post(format!("{base}/auth/api/guest"))
+                .header("x-requested-with", "fetch")
+                .header("x-forwarded-for", spoof)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        // 3rd request spoofing a brand-new X-Forwarded-For STILL hits 429 on real peer 127.0.0.1.
+        let blocked = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "198.51.100.99")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

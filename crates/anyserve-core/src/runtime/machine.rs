@@ -721,16 +721,16 @@ impl Inner {
                     .or_default()
                     .insert(interface.to_string(), next_cursor);
                 rotation_pending = true;
-            } else if let Some(m) = st.scan_cursor.get_mut(namespace) {
-                m.remove(interface);
+            } else {
+                State::remove_nested(&mut st.scan_cursor, namespace, interface);
             }
             {
                 let seen: HashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
                 window.retain(|k| !seen.contains(k.job_id.as_str()));
             }
             keys.extend(window);
-        } else if let Some(m) = st.scan_cursor.get_mut(namespace) {
-            m.remove(interface);
+        } else {
+            State::remove_nested(&mut st.scan_cursor, namespace, interface);
         }
         let priority_cap = self.config.priority_levels.saturating_sub(1);
         let policy = self.config.interfaces.get(interface);

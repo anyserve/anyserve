@@ -6,7 +6,9 @@ import {
   AuthorizationError,
   cancelJob,
   clearConsoleToken,
+  createGuestSandbox,
   drainWorker,
+  fetchGuestStatus,
   fetchInfo,
   getJob,
   getJobs,
@@ -25,7 +27,9 @@ vi.mock("./api", async (importOriginal) => {
     AuthorizationError: actual.AuthorizationError,
     safeHttpUrl: actual.safeHttpUrl,
     cancelJob: vi.fn(),
+    createGuestSandbox: vi.fn(),
     drainWorker: vi.fn(),
+    fetchGuestStatus: vi.fn().mockResolvedValue({ guest_enabled: false }),
     fetchInfo: vi.fn().mockResolvedValue({ auth_enabled: false, grpc_enabled: true }),
     getJob: vi.fn(),
     getJobs: vi.fn(),
@@ -1468,4 +1472,45 @@ it("keeps 403 authorization errors inline, locks tenant reset filter, shows auth
       expect.objectContaining({ namespace: "all" }),
     ),
   );
+});
+
+it("offers 1-click Try Live Demo guest sandbox on auth gate, opens /playground, and injects guest worker token in memory only", async () => {
+  vi.mocked(fetchInfo).mockResolvedValue({
+    auth_enabled: true,
+    auth_portal_url: "http://localhost:3000/tokens",
+    public_endpoint: "https://anyserve.arcosx.org",
+    grpc_enabled: false,
+  });
+  vi.mocked(fetchGuestStatus).mockResolvedValue({ guest_enabled: true, guest_ttl_secs: 1800 });
+  vi.mocked(createGuestSandbox).mockResolvedValue({
+    namespace: "guest-a1b2c3d4e5f6",
+    client_token: "asv1.guest-client.sig",
+    worker_token: "asv1.guest-worker.sig",
+    expires_at: 1_900_000_000,
+    ttl_secs: 1800,
+  });
+  vi.mocked(getOverview)
+    .mockRejectedValueOnce(new (await import("./api")).AuthenticationError("auth required"))
+    .mockResolvedValue({
+      ...richOverview(),
+      control_plane: {
+        ...richOverview().control_plane!,
+        auth_enabled: true,
+        auth_portal_url: "http://localhost:3000/tokens",
+      },
+      scope: { is_operator: false, namespace: "guest-a1b2c3d4e5f6", subject: "guest:guest-a1b2c3d4e5f6" },
+    });
+
+  render(<App />);
+  const demoBtn = await screen.findByRole("button", { name: /Try Live Demo \(No Login · 30m Sandbox\)/i });
+  fireEvent.click(demoBtn);
+
+  await waitFor(() => expect(createGuestSandbox).toHaveBeenCalledWith("http://localhost:3000/tokens"));
+  expect(setConsoleToken).toHaveBeenCalledWith("asv1.guest-client.sig");
+  expect(setConsoleToken).not.toHaveBeenCalledWith("asv1.guest-worker.sig");
+  expect(await screen.findByText(/Browser Worker Playground/i)).toBeTruthy();
+  expect(window.location.pathname).toBe("/playground");
+
+  const workerInput = screen.getByPlaceholderText(/Paste worker token/i) as HTMLInputElement;
+  expect(workerInput.value).toBe("asv1.guest-worker.sig");
 });

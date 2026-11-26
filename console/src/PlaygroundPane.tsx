@@ -22,6 +22,7 @@ interface PlaygroundPaneProps {
   controlPlane?: ControlPlaneSummary;
   authPortalUrl?: string | null;
   lockedNamespace?: string | null;
+  initialWorkerToken?: string | null;
   manager?: BrowserWorkerManager;
   invokeRelay?: (options: StreamingInvokeOptions) => Promise<StreamingInvokeResult>;
   invokeWebRtc?: (options: RtcInvokeOptions) => Promise<StreamingInvokeResult>;
@@ -99,6 +100,7 @@ export function PlaygroundPane({
   controlPlane,
   authPortalUrl,
   lockedNamespace,
+  initialWorkerToken,
   manager = browserWorkerManager,
   invokeRelay = invokeStreamingJob,
   invokeWebRtc = invokeWebRtcOrFallback,
@@ -112,7 +114,13 @@ export function PlaygroundPane({
   const wsBaseUrl = deriveWsBaseUrl(import.meta.env.VITE_CONSOLE_API_BASE_URL ?? "");
 
   // Worker token lives strictly in component/worker memory — never overwrites Console's client token.
-  const [workerToken, setWorkerToken] = useState("");
+  const [workerToken, setWorkerToken] = useState(() => initialWorkerToken?.trim() ?? "");
+  useEffect(() => {
+    const trimmed = initialWorkerToken?.trim() ?? "";
+    if (trimmed && !workerToken) {
+      setWorkerToken(trimmed);
+    }
+  }, [initialWorkerToken, workerToken]);
   const [selectedInterface, setSelectedInterface] = useState<string>(ECHO_INTERFACE);
   const [transportMode, setTransportMode] = useState<TransportMode>("relay");
   const [prompt, setPrompt] = useState(DEFAULT_ECHO_PROMPT);

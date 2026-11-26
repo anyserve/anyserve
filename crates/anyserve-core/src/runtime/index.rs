@@ -58,6 +58,11 @@ impl JobIndex {
             .map(|(_, id)| id.as_str())
     }
 
+    #[cfg(test)]
+    pub(crate) fn namespace_count(&self) -> usize {
+        self.namespaces.len()
+    }
+
     pub(crate) fn position(job: &Job) -> Position {
         (job.state(), job.updated_at_ms, job.queued_since_ms)
     }

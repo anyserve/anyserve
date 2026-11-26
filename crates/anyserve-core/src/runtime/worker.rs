@@ -1830,6 +1830,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ephemeral_guest_namespaces_reclaim_all_maps_on_drain_and_eviction() {
+        let runtime = Runtime::start(RuntimeConfig {
+            max_terminal_jobs: 0,
+            heartbeat_timeout: Duration::from_millis(50),
+            reconnect_grace: Some(Duration::from_millis(10)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let auth = crate::auth::AuthPolicy::default();
+
+        for i in 0..200u32 {
+            let ns = format!("guest-{i:012x}");
+            let mut sess = runtime
+                .open_session_for(
+                    hello(&format!("w-{i}"), "", Vec::new()),
+                    worker_principal(&ns),
+                    &auth,
+                )
+                .unwrap();
+            let mut spec = JobSpec::default();
+            spec.demand.interface = "echo".into();
+            spec.policy.durability = Some(Durability::Ephemeral);
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some(ns.clone()),
+                    job_id: Some(format!("j-{i}")),
+                    spec,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let assign = next_assign(&mut sess).await;
+            let (link, _) = runtime
+                .open_attempt_for(
+                    &worker_principal(&ns),
+                    &auth,
+                    &pb::AttemptOpen {
+                        lease_id: assign.lease_id.clone(),
+                        generation: assign.generation,
+                        resume_after_sequence: 0,
+                    },
+                )
+                .await
+                .unwrap();
+            runtime
+                .finish_attempt(&link, AttemptOutcome::Succeeded, Vec::new())
+                .await
+                .unwrap();
+            runtime.session_closed(&sess.session_id, sess.connection);
+        }
+
+        // Wait past reconnect_grace so timer sweep removes all 200 disconnected guest sessions.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            {
+                let st = runtime.inner.lock();
+                if st.sessions.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for disconnected guest sessions to expire"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        let st = runtime.inner.lock();
+        assert!(st.jobs.is_empty(), "jobs leaked: {}", st.jobs.len());
+        assert_eq!(
+            st.job_index.namespace_count(),
+            0,
+            "job_index namespaces leaked"
+        );
+        assert!(st.queues.is_empty(), "queues leaked: {}", st.queues.len());
+        assert!(
+            st.scan_cursor.is_empty(),
+            "scan_cursor leaked: {}",
+            st.scan_cursor.len()
+        );
+        assert!(
+            st.accepting.is_empty(),
+            "accepting leaked: {}",
+            st.accepting.len()
+        );
+        assert!(
+            st.in_flight_concurrency.is_empty(),
+            "in_flight_concurrency leaked: {}",
+            st.in_flight_concurrency.len()
+        );
+        assert!(
+            st.sessions_by_interface.is_empty(),
+            "sessions_by_interface leaked: {}",
+            st.sessions_by_interface.len()
+        );
+    }
+
+    #[tokio::test]
     async fn hello_heartbeat_and_routing_key_bounds_enforced() {
         let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
         // max_concurrency > 65536 rejected.

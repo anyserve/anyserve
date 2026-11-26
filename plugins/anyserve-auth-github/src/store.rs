@@ -358,4 +358,15 @@ impl SqliteStore {
             revoked_jtis,
         }))
     }
+
+    #[cfg(test)]
+    pub async fn count_users_and_tokens(&self) -> Result<(i64, i64)> {
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+        let tokens: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tokens")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((users, tokens))
+    }
 }

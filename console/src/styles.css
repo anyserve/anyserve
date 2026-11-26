@@ -578,6 +578,11 @@ td.ellipsis, th.ellipsis { display: table-cell; }
 .pg-bench-table th, .pg-bench-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line-2); }
 .pg-bench-table th { color: var(--muted); font-weight: 550; }
 .pg-bench-table tr:last-child td { border-bottom: 0; }
+.auth__guest { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; margin-bottom: 10px; border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--line)); border-radius: 9px; background: color-mix(in srgb, var(--accent) 8%, var(--card-2)); }
+.auth__guest-btn { width: 100%; background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 8px; padding: 9px 12px; font-weight: 600; cursor: pointer; }
+.auth__guest-btn:hover { filter: brightness(1.06); }
+.auth__guest-btn:disabled { opacity: 0.6; cursor: default; }
+.auth__guest-note { margin: 0; font-size: 11.5px; color: var(--muted); line-height: 1.45; }
 @media (max-width: 960px) { .pg-grid { grid-template-columns: 1fr; } }
 
 /* ---- Responsive ---- */
