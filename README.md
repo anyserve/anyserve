@@ -1,4 +1,4 @@
-# Anyserve
+# AnyServe
 
 Backend-independent execution and scheduling control plane. Clients send opaque payloads over gRPC or WebSocket; the control plane matches jobs to outbound workers by capability and capacity, handling admission, flow control, cancellation, retries, and optional durable recovery—while workers own all application and backend logic.
 
@@ -8,12 +8,33 @@ Clients ── gRPC / WSS ──▶ Control plane (leader or Cloudflare DO) ◀�
                   SQLite · PostgreSQL · DO SQLite + R2                           application backend
 ```
 
+## Live Demo
+
+Try AnyServe right now without running your own server:
+
+- **Web Console**: [https://anyserve.arcosx.org](https://anyserve.arcosx.org)
+- **GitHub Login Token Portal**: [https://anyserve.arcosx.org/tokens](https://anyserve.arcosx.org/tokens)
+
+Sign in with GitHub to mint scoped `client` and `worker` tokens in your own isolated `gh-<id>` namespace, then connect a local worker over native HTTP/2 gRPC (`https://anyserve.arcosx.org`) or WebSocket (`wss://anyserve.arcosx.org`):
+
+```bash
+pip install anyserve-runtime
+
+# 1. Connect a worker from your machine (no inbound ports needed)
+ANYSERVE_ENDPOINT=https://anyserve.arcosx.org ANYSERVE_TOKEN=<worker-token> \
+  python examples/python/worker.py
+
+# 2. Invoke it from another terminal and inspect the live Execution Waterfall in Console
+ANYSERVE_ENDPOINT=https://anyserve.arcosx.org ANYSERVE_TOKEN=<client-token> \
+  anyserve invoke demo.echo.v1 --input "hello AnyServe"
+```
+
 ## Capabilities
 
 - **Execution**: `Invoke` (ephemeral, optional full-duplex streaming; drop cancels) and `Submit` (durable by default, crash recovery, `job_id` idempotency, bounded at-least-once retries; exposed streamed output never silently switches attempts).
 - **Placement & backpressure**: Interface matching, `namespace` isolation, `pool` tiers with spillover, `affinity_key` sticky routing, priority + `fairness_key` queueing, `concurrency_key` serialization, required/preferred attributes, resource capacity, worker credits, and bounded memory budgets.
 - **Outbound SDKs**: Python 3.10+ and Rust SDKs over gRPC (`http(s)://`) or WebSocket (`ws(s)://`)—workers dial out and need no inbound port. Ready-made inference connectors (vLLM, Ollama, Triton, YOLO, VLA) live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
-- **Operations**: Client/worker/scoped/signed bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job`, `token`, `invoke`, `doctor`), and a React Console with W3C Trace Waterfall and DuckDB-WASM Explore (embedded by default in the official Docker image; optional in local builds via `--features embed-console`).
+- **Operations**: Client/worker/scoped/signed bearer tokens, gRPC TLS, `/healthz` · `/readyz` · `/metrics`, CLI (`job`, `token`, `invoke`, `doctor`), and a React Console with W3C Trace Waterfall (breaking down AnyServe admit/queue/relay overhead vs. handler execution time) and DuckDB-WASM Explore (embedded by default in the official Docker image; optional in local builds via `--features embed-console`).
 
 ## Quick start
 

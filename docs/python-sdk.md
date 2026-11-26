@@ -1,7 +1,10 @@
 # Python SDK
 
 Python 3.10+ is required. Install `anyserve-runtime` from the same release as the
-server, or `pip install ./clients/python` from this checkout.
+server, or `pip install ./clients/python` from this checkout. To try the SDK without
+hosting a control plane, mint isolated `client`/`worker` tokens via GitHub Login on
+the public demo at [https://anyserve.arcosx.org/tokens](https://anyserve.arcosx.org/tokens)
+and point `ANYSERVE_ENDPOINT` to `https://anyserve.arcosx.org` (or `wss://anyserve.arcosx.org`).
 
 ## Client
 
@@ -14,10 +17,10 @@ output = client.call("demo.echo.v1", b"hello",
 ```
 
 `AnyserveClient` is an alias of `ExecutionClient`; `AsyncAnyserveClient` wraps
-`call`, `execute`, `invoke`, `submit`, `get`, `watch`, `cancel` and `result` for
-`asyncio` applications (`await client.call(...)`,
-`async with await client.invoke(...) as events: ...`; duplex `invoke_stream` is on
-`AnyserveClient`). Endpoint resolution is
+`call`, `execute`, `invoke`, `invoke_stream`, `submit`, `get`, `list`, `watch`,
+`cancel` and `result` for `asyncio` applications (`await client.call(...)`,
+`async with await client.invoke(...) as events: ...`,
+`async with client.invoke_stream(...) as stream: ...`). Endpoint resolution is
 the explicit argument, then `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`
 (comma-separated URLs probe sequentially on `UNAVAILABLE` and stick to the
 active leader).
@@ -38,8 +41,9 @@ transient presigned URLs still deduplicate under `job_id` idempotency. Set
 | `execute(interface, inputs=b"", *, options=None)` | Terminal output objects of an ephemeral invocation |
 | `invoke(interface, inputs=b"", *, options=None)` | Iterable live event stream; closing cancels unfinished work |
 | `invoke_stream(interface, *, options=None)` | Duplex event stream with `send(data, metadata=None)` and `finish_input()` |
-| `submit(interface, inputs=b"", *, job_id=None, durability="durable", options=None)` | Accepted job dictionary with `created`; `durability="ephemeral"` is also supported |
+| `submit(interface, inputs=b"", *, job_id=None, durability="durable", conflict_policy=None, options=None)` | Accepted job dictionary with `created`; `durability="ephemeral"` and `conflict_policy="fail"\|"use_existing"` are supported |
 | `get(job_id, *, include_outputs=True)` | Current job dictionary |
+| `list(*, states=None, interface=None, limit=50, page_token=None)` | Paginated jobs dictionary (`jobs`, `next_page_token`) |
 | `watch(job_id, *, after_sequence=0)` | Iterable event stream; closing leaves the job running |
 | `cancel(job_id, reason="caller cancelled")` | Job dictionary after requesting cancellation |
 | `result(job_id)` | Terminal output objects; waits if unfinished |
@@ -159,7 +163,8 @@ functions, synchronous generators, `async def` coroutines, or `async` generators
 (`serve(handler, "http://host:50052")`), several handlers
 (`serve(h1, h2, endpoint=...)`) or a list (`serve([h1, h2], endpoint)`), with
 the keyword options `endpoint`, `worker_id`, `token`, `namespace`, `pool`,
-`reconnect_interval_secs=1.0` and `connection`. It blocks until stopped or a
+`reconnect_interval_secs=1.0`, `max_reconnect_interval_secs=30.0`,
+`graceful_shutdown_timeout=30.0`, `load_provider=None`, and `connection`. It blocks until stopped or a
 permanent connection error and multiplexes the handlers onto one session.
 Endpoint/token defaults match the client, but
 workers need a worker-role token. The default ID is hostname plus process ID;

@@ -46,6 +46,8 @@ docker compose --profile auth-github up -d --build
 
 Users visit `https://relay.example.com/tokens` to sign in with GitHub, mint/revoke `client` and `worker` tokens scoped strictly to their isolated `gh-<id>` namespace, and open the Console directly via **Open in Console**. Operator tokens in `ANYSERVE_CLIENT_TOKENS` retain full cluster access and `/metrics`.
 
+A live reference deployment of this stack (with automated `main`-branch GHCR builds and SSH rollouts via [deploy-vps.yml](../../.github/workflows/deploy-vps.yml)) is running at [https://anyserve.arcosx.org](https://anyserve.arcosx.org) ([GitHub Login token portal](https://anyserve.arcosx.org/tokens)).
+
 ## Upgrading from older root-owned `/data` volumes
 
 The `anyserve` container runs as non-root `anyserve` (`10001:10001`). Fresh volumes inherit `/data` ownership automatically; when upgrading an existing root-owned `anyserve_data` volume (or bind mount), update ownership once before starting:
