@@ -11,6 +11,7 @@ import {
   formatRustDuration,
   formatTimestamp,
   latestAttemptWorker,
+  redactDirectUri,
 } from "./format";
 import { CopyButton, EmptyState, PanelHeader, StateBadge } from "./pane-tables";
 import { ExecutionWaterfall } from "./trace-waterfall";
@@ -194,9 +195,9 @@ function ObjectRefList({ objects, resetKey }: { objects: ObjectRefSummary[]; res
   return (
     <div className="timeline">
       {objects.map((obj, idx) => (
-        <div key={`${obj.kind}-${obj.uri ?? idx}`} className="timeline__item">
+        <div key={`${obj.kind}-${idx}`} className="timeline__item">
           <div className="timeline__title">{obj.kind}{obj.content_type ? ` · ${obj.content_type}` : ""}</div>
-          <div className="timeline__subtitle">{obj.uri ?? formatObjectMeta(obj)}</div>
+          <div className="timeline__subtitle">{obj.uri != null ? redactDirectUri(obj.uri) : formatObjectMeta(obj)}</div>
           {obj.preview ? (
             <PayloadPreview
               raw={obj.preview}

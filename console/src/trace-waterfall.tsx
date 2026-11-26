@@ -400,6 +400,24 @@ export function parseJobTransport(detail: JobDetailResponse): ParsedTransportInf
   return null;
 }
 
+export interface ParsedDirectTransfer {
+  path: "direct" | "relay";
+  bytes: number | null;
+}
+
+export function parseDirectTransfer(detail: JobDetailResponse): ParsedDirectTransfer | null {
+  for (const out of detail.job.outputs) {
+    const pathRaw = out.metadata["anyserve.direct_path"]?.trim();
+    if (pathRaw === "direct" || pathRaw === "relay") {
+      return {
+        path: pathRaw,
+        bytes: parseNonNegativeInt(out.metadata["anyserve.direct_bytes"]),
+      };
+    }
+  }
+  return null;
+}
+
 export const ExecutionWaterfall = memo(function ExecutionWaterfall({
   detail,
   onOpenWorker,
@@ -411,6 +429,7 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
 }) {
   const trace = useMemo(() => parseW3cTrace(detail.job.metadata), [detail.job.metadata]);
   const transport = useMemo(() => parseJobTransport(detail), [detail]);
+  const directTransfer = useMemo(() => parseDirectTransfer(detail), [detail]);
   const model = useMemo(() => buildExecutionWaterfall(detail), [detail]);
 
   if (!trace && !model) return null;
@@ -521,6 +540,15 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
             {transport?.actual === "pending" ? (
               <span className="waterfall__metric">
                 Data plane <strong>WebRTC signaling…</strong>
+              </span>
+            ) : null}
+            {directTransfer ? (
+              <span
+                className={`waterfall__metric ${directTransfer.path === "direct" ? "waterfall__metric--p2p" : "waterfall__metric--warn"}`}
+                title={`SDK-reported iroh direct data-plane transfer (${directTransfer.path}${directTransfer.bytes != null ? `, ${formatByteCount(directTransfer.bytes)}` : ""}; SDK-reported metadata, not server-audited)`}
+              >
+                Data plane <strong>{directTransfer.path === "direct" ? "iroh direct" : "iroh relay"}</strong>
+                {directTransfer.bytes != null ? ` · ${formatByteCount(directTransfer.bytes)} (SDK-reported)` : " (SDK-reported)"}
               </span>
             ) : null}
           </div>
