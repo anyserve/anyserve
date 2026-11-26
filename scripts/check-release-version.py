@@ -15,7 +15,7 @@ app_version = re.search(r'^appVersion:\s*"([^"]+)"\s*$', chart, re.MULTILINE)
 if python["project"]["version"] != version or not app_version or app_version[1] != version:
     sys.exit("Rust, Python and Helm appVersion must match before release.")
 compose = (root / "deploy/vps/docker-compose.yml").read_text()
-compose_ver = re.search(r'image:\s*ghcr\.io/anyserve/anyserve:v([^\s]+)', compose)
+compose_ver = re.search(r'ghcr\.io/anyserve/anyserve:v([^\s}]+)', compose)
 if not compose_ver:
     sys.exit("Could not find anyserve image version in deploy/vps/docker-compose.yml.")
 modal = (root / "console/src/ConnectWorkerModal.tsx").read_text()

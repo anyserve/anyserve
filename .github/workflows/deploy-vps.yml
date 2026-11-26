@@ -1,0 +1,192 @@
+name: Deploy VPS
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  build-images:
+    name: Build and push main images
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      image_repo: ${{ steps.meta.outputs.image_repo }}
+      sha_tag: ${{ steps.meta.outputs.sha_tag }}
+      target_sha: ${{ steps.meta.outputs.target_sha }}
+    steps:
+      - name: Resolve target revision
+        id: meta
+        env:
+          WR_SHA: ${{ github.event.workflow_run.head_sha }}
+          DEFAULT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha="${WR_SHA:-$DEFAULT_SHA}"
+          repo_lc="${REPO,,}"
+          {
+            echo "target_sha=${sha}"
+            echo "sha_tag=sha-${sha:0:12}"
+            echo "image_repo=ghcr.io/${repo_lc}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.target_sha }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push anyserve image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_repo }}:main
+            ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push anyserve-auth-github image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: plugins/anyserve-auth-github/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_repo }}-auth-github:main
+            ${{ steps.meta.outputs.image_repo }}-auth-github:${{ steps.meta.outputs.sha_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    needs: [build-images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-images.outputs.target_sha }}
+
+      - name: Sync Compose files and roll out on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REPO: ${{ needs.build-images.outputs.image_repo }}
+          SHA_TAG: ${{ needs.build-images.outputs.sha_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${VPS_HOST}" || -z "${VPS_SSH_KEY}" ]]; then
+            echo "VPS_HOST / VPS_SSH_KEY secrets not configured; skipping VPS deployment."
+            exit 0
+          fi
+
+          vps_user="${VPS_USER:-root}"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "${VPS_SSH_KEY}" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan -H "${VPS_HOST}" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+
+          ssh_opts=(-i "$HOME/.ssh/deploy_key" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15)
+
+          ssh "${ssh_opts[@]}" "${vps_user}@${VPS_HOST}" "mkdir -p /opt/anyserve"
+          scp "${ssh_opts[@]}" \
+            deploy/vps/docker-compose.yml \
+            deploy/vps/server.toml \
+            deploy/vps/Caddyfile \
+            deploy/vps/Caddyfile.auth-github \
+            "${vps_user}@${VPS_HOST}:/opt/anyserve/"
+
+          # Write the non-secret rollout script remotely, then pipe GHCR_TOKEN over stdin.
+          ssh "${ssh_opts[@]}" "${vps_user}@${VPS_HOST}" "cat > /opt/anyserve/.rollout.sh && chmod 700 /opt/anyserve/.rollout.sh" <<'REMOTE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd /opt/anyserve
+          if [[ ! -f .env ]]; then
+            echo "/opt/anyserve/.env not found; aborting rollout." >&2
+            exit 1
+          fi
+
+          read -r ANYSERVE_IMAGE
+          read -r ANYSERVE_AUTH_GITHUB_IMAGE
+          read -r GHCR_USER
+          read -r GHCR_TOKEN
+          printf '%s\n' "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true; rm -f /opt/anyserve/.rollout.sh' EXIT
+
+          export ANYSERVE_IMAGE ANYSERVE_AUTH_GITHUB_IMAGE
+          set -a
+          # shellcheck disable=SC1091
+          source .env
+          set +a
+
+          profile_args=()
+          pull_services=(anyserve caddy)
+          check_auth_github=false
+          if [[ -n "${GITHUB_CLIENT_ID:-}" && -n "${GITHUB_CLIENT_SECRET:-}" ]]; then
+            profile_args=(--profile auth-github)
+            pull_services=(anyserve auth-github caddy)
+            check_auth_github=true
+          fi
+
+          docker compose "${profile_args[@]}" pull "${pull_services[@]}"
+          docker compose "${profile_args[@]}" up -d --remove-orphans
+
+          for i in $(seq 1 30); do
+            anyserve_ok=false
+            auth_ok=true
+            if docker compose "${profile_args[@]}" exec -T anyserve anyserve doctor --endpoint http://127.0.0.1:3001 >/dev/null 2>&1; then
+              anyserve_ok=true
+            fi
+            if [[ "${check_auth_github}" == "true" ]]; then
+              auth_ok=false
+              if docker compose "${profile_args[@]}" exec -T auth-github bash -c 'exec 3<>/dev/tcp/127.0.0.1/3002 && printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3 && grep -q " 204 " <&3'; then
+                auth_ok=true
+              fi
+            fi
+            if [[ "${anyserve_ok}" == "true" && "${auth_ok}" == "true" ]]; then
+              echo "VPS containers healthy."
+              break
+            fi
+            if [[ "$i" -eq 30 ]]; then
+              docker compose "${profile_args[@]}" ps
+              docker compose "${profile_args[@]}" logs --tail=50 "${pull_services[@]}"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          docker image prune -f --filter "until=168h" >/dev/null || true
+          REMOTE
+
+          printf '%s\n%s\n%s\n%s\n' \
+            "${IMAGE_REPO}:${SHA_TAG}" \
+            "${IMAGE_REPO}-auth-github:${SHA_TAG}" \
+            "${GHCR_USER}" \
+            "${GHCR_TOKEN}" \
+            | ssh "${ssh_opts[@]}" "${vps_user}@${VPS_HOST}" '/opt/anyserve/.rollout.sh'

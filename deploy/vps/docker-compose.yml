@@ -1,6 +1,6 @@
 services:
   anyserve:
-    image: ghcr.io/anyserve/anyserve:v0.5.0
+    image: ${ANYSERVE_IMAGE:-ghcr.io/anyserve/anyserve:v0.5.0}
     # Uncomment to build locally from a source checkout (embeds the Console UI):
     # build: ../..
     restart: unless-stopped
@@ -44,6 +44,7 @@ services:
   #   ANYSERVE_CADDYFILE=./Caddyfile.auth-github docker compose --profile auth-github up -d
   auth-github:
     profiles: ["auth-github"]
+    image: ${ANYSERVE_AUTH_GITHUB_IMAGE:-ghcr.io/anyserve/anyserve-auth-github:main}
     build:
       context: ../..
       dockerfile: plugins/anyserve-auth-github/Dockerfile
