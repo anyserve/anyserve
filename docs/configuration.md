@@ -170,7 +170,10 @@ the control plane must persist and replay durable outputs.
   exposed to the caller, the client automatically re-schedules on another worker;
   once output has been exposed, disconnects fail fast with `output_interrupted`
   (matching relay semantics). Short text streams pay cold ICE setup (~50–200 ms);
-  P2P is intended for large payloads where avoiding server egress matters.
+  on localhost/loopback, browser WebRTC DataChannel throughput is lower than
+  plain TCP WebSocket relay (Chromium userspace SCTP + DTLS-over-UDP ceiling).
+  WebRTC P2P's value is zero control-plane relayed payload bytes and end-to-end
+  direct transport, not higher raw throughput.
 
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a

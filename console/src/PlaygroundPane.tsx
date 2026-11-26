@@ -706,8 +706,11 @@ export function PlaygroundPane({
                 sees scheduling, lease health, and worker-reported metadata (it cannot verify or replay payload bytes).
                 Pre-output peer drops re-schedule automatically; post-output drops fail fast with{" "}
                 <code>output_interrupted</code>. Plain-text token streams pay cold ICE setup (~50–200 ms) for little
-                latency gain — use <strong>Benchmark: Relay vs P2P (16 MB)</strong> to measure sustained large-payload
-                throughput &amp; client-counted relayed payload bytes.
+                latency gain. Browser WebRTC P2P&apos;s value is{" "}
+                <strong>0 B control-plane relayed payload and end-to-end direct transport — not higher localhost
+                throughput</strong> (on loopback, Chromium&apos;s userspace SCTP/DTLS is slower than TCP WebSocket
+                relay). Use <strong>Benchmark: Relay vs P2P (16 MB)</strong> to inspect cold ICE, throughput, and
+                client-counted relayed payload bytes side by side.
               </p>
             ) : null}
 
@@ -881,12 +884,14 @@ export function PlaygroundPane({
                   </tbody>
                 </table>
                 <p className="pg-note muted">
-                  <strong>Honest trade-off &amp; metering:</strong> large binary streams (images, audio, video frames,
-                  tensors) bypass control-plane payload relay (<code>0 B</code> client-counted payload on{" "}
-                  <code>/ws/v2/client/invoke</code>; only SDP/ICE signaling + summary metadata cross the server),
-                  whereas short text prompts pay cold ICE setup (~50–200 ms) with negligible speedup. Public STUN only
-                  (no TURN): symmetric NATs / corporate firewalls fall back to WS Relay after 3.5 s. EPHEMERAL Invoke
-                  only — P2P byte counts are client/worker-reported (not server-audited or replayable).
+                  <strong>Honest trade-off &amp; metering:</strong> browser WebRTC P2P&apos;s value is{" "}
+                  <strong>0 B control-plane relayed payload and end-to-end direct transport — not higher localhost
+                  throughput</strong> (on loopback, Chromium&apos;s userspace SCTP/DTLS is slower than TCP WebSocket
+                  relay). Large binary payloads bypass control-plane payload egress (<code>0 B</code> client-counted
+                  payload on <code>/ws/v2/client/invoke</code>; only SDP/ICE signaling + summary metadata cross the
+                  server), whereas short text prompts pay cold ICE setup (~50–200 ms). Public STUN only (no TURN):
+                  symmetric NATs / corporate firewalls fall back to WS Relay after 3.5 s. EPHEMERAL Invoke only — P2P
+                  byte counts are client/worker-reported (not server-audited or replayable).
                 </p>
               </div>
             ) : null}

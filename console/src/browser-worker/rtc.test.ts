@@ -607,4 +607,34 @@ describe("WebRTC P2P data plane (rtc.ts)", () => {
     expect(chunks).toEqual(["partial "]);
     (activePeer as WorkerRtcPeer | null)?.close();
   });
+
+  it("sets bufferedAmountLowThreshold on datachannel attach and drains without 1s stall on missed edge", async () => {
+    FakeRTCPeerConnection.pairs = [];
+    const peer = new WorkerRtcPeer(
+      {
+        sendSignal: () => {},
+        onRequest: () => {},
+      },
+      [],
+      FakeRTCPeerConnection as unknown as typeof RTCPeerConnection,
+    );
+    const responder = FakeRTCPeerConnection.pairs[0]!;
+    const dc = new FakeDataChannel();
+    dc.readyState = "open";
+    responder.ondatachannel?.({ channel: dc });
+    expect(dc.bufferedAmountLowThreshold).toBe(64 * 1024);
+
+    // Simulate bufferedAmount above high-water dropping below low-water without a
+    // bufferedamountlow event firing: the 20 ms re-check must unblock well under 1 s.
+    dc.bufferedAmount = 300 * 1024;
+    const t0 = performance.now();
+    setTimeout(() => {
+      dc.bufferedAmount = 0;
+    }, 15);
+    await peer.sendData(new Uint8Array(1024));
+    const elapsedMs = performance.now() - t0;
+    expect(dc.sent.length).toBe(1);
+    expect(elapsedMs).toBeLessThan(300);
+    peer.close();
+  });
 });

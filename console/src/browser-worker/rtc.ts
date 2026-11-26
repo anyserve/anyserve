@@ -16,6 +16,9 @@ export const RTC_SIGNAL_META_KEY = "anyserve.rtc";
 export const RTC_SIGNAL_META_VALUE = "signal";
 export const DEFAULT_ICE_TIMEOUT_MS = 3_500;
 export const DEFAULT_RTC_MAX_ATTEMPTS = 2;
+const DC_HIGH_WATER_BYTES = 256 * 1024;
+const DC_LOW_WATER_BYTES = 64 * 1024;
+const DC_DRAIN_POLL_MS = 20;
 
 export type ClientRtcSignal =
   | { t: "offer"; kind?: "webrtc"; sdp: string }
@@ -138,6 +141,7 @@ export class WorkerRtcPeer {
       if (this.closed) return;
       const dc = ev.channel;
       dc.binaryType = "arraybuffer";
+      dc.bufferedAmountLowThreshold = DC_LOW_WATER_BYTES;
       this.dc = dc;
       dc.onopen = () => {
         if (this.iceMs === null) {
@@ -205,28 +209,36 @@ export class WorkerRtcPeer {
   private async writeFrame(payload: string | Uint8Array): Promise<void> {
     const dc = this.dc;
     if (this.closed || !dc || dc.readyState !== "open") return;
-    if (dc.bufferedAmount > 256 * 1024) {
+    if (dc.bufferedAmount > DC_HIGH_WATER_BYTES) {
       await new Promise<void>((resolve) => {
-        dc.bufferedAmountLowThreshold = 64 * 1024;
-        const onLow = () => {
-          dc.removeEventListener?.("bufferedamountlow", onLow);
-          clearTimeout(timer);
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          dc.removeEventListener?.("bufferedamountlow", finish);
+          clearInterval(poll);
           resolve();
         };
-        const timer = setTimeout(() => {
-          dc.removeEventListener?.("bufferedamountlow", onLow);
-          resolve();
-        }, 1_000);
         if (typeof dc.addEventListener === "function") {
-          dc.addEventListener("bufferedamountlow", onLow, { once: true });
+          dc.addEventListener("bufferedamountlow", finish, { once: true });
         } else {
-          dc.onbufferedamountlow = onLow;
+          dc.onbufferedamountlow = finish;
+        }
+        const poll = setInterval(() => {
+          if (this.closed || dc.readyState !== "open" || dc.bufferedAmount <= DC_LOW_WATER_BYTES) {
+            finish();
+          }
+        }, DC_DRAIN_POLL_MS);
+        if (dc.bufferedAmount <= DC_LOW_WATER_BYTES) {
+          finish();
         }
       });
     }
     if (!this.closed && dc.readyState === "open") {
       if (typeof payload === "string") {
         dc.send(payload);
+      } else if (payload.buffer instanceof ArrayBuffer) {
+        dc.send(payload as Uint8Array<ArrayBuffer>);
       } else {
         const copy = new Uint8Array(payload.byteLength);
         copy.set(payload);
