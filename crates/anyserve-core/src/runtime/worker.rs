@@ -2918,6 +2918,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            // Unconfigured prefix_overrides must not populate pending_namespaces index.
+            assert!(rt_base.inner.lock().job_index.pending_namespaces_is_empty());
             let err = rt_base
                 .submit(SubmitRequest {
                     namespace: Some("guest-abc".into()),
@@ -2977,13 +2979,14 @@ mod tests {
         assert_eq!(vip.max_interfaces_per_namespace, Some(4));
 
         // 3. Per-namespace guest session + interface caps (2 sessions, 1 interface).
-        let _g1_s1 = runtime
+        let g1_s1 = runtime
             .open_session_for(
                 hello_ifaces("gw-1", &["echo"]),
                 worker_principal("guest-1"),
                 &auth,
             )
             .unwrap();
+        let g1_s1_id = g1_s1.session_id.clone();
         // Registering a 2nd distinct interface in guest-1 fails with ResourceExhausted.
         match runtime.open_session_for(
             hello_ifaces("gw-iface", &["other"]),
@@ -3056,6 +3059,27 @@ mod tests {
                 panic!("expected Runtime error for guest aggregate session cap, got {other:?}")
             }
         }
+
+        // 4b. Resuming an existing session while BOTH per-namespace (2/2) and prefix
+        //     aggregate (3/3) session caps are full must succeed and not double-count.
+        assert_eq!(runtime.inner.lock().sessions.len(), 3);
+        let mut resume_hello = hello_ifaces("gw-1", &["echo"]);
+        resume_hello.resume_session_id = g1_s1_id.clone();
+        drop(g1_s1);
+        let _g1_s1_resumed = runtime
+            .open_session_for(resume_hello, worker_principal("guest-1"), &auth)
+            .expect("resuming an existing session must bypass saturated prefix session cap");
+        assert_eq!(_g1_s1_resumed.session_id, g1_s1_id);
+        assert_eq!(runtime.inner.lock().sessions.len(), 3);
+        // Aggregate cap is still full (3/3), so guest-3 remains rejected.
+        assert!(matches!(
+            runtime.open_session_for(
+                hello_ifaces("gw-6", &["echo"]),
+                worker_principal("guest-3"),
+                &auth,
+            ),
+            Err(WorkerOpenError::Runtime(err)) if err.kind == ErrorKind::ResourceExhausted
+        ));
 
         // 5. Authenticated `gh-*` tenant is completely unaffected by guest aggregate saturation.
         let mut gh_sessions = Vec::new();

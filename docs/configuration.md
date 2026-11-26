@@ -90,7 +90,9 @@ event_log_max_bytes = 8388608
 #
 # Optional longest-prefix overrides (e.g. tighter per-namespace and aggregate
 # caps for ephemeral `guest-*` sandboxes so they cannot crowd out `gh-*` tenants;
-# empty, invalid, or duplicate `prefix` entries are rejected at config load):
+# empty, invalid, or duplicate `prefix` entries are rejected at config load).
+# Prefer a trailing delimiter such as `"guest-"` rather than `"guest"` or `"gh"`
+# so an override cannot accidentally match unrelated namespaces like `"ghost-"`.
 # [[runtime.tenant_quotas.prefix_overrides]]
 # prefix = "guest-"
 # max_sessions_per_namespace = 4
