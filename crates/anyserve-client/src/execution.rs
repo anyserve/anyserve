@@ -46,6 +46,8 @@ pub struct ExecutionClient {
     auth: BearerAuth,
     http: reqwest::Client,
     slot: Arc<Mutex<(usize, SlotClient)>>,
+    #[cfg(feature = "direct")]
+    direct: Option<Arc<crate::direct::LazyDirectEndpoint>>,
 }
 
 fn build_client(channel: Channel, auth: BearerAuth) -> ClientClient<Transport> {
@@ -100,6 +102,8 @@ impl ExecutionClient {
                         auth,
                         http,
                         slot: Arc::new(Mutex::new((idx, client))),
+                        #[cfg(feature = "direct")]
+                        direct: None,
                     });
                 }
                 Err(err) => last_err = Some(err),
@@ -360,6 +364,136 @@ impl ExecutionClient {
         .await
     }
 
+    /// Enables optional `iroh` direct data-plane transfers for ephemeral
+    /// [`ExecutionClient::invoke_direct`] calls. The underlying `iroh` endpoint
+    /// is bound lazily on first use and reused across invocations.
+    #[cfg(feature = "direct")]
+    pub fn with_direct(mut self, config: crate::direct::DirectConfig) -> Self {
+        self.direct = Some(Arc::new(crate::direct::LazyDirectEndpoint::new(config)));
+        self
+    }
+
+    /// Returns the lazily initialized [`crate::direct::DirectEndpoint`] if
+    /// configured via [`ExecutionClient::with_direct`].
+    #[cfg(feature = "direct")]
+    pub async fn direct_endpoint(
+        &self,
+    ) -> Result<Option<Arc<crate::direct::DirectEndpoint>>, crate::direct::DirectError> {
+        match &self.direct {
+            Some(lazy) => lazy.get_or_init().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Ephemeral invocation with optional `iroh` direct data-plane offloading
+    /// for static large inputs (`>= DirectConfig::threshold_bytes`) and direct
+    /// terminal outputs (`ResultChunk.uri`).
+    ///
+    /// - Strictly limited to ephemeral `Invoke` (durable policies are rejected).
+    /// - Sets `metadata["anyserve.direct"] = "1"` so direct workers know the
+    ///   caller can resolve `anyserve+iroh://` outputs; when any input is staged
+    ///   over direct, also sets `demand.required_attributes["anyserve.direct"] = "1"`
+    ///   so the scheduler routes only to direct-capable workers (queuing until
+    ///   `queue_timeout` if none are online).
+    /// - If the worker reports `direct_public_relay_throttled` pre-handler and
+    ///   total staged input bytes `<= inline_fallback_limit_bytes`, automatically
+    ///   re-invokes once inline (stripping `anyserve.direct`). Any server error
+    ///   (e.g. `max_inline_object_bytes`) is propagated unchanged.
+    #[cfg(feature = "direct")]
+    pub async fn invoke_direct(
+        &mut self,
+        spec: v2::JobSpec,
+    ) -> Result<DirectExecutionEvents, Status> {
+        let lazy = self.direct.clone().ok_or_else(|| {
+            Status::failed_precondition(
+                "direct data plane is not configured on ExecutionClient (call with_direct)",
+            )
+        })?;
+        if spec
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.durability == v2::Durability::Durable as i32)
+        {
+            return Err(Status::invalid_argument(
+                "invoke_direct only supports ephemeral invocations (Submit/durable stays off by default)",
+            ));
+        }
+
+        let endpoint = lazy
+            .get_or_init()
+            .await
+            .map_err(crate::direct::DirectError::into_status)?;
+        let threshold = endpoint.config().threshold_bytes;
+        let inline_fallback_limit = endpoint.config().inline_fallback_limit_bytes;
+        let max_fetches =
+            crate::direct::derive_input_max_fetches(spec.policy.as_ref().map(|p| p.max_attempts));
+
+        let original_spec = spec.clone();
+        let mut direct_spec = spec;
+        let mut guards = Vec::new();
+        let mut total_staged_bytes = 0usize;
+
+        for obj in &mut direct_spec.inputs {
+            let inline_len = match &obj.body {
+                Some(v2::object::Body::Inline(data)) if data.len() >= threshold => data.len(),
+                _ => continue,
+            };
+            let data = match obj.body.take() {
+                Some(v2::object::Body::Inline(data)) => data,
+                other => {
+                    obj.body = other;
+                    continue;
+                }
+            };
+            let (uri, sha256, size_bytes, guard) = endpoint
+                .stage_input(data, max_fetches)
+                .map_err(crate::direct::DirectError::into_status)?;
+            obj.body = Some(v2::object::Body::Uri(uri));
+            obj.metadata
+                .insert(crate::OBJECT_SHA256_METADATA_KEY.to_owned(), sha256);
+            obj.metadata.insert(
+                crate::OBJECT_SIZE_METADATA_KEY.to_owned(),
+                size_bytes.to_string(),
+            );
+            total_staged_bytes = total_staged_bytes.saturating_add(inline_len);
+            guards.push(guard);
+        }
+
+        direct_spec.metadata.insert(
+            crate::DIRECT_CAPABILITY_KEY.to_owned(),
+            crate::DIRECT_CAPABILITY_VALUE.to_owned(),
+        );
+        if !guards.is_empty() {
+            direct_spec
+                .demand
+                .get_or_insert_with(Default::default)
+                .required_attributes
+                .insert(
+                    crate::DIRECT_CAPABILITY_KEY.to_owned(),
+                    crate::DIRECT_CAPABILITY_VALUE.to_owned(),
+                );
+        }
+
+        let events = self.invoke(direct_spec).await?;
+        let fallback_spec = (!guards.is_empty()
+            && inline_fallback_limit > 0
+            && total_staged_bytes <= inline_fallback_limit)
+            .then_some(original_spec);
+
+        Ok(DirectExecutionEvents {
+            events,
+            client: self.clone(),
+            endpoint,
+            input_guards: guards,
+            fallback_spec,
+            total_staged_bytes,
+            fallback_attempted: false,
+            fell_back_inline: false,
+            cancel: crate::direct::DirectCancel::new(),
+            output_reports: Vec::new(),
+        })
+    }
+
     pub async fn list(
         &mut self,
         request: v2::ListJobsRequest,
@@ -377,6 +511,114 @@ impl ExecutionClient {
 pub struct Invocation {
     pub input: mpsc::Sender<v2::InvokeRequest>,
     pub events: ExecutionEvents,
+}
+
+/// Event stream returned by [`ExecutionClient::invoke_direct`].
+///
+/// Holds input capability-token leases until completion/cancellation/drop,
+/// transparently resolves `anyserve+iroh://` terminal outputs with SHA-256
+/// verification, and handles bounded pre-handler inline fallback on
+/// `direct_public_relay_throttled`.
+#[cfg(feature = "direct")]
+pub struct DirectExecutionEvents {
+    events: ExecutionEvents,
+    client: ExecutionClient,
+    endpoint: Arc<crate::direct::DirectEndpoint>,
+    input_guards: Vec<crate::direct::InputLeaseGuard>,
+    fallback_spec: Option<v2::JobSpec>,
+    total_staged_bytes: usize,
+    fallback_attempted: bool,
+    fell_back_inline: bool,
+    cancel: crate::direct::DirectCancel,
+    output_reports: Vec<crate::direct::DirectTransferReport>,
+}
+
+#[cfg(feature = "direct")]
+impl DirectExecutionEvents {
+    /// Returns a cooperative cancel handle that also resets/stops any active
+    /// output QUIC stream.
+    pub fn cancel_handle(&self) -> crate::direct::DirectCancel {
+        self.cancel.clone()
+    }
+
+    /// Returns telemetry reports for all resolved direct outputs so far.
+    pub fn output_reports(&self) -> &[crate::direct::DirectTransferReport] {
+        &self.output_reports
+    }
+
+    /// Returns `true` if this invocation fell back to inline relay after
+    /// hitting `direct_public_relay_throttled`.
+    pub fn fell_back_inline(&self) -> bool {
+        self.fell_back_inline
+    }
+
+    /// Reads the next execution event, resolving `anyserve+iroh://` terminal
+    /// outputs and handling pre-handler `direct_public_relay_throttled` fallback.
+    pub async fn message(&mut self) -> Result<Option<v2::ExecutionEvent>, Status> {
+        loop {
+            let Some(mut event) = self.events.message().await? else {
+                self.input_guards.clear();
+                return Ok(None);
+            };
+            if let Some(v2::execution_event::Event::Finished(ref mut fin)) = event.event {
+                // Terminal state reached: revoke all staged input tokens immediately.
+                self.input_guards.clear();
+
+                let is_throttled = fin.state == v2::JobState::Failed as i32
+                    && fin.error.as_ref().is_some_and(|err| {
+                        err.code == crate::ERROR_CODE_DIRECT_PUBLIC_RELAY_THROTTLED
+                    });
+                if is_throttled && !self.fallback_attempted {
+                    self.fallback_attempted = true;
+                    if let Some(mut inline_spec) = self.fallback_spec.take() {
+                        inline_spec.metadata.remove(crate::DIRECT_CAPABILITY_KEY);
+                        if let Some(demand) = inline_spec.demand.as_mut() {
+                            demand
+                                .required_attributes
+                                .remove(crate::DIRECT_CAPABILITY_KEY);
+                        }
+                        // Propagate any server rejection (e.g. max_inline_*) verbatim.
+                        self.events = self.client.invoke(inline_spec).await?;
+                        self.fell_back_inline = true;
+                        continue;
+                    }
+                    return Err(crate::direct::DirectError::PublicRelayThrottled {
+                        detail: format!(
+                            "staged input ({} B) exceeds inline_fallback_limit_bytes ({} B)",
+                            self.total_staged_bytes,
+                            self.endpoint.config().inline_fallback_limit_bytes
+                        ),
+                    }
+                    .into_status());
+                }
+
+                if fin.state == v2::JobState::Succeeded as i32 {
+                    for obj in &mut fin.outputs {
+                        let uri = match &obj.body {
+                            Some(v2::object::Body::Uri(u)) if crate::is_direct_uri(u) => u.clone(),
+                            _ => continue,
+                        };
+                        let (bytes, report) = self
+                            .endpoint
+                            .fetch_object(&uri, &obj.metadata, &self.cancel)
+                            .await
+                            .map_err(crate::direct::DirectError::into_status)?;
+                        obj.body = Some(v2::object::Body::Inline(bytes));
+                        self.output_reports.push(report);
+                    }
+                }
+            }
+            return Ok(Some(event));
+        }
+    }
+}
+
+#[cfg(feature = "direct")]
+impl Drop for DirectExecutionEvents {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.input_guards.clear();
+    }
 }
 
 impl Invocation {

@@ -31,6 +31,8 @@ pub struct Attempt {
     pub terminal_replay: bool,
     pub inputs: Vec<v2::Object>,
     pub params: Bytes,
+    /// Assignment job metadata copied from `Assign.metadata`.
+    pub metadata: HashMap<String, String>,
 }
 
 enum ReceivedBody {
@@ -146,6 +148,7 @@ impl Attempt {
             terminal_replay: false,
             inputs: assignment.inline_inputs.clone(),
             params: assignment.params.clone(),
+            metadata: assignment.metadata.clone(),
         };
         let mut inputs: BTreeMap<u32, ReceivedObject> = BTreeMap::new();
         let mut parameters = Vec::new();
@@ -290,6 +293,118 @@ impl Attempt {
     /// user handler so the control plane can separate handler time from relay overhead.
     pub fn set_handler_duration_ms(&mut self, duration_ms: u64) {
         self.handler_duration_ms = Some(duration_ms);
+    }
+
+    /// Returns `true` when the caller advertised `anyserve.direct = "1"` in job
+    /// metadata, indicating it can resolve `anyserve+iroh://` direct outputs.
+    pub fn client_supports_direct(&self) -> bool {
+        self.metadata
+            .get(crate::DIRECT_CAPABILITY_KEY)
+            .is_some_and(|v| v == crate::DIRECT_CAPABILITY_VALUE)
+    }
+
+    /// Returns `true` when any input object carries an `anyserve+iroh://` URI.
+    pub fn has_direct_inputs(&self) -> bool {
+        self.inputs.iter().any(|obj| {
+            matches!(
+                &obj.body,
+                Some(v2::object::Body::Uri(uri)) if crate::is_direct_uri(uri)
+            )
+        })
+    }
+
+    /// Non-retryable pre-handler failure outcome for workers built without
+    /// direct data-plane support that unexpectedly receive an `anyserve+iroh://` input.
+    pub fn direct_unsupported_outcome() -> v2::finish::Outcome {
+        v2::finish::Outcome::Failed(v2::ErrorInfo {
+            code: crate::ERROR_CODE_DIRECT_UNSUPPORTED.to_owned(),
+            message:
+                "worker cannot resolve anyserve+iroh:// input without direct data-plane support"
+                    .to_owned(),
+            retryable: false,
+        })
+    }
+
+    /// Resolves any `anyserve+iroh://` URI objects in `self.inputs` into inline
+    /// bytes **before** the user handler executes, verifying `anyserve.size_bytes`
+    /// and `anyserve.sha256`. On error (including `PublicRelayThrottled`), the
+    /// caller should immediately finish the attempt with
+    /// [`crate::direct::DirectError::to_attempt_failure_outcome`] without
+    /// invoking the user handler.
+    #[cfg(feature = "direct")]
+    pub async fn resolve_direct_inputs(
+        &mut self,
+        direct: &crate::direct::DirectEndpoint,
+        cancel: &crate::direct::DirectCancel,
+    ) -> Result<Vec<crate::direct::DirectTransferReport>, crate::direct::DirectError> {
+        let mut reports = Vec::new();
+        for obj in &mut self.inputs {
+            let uri = match &obj.body {
+                Some(v2::object::Body::Uri(u)) if crate::is_direct_uri(u) => u.clone(),
+                _ => continue,
+            };
+            let (bytes, report) = direct.fetch_object(&uri, &obj.metadata, cancel).await?;
+            obj.body = Some(v2::object::Body::Inline(bytes));
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
+    /// Builds an output [`v2::Object`] for [`Attempt::finish`]. When the caller
+    /// declared `anyserve.direct = "1"` and `data.len() >= direct.config().threshold_bytes`,
+    /// stages `data` in the worker's bounded post-finish LRU cache and returns an
+    /// `anyserve+iroh://` URI object with `anyserve.sha256`, `anyserve.size_bytes`,
+    /// `anyserve.direct_path`, and `anyserve.direct_bytes` (SDK-reported).
+    /// Otherwise returns a standard inline object (attaching observed direct input
+    /// telemetry if `input_reports` is non-empty).
+    #[cfg(feature = "direct")]
+    pub fn stage_direct_output(
+        &self,
+        data: Bytes,
+        mut metadata: HashMap<String, String>,
+        direct: &crate::direct::DirectEndpoint,
+        input_reports: &[crate::direct::DirectTransferReport],
+    ) -> Result<v2::Object, crate::direct::DirectError> {
+        if self.client_supports_direct() && data.len() >= direct.config().threshold_bytes {
+            let (uri, sha256, size_bytes) = direct.stage_output(data)?;
+            metadata.insert(crate::OBJECT_SHA256_METADATA_KEY.to_owned(), sha256);
+            metadata.insert(
+                crate::OBJECT_SIZE_METADATA_KEY.to_owned(),
+                size_bytes.to_string(),
+            );
+            let path = input_reports
+                .first()
+                .map(|r| r.path)
+                .unwrap_or(crate::direct::DirectPath::Direct);
+            metadata.insert(
+                crate::DIRECT_PATH_METADATA_KEY.to_owned(),
+                path.as_str().to_owned(),
+            );
+            let total_direct_bytes =
+                size_bytes.saturating_add(input_reports.iter().map(|r| r.bytes).sum::<u64>());
+            metadata.insert(
+                crate::DIRECT_BYTES_METADATA_KEY.to_owned(),
+                total_direct_bytes.to_string(),
+            );
+            return Ok(v2::Object {
+                body: Some(v2::object::Body::Uri(uri)),
+                metadata,
+            });
+        }
+
+        if let Some(first) = input_reports.first() {
+            let total_input_bytes: u64 = input_reports.iter().map(|r| r.bytes).sum();
+            metadata
+                .entry(crate::DIRECT_PATH_METADATA_KEY.to_owned())
+                .or_insert_with(|| first.path.as_str().to_owned());
+            metadata
+                .entry(crate::DIRECT_BYTES_METADATA_KEY.to_owned())
+                .or_insert_with(|| total_input_bytes.to_string());
+        }
+        Ok(v2::Object {
+            body: Some(v2::object::Body::Inline(data)),
+            metadata,
+        })
     }
 
     fn effective_handler_duration_ms(&mut self) -> u64 {
