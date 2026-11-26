@@ -1,3 +1,4 @@
+import { WorkerRtcPeer } from "./rtc";
 import type { ComputeBackend, HostToWorkerCmd, WorkerSlotRole, WorkerToHostEvent } from "./worker";
 
 export type BrowserWorkerStatus = "stopped" | "connecting" | "online" | "busy" | "killed" | "error";
@@ -50,6 +51,10 @@ function makeInitialSlot(slot: WorkerSlotRole): BrowserWorkerSlotState {
 export class BrowserWorkerManager {
   private readonly factory: WorkerFactory;
   private readonly workers: Partial<Record<WorkerSlotRole, ReturnType<WorkerFactory>>> = {};
+  private readonly rtcPeers: Record<WorkerSlotRole, Map<string, WorkerRtcPeer>> = {
+    primary: new Map(),
+    standby: new Map(),
+  };
   private readonly listeners = new Set<() => void>();
   private readonly onlineWaiters: Partial<
     Record<WorkerSlotRole, Array<{ resolve: () => void; reject: (err: Error) => void }>>
@@ -146,6 +151,59 @@ export class BrowserWorkerManager {
           modelFile: msg.file,
           modelError: msg.error,
         });
+      } else if (msg.type === "rtc_signal_in") {
+        let peer = this.rtcPeers[slot].get(msg.leaseId);
+        if (!peer) {
+          peer = new WorkerRtcPeer({
+            sendSignal: (signal) => {
+              const curW = this.workers[slot];
+              if (curW) {
+                curW.postMessage({ type: "rtc_signal_out", leaseId: msg.leaseId, signal } satisfies HostToWorkerCmd);
+              }
+            },
+            onRequest: (req) => {
+              const curW = this.workers[slot];
+              if (curW) {
+                curW.postMessage({
+                  type: "rtc_req",
+                  leaseId: msg.leaseId,
+                  req,
+                  iceMs: peer!.getIceMs(),
+                } satisfies HostToWorkerCmd);
+              }
+            },
+            onAck: () => {
+              const curW = this.workers[slot];
+              if (curW) {
+                curW.postMessage({ type: "rtc_ack", leaseId: msg.leaseId } satisfies HostToWorkerCmd);
+              }
+            },
+            onDisconnected: () => {
+              const curW = this.workers[slot];
+              if (curW) {
+                curW.postMessage({ type: "rtc_disconnected", leaseId: msg.leaseId } satisfies HostToWorkerCmd);
+              }
+            },
+          });
+          this.rtcPeers[slot].set(msg.leaseId, peer);
+        }
+        void peer.handleSignal(msg.signal);
+        return;
+      } else if (msg.type === "rtc_send") {
+        const peer = this.rtcPeers[slot].get(msg.leaseId);
+        if (peer) {
+          void peer.sendData(
+            msg.payload instanceof Uint8Array ? msg.payload : JSON.stringify(msg.payload),
+          );
+        }
+        return;
+      } else if (msg.type === "rtc_close") {
+        const peer = this.rtcPeers[slot].get(msg.leaseId);
+        if (peer) {
+          peer.close();
+          this.rtcPeers[slot].delete(msg.leaseId);
+        }
+        return;
       } else if (msg.type === "log") {
         this.pushLog(msg.message);
       }
@@ -201,12 +259,20 @@ export class BrowserWorkerManager {
     w.postMessage(cmd);
   }
 
+  private closeSlotRtcPeers(slot: WorkerSlotRole): void {
+    for (const peer of this.rtcPeers[slot].values()) {
+      peer.close();
+    }
+    this.rtcPeers[slot].clear();
+  }
+
   /**
    * Abruptly terminates the Dedicated Web Worker via `worker.terminate()` without
    * sending any stop/Finish frame so the control plane detects the real dropped
    * WebSocket and executes its genuine reconnect_grace + retry failover path.
    */
   killWorker(slot: WorkerSlotRole): void {
+    this.closeSlotRtcPeers(slot);
     const cur = this.snapshot.slots[slot];
     const w = this.workers[slot];
     if (w) {
@@ -231,6 +297,7 @@ export class BrowserWorkerManager {
   }
 
   stopWorker(slot: WorkerSlotRole): void {
+    this.closeSlotRtcPeers(slot);
     const w = this.workers[slot];
     if (w) {
       try {

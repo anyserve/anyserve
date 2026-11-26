@@ -8,9 +8,11 @@ import {
   SMOLLM_MODEL_ID,
   deriveWsBaseUrl,
   invokeStreamingJob,
+  type StreamingInvokeOptions,
   type StreamingInvokeResult,
   type StreamingInvokeTimelineEvent,
 } from "./browser-worker/protocol";
+import { invokeWebRtcOrFallback, type RtcInvokeOptions } from "./browser-worker/rtc";
 import type { WorkerSlotRole } from "./browser-worker/worker";
 import { formatDuration } from "./format";
 import { IconArrowRight, IconKey, IconPlayground } from "./icons";
@@ -21,13 +23,45 @@ interface PlaygroundPaneProps {
   authPortalUrl?: string | null;
   lockedNamespace?: string | null;
   manager?: BrowserWorkerManager;
+  invokeRelay?: (options: StreamingInvokeOptions) => Promise<StreamingInvokeResult>;
+  invokeWebRtc?: (options: RtcInvokeOptions) => Promise<StreamingInvokeResult>;
   onOpenJobInJobs: (jobId: string, namespace?: string) => void;
   onOpenWorkers: () => void;
   onRefresh?: () => void;
 }
 
+type TransportMode = "relay" | "webrtc";
+
+interface BenchmarkComparison {
+  bytesTotal: number;
+  chunks: number;
+  relay: StreamingInvokeResult;
+  webrtc: StreamingInvokeResult;
+}
+
+const BENCH_CHUNKS = 32;
+const BENCH_CHUNK_BYTES = 16_384;
 const DEFAULT_ECHO_PROMPT = "Schedule this prompt from the browser and stream every word back with waterfall tracing.";
 const DEFAULT_LLM_PROMPT = "Explain in two short sentences why outbound workers help when a GPU sits behind NAT.";
+
+export function buildPeerTabUrl(origin: string, authEnabled: boolean, clientToken: string | null): string {
+  const base = `${origin.replace(/\/+$/, "")}/playground`;
+  const trimmed = clientToken?.trim() ?? "";
+  if (!authEnabled || !trimmed) return base;
+  return `${base}#token=${encodeURIComponent(trimmed)}`;
+}
+
+function formatByteCount(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function formatThroughput(bytes: number, durationMs: number | null | undefined): string {
+  if (bytes <= 0 || !durationMs || durationMs <= 0) return "—";
+  const mbPerSec = bytes / (1024 * 1024) / (durationMs / 1000);
+  return `${mbPerSec.toFixed(1)} MB/s`;
+}
 
 function statusTone(status: BrowserWorkerSlotState["status"]): "ok" | "warn" | "bad" | "offline" {
   switch (status) {
@@ -66,6 +100,8 @@ export function PlaygroundPane({
   authPortalUrl,
   lockedNamespace,
   manager = browserWorkerManager,
+  invokeRelay = invokeStreamingJob,
+  invokeWebRtc = invokeWebRtcOrFallback,
   onOpenJobInJobs,
   onOpenWorkers,
   onRefresh,
@@ -78,12 +114,15 @@ export function PlaygroundPane({
   // Worker token lives strictly in component/worker memory — never overwrites Console's client token.
   const [workerToken, setWorkerToken] = useState("");
   const [selectedInterface, setSelectedInterface] = useState<string>(ECHO_INTERFACE);
+  const [transportMode, setTransportMode] = useState<TransportMode>("relay");
   const [prompt, setPrompt] = useState(DEFAULT_ECHO_PROMPT);
   const [running, setRunning] = useState(false);
   const [liveOutput, setLiveOutput] = useState("");
   const [liveProgress, setLiveProgress] = useState<string | null>(null);
   const [liveTimeline, setLiveTimeline] = useState<StreamingInvokeTimelineEvent[]>([]);
   const [lastResult, setLastResult] = useState<StreamingInvokeResult | null>(null);
+  const [benchResult, setBenchResult] = useState<BenchmarkComparison | null>(null);
+  const [peerCopied, setPeerCopied] = useState(false);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [invokeError, setInvokeError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -206,40 +245,55 @@ export function PlaygroundPane({
       abortRef.current = controller;
       setRunning(true);
       let killedPrimary = false;
+      const promptText = prompt.trim() || (targetInterface === LLM_INTERFACE ? DEFAULT_LLM_PROMPT : DEFAULT_ECHO_PROMPT);
 
       try {
-        const res = await invokeStreamingJob({
-          wsBaseUrl,
-          token: getConsoleToken(),
-          interfaceName: targetInterface,
-          prompt: prompt.trim() || (targetInterface === LLM_INTERFACE ? DEFAULT_LLM_PROMPT : DEFAULT_ECHO_PROMPT),
-          preferredAttributes: failoverDemo ? { role: "primary" } : undefined,
-          metadata: failoverDemo
-            ? {
-                "demo.prefill_ms": "2500",
-                "demo.scenario": "real-failover-terminate",
-              }
-            : { "demo.scenario": targetInterface === LLM_INTERFACE ? "smollm2-135m" : "echo" },
-          maxAttempts: failoverDemo ? 3 : 2,
-          signal: controller.signal,
-          onJobAccepted: (jid) => setActiveJobId(jid),
-          onAssigned: (assignedWorkerId, attemptNum) => {
-            if (failoverDemo && attemptNum === 1 && !killedPrimary && assignedWorkerId === "browser-worker-1") {
-              killedPrimary = true;
-              failoverKillTimerRef.current = setTimeout(() => {
-                failoverKillTimerRef.current = null;
-                if (controller.signal.aborted) return;
-                manager.killWorker("primary");
-                setLiveProgress(
-                  `browser-worker-1 killed via worker.terminate() — waiting reconnect_grace_ms (${formatDuration(reconnectGraceMs)}) for scheduler failover to browser-worker-2…`,
-                );
-              }, 250);
-            }
-          },
-          onChunk: (chunk) => setLiveOutput((cur) => cur + chunk),
-          onProgress: (msg) => setLiveProgress(msg),
-          onTimeline: (ev) => setLiveTimeline((cur) => [...cur, ev]),
-        });
+        const useWebRtc = !failoverDemo && transportMode === "webrtc";
+        const res = useWebRtc
+          ? await invokeWebRtc({
+              wsBaseUrl,
+              token: getConsoleToken(),
+              interfaceName: targetInterface,
+              prompt: promptText,
+              metadata: { "demo.scenario": targetInterface === LLM_INTERFACE ? "smollm2-135m-p2p" : "echo-p2p" },
+              signal: controller.signal,
+              onJobAccepted: (jid) => setActiveJobId(jid),
+              onChunk: (chunk) => setLiveOutput((cur) => cur + chunk),
+              onProgress: (msg) => setLiveProgress(msg),
+              onTimeline: (ev) => setLiveTimeline((cur) => [...cur, ev]),
+            })
+          : await invokeRelay({
+              wsBaseUrl,
+              token: getConsoleToken(),
+              interfaceName: targetInterface,
+              prompt: promptText,
+              preferredAttributes: failoverDemo ? { role: "primary" } : undefined,
+              metadata: failoverDemo
+                ? {
+                    "demo.prefill_ms": "2500",
+                    "demo.scenario": "real-failover-terminate",
+                  }
+                : { "demo.scenario": targetInterface === LLM_INTERFACE ? "smollm2-135m" : "echo" },
+              maxAttempts: failoverDemo ? 3 : 2,
+              signal: controller.signal,
+              onJobAccepted: (jid) => setActiveJobId(jid),
+              onAssigned: (assignedWorkerId, attemptNum) => {
+                if (failoverDemo && attemptNum === 1 && !killedPrimary && assignedWorkerId === "browser-worker-1") {
+                  killedPrimary = true;
+                  failoverKillTimerRef.current = setTimeout(() => {
+                    failoverKillTimerRef.current = null;
+                    if (controller.signal.aborted) return;
+                    manager.killWorker("primary");
+                    setLiveProgress(
+                      `browser-worker-1 killed via worker.terminate() — waiting reconnect_grace_ms (${formatDuration(reconnectGraceMs)}) for scheduler failover to browser-worker-2…`,
+                    );
+                  }, 250);
+                }
+              },
+              onChunk: (chunk) => setLiveOutput((cur) => cur + chunk),
+              onProgress: (msg) => setLiveProgress(msg),
+              onTimeline: (ev) => setLiveTimeline((cur) => [...cur, ev]),
+            });
         setLastResult(res);
         setActiveJobId(res.jobId);
         onRefresh?.();
@@ -263,14 +317,109 @@ export function PlaygroundPane({
       anyOnline,
       anyModelReady,
       selectedInterface,
+      transportMode,
       wsBaseUrl,
       prompt,
       ensureSlotOnline,
+      invokeRelay,
+      invokeWebRtc,
       manager,
       reconnectGraceMs,
       onRefresh,
     ],
   );
+
+  const runBenchmark = useCallback(async () => {
+    setInvokeError(null);
+    setBenchResult(null);
+    setLastResult(null);
+    setLiveOutput("");
+    setLiveTimeline([]);
+    setActiveJobId(null);
+
+    if (!anyOnline) {
+      if (needsWorkerToken) {
+        setInvokeError("Paste a worker token above and start a browser worker before running the Relay vs P2P benchmark.");
+        return;
+      }
+      try {
+        await ensureSlotOnline("primary");
+      } catch (err) {
+        setInvokeError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+    }
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setRunning(true);
+    const totalBytes = BENCH_CHUNKS * BENCH_CHUNK_BYTES;
+
+    try {
+      setLiveProgress(`Benchmark 1/2: streaming ${formatByteCount(totalBytes)} via WebSocket Relay…`);
+      const relay = await invokeRelay({
+        wsBaseUrl,
+        token: getConsoleToken(),
+        interfaceName: ECHO_INTERFACE,
+        prompt: "bench-relay",
+        benchChunks: BENCH_CHUNKS,
+        benchChunkBytes: BENCH_CHUNK_BYTES,
+        metadata: { "demo.scenario": "bench-relay-512kb" },
+        maxAttempts: 1,
+        signal: controller.signal,
+        onJobAccepted: (jid) => setActiveJobId(jid),
+        onTimeline: (ev) => setLiveTimeline((cur) => [...cur, ev]),
+      });
+      if (controller.signal.aborted) return;
+
+      setLiveProgress(`Benchmark 2/2: streaming ${formatByteCount(totalBytes)} via WebRTC P2P DataChannel…`);
+      const webrtc = await invokeWebRtc({
+        wsBaseUrl,
+        token: getConsoleToken(),
+        interfaceName: ECHO_INTERFACE,
+        prompt: "bench-p2p",
+        benchChunks: BENCH_CHUNKS,
+        benchChunkBytes: BENCH_CHUNK_BYTES,
+        metadata: { "demo.scenario": "bench-p2p-512kb" },
+        signal: controller.signal,
+        onJobAccepted: (jid) => setActiveJobId(jid),
+        onProgress: (msg) => setLiveProgress(msg),
+        onTimeline: (ev) => setLiveTimeline((cur) => [...cur, ev]),
+      });
+      setBenchResult({ bytesTotal: totalBytes, chunks: BENCH_CHUNKS, relay, webrtc });
+      setLastResult(webrtc);
+      setActiveJobId(webrtc.jobId ?? relay.jobId);
+      setLiveProgress(
+        webrtc.transportActual === "p2p"
+          ? `Benchmark done: Relay transferred ${formatByteCount(relay.relayedPayloadBytes ?? totalBytes)} through server; WebRTC P2P transferred ${formatByteCount(webrtc.p2pBytes ?? totalBytes)} directly (0 B relayed).`
+          : `Benchmark done: WebRTC fell back to WS Relay (${webrtc.fallbackReason ?? "unavailable"}).`,
+      );
+      onRefresh?.();
+    } catch (err) {
+      setInvokeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+      }
+      setRunning(false);
+    }
+  }, [anyOnline, needsWorkerToken, ensureSlotOnline, invokeRelay, invokeWebRtc, wsBaseUrl, onRefresh]);
+
+  const handleOpenPeerTab = useCallback(() => {
+    const url = buildPeerTabUrl(window.location.origin, authEnabled, getConsoleToken());
+    window.open(url, "_blank", "noopener,noreferrer");
+  }, [authEnabled]);
+
+  const handleCopyPeerLink = useCallback(async () => {
+    const url = buildPeerTabUrl(window.location.origin, authEnabled, getConsoleToken());
+    try {
+      await navigator.clipboard.writeText(url);
+      setPeerCopied(true);
+      setTimeout(() => setPeerCopied(false), 1_800);
+    } catch {
+      setInvokeError("Clipboard unavailable — use 'Open 2nd Tab (Peer)' instead.");
+    }
+  }, [authEnabled]);
 
   const handleSelectInterface = (iface: string) => {
     setSelectedInterface(iface);
@@ -373,6 +522,22 @@ export function PlaygroundPane({
           <span>Outbound Dedicated Web Workers over /ws/v2/* — stays alive while inspecting Jobs &amp; Workers</span>
         </div>
         <div className="panel__header-actions">
+          <button
+            type="button"
+            className="btn"
+            title="Open a second Playground tab with your client session (never shares worker token) to invoke this tab's Browser Worker peer-to-peer"
+            onClick={handleOpenPeerTab}
+          >
+            Open 2nd Tab (Peer)
+          </button>
+          <button
+            type="button"
+            className="btn btn--ghost"
+            title="Copy peer client URL (client token only, never worker token)"
+            onClick={() => void handleCopyPeerLink()}
+          >
+            {peerCopied ? "Peer Link Copied" : "Copy Peer Link"}
+          </button>
           <button type="button" className="btn" onClick={onOpenWorkers}>
             View in Workers <IconArrowRight />
           </button>
@@ -431,32 +596,57 @@ export function PlaygroundPane({
 
           <div className="pg-col">
             <div className="pg-section-head">
-              <h2>2. Live Streaming Invoke &amp; Failover</h2>
+              <h2>2. Live Streaming Invoke, WebRTC P2P &amp; Failover</h2>
               <p className="muted">
-                Streams over <code>/ws/v2/client/invoke</code> with <code>Sec-WebSocket-Protocol</code> auth and reports exact{" "}
-                <code>handler_duration_ms</code> into the Execution Waterfall.
+                Default path is <strong>WebSocket Relay</strong> over <code>/ws/v2/client/invoke</code>. Switching to{" "}
+                <strong>WebRTC P2P</strong> enables an <em>optional data-plane bypass</em> (<code>anyserve.transport=webrtc</code>,{" "}
+                <strong>EPHEMERAL Invoke only</strong>; durable/Submit jobs stay on relay) using public STUN only (no TURN —
+                symmetric NAT / corporate firewalls auto-fallback to WS Relay after 3.5 s).
               </p>
             </div>
 
-            <div className="seg-control" role="tablist" aria-label="Target interface">
-              <button
-                type="button"
-                role="tab"
-                aria-selected={selectedInterface === ECHO_INTERFACE}
-                className={`seg-control__btn${selectedInterface === ECHO_INTERFACE ? " is-active" : ""}`}
-                onClick={() => handleSelectInterface(ECHO_INTERFACE)}
-              >
-                {ECHO_INTERFACE} (0 MB · Instant)
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={selectedInterface === LLM_INTERFACE}
-                className={`seg-control__btn${selectedInterface === LLM_INTERFACE ? " is-active" : ""}`}
-                onClick={() => handleSelectInterface(LLM_INTERFACE)}
-              >
-                {LLM_INTERFACE} (SmolLM2-135M)
-              </button>
+            <div className="pg-controls-row">
+              <div className="seg-control" role="tablist" aria-label="Target interface">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={selectedInterface === ECHO_INTERFACE}
+                  className={`seg-control__btn${selectedInterface === ECHO_INTERFACE ? " is-active" : ""}`}
+                  onClick={() => handleSelectInterface(ECHO_INTERFACE)}
+                >
+                  {ECHO_INTERFACE} (0 MB · Instant)
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={selectedInterface === LLM_INTERFACE}
+                  className={`seg-control__btn${selectedInterface === LLM_INTERFACE ? " is-active" : ""}`}
+                  onClick={() => handleSelectInterface(LLM_INTERFACE)}
+                >
+                  {LLM_INTERFACE} (SmolLM2-135M)
+                </button>
+              </div>
+
+              <div className="seg-control" role="tablist" aria-label="Data plane transport">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={transportMode === "relay"}
+                  className={`seg-control__btn${transportMode === "relay" ? " is-active" : ""}`}
+                  onClick={() => setTransportMode("relay")}
+                >
+                  WebSocket Relay
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={transportMode === "webrtc"}
+                  className={`seg-control__btn${transportMode === "webrtc" ? " is-active" : ""}`}
+                  onClick={() => setTransportMode("webrtc")}
+                >
+                  WebRTC P2P (auto-fallback)
+                </button>
+              </div>
             </div>
 
             <label className="pg-prompt-label">
@@ -477,7 +667,10 @@ export function PlaygroundPane({
               ) : (
                 <>
                   <button type="button" className="btn btn--primary" onClick={() => void runInvoke(false)}>
-                    Run Streaming Invoke
+                    {transportMode === "webrtc" ? "Run WebRTC P2P Invoke" : "Run Streaming Invoke"}
+                  </button>
+                  <button type="button" className="btn" onClick={() => void runBenchmark()}>
+                    Benchmark: Relay vs P2P (512 KB)
                   </button>
                   <button type="button" className="btn" onClick={() => void runInvoke(true)}>
                     Kill worker &amp; test failover
@@ -485,6 +678,17 @@ export function PlaygroundPane({
                 </>
               )}
             </div>
+
+            {transportMode === "webrtc" ? (
+              <p className="pg-note muted">
+                <strong>Trust boundary &amp; trade-off:</strong> P2P bypass is EPHEMERAL-only — the control plane only
+                sees scheduling, lease health, and worker-reported metadata (it cannot verify or replay payload bytes).
+                Pre-output peer drops re-schedule automatically; post-output drops fail fast with{" "}
+                <code>output_interrupted</code>. Plain-text token streams pay cold ICE setup (~50–200 ms) for little
+                latency gain — use <strong>Benchmark: Relay vs P2P (512 KB)</strong> to measure real large-payload
+                throughput &amp; <code>0 B</code> relayed egress.
+              </p>
+            ) : null}
 
             <p className="pg-note muted">
               <strong>Real failover (no faked errors):</strong> starts primary + standby workers, routes attempt #1 to{" "}
@@ -515,6 +719,20 @@ export function PlaygroundPane({
                       <span className={`tag ${lastResult.state === "succeeded" ? "tag--ok" : ""}`}>
                         {lastResult.state}
                       </span>
+                      {lastResult.transportActual === "p2p" ? (
+                        <span className="tag tag--ok mono">
+                          WebRTC P2P · {lastResult.iceMs != null ? `cold ICE ${formatDuration(lastResult.iceMs)} · ` : ""}0 B relayed
+                        </span>
+                      ) : lastResult.fallbackReason ? (
+                        <span className="tag tag--warn mono">
+                          WS Relay (fallback: {lastResult.fallbackReason})
+                        </span>
+                      ) : (
+                        <span className="tag mono">WS Relay</span>
+                      )}
+                      {lastResult.errorCode ? (
+                        <span className="tag tag--warn mono">{lastResult.errorCode}</span>
+                      ) : null}
                       {lastResult.restarted ? (
                         <span className="tag tag--warn">
                           failover · {lastResult.attempts} attempts
@@ -543,6 +761,108 @@ export function PlaygroundPane({
                 {liveOutput || (running ? "Waiting for tokens…" : "Run an invoke or failover demo to see live streamed tokens.")}
               </pre>
             </div>
+
+            {benchResult ? (
+              <div className="pg-bench-card" aria-label="Relay vs WebRTC P2P benchmark">
+                <div className="pg-bench-card__head">
+                  <span>
+                    Benchmark · {benchResult.chunks} × {formatByteCount(BENCH_CHUNK_BYTES)} (
+                    {formatByteCount(benchResult.bytesTotal)})
+                  </span>
+                  <span className="muted mono">Honest 3-metric comparison</span>
+                </div>
+                <table className="pg-bench-table">
+                  <thead>
+                    <tr>
+                      <th>Path</th>
+                      <th>Cold ICE</th>
+                      <th>TTFT / Throughput</th>
+                      <th>Server Relayed Payload</th>
+                      <th>Trace</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td>
+                        <span className="tag mono">WS Relay</span>
+                      </td>
+                      <td className="mono muted">—</td>
+                      <td className="mono">
+                        {benchResult.relay.ttftMs != null ? formatDuration(benchResult.relay.ttftMs) : "—"} ·{" "}
+                        {formatThroughput(
+                          benchResult.relay.relayedPayloadBytes ?? benchResult.bytesTotal,
+                          benchResult.relay.streamDurationMs ?? benchResult.relay.totalMs,
+                        )}
+                      </td>
+                      <td className="mono">
+                        {formatByteCount(benchResult.relay.relayedPayloadBytes ?? benchResult.bytesTotal)}
+                      </td>
+                      <td>
+                        {benchResult.relay.jobId ? (
+                          <button
+                            type="button"
+                            className="entity-link mono"
+                            onClick={() => onOpenJobInJobs(benchResult.relay.jobId!, lockedNamespace ?? undefined)}
+                          >
+                            Waterfall
+                          </button>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td>
+                        {benchResult.webrtc.transportActual === "p2p" ? (
+                          <span className="tag tag--ok mono">WebRTC P2P</span>
+                        ) : (
+                          <span className="tag tag--warn mono">
+                            Fallback ({benchResult.webrtc.fallbackReason ?? "relay"})
+                          </span>
+                        )}
+                      </td>
+                      <td className="mono">
+                        {benchResult.webrtc.iceMs != null ? formatDuration(benchResult.webrtc.iceMs) : "—"}
+                      </td>
+                      <td className="mono">
+                        {benchResult.webrtc.ttftMs != null ? formatDuration(benchResult.webrtc.ttftMs) : "—"} ·{" "}
+                        {formatThroughput(
+                          benchResult.webrtc.transportActual === "p2p"
+                            ? (benchResult.webrtc.p2pBytes ?? benchResult.bytesTotal)
+                            : (benchResult.webrtc.relayedPayloadBytes ?? benchResult.bytesTotal),
+                          benchResult.webrtc.streamDurationMs ?? benchResult.webrtc.totalMs,
+                        )}
+                      </td>
+                      <td className="mono">
+                        {benchResult.webrtc.transportActual === "p2p"
+                          ? "0 B"
+                          : formatByteCount(benchResult.webrtc.relayedPayloadBytes ?? 0)}
+                      </td>
+                      <td>
+                        {benchResult.webrtc.jobId ? (
+                          <button
+                            type="button"
+                            className="entity-link mono"
+                            onClick={() => onOpenJobInJobs(benchResult.webrtc.jobId!, lockedNamespace ?? undefined)}
+                          >
+                            Waterfall
+                          </button>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p className="pg-note muted">
+                  <strong>Honest trade-off:</strong> large binary streams (images, audio, video frames, tensors) bypass
+                  control-plane egress completely (<code>0 B</code> relayed), whereas short text prompts pay cold ICE
+                  setup (~50–200 ms) with negligible speedup. Public STUN only (no TURN): symmetric NATs / corporate
+                  firewalls fall back to WS Relay after 3.5 s. EPHEMERAL Invoke only — payload bytes &amp; metrics in
+                  P2P mode are worker-reported (not server-audited or replayable).
+                </p>
+              </div>
+            ) : null}
 
             {liveTimeline.length > 0 ? (
               <div className="pg-timeline">

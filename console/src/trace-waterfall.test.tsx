@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ExecutionWaterfall, buildExecutionWaterfall, parseW3cTrace } from "./trace-waterfall";
+import { ExecutionWaterfall, buildExecutionWaterfall, parseJobTransport, parseW3cTrace } from "./trace-waterfall";
 import type { JobDetailResponse } from "./types";
 
 afterEach(() => {
@@ -215,5 +215,59 @@ describe("ExecutionWaterfall component", () => {
 
     fireEvent.click(screen.getByText("worker-b"));
     expect(onOpenWorker).toHaveBeenCalledWith("worker-b");
+  });
+
+  it("renders WebRTC P2P and fallback transport badges from output metadata", () => {
+    const p2pDetail = makeDetail();
+    p2pDetail.job.metadata = { "anyserve.transport": "webrtc" };
+    p2pDetail.job.outputs = [
+      {
+        kind: "inline",
+        size_bytes: 64,
+        uri: null,
+        content_type: "application/json",
+        preview: "{}",
+        truncated: false,
+        metadata: {
+          "anyserve.transport_actual": "p2p",
+          "anyserve.p2p_bytes": "524288",
+          "anyserve.relayed_payload_bytes": "0",
+          "anyserve.ice_ms": "84",
+        },
+      },
+    ];
+    expect(parseJobTransport(p2pDetail)).toEqual({
+      requested: "webrtc",
+      actual: "p2p",
+      p2pBytes: 524288,
+      relayedPayloadBytes: 0,
+      iceMs: 84,
+      fallbackReason: null,
+    });
+    render(<ExecutionWaterfall detail={p2pDetail} />);
+    expect(screen.getByText("WebRTC P2P")).toBeTruthy();
+    expect(screen.getByText(/512\.0 KB \(0 B relayed\) · ICE 84 ms/)).toBeTruthy();
+
+    cleanup();
+    const fallbackDetail = makeDetail();
+    fallbackDetail.job.metadata = { "anyserve.transport": "webrtc" };
+    fallbackDetail.job.outputs = [
+      {
+        kind: "inline",
+        size_bytes: 48,
+        uri: null,
+        content_type: "application/json",
+        preview: "{}",
+        truncated: false,
+        metadata: {
+          "anyserve.transport_actual": "relay",
+          "anyserve.fallback_reason": "ice_timeout",
+          "anyserve.relayed_payload_bytes": "524288",
+        },
+      },
+    ];
+    render(<ExecutionWaterfall detail={fallbackDetail} />);
+    expect(screen.getByText("WS Relay")).toBeTruthy();
+    expect(screen.getByText(/fallback: ice_timeout/)).toBeTruthy();
   });
 });

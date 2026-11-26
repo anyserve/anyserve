@@ -352,6 +352,54 @@ export function buildExecutionWaterfall(detail: JobDetailResponse): ExecutionWat
   };
 }
 
+export interface ParsedTransportInfo {
+  requested: "webrtc" | "relay";
+  actual: "p2p" | "relay" | "pending";
+  p2pBytes: number | null;
+  relayedPayloadBytes: number | null;
+  iceMs: number | null;
+  fallbackReason: string | null;
+}
+
+function parseNonNegativeInt(raw?: string): number | null {
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+}
+
+function formatByteCount(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function parseJobTransport(detail: JobDetailResponse): ParsedTransportInfo | null {
+  for (const out of detail.job.outputs) {
+    const actualRaw = out.metadata["anyserve.transport_actual"]?.trim();
+    if (actualRaw === "p2p" || actualRaw === "relay") {
+      return {
+        requested: detail.job.metadata["anyserve.transport"] === "webrtc" ? "webrtc" : "relay",
+        actual: actualRaw,
+        p2pBytes: parseNonNegativeInt(out.metadata["anyserve.p2p_bytes"]),
+        relayedPayloadBytes: parseNonNegativeInt(out.metadata["anyserve.relayed_payload_bytes"]),
+        iceMs: parseNonNegativeInt(out.metadata["anyserve.ice_ms"]),
+        fallbackReason: out.metadata["anyserve.fallback_reason"]?.trim() || null,
+      };
+    }
+  }
+  if (detail.job.metadata["anyserve.transport"] === "webrtc") {
+    return {
+      requested: "webrtc",
+      actual: "pending",
+      p2pBytes: null,
+      relayedPayloadBytes: null,
+      iceMs: null,
+      fallbackReason: null,
+    };
+  }
+  return null;
+}
+
 export const ExecutionWaterfall = memo(function ExecutionWaterfall({
   detail,
   onOpenWorker,
@@ -362,6 +410,7 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
   onFilterTrace?: (traceId: string) => void;
 }) {
   const trace = useMemo(() => parseW3cTrace(detail.job.metadata), [detail.job.metadata]);
+  const transport = useMemo(() => parseJobTransport(detail), [detail]);
   const model = useMemo(() => buildExecutionWaterfall(detail), [detail]);
 
   if (!trace && !model) return null;
@@ -449,6 +498,29 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
             {model.retries > 0 ? (
               <span className="waterfall__metric">
                 Retries <strong>{formatNumber(model.retries)}</strong>
+              </span>
+            ) : null}
+            {transport?.actual === "p2p" ? (
+              <span
+                className="waterfall__metric waterfall__metric--p2p"
+                title={`WebRTC P2P direct DataChannel transfer (${transport.p2pBytes != null ? formatByteCount(transport.p2pBytes) : "direct"}, ${transport.relayedPayloadBytes ?? 0} B relayed via control plane${transport.iceMs != null ? `, ICE ${formatDuration(transport.iceMs)}` : ""})`}
+              >
+                Data plane <strong>WebRTC P2P</strong>
+                {transport.p2pBytes != null ? ` · ${formatByteCount(transport.p2pBytes)} (0 B relayed)` : ""}
+                {transport.iceMs != null ? ` · ICE ${formatDuration(transport.iceMs)}` : ""}
+              </span>
+            ) : null}
+            {transport?.actual === "relay" && transport.fallbackReason ? (
+              <span
+                className="waterfall__metric waterfall__metric--warn"
+                title={`WebRTC fell back to WebSocket relay (${transport.fallbackReason})`}
+              >
+                Data plane <strong>WS Relay</strong> (fallback: {transport.fallbackReason})
+              </span>
+            ) : null}
+            {transport?.actual === "pending" ? (
+              <span className="waterfall__metric">
+                Data plane <strong>WebRTC signaling…</strong>
               </span>
             ) : null}
           </div>

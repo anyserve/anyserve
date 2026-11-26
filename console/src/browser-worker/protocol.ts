@@ -92,12 +92,20 @@ export interface StreamingInvokeResult {
   state: "succeeded" | "failed" | "cancelled";
   text: string;
   error: string | null;
+  errorCode?: string | null;
   workerId: string | null;
   attempts: number;
   restarted: boolean;
   failoverMs: number | null;
   ttftMs: number | null;
   totalMs: number;
+  transportActual?: "p2p" | "relay";
+  fallbackReason?: string | null;
+  iceMs?: number | null;
+  p2pBytes?: number;
+  relayedPayloadBytes?: number;
+  streamDurationMs?: number | null;
+  framesReceived?: number;
   timeline: StreamingInvokeTimelineEvent[];
 }
 
@@ -106,6 +114,8 @@ export interface StreamingInvokeOptions {
   token?: string | null;
   interfaceName: string;
   prompt: string;
+  benchChunks?: number;
+  benchChunkBytes?: number;
   preferredAttributes?: Record<string, string>;
   metadata?: Record<string, string>;
   maxAttempts?: number;
@@ -114,6 +124,7 @@ export interface StreamingInvokeOptions {
   onJobAccepted?: (jobId: string) => void;
   onAssigned?: (workerId: string, attemptNumber: number) => void;
   onChunk?: (text: string) => void;
+  onBinaryChunk?: (bytes: Uint8Array) => void;
   onProgress?: (message: string) => void;
   onTimeline?: (event: StreamingInvokeTimelineEvent) => void;
 }
@@ -141,6 +152,10 @@ export function invokeStreamingJob(options: StreamingInvokeOptions): Promise<Str
     let firstAssignedAt: number | null = null;
     let failoverMs: number | null = null;
     let ttftMs: number | null = null;
+    let firstDataAt: number | null = null;
+    let lastDataAt: number | null = null;
+    let relayedPayloadBytes = 0;
+    let framesReceived = 0;
     let combinedText = "";
 
     const wsUrl = `${options.wsBaseUrl.replace(/\/+$/, "")}/ws/v2/client/invoke`;
@@ -179,6 +194,14 @@ export function invokeStreamingJob(options: StreamingInvokeOptions): Promise<Str
         failoverMs,
         ttftMs,
         totalMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        transportActual: "relay",
+        fallbackReason: null,
+        iceMs: null,
+        p2pBytes: 0,
+        relayedPayloadBytes,
+        streamDurationMs:
+          firstDataAt !== null && lastDataAt !== null ? Math.max(1, Math.round(lastDataAt - firstDataAt)) : null,
+        framesReceived,
         timeline,
       });
     };
@@ -209,6 +232,10 @@ export function invokeStreamingJob(options: StreamingInvokeOptions): Promise<Str
               ],
               metadata: {
                 source: "console.playground",
+                ...(options.benchChunks != null ? { "demo.bench_chunks": String(options.benchChunks) } : {}),
+                ...(options.benchChunkBytes != null
+                  ? { "demo.bench_chunk_bytes": String(options.benchChunkBytes) }
+                  : {}),
                 ...(options.metadata ?? {}),
               },
               policy: {
@@ -273,17 +300,27 @@ export function invokeStreamingJob(options: StreamingInvokeOptions): Promise<Str
           );
           break;
         case "output": {
-          const text = decodeUtf8(kind.value.data);
+          const now = performance.now();
           if (kind.value.progress) {
+            const text = decodeUtf8(kind.value.data);
             pushTimeline("progress", text);
             options.onProgress?.(text);
           } else {
             if (ttftMs === null) {
-              ttftMs = Math.max(0, Math.round(performance.now() - startedAt));
+              ttftMs = Math.max(0, Math.round(now - startedAt));
+              firstDataAt = now;
               pushTimeline("output", `first token at +${ttftMs} ms`);
             }
-            combinedText += text;
-            options.onChunk?.(text);
+            lastDataAt = now;
+            relayedPayloadBytes += kind.value.data.byteLength;
+            framesReceived += 1;
+            if (kind.value.metadata["content_type"] === "application/octet-stream") {
+              options.onBinaryChunk?.(kind.value.data);
+            } else {
+              const text = decodeUtf8(kind.value.data);
+              combinedText += text;
+              options.onChunk?.(text);
+            }
           }
           break;
         }
@@ -305,6 +342,7 @@ export function invokeStreamingJob(options: StreamingInvokeOptions): Promise<Str
                 ? "cancelled"
                 : "failed";
           const errMsg = kind.value.error?.message || null;
+          const errCode = kind.value.error?.code || null;
           pushTimeline("finished", errMsg ? `${state}: ${errMsg}` : state);
           try {
             ws.close(1000, "done");
@@ -316,12 +354,21 @@ export function invokeStreamingJob(options: StreamingInvokeOptions): Promise<Str
             state,
             text: combinedText,
             error: errMsg,
+            errorCode: errCode,
             workerId: lastWorkerId,
             attempts,
             restarted,
             failoverMs,
             ttftMs,
             totalMs: Math.max(0, Math.round(performance.now() - startedAt)),
+            transportActual: "relay",
+            fallbackReason: null,
+            iceMs: null,
+            p2pBytes: 0,
+            relayedPayloadBytes,
+            streamDurationMs:
+              firstDataAt !== null && lastDataAt !== null ? Math.max(1, Math.round(lastDataAt - firstDataAt)) : null,
+            framesReceived,
             timeline,
           });
           break;

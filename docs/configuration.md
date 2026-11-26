@@ -137,6 +137,25 @@ the exact same role, namespace, expiry, and revocation checks as `Authorization:
 Bearer`, echoes only `anyserve.v2` in the 101 response, and rejects conflicting
 `Authorization` + `anyserve.bearer.*` headers with HTTP `400` (`INVALID_ARGUMENT`).
 
+**Optional Browser WebRTC P2P data-plane bypass** (Console Playground): default
+traffic always uses the WebSocket relay, and the core runtime/protocol never
+depends on WebRTC. Callers may opt in per job with metadata
+`anyserve.transport=webrtc` on **EPHEMERAL** streaming `/ws/v2/client/invoke`
+requests only — durable and `Submit` jobs reject or fall back to relay because
+the control plane must persist and replay durable outputs.
+- *Trust boundary*: in P2P mode, payload bytes flow directly over
+  `RTCDataChannel` (`0 B` payload relayed); the control plane only sees
+  scheduling, lease liveness, and worker-reported summary metadata
+  (`anyserve.transport_actual`, `anyserve.p2p_bytes`, `anyserve.ice_ms`).
+- *NAT & fallback*: public STUN only (`stun.l.google.com:19302`,
+  `stun.cloudflare.com:3478`), **no TURN** — symmetric NATs and restrictive
+  corporate firewalls automatically fall back to WebSocket relay after 3.5 s.
+- *Failover consistency*: if the P2P peer drops before any output chunk is
+  exposed to the caller, the client automatically re-schedules on another worker;
+  once output has been exposed, disconnects fail fast with `output_interrupted`
+  (matching relay semantics). Short text streams pay cold ICE setup (~50–200 ms);
+  P2P is intended for large payloads where avoiding server egress matters.
+
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
 certificate trusted by those roots, or supply a custom Rust transport for a

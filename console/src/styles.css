@@ -433,6 +433,10 @@ td.ellipsis, th.ellipsis { display: table-cell; }
 .waterfall__metric strong { color: var(--fg); font-family: var(--mono); font-weight: 600; }
 .waterfall__metric--overhead { background: var(--amber-soft); border-color: color-mix(in srgb, var(--amber) 32%, var(--line)); color: var(--amber); }
 .waterfall__metric--overhead strong { color: var(--amber); }
+.waterfall__metric--p2p { background: var(--green-soft); border-color: color-mix(in srgb, var(--green) 36%, var(--line)); color: var(--green); }
+.waterfall__metric--p2p strong { color: var(--green); }
+.waterfall__metric--warn { background: var(--amber-soft); border-color: color-mix(in srgb, var(--amber) 36%, var(--line)); color: var(--amber); }
+.waterfall__metric--warn strong { color: var(--amber); }
 
 .waterfall__rows { display: flex; flex-direction: column; gap: 5px; }
 .waterfall__row { display: grid; grid-template-columns: minmax(96px, 128px) minmax(0, 1fr) auto; align-items: center; gap: 8px; }
@@ -567,6 +571,13 @@ td.ellipsis, th.ellipsis { display: table-cell; }
 .pg-timeline__item { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; font-size: 11.5px; }
 .pg-timeline__item--attempt_restarted .tag { background: var(--amber-soft); color: var(--amber); }
 .pg-timeline__item--finished .tag { background: var(--green-soft); color: var(--green); }
+.pg-controls-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.pg-bench-card { display: flex; flex-direction: column; gap: 8px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--card-2); }
+.pg-bench-card__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; font-size: 12px; font-weight: 600; }
+.pg-bench-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.pg-bench-table th, .pg-bench-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line-2); }
+.pg-bench-table th { color: var(--muted); font-weight: 550; }
+.pg-bench-table tr:last-child td { border-bottom: 0; }
 @media (max-width: 960px) { .pg-grid { grid-template-columns: 1fr; } }
 
 /* ---- Responsive ---- */

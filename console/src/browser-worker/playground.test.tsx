@@ -13,7 +13,7 @@ import {
   pb,
 } from "./protocol";
 import type { HostToWorkerCmd, WorkerToHostEvent } from "./worker";
-import { PlaygroundPane } from "../PlaygroundPane";
+import { PlaygroundPane, buildPeerTabUrl } from "../PlaygroundPane";
 
 afterEach(() => {
   cleanup();
@@ -269,5 +269,98 @@ describe("BrowserWorkerManager & PlaygroundPane", () => {
     expect(manager.getSnapshot().slots.primary.status).toBe("killed");
     expect(manager.onlineCount()).toBe(0);
     expect(screen.getAllByText(/reconnect_grace_ms/i).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("never leaks worker tokens into Peer Tab links and renders Relay vs WebRTC P2P benchmark", async () => {
+    expect(buildPeerTabUrl("https://anyserve.arcosx.org/", false, "as_c_client")).toBe(
+      "https://anyserve.arcosx.org/playground",
+    );
+    expect(buildPeerTabUrl("https://anyserve.arcosx.org/", true, "as_c_client+1")).toBe(
+      "https://anyserve.arcosx.org/playground#token=as_c_client%2B1",
+    );
+
+    const workers: ReturnType<typeof makeFakeWorker>[] = [];
+    const manager = new BrowserWorkerManager(() => {
+      const w = makeFakeWorker();
+      workers.push(w);
+      return w;
+    });
+    const startP = manager.startWorker("primary", { wsBaseUrl: "ws://127.0.0.1:3001", token: null });
+    workers[0]!.emit({
+      type: "state",
+      status: "online",
+      sessionId: "sess-bench",
+      interfaces: [ECHO_INTERFACE],
+      activeJobId: null,
+      jobsCompleted: 0,
+      backend: "echo-only",
+      error: null,
+    });
+    await startP;
+
+    const invokeRelay = vi.fn().mockResolvedValue({
+      jobId: "job-bench-relay",
+      state: "succeeded",
+      text: "",
+      error: null,
+      workerId: "browser-worker-1",
+      attempts: 1,
+      restarted: false,
+      failoverMs: null,
+      ttftMs: 14,
+      totalMs: 42,
+      transportActual: "relay",
+      fallbackReason: null,
+      iceMs: null,
+      p2pBytes: 0,
+      relayedPayloadBytes: 524_288,
+      streamDurationMs: 28,
+      framesReceived: 32,
+      timeline: [],
+    });
+    const invokeWebRtc = vi.fn().mockResolvedValue({
+      jobId: "job-bench-p2p",
+      state: "succeeded",
+      text: "",
+      error: null,
+      workerId: "browser-worker-1",
+      attempts: 1,
+      restarted: false,
+      failoverMs: null,
+      ttftMs: 75,
+      totalMs: 92,
+      transportActual: "p2p",
+      fallbackReason: null,
+      iceMs: 68,
+      p2pBytes: 524_288,
+      relayedPayloadBytes: 0,
+      streamDurationMs: 12,
+      framesReceived: 32,
+      timeline: [],
+    });
+
+    const onOpenJobInJobs = vi.fn();
+    render(
+      <PlaygroundPane
+        manager={manager}
+        invokeRelay={invokeRelay}
+        invokeWebRtc={invokeWebRtc}
+        onOpenJobInJobs={onOpenJobInJobs}
+        onOpenWorkers={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Benchmark: Relay vs P2P/i }));
+    await waitFor(() => expect(screen.getByLabelText(/Relay vs WebRTC P2P benchmark/i)).toBeTruthy());
+
+    expect(invokeRelay).toHaveBeenCalledWith(expect.objectContaining({ benchChunks: 32, benchChunkBytes: 16_384 }));
+    expect(invokeWebRtc).toHaveBeenCalledWith(expect.objectContaining({ benchChunks: 32, benchChunkBytes: 16_384 }));
+    expect(screen.getByText("512.0 KB")).toBeTruthy();
+    expect(screen.getAllByText("0 B").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("68 ms")).toBeTruthy();
+
+    const waterfallBtns = screen.getAllByRole("button", { name: /^Waterfall$/i });
+    fireEvent.click(waterfallBtns[1]!);
+    expect(onOpenJobInJobs).toHaveBeenCalledWith("job-bench-p2p", undefined);
   });
 });
