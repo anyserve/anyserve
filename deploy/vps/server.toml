@@ -35,12 +35,24 @@ max_terminal_jobs = 1000
 max_inline_object_bytes = 8388608
 max_inline_total_bytes = 25165824
 
-# Per-namespace quotas enforced for every tenant, including ephemeral `guest-*`
-# sandboxes when ANYSERVE_AUTH_GUEST_ENABLED=true on the auth plugin.
-# Note: `guest-*` sandboxes share the global `[runtime]` ceilings above
-# (`max_sessions`, `max_pending_jobs`, `max_terminal_jobs`) with `gh-*` tenants;
-# bound active guest count via ANYSERVE_AUTH_GUEST_MAX_ACTIVE when enabling guests.
+# Per-namespace quotas enforced for every tenant (Rust control plane only).
+# `gh-*` tenants receive the full per-namespace quotas below.
 [runtime.tenant_quotas]
 max_sessions_per_namespace = 32
 max_pending_jobs_per_namespace = 200
 max_interfaces_per_namespace = 32
+
+# Ephemeral `guest-*` sandboxes (when ANYSERVE_AUTH_GUEST_ENABLED=true on the
+# auth plugin) are tightly capped both per namespace and in aggregate so
+# anonymous traffic cannot amplify across sandboxes and crowd out `gh-*` tenants:
+# - max_total_sessions = 400 / 4096 default max_sessions (~9.8%, <= 10% of global)
+# - max_total_pending_jobs = 400 / 2000 max_pending_jobs (20% of global)
+# One anonymous IP (10 sandboxes / 10m) is bounded to <= 40 sessions (<1%) and
+# <= 100 pending jobs (5%), preserving >= 80% global capacity for `gh-*` tenants.
+[[runtime.tenant_quotas.prefix_overrides]]
+prefix = "guest-"
+max_sessions_per_namespace = 4
+max_pending_jobs_per_namespace = 10
+max_interfaces_per_namespace = 4
+max_total_sessions = 400
+max_total_pending_jobs = 400

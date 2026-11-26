@@ -907,3 +907,77 @@ fn revocation_env_precedence_portal_url_validation_scoped_tokens_and_budget_clam
     .unwrap_err();
     assert!(err.to_string().contains("65536"), "{err}");
 }
+
+#[test]
+fn tenant_quotas_prefix_overrides_parse_validate_and_match_vps_config() {
+    let raw = r#"
+[runtime.tenant_quotas]
+max_sessions_per_namespace = 32
+max_pending_jobs_per_namespace = 200
+max_interfaces_per_namespace = 32
+
+[[runtime.tenant_quotas.prefix_overrides]]
+prefix = "guest-"
+max_sessions_per_namespace = 4
+max_pending_jobs_per_namespace = 10
+max_interfaces_per_namespace = 4
+max_total_sessions = 400
+max_total_pending_jobs = 400
+"#;
+    let resolved = config_with_env(raw, ServeOverrides::default(), |_| None).unwrap();
+    assert_eq!(resolved.runtime.tenant_quotas.prefix_overrides.len(), 1);
+    let guest = &resolved.runtime.tenant_quotas.prefix_overrides[0];
+    assert_eq!(guest.prefix, "guest-");
+    assert_eq!(guest.max_sessions_per_namespace, Some(4));
+    assert_eq!(guest.max_pending_jobs_per_namespace, Some(10));
+    assert_eq!(guest.max_interfaces_per_namespace, Some(4));
+    assert_eq!(guest.max_total_sessions, Some(400));
+    assert_eq!(guest.max_total_pending_jobs, Some(400));
+
+    // Empty, whitespace, invalid, and duplicate prefixes must be rejected.
+    for bad_prefix in ["", "   ", "guest/1", " guest-"] {
+        let bad_toml = format!(
+            "[runtime.tenant_quotas]\n[[runtime.tenant_quotas.prefix_overrides]]\nprefix = \"{bad_prefix}\"\nmax_total_pending_jobs = 10\n"
+        );
+        let err = config_with_env(&bad_toml, ServeOverrides::default(), |_| None).unwrap_err();
+        assert!(
+            err.to_string().contains("prefix_overrides"),
+            "expected prefix validation error for '{bad_prefix}', got: {err}"
+        );
+    }
+
+    let dup_toml = r#"
+[runtime.tenant_quotas]
+[[runtime.tenant_quotas.prefix_overrides]]
+prefix = "guest-"
+max_total_pending_jobs = 100
+
+[[runtime.tenant_quotas.prefix_overrides]]
+prefix = "guest-"
+max_total_pending_jobs = 200
+"#;
+    let err = config_with_env(dup_toml, ServeOverrides::default(), |_| None).unwrap_err();
+    assert!(
+        err.to_string().contains("duplicate") && err.to_string().contains("guest-"),
+        "{err}"
+    );
+
+    // Real deploy/vps/server.toml parses cleanly and bounds guest-* aggregate
+    // quotas to <= 10% global sessions and <= 20% global pending jobs.
+    let vps_toml = include_str!("../../../../deploy/vps/server.toml");
+    let vps = config_with_env(vps_toml, ServeOverrides::default(), |_| None).unwrap();
+    let vps_guest = vps
+        .runtime
+        .tenant_quotas
+        .prefix_overrides
+        .iter()
+        .find(|entry| entry.prefix == "guest-")
+        .expect("deploy/vps/server.toml must configure guest- prefix override");
+    assert_eq!(vps_guest.max_sessions_per_namespace, Some(4));
+    assert_eq!(vps_guest.max_pending_jobs_per_namespace, Some(10));
+    assert_eq!(vps_guest.max_interfaces_per_namespace, Some(4));
+    assert_eq!(vps_guest.max_total_sessions, Some(400));
+    assert_eq!(vps_guest.max_total_pending_jobs, Some(400));
+    assert!(vps_guest.max_total_sessions.unwrap() * 10 <= vps.runtime.max_sessions);
+    assert!(vps_guest.max_total_pending_jobs.unwrap() * 5 <= vps.runtime.max_pending_jobs);
+}

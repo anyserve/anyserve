@@ -81,11 +81,23 @@ max_terminal_jobs = 10000
 event_log_max_events = 8192
 event_log_max_bytes = 8388608
 
-# Optional per-tenant fairness/noisy-neighbor caps:
+# Optional per-tenant fairness/noisy-neighbor caps (Rust control plane only;
+# not implemented in the Cloudflare Workers/DO native engine):
 # [runtime.tenant_quotas]
 # max_sessions_per_namespace = 32
 # max_pending_jobs_per_namespace = 200
 # max_interfaces_per_namespace = 32
+#
+# Optional longest-prefix overrides (e.g. tighter per-namespace and aggregate
+# caps for ephemeral `guest-*` sandboxes so they cannot crowd out `gh-*` tenants;
+# empty, invalid, or duplicate `prefix` entries are rejected at config load):
+# [[runtime.tenant_quotas.prefix_overrides]]
+# prefix = "guest-"
+# max_sessions_per_namespace = 4
+# max_pending_jobs_per_namespace = 10
+# max_interfaces_per_namespace = 4
+# max_total_sessions = 400
+# max_total_pending_jobs = 400
 
 # Optional per-interface overrides; quote names containing dots.
 # [runtime.interfaces."demo.echo.v1"]
@@ -288,7 +300,7 @@ mutually exclusive. Use each command's `--help` for accepted values.
 | `--console-listen ADDR` | — | Enables the management HTTP, WebSocket (`/ws/v2/*`), and embedded Console listener (e.g. `127.0.0.1:3001` or `0.0.0.0:3001`) without a TOML file; overrides `[console].listen`. |
 | `--public-endpoint URL` | `ANYSERVE_PUBLIC_ENDPOINT` | Advertised endpoint for `/api/overview` and the Console "Connect worker" dialog. Precedence: `--public-endpoint` > `ANYSERVE_PUBLIC_ENDPOINT` > `[console].public_endpoint`. |
 | — | `ANYSERVE_CONSOLE_AUTH_PORTAL_URL` | Optional portal URL exposed via unauthenticated `/api/info` and Console links ("Sign in with GitHub" / "Manage Tokens"); overrides `[console].auth_portal_url`. |
-| — | `ANYSERVE_AUTH_GUEST_ENABLED` | Opt-in toggle on `anyserve-auth-github` (default `false`). When `true`, enables `POST /auth/api/guest` to mint stateless 30-minute `asv1.` client+worker pairs in isolated `guest-<12hex>` namespaces with zero SQLite writes, bounded by per-client (`ANYSERVE_AUTH_GUEST_RATE_LIMIT_PER_IP`, default `10`/10m; IPv6 bucketed by `/64`, IPv4-mapped IPv6 normalized to IPv4), global burst (`ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL`, default `30`/m), and total active-TTL ceiling (`ANYSERVE_AUTH_GUEST_MAX_ACTIVE`, default `200` concurrent unexpired sandboxes). TTL via `ANYSERVE_AUTH_GUEST_TTL_SECS` (default `1800`, clamped `60..=86400`). Set `ANYSERVE_AUTH_TRUST_PROXY=true` only behind a trusted reverse proxy (e.g. Caddy) so client IP extraction uses the rightmost non-empty entry of the last `X-Forwarded-For` header line; when `false` (default), forwarding headers are ignored and peer socket IP is used directly. Note: `guest-*` sandboxes share global `[runtime]` limits (`max_sessions`, `max_pending_jobs`, `max_terminal_jobs`) with authenticated tenants, so keep `ANYSERVE_AUTH_GUEST_MAX_ACTIVE` and `[runtime.tenant_quotas]` configured before enabling guests in production. |
+| — | `ANYSERVE_AUTH_GUEST_ENABLED` | Opt-in toggle on `anyserve-auth-github` (default `false`). When `true`, enables `POST /auth/api/guest` to mint stateless 30-minute `asv1.` client+worker pairs in isolated `guest-<12hex>` namespaces with zero SQLite writes, bounded by per-client (`ANYSERVE_AUTH_GUEST_RATE_LIMIT_PER_IP`, default `10`/10m; IPv6 bucketed by `/64`, IPv4-mapped IPv6 normalized to IPv4), global burst (`ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL`, default `30`/m), and total active-TTL ceiling (`ANYSERVE_AUTH_GUEST_MAX_ACTIVE`, default `200` concurrent unexpired sandboxes). TTL via `ANYSERVE_AUTH_GUEST_TTL_SECS` (default `1800`, clamped `60..=86400`). Set `ANYSERVE_AUTH_TRUST_PROXY=true` only behind a trusted reverse proxy (e.g. Caddy) so client IP extraction uses the rightmost non-empty entry of the last `X-Forwarded-For` header line; when `false` (default), forwarding headers are ignored and peer socket IP is used directly. Note: `guest-*` sandboxes share global `[runtime]` limits (`max_sessions`, `max_pending_jobs`, `max_terminal_jobs`) with authenticated tenants, so keep `ANYSERVE_AUTH_GUEST_MAX_ACTIVE` and `[runtime.tenant_quotas]` with a `[[runtime.tenant_quotas.prefix_overrides]]` rule for `prefix = "guest-"` (Rust control plane only) configured before enabling guests in production. |
 | `--memory-limit MB` | `ANYSERVE_MEMORY_LIMIT_MB` | Scales unspecified `max_pending_bytes` (25%), `max_result_bytes` (25%), and `max_event_bytes` (10%) from a total RAM budget while preserving explicit TOML limits. |
 | `--journal-max-bytes BYTES` | `ANYSERVE_JOURNAL_MAX_BYTES` | Sets the SQLite database byte cap (hard `PRAGMA max_page_count` ceiling + size-based terminal purge during maintenance/backpressure); overrides `[journal].max_bytes`. |
 | `--no-grpc` | — | Disables the gRPC listener without a TOML file. Requires management HTTP (`--console-listen` or `[console].enabled = true`). |

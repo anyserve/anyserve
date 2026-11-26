@@ -264,12 +264,20 @@ impl Inner {
         if st.unfinished_jobs >= self.config.max_pending_jobs {
             return Err(RuntimeError::exhausted("unfinished job limit reached"));
         }
-        let quotas = &self.config.tenant_quotas;
+        let quotas = self.config.tenant_quotas.resolve_for(namespace);
         if let Some(ns_pending_limit) = quotas.max_pending_jobs_per_namespace
             && st.job_index.namespace_pending_count(namespace) >= ns_pending_limit
         {
             return Err(RuntimeError::exhausted(format!(
                 "unfinished job limit reached for namespace '{namespace}'"
+            )));
+        }
+        if let (Some(prefix), Some(prefix_pending_limit)) =
+            (quotas.matched_prefix, quotas.max_total_pending_jobs)
+            && st.job_index.prefix_pending_count(prefix) >= prefix_pending_limit
+        {
+            return Err(RuntimeError::exhausted(format!(
+                "unfinished job limit reached for namespace prefix '{prefix}'"
             )));
         }
         let interface = &spec.demand.interface;

@@ -46,6 +46,10 @@ struct NamespaceIndex {
 #[derive(Default)]
 pub(crate) struct JobIndex {
     namespaces: HashMap<String, NamespaceIndex>,
+    /// Unfinished (queued + running) counts for namespaces with `pending > 0`,
+    /// ordered lexicographically so prefix aggregate lookups run in
+    /// `O(log N_active + K_active)` instead of scanning jobs or terminal namespaces.
+    pending_namespaces: BTreeMap<String, usize>,
     counts: [usize; 5],
 }
 
@@ -91,6 +95,15 @@ impl JobIndex {
             ns_iface
                 .queued_since
                 .insert((job.queued_since_ms, job.id.clone()));
+        }
+        if state <= 1 {
+            let pending = ns.jobs[0].len() + ns.jobs[1].len();
+            if let Some(count) = self.pending_namespaces.get_mut(&job.namespace) {
+                *count = pending;
+            } else {
+                self.pending_namespaces
+                    .insert(job.namespace.clone(), pending);
+            }
         }
     }
 
@@ -194,6 +207,14 @@ impl JobIndex {
                 }
                 if prune && ns_iface.jobs.iter().all(BTreeSet::is_empty) {
                     ns.interfaces.remove(name);
+                }
+            }
+            if state <= 1 {
+                let pending = ns.jobs[0].len() + ns.jobs[1].len();
+                if pending == 0 {
+                    self.pending_namespaces.remove(&job.namespace);
+                } else if let Some(count) = self.pending_namespaces.get_mut(&job.namespace) {
+                    *count = pending;
                 }
             }
         }
@@ -396,6 +417,19 @@ impl JobIndex {
             .map_or(0, |ns| ns.jobs[0].len() + ns.jobs[1].len())
     }
 
+    /// Counts unfinished (queued + running) jobs across all namespaces matching
+    /// `prefix` via the active-namespace `BTreeMap` range.
+    /// Complexity: `O(log N_active + K_active)`, where `N_active` is the number
+    /// of namespaces with `>= 1` unfinished job and `K_active` is the matching
+    /// subset (independent of total job count and retained terminal namespaces).
+    pub(crate) fn prefix_pending_count(&self, prefix: &str) -> usize {
+        self.pending_namespaces
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|(ns, _)| ns.starts_with(prefix))
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
     pub(crate) fn interfaces(&self, now: u64) -> BTreeMap<String, InterfaceStats> {
         let mut merged: BTreeMap<String, InterfaceStats> = BTreeMap::new();
         for ns in self.namespaces.values() {
@@ -485,6 +519,15 @@ pub(crate) fn assert_matches_jobs(st: &super::state::State) {
     }
     assert_eq!(st.job_index.counts(), expected_counts);
     assert_eq!(st.job_index.interfaces(now), expected_interfaces);
+    let mut expected_pending_namespaces: BTreeMap<String, usize> = BTreeMap::new();
+    for job in st.jobs.values() {
+        if !job.is_terminal() {
+            *expected_pending_namespaces
+                .entry(job.namespace.clone())
+                .or_default() += 1;
+        }
+    }
+    assert_eq!(st.job_index.pending_namespaces, expected_pending_namespaces);
     let interfaces = [None, Some("missing".to_string())]
         .into_iter()
         .chain(expected_interfaces.keys().cloned().map(Some));

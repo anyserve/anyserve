@@ -256,25 +256,46 @@ impl Runtime {
                 .is_some_and(|session| {
                     session.worker_id == worker_id && session.namespace == namespace
                 });
+        let quotas = inner.config.tenant_quotas.resolve_for(&namespace);
         if !resume {
             if st.sessions.len() >= inner.config.max_sessions {
                 return Err(RuntimeError::exhausted("worker session limit reached").into());
             }
-            if let Some(ns_limit) = inner.config.tenant_quotas.max_sessions_per_namespace {
-                let ns_sessions = st
-                    .sessions
-                    .values()
-                    .filter(|session| session.namespace == namespace)
-                    .count();
-                if ns_sessions >= ns_limit {
+            let check_ns = quotas.max_sessions_per_namespace.is_some();
+            let check_prefix =
+                quotas.matched_prefix.is_some() && quotas.max_total_sessions.is_some();
+            if check_ns || check_prefix {
+                let prefix = quotas.matched_prefix.unwrap_or_default();
+                let mut ns_sessions = 0usize;
+                let mut prefix_sessions = 0usize;
+                for session in st.sessions.values() {
+                    if check_ns && session.namespace == namespace {
+                        ns_sessions += 1;
+                    }
+                    if check_prefix && session.namespace.starts_with(prefix) {
+                        prefix_sessions += 1;
+                    }
+                }
+                if let Some(ns_limit) = quotas.max_sessions_per_namespace
+                    && ns_sessions >= ns_limit
+                {
                     return Err(RuntimeError::exhausted(format!(
                         "worker session limit reached for namespace '{namespace}'"
                     ))
                     .into());
                 }
+                if let (Some(prefix), Some(prefix_limit)) =
+                    (quotas.matched_prefix, quotas.max_total_sessions)
+                    && prefix_sessions >= prefix_limit
+                {
+                    return Err(RuntimeError::exhausted(format!(
+                        "worker session limit reached for namespace prefix '{prefix}'"
+                    ))
+                    .into());
+                }
             }
         }
-        if let Some(ns_iface_limit) = inner.config.tenant_quotas.max_interfaces_per_namespace {
+        if let Some(ns_iface_limit) = quotas.max_interfaces_per_namespace {
             let resuming_id = resume.then_some(hello.resume_session_id.as_str());
             let kept_other = st.sessions_by_interface.get(&namespace).map_or(0, |m| {
                 m.iter()
@@ -2037,6 +2058,7 @@ mod tests {
                 max_sessions_per_namespace: Some(1),
                 max_pending_jobs_per_namespace: Some(1),
                 max_interfaces_per_namespace: Some(1),
+                ..Default::default()
             },
             ..Default::default()
         })
@@ -2314,6 +2336,7 @@ mod tests {
                     max_sessions_per_namespace: None,
                     max_pending_jobs_per_namespace: None,
                     max_interfaces_per_namespace: Some(2),
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -2826,6 +2849,344 @@ mod tests {
         .await
         .expect("committed attempt start must increment counter");
         assert_eq!(runtime.stats().attempts_started_total, 1);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tenant_quotas_prefix_overrides_cap_guests_and_preserve_default_tenants() {
+        use crate::error::ErrorKind;
+        use crate::runtime::api::{NamespaceQuotaOverride, TenantQuotas};
+
+        let hello_ifaces = |worker_id: &str, ifaces: &[&str]| pb::Hello {
+            interfaces: ifaces.iter().map(|s| (*s).to_string()).collect(),
+            ..hello(worker_id, "", Vec::new())
+        };
+
+        // 1. Unconfigured prefix_overrides behaves identically to base TenantQuotas
+        //    (including exact error kind and error message at runtime).
+        let base_only = TenantQuotas {
+            max_sessions_per_namespace: Some(1),
+            max_pending_jobs_per_namespace: Some(1),
+            max_interfaces_per_namespace: Some(1),
+            prefix_overrides: Vec::new(),
+        };
+        let resolved_base = base_only.resolve_for("guest-abc");
+        assert_eq!(resolved_base.matched_prefix, None);
+        assert_eq!(resolved_base.max_sessions_per_namespace, Some(1));
+        assert_eq!(resolved_base.max_pending_jobs_per_namespace, Some(1));
+        assert_eq!(resolved_base.max_interfaces_per_namespace, Some(1));
+        assert_eq!(resolved_base.max_total_sessions, None);
+        assert_eq!(resolved_base.max_total_pending_jobs, None);
+        {
+            let rt_base = Runtime::start(RuntimeConfig {
+                tenant_quotas: base_only,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let auth_base = crate::auth::AuthPolicy::default();
+            let _s = rt_base
+                .open_session_for(
+                    hello_ifaces("bw-1", &["echo"]),
+                    worker_principal("guest-abc"),
+                    &auth_base,
+                )
+                .unwrap();
+            match rt_base.open_session_for(
+                hello_ifaces("bw-2", &["echo"]),
+                worker_principal("guest-abc"),
+                &auth_base,
+            ) {
+                Err(WorkerOpenError::Runtime(err)) => {
+                    assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+                    assert_eq!(
+                        err.message(),
+                        "worker session limit reached for namespace 'guest-abc'"
+                    );
+                }
+                Ok(_) => panic!("expected ResourceExhausted without prefix_overrides"),
+                Err(other) => panic!("unexpected error without prefix_overrides: {other:?}"),
+            }
+            let mut base_spec = JobSpec::default();
+            base_spec.demand.interface = "unserved.a".into();
+            base_spec.policy.durability = Some(Durability::Ephemeral);
+            rt_base
+                .submit(SubmitRequest {
+                    namespace: Some("guest-abc".into()),
+                    spec: base_spec.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let err = rt_base
+                .submit(SubmitRequest {
+                    namespace: Some("guest-abc".into()),
+                    spec: base_spec,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+            assert_eq!(
+                err.message(),
+                "unfinished job limit reached for namespace 'guest-abc'"
+            );
+            rt_base.shutdown().await;
+        }
+
+        // 2. Longest-prefix match: `guest-vip-` beats `guest-` and inherits omitted fields.
+        let runtime = Runtime::start(RuntimeConfig {
+            tenant_quotas: TenantQuotas {
+                max_sessions_per_namespace: Some(4),
+                max_pending_jobs_per_namespace: Some(5),
+                max_interfaces_per_namespace: Some(4),
+                prefix_overrides: vec![
+                    NamespaceQuotaOverride {
+                        prefix: "guest-".into(),
+                        max_sessions_per_namespace: Some(2),
+                        max_pending_jobs_per_namespace: Some(2),
+                        max_interfaces_per_namespace: Some(1),
+                        max_total_sessions: Some(3),
+                        max_total_pending_jobs: Some(3),
+                    },
+                    NamespaceQuotaOverride {
+                        prefix: "guest-vip-".into(),
+                        max_sessions_per_namespace: Some(3),
+                        max_pending_jobs_per_namespace: None, // inherits base 5
+                        max_interfaces_per_namespace: None,   // inherits base 4
+                        max_total_sessions: Some(3),
+                        max_total_pending_jobs: Some(6),
+                    },
+                ],
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let auth = crate::auth::AuthPolicy::default();
+
+        // Longest-prefix resolution check.
+        let vip = runtime
+            .inner
+            .config
+            .tenant_quotas
+            .resolve_for("guest-vip-1");
+        assert_eq!(vip.matched_prefix, Some("guest-vip-"));
+        assert_eq!(vip.max_sessions_per_namespace, Some(3));
+        assert_eq!(vip.max_pending_jobs_per_namespace, Some(5));
+        assert_eq!(vip.max_interfaces_per_namespace, Some(4));
+
+        // 3. Per-namespace guest session + interface caps (2 sessions, 1 interface).
+        let _g1_s1 = runtime
+            .open_session_for(
+                hello_ifaces("gw-1", &["echo"]),
+                worker_principal("guest-1"),
+                &auth,
+            )
+            .unwrap();
+        // Registering a 2nd distinct interface in guest-1 fails with ResourceExhausted.
+        match runtime.open_session_for(
+            hello_ifaces("gw-iface", &["other"]),
+            worker_principal("guest-1"),
+            &auth,
+        ) {
+            Err(WorkerOpenError::Runtime(err)) => {
+                assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+                assert!(
+                    err.message()
+                        .contains("registered interface limit reached for namespace 'guest-1'"),
+                    "{}",
+                    err.message()
+                );
+            }
+            Ok(_) => panic!("expected ResourceExhausted for guest interface cap, got Ok"),
+            Err(other) => panic!("expected Runtime error for guest interface cap, got {other:?}"),
+        }
+        let _g1_s2 = runtime
+            .open_session_for(
+                hello_ifaces("gw-2", &["echo"]),
+                worker_principal("guest-1"),
+                &auth,
+            )
+            .unwrap();
+        // 3rd session in guest-1 hits per-namespace limit (2) with ResourceExhausted.
+        match runtime.open_session_for(
+            hello_ifaces("gw-3", &["echo"]),
+            worker_principal("guest-1"),
+            &auth,
+        ) {
+            Err(WorkerOpenError::Runtime(err)) => {
+                assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+                assert!(
+                    err.message().contains("namespace 'guest-1'"),
+                    "{}",
+                    err.message()
+                );
+            }
+            Ok(_) => panic!("expected ResourceExhausted for guest per-ns session cap, got Ok"),
+            Err(other) => {
+                panic!("expected Runtime error for guest per-ns session cap, got {other:?}")
+            }
+        }
+
+        // 4. Prefix aggregate session cap (3 total across guest-*).
+        let _g2_s1 = runtime
+            .open_session_for(
+                hello_ifaces("gw-4", &["echo"]),
+                worker_principal("guest-2"),
+                &auth,
+            )
+            .unwrap();
+        // guest-3's 1st session is rejected by aggregate cap (3) with ResourceExhausted.
+        match runtime.open_session_for(
+            hello_ifaces("gw-5", &["echo"]),
+            worker_principal("guest-3"),
+            &auth,
+        ) {
+            Err(WorkerOpenError::Runtime(err)) => {
+                assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+                assert!(
+                    err.message().contains("namespace prefix 'guest-'"),
+                    "{}",
+                    err.message()
+                );
+            }
+            Ok(_) => panic!("expected ResourceExhausted for guest aggregate session cap, got Ok"),
+            Err(other) => {
+                panic!("expected Runtime error for guest aggregate session cap, got {other:?}")
+            }
+        }
+
+        // 5. Authenticated `gh-*` tenant is completely unaffected by guest aggregate saturation.
+        let mut gh_sessions = Vec::new();
+        for i in 0..4 {
+            let iface = format!("iface.{i}");
+            gh_sessions.push(
+                runtime
+                    .open_session_for(
+                        hello_ifaces(&format!("ghw-{i}"), &[iface.as_str()]),
+                        worker_principal("gh-42"),
+                        &auth,
+                    )
+                    .unwrap(),
+            );
+        }
+
+        // 6. Guest per-namespace pending cap (2), interface cap (1), and aggregate pending cap (3).
+        let make_spec = |iface: &str| {
+            let mut spec = JobSpec::default();
+            spec.demand.interface = iface.into();
+            spec.policy.durability = Some(Durability::Ephemeral);
+            spec
+        };
+        let g1_j1 = runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-1".into()),
+                spec: make_spec("unserved.a"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 2nd distinct queued interface in guest-1 rejected (max_interfaces_per_namespace = 1).
+        let err = runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-1".into()),
+                spec: make_spec("unserved.b"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+        // 2nd job on same interface in guest-1 succeeds.
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-1".into()),
+                spec: make_spec("unserved.a"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 3rd job in guest-1 hits per-namespace pending limit (2).
+        let err = runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-1".into()),
+                spec: make_spec("unserved.a"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+        assert!(
+            err.message().contains("namespace 'guest-1'"),
+            "{}",
+            err.message()
+        );
+
+        // guest-2 takes the 3rd aggregate guest-* slot.
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-2".into()),
+                spec: make_spec("unserved.a"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // guest-3 is blocked by prefix aggregate pending cap (3).
+        let err = runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-3".into()),
+                spec: make_spec("unserved.a"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::ResourceExhausted);
+        assert!(
+            err.message().contains("namespace prefix 'guest-'"),
+            "{}",
+            err.message()
+        );
+
+        // Meanwhile `gh-42` still gets its full default quota (5 pending across 4 interfaces).
+        for i in 0..5 {
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some("gh-42".into()),
+                    spec: make_spec(&format!("unserved.{}", i % 4)),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        // Cancelling a guest-1 pending job immediately frees aggregate headroom for guest-3.
+        runtime
+            .cancel_in("guest-1", &g1_j1.job.job_id, "free-slot".into())
+            .await
+            .unwrap();
+        runtime
+            .submit(SubmitRequest {
+                namespace: Some("guest-3".into()),
+                spec: make_spec("unserved.a"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // `guest-vip-1` matches the longer prefix `guest-vip-` (inherits base pending 5,
+        // aggregate 6) rather than `guest-`'s tighter 2/3 caps.
+        for _ in 0..3 {
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some("guest-vip-1".into()),
+                    spec: make_spec("unserved.vip"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+
+        drop(gh_sessions);
         runtime.shutdown().await;
     }
 }
