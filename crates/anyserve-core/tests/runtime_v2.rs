@@ -303,6 +303,7 @@ impl Attempt {
         self.tx
             .send(up(pb::attempt_up::Msg::Finish(pb::Finish {
                 outcome: Some(outcome),
+                handler_duration_ms: None,
             })))
             .await
             .unwrap();
@@ -1077,6 +1078,7 @@ impl Attempt {
             .tx
             .send(up(pb::attempt_up::Msg::Finish(pb::Finish {
                 outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+                handler_duration_ms: None,
             })))
             .await;
         loop {
@@ -2588,6 +2590,7 @@ async fn one_worker_connection_carries_thousands_of_attempts() {
             }),
             pb::attempt_up::Msg::Finish(pb::Finish {
                 outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+                handler_duration_ms: None,
             }),
         ] {
             attempt.tx.send(up(message)).await.unwrap();

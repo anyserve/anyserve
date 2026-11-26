@@ -487,6 +487,7 @@ pub fn event_to_proto(event: api::ExecutionEvent) -> pb::ExecutionEvent {
             state,
             outputs,
             error,
+            ..
         } => pb::execution_event::Event::Finished(pb::ExecutionFinished {
             state: state_to_proto(state),
             outputs: outputs.into_iter().map(object_to_proto).collect(),
@@ -613,6 +614,7 @@ pub fn event_from_proto(event: pb::ExecutionEvent) -> Result<api::ExecutionEvent
                 .map(object_from_proto)
                 .collect::<Result<_, _>>()?,
             error: finished.error.map(error_from_proto),
+            handler_duration_ms: None,
         },
     };
     Ok(api::ExecutionEvent {

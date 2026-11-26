@@ -504,6 +504,8 @@ pub(crate) struct TerminalPlan {
     pub cancel_lease: Option<(String, String)>,
     /// Lease and digest of the completion that produced this outcome.
     pub finished: Option<(String, String)>,
+    /// Worker-measured monotonic handler execution time, when reported.
+    pub handler_duration_ms: Option<u64>,
     /// Phase the job was in when the plan was made; `finish_job_locked` sets
     /// it, so the public state stays the same while the commit is in flight.
     pub previous: Box<Phase>,
@@ -519,6 +521,7 @@ impl TerminalPlan {
             release_lease: None,
             cancel_lease: None,
             finished: None,
+            handler_duration_ms: None,
             previous: Box::new(Phase::Queued),
         }
     }

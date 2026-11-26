@@ -25,6 +25,8 @@ pub struct Attempt {
     discard_input: bool,
     pending_input: VecDeque<v2::InputData>,
     pending_input_bytes: usize,
+    opened_at: Instant,
+    handler_duration_ms: Option<u64>,
     /// A committed lease reopened solely to validate a repeated Finish.
     pub terminal_replay: bool,
     pub inputs: Vec<v2::Object>,
@@ -139,6 +141,8 @@ impl Attempt {
             discard_input: false,
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
+            opened_at: Instant::now(),
+            handler_duration_ms: None,
             terminal_replay: false,
             inputs: assignment.inline_inputs.clone(),
             params: assignment.params.clone(),
@@ -205,6 +209,7 @@ impl Attempt {
                 "attempt input arrived before Opened",
             ));
         }
+        attempt.opened_at = Instant::now();
         Ok(attempt)
     }
 
@@ -281,6 +286,18 @@ impl Attempt {
         }
     }
 
+    /// Records the worker-measured monotonic execution duration (in ms) of the
+    /// user handler so the control plane can separate handler time from relay overhead.
+    pub fn set_handler_duration_ms(&mut self, duration_ms: u64) {
+        self.handler_duration_ms = Some(duration_ms);
+    }
+
+    fn effective_handler_duration_ms(&mut self) -> u64 {
+        *self.handler_duration_ms.get_or_insert_with(|| {
+            self.opened_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+        })
+    }
+
     pub async fn finish(
         &mut self,
         outputs: &[v2::Object],
@@ -331,8 +348,10 @@ impl Attempt {
                 }
             }
         }
+        let handler_duration_ms = Some(self.effective_handler_duration_ms());
         self.send(v2::attempt_up::Msg::Finish(v2::Finish {
             outcome: Some(outcome),
+            handler_duration_ms,
         }))
         .await?;
         loop {
@@ -359,6 +378,7 @@ impl Attempt {
         outcome: v2::finish::Outcome,
     ) -> Result<(), Status> {
         let deadline = retry_deadline(self.heartbeat_timeout)?;
+        let saved_handler_duration_ms = self.effective_handler_duration_ms();
         let last_frame = self.next_sequence - 1;
         let mut outputs = outputs;
         let mut outcome = outcome;
@@ -401,6 +421,7 @@ impl Attempt {
                                 outputs = &[];
                             }
                             reopened.discard_input = true;
+                            reopened.handler_duration_ms = Some(saved_handler_duration_ms);
                             *self = reopened;
                             break;
                         }

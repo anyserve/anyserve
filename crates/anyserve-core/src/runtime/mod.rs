@@ -1383,6 +1383,7 @@ impl Runtime {
                     state: job.state,
                     outputs: job.outputs.clone().unwrap_or_default(),
                     error: job.error.clone(),
+                    handler_duration_ms: None,
                 },
             });
         }

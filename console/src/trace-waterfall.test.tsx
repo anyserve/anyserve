@@ -152,9 +152,50 @@ describe("buildExecutionWaterfall", () => {
     const model = buildExecutionWaterfall(d)!;
     expect(model.queueMs).toBe(250);
     expect(model.execMs).toBe(0);
+    expect(model.anyserveOverheadMs).toBe(250);
+    expect(model.overheadExact).toBe(false);
     expect(model.ttfoMs).toBeNull();
     expect(model.retries).toBe(0);
     expect(model.spans.map((s) => s.kind)).toEqual(["job", "queue_wait"]);
+  });
+
+  it("separates admit persist, queue wait, relay overhead, and worker handler time", () => {
+    const d = makeDetail({
+      attempts: [
+        {
+          attempt_id: "att-1",
+          state: "succeeded",
+          worker_id: "worker-ws",
+          created_at_ms: 1_007,
+          finished_at_ms: 1_341,
+          duration_ms: 334,
+          handler_duration_ms: 1,
+          last_error: null,
+        },
+      ],
+      events: [
+        { sequence: 1, kind: "accepted", created_at_ms: 1_005, payload_size_bytes: 0 },
+        { sequence: 2, kind: "assigned", created_at_ms: 1_007, payload_size_bytes: 0, attempt_id: "att-1" },
+        { sequence: 3, kind: "finished", created_at_ms: 1_341, payload_size_bytes: 0, attempt_id: "att-1" },
+      ],
+    });
+    d.job.created_at_ms = 1_000;
+    d.job.updated_at_ms = 1_341;
+    d.job.duration_ms = 341;
+
+    const model = buildExecutionWaterfall(d)!;
+    expect(model.admitMs).toBe(5);
+    expect(model.queueMs).toBe(2);
+    expect(model.handlerMs).toBe(1);
+    expect(model.relayMs).toBe(333);
+    expect(model.anyserveOverheadMs).toBe(340);
+    expect(model.overheadExact).toBe(true);
+    expect(model.spans.map((s) => s.kind)).toEqual(["job", "admit", "queue_wait", "attempt"]);
+
+    render(<ExecutionWaterfall detail={d} />);
+    expect(screen.getByText("+340 ms")).toBeTruthy();
+    expect(screen.getByText("anyserve · admit")).toBeTruthy();
+    expect(screen.getByText("handler 1 ms · relay 333 ms")).toBeTruthy();
   });
 });
 

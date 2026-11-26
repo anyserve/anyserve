@@ -668,6 +668,7 @@ def _process_assignment(
                         raise ValueError("input object has neither inline nor uri")
                 raw = b"".join(parts)
             value = _decode_payload(spec.codec, raw)
+        handler_started = time.monotonic()
         result = handler(value, attempt) if spec.pass_context else handler(value)
         def _run_coro(coro: Any) -> Any:
             if async_runner is not None:
@@ -696,15 +697,17 @@ def _process_assignment(
             outputs = []
         else:
             outputs = [{"inline": _encode_payload(spec.codec, result), "metadata": {}}]
+        handler_ms = max(0, int(round((time.monotonic() - handler_started) * 1000)))
         if not attempt.cancelled:
             finishing()
-            attempt.complete(outputs)
+            _attempt_complete(attempt, outputs, handler_ms)
     except (asyncio.CancelledError, concurrent.futures.CancelledError) as exc:
         if attempt.cancelled:
             return
         _LOG.exception("worker handler cancelled for interface %s", spec.interface)
+        handler_ms = max(0, int(round((time.monotonic() - handler_started) * 1000))) if "handler_started" in locals() else None
         finishing()
-        attempt.fail(_failure_reason(exc), retryable=False, code=_DEFAULT_ERROR_CODE)
+        _attempt_fail(attempt, _failure_reason(exc), retryable=False, code=_DEFAULT_ERROR_CODE, handler_duration_ms=handler_ms)
     except Exception as exc:
         code = getattr(exc, "status_code", None)
         if code in _TRANSPORT_RPC_CODES or code in _RETIRED_RPC_CODES:
@@ -715,8 +718,36 @@ def _process_assignment(
             _LOG.exception("worker handler failed for interface %s", spec.interface)
         retryable = getattr(exc, "retryable", code == 8)
         err_code = exc.code if isinstance(exc, WorkerError) else _DEFAULT_ERROR_CODE
+        handler_ms = max(0, int(round((time.monotonic() - handler_started) * 1000))) if "handler_started" in locals() else None
         finishing()
-        attempt.fail(_failure_reason(exc), retryable=bool(retryable), code=err_code)
+        _attempt_fail(attempt, _failure_reason(exc), retryable=bool(retryable), code=err_code, handler_duration_ms=handler_ms)
+
+
+def _attempt_complete(attempt: Any, outputs: list[dict[str, Any]], handler_duration_ms: Optional[int]) -> None:
+    if handler_duration_ms is not None:
+        try:
+            attempt.complete(outputs, handler_duration_ms=handler_duration_ms)
+            return
+        except TypeError:
+            pass
+    attempt.complete(outputs)
+
+
+def _attempt_fail(
+    attempt: Any,
+    message: str,
+    *,
+    retryable: bool,
+    code: str,
+    handler_duration_ms: Optional[int],
+) -> None:
+    if handler_duration_ms is not None:
+        try:
+            attempt.fail(message, retryable=retryable, code=code, handler_duration_ms=handler_duration_ms)
+            return
+        except TypeError:
+            pass
+    attempt.fail(message, retryable=retryable, code=code)
 
 
 def _input_fragments(attempt: Any):

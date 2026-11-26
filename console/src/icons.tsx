@@ -96,6 +96,13 @@ export const IconDisconnect = (p: IconProps) => (
   </IconFrame>
 );
 
+export const IconKey = (p: IconProps) => (
+  <IconFrame width={14} height={14} {...p}>
+    <circle cx={5.75} cy={8} r={2.5} />
+    <path d="M8.25 8H13.5M11.25 8v2M13.25 8v1.5" />
+  </IconFrame>
+);
+
 export const IconRefresh = (p: IconProps) => (
   <IconFrame width={14} height={14} {...p}>
     <path d="M13 8a5 5 0 1 1-1-3M12 2.5V5H9.5" />

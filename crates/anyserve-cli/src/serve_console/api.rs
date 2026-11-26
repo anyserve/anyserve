@@ -320,6 +320,8 @@ pub(crate) struct AttemptSummary {
     pub(crate) created_at_ms: u64,
     pub(crate) finished_at_ms: Option<u64>,
     pub(crate) duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) handler_duration_ms: Option<u64>,
     pub(crate) last_error: Option<String>,
 }
 #[derive(Serialize)]

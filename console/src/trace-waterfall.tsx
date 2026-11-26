@@ -87,13 +87,15 @@ export interface WaterfallMarker {
 
 export interface WaterfallSpan {
   id: string;
-  kind: "job" | "queue_wait" | "requeue_wait" | "attempt";
+  kind: "job" | "admit" | "queue_wait" | "requeue_wait" | "attempt";
   label: string;
   workerId: string | null;
-  tone: "job" | "queue" | "running" | "succeeded" | "failed" | "cancelled" | "restarted";
+  tone: "job" | "queue" | "overhead" | "running" | "succeeded" | "failed" | "cancelled" | "restarted";
   startMs: number;
   endMs: number;
   durationMs: number;
+  handlerMs?: number | null;
+  relayMs?: number | null;
   leftPct: number;
   widthPct: number;
   markers: WaterfallMarker[];
@@ -103,8 +105,13 @@ export interface ExecutionWaterfallModel {
   originMs: number;
   endMs: number;
   totalMs: number;
+  admitMs: number;
   queueMs: number;
   execMs: number;
+  handlerMs: number | null;
+  relayMs: number | null;
+  anyserveOverheadMs: number;
+  overheadExact: boolean;
   ttfoMs: number | null;
   retries: number;
   spans: WaterfallSpan[];
@@ -170,19 +177,42 @@ export function buildExecutionWaterfall(detail: JobDetailResponse): ExecutionWat
     markers: [],
   });
 
+  const acceptedEvent = events.find((e) => e.kind === "accepted");
+  const acceptedAtMs = acceptedEvent ? Math.max(originMs, acceptedEvent.created_at_ms) : originMs;
+  const admitMs = Math.max(0, acceptedAtMs - originMs);
   let queueMs = 0;
   let execMs = 0;
+  let handlerSumMs = 0;
+  let relaySumMs = 0;
+  let measuredAttempts = 0;
+
+  if (admitMs > 0) {
+    const admitRange = clampTrackRange(originMs, acceptedAtMs, originMs, trackSpanMs);
+    spans.push({
+      id: "admit",
+      kind: "admit",
+      label: "anyserve · admit",
+      workerId: null,
+      tone: "overhead",
+      startMs: originMs,
+      endMs: acceptedAtMs,
+      durationMs: admitMs,
+      leftPct: admitRange.leftPct,
+      widthPct: admitRange.widthPct,
+      markers: [],
+    });
+  }
 
   if (attempts.length === 0) {
-    queueMs = totalMs;
-    const qRange = clampTrackRange(originMs, rawEndMs, originMs, trackSpanMs);
+    queueMs = Math.max(0, rawEndMs - acceptedAtMs);
+    const qRange = clampTrackRange(acceptedAtMs, rawEndMs, originMs, trackSpanMs);
     spans.push({
       id: "queue-0",
       kind: "queue_wait",
       label: "queue wait",
       workerId: null,
       tone: "queue",
-      startMs: originMs,
+      startMs: acceptedAtMs,
       endMs: rawEndMs,
       durationMs: queueMs,
       leftPct: qRange.leftPct,
@@ -190,17 +220,17 @@ export function buildExecutionWaterfall(detail: JobDetailResponse): ExecutionWat
       markers: [],
     });
   } else {
-    const firstStart = Math.max(originMs, attempts[0]!.created_at_ms);
-    const initialQueueMs = Math.max(0, firstStart - originMs);
+    const firstStart = Math.max(acceptedAtMs, attempts[0]!.created_at_ms);
+    const initialQueueMs = Math.max(0, firstStart - acceptedAtMs);
     queueMs += initialQueueMs;
-    const q0Range = clampTrackRange(originMs, firstStart, originMs, trackSpanMs);
+    const q0Range = clampTrackRange(acceptedAtMs, firstStart, originMs, trackSpanMs);
     spans.push({
       id: "queue-0",
       kind: "queue_wait",
       label: "queue wait",
       workerId: null,
       tone: "queue",
-      startMs: originMs,
+      startMs: acceptedAtMs,
       endMs: firstStart,
       durationMs: initialQueueMs,
       leftPct: q0Range.leftPct,
@@ -258,6 +288,16 @@ export function buildExecutionWaterfall(detail: JobDetailResponse): ExecutionWat
       const aEnd = Math.max(aStart, attempt.finished_at_ms ?? rawEndMs);
       const aDur = attempt.duration_ms ?? Math.max(0, aEnd - aStart);
       execMs += aDur;
+      const reportedHandler = attempt.handler_duration_ms;
+      let spanHandlerMs: number | null = null;
+      let spanRelayMs: number | null = null;
+      if (reportedHandler != null && Number.isFinite(reportedHandler)) {
+        spanHandlerMs = Math.min(aDur, Math.max(0, reportedHandler));
+        spanRelayMs = Math.max(0, aDur - spanHandlerMs);
+        handlerSumMs += spanHandlerMs;
+        relaySumMs += spanRelayMs;
+        measuredAttempts += 1;
+      }
       const aRange = clampTrackRange(aStart, aEnd, originMs, trackSpanMs);
       const markers: WaterfallMarker[] = streamEvents
         .filter((entry) => entry.assignedAttemptIdx === i)
@@ -279,6 +319,8 @@ export function buildExecutionWaterfall(detail: JobDetailResponse): ExecutionWat
         startMs: aStart,
         endMs: aEnd,
         durationMs: aDur,
+        handlerMs: spanHandlerMs,
+        relayMs: spanRelayMs,
         leftPct: aRange.leftPct,
         widthPct: aRange.widthPct,
         markers,
@@ -286,12 +328,24 @@ export function buildExecutionWaterfall(detail: JobDetailResponse): ExecutionWat
     }
   }
 
+  const lastAttemptEnd = attempts.length > 0 ? (attempts[attempts.length - 1]!.finished_at_ms ?? rawEndMs) : rawEndMs;
+  const tailMs = Math.max(0, rawEndMs - lastAttemptEnd);
+  const overheadExact = attempts.length > 0 && measuredAttempts === attempts.length;
+  const handlerMs = overheadExact ? handlerSumMs : null;
+  const relayMs = overheadExact ? relaySumMs : null;
+  const anyserveOverheadMs = overheadExact ? Math.max(0, totalMs - handlerSumMs) : admitMs + queueMs + tailMs;
+
   return {
     originMs,
     endMs: rawEndMs,
     totalMs,
+    admitMs,
     queueMs,
     execMs,
+    handlerMs,
+    relayMs,
+    anyserveOverheadMs,
+    overheadExact,
     ttfoMs,
     retries,
     spans,
@@ -365,12 +419,28 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
             <span className="waterfall__metric">
               Total <strong>{formatDuration(model.totalMs)}</strong>
             </span>
+            <span
+              className="waterfall__metric waterfall__metric--overhead"
+              title={
+                model.overheadExact
+                  ? `AnyServe added latency: admit ${formatDuration(model.admitMs)} · queue ${formatDuration(model.queueMs)} · relay & RTT ${formatDuration(model.relayMs ?? 0)}`
+                  : `AnyServe control-plane overhead: admit ${formatDuration(model.admitMs)} · queue ${formatDuration(model.queueMs)} (upgrade worker SDK to separate relay RTT from handler exec)`
+              }
+            >
+              AnyServe <strong>+{formatDuration(model.anyserveOverheadMs)}</strong>
+            </span>
             <span className="waterfall__metric">
               Queue <strong>{formatDuration(model.queueMs)}</strong>
             </span>
-            <span className="waterfall__metric">
-              Exec <strong>{formatDuration(model.execMs)}</strong>
-            </span>
+            {model.handlerMs != null ? (
+              <span className="waterfall__metric" title={`Worker handler execution across ${model.spans.filter((s) => s.kind === "attempt").length} attempt(s)`}>
+                Handler <strong>{formatDuration(model.handlerMs)}</strong>
+              </span>
+            ) : (
+              <span className="waterfall__metric">
+                Exec <strong>{formatDuration(model.execMs)}</strong>
+              </span>
+            )}
             {model.ttfoMs != null ? (
               <span className="waterfall__metric">
                 TTFO <strong>{formatDuration(model.ttfoMs)}</strong>
@@ -384,47 +454,71 @@ export const ExecutionWaterfall = memo(function ExecutionWaterfall({
           </div>
 
           <div className="waterfall__rows" role="list" aria-label="Execution waterfall">
-            {model.spans.map((span) => (
-              <div key={span.id} className="waterfall__row" role="listitem">
-                <div className="waterfall__label">
-                  <span className="waterfall__span-name" title={span.label}>
-                    {span.label}
-                  </span>
-                  {span.workerId ? (
-                    onOpenWorker ? (
-                      <button
-                        type="button"
-                        className="entity-link mono waterfall__worker"
-                        title={`Open worker ${span.workerId}`}
-                        onClick={() => onOpenWorker(span.workerId!)}
+            {model.spans.map((span) => {
+              const splitAttempt = span.kind === "attempt" && span.handlerMs != null && span.relayMs != null && span.durationMs > 0;
+              const relaySharePct = splitAttempt ? (span.relayMs! / span.durationMs) * 100 : 0;
+              const handlerSharePct = splitAttempt ? 100 - relaySharePct : 100;
+              const trackTitle = splitAttempt
+                ? `${span.label} · ${formatDuration(span.durationMs)} (handler ${formatDuration(span.handlerMs!)} · anyserve relay ${formatDuration(span.relayMs!)})`
+                : `${span.label} · ${formatDuration(span.durationMs)} (${formatTimestamp(span.startMs)} → ${formatTimestamp(span.endMs)})`;
+              return (
+                <div key={span.id} className="waterfall__row" role="listitem">
+                  <div className="waterfall__label">
+                    <span className="waterfall__span-name" title={span.label}>
+                      {span.label}
+                    </span>
+                    {span.workerId ? (
+                      onOpenWorker ? (
+                        <button
+                          type="button"
+                          className="entity-link mono waterfall__worker"
+                          title={`Open worker ${span.workerId}`}
+                          onClick={() => onOpenWorker(span.workerId!)}
+                        >
+                          {span.workerId}
+                        </button>
+                      ) : (
+                        <span className="mono waterfall__worker">{span.workerId}</span>
+                      )
+                    ) : null}
+                    {span.kind === "attempt" && span.handlerMs != null && span.relayMs != null ? (
+                      <span className="mono waterfall__submeta" title={trackTitle}>
+                        handler {formatDuration(span.handlerMs)} · relay {formatDuration(span.relayMs)}
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="waterfall__track" title={trackTitle}>
+                    {splitAttempt ? (
+                      <div
+                        className="waterfall__bar waterfall__bar--split"
+                        style={{ left: `${span.leftPct.toFixed(2)}%`, width: `${span.widthPct.toFixed(2)}%` }}
                       >
-                        {span.workerId}
-                      </button>
+                        {span.relayMs! > 0 ? (
+                          <div className="waterfall__bar-seg waterfall__bar-seg--overhead" style={{ width: `${relaySharePct.toFixed(2)}%` }} />
+                        ) : null}
+                        {span.handlerMs! > 0 ? (
+                          <div className={`waterfall__bar-seg waterfall__bar-seg--${span.tone}`} style={{ width: `${handlerSharePct.toFixed(2)}%` }} />
+                        ) : null}
+                      </div>
                     ) : (
-                      <span className="mono waterfall__worker">{span.workerId}</span>
-                    )
-                  ) : null}
+                      <div
+                        className={`waterfall__bar waterfall__bar--${span.tone}`}
+                        style={{ left: `${span.leftPct.toFixed(2)}%`, width: `${span.widthPct.toFixed(2)}%` }}
+                      />
+                    )}
+                    {span.markers.map((marker) => (
+                      <span
+                        key={marker.key}
+                        className={`waterfall__marker waterfall__marker--${marker.kind}${marker.isTtfo ? " waterfall__marker--ttfo" : ""}`}
+                        style={{ left: `${marker.leftPct.toFixed(2)}%` }}
+                        title={`${marker.isTtfo ? "TTFO · " : ""}${marker.kind} at +${formatDuration(Math.max(0, marker.atMs - model.originMs))} (${formatNumber(marker.bytes)} B)`}
+                      />
+                    ))}
+                  </div>
+                  <div className="waterfall__dur num">{formatDuration(span.durationMs)}</div>
                 </div>
-                <div
-                  className="waterfall__track"
-                  title={`${span.label} · ${formatDuration(span.durationMs)} (${formatTimestamp(span.startMs)} → ${formatTimestamp(span.endMs)})`}
-                >
-                  <div
-                    className={`waterfall__bar waterfall__bar--${span.tone}`}
-                    style={{ left: `${span.leftPct.toFixed(2)}%`, width: `${span.widthPct.toFixed(2)}%` }}
-                  />
-                  {span.markers.map((marker) => (
-                    <span
-                      key={marker.key}
-                      className={`waterfall__marker waterfall__marker--${marker.kind}${marker.isTtfo ? " waterfall__marker--ttfo" : ""}`}
-                      style={{ left: `${marker.leftPct.toFixed(2)}%` }}
-                      title={`${marker.isTtfo ? "TTFO · " : ""}${marker.kind} at +${formatDuration(Math.max(0, marker.atMs - model.originMs))} (${formatNumber(marker.bytes)} B)`}
-                    />
-                  ))}
-                </div>
-                <div className="waterfall__dur num">{formatDuration(span.durationMs)}</div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       ) : null}

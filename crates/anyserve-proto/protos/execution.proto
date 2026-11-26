@@ -153,6 +153,7 @@ message ResultChunk {
 }
 message Finish {
   oneof outcome { Succeeded succeeded = 1; ErrorInfo failed = 2; Cancelled cancelled = 3; }
+  optional uint64 handler_duration_ms = 4;
 }
 message Succeeded {}
 message Cancelled {}

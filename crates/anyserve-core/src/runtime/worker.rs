@@ -940,11 +940,25 @@ impl Runtime {
 
     /// Records a worker's outcome for its lease. Repeated completions of the
     /// same lease succeed only when the server-computed digest matches.
+    #[cfg(test)]
     pub(crate) async fn finish_attempt(
         &self,
         link: &AttemptLink,
         outcome: AttemptOutcome,
         outputs: Vec<Object>,
+    ) -> Result<FinishStatus, RuntimeError> {
+        self.finish_attempt_with_duration(link, outcome, outputs, None)
+            .await
+    }
+
+    /// Records a worker's outcome for its lease along with optional
+    /// worker-measured monotonic handler execution time.
+    pub(crate) async fn finish_attempt_with_duration(
+        &self,
+        link: &AttemptLink,
+        outcome: AttemptOutcome,
+        outputs: Vec<Object>,
+        handler_duration_ms: Option<u64>,
     ) -> Result<FinishStatus, RuntimeError> {
         let (error, outputs) = match outcome {
             AttemptOutcome::Succeeded => (None, outputs),
@@ -1035,6 +1049,7 @@ impl Runtime {
                                     outputs,
                                     release_lease: Some(lease_id.clone()),
                                     finished: receipt,
+                                    handler_duration_ms,
                                     ..TerminalPlan::new(JobState::Succeeded, None)
                                 },
                                 now,

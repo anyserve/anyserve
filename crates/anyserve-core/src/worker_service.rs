@@ -561,12 +561,16 @@ impl ResultAssembler {
         Ok(())
     }
 
-    fn finish(self, finish: pb::Finish) -> Result<(AttemptOutcome, Vec<Object>), Status> {
+    fn finish(
+        self,
+        finish: pb::Finish,
+    ) -> Result<(AttemptOutcome, Vec<Object>, Option<u64>), Status> {
         if self.current.is_some() {
             return Err(Status::invalid_argument(
                 "Finish arrived before the last result chunk",
             ));
         }
+        let handler_duration_ms = finish.handler_duration_ms;
         let outcome =
             match finish.outcome {
                 Some(pb::finish::Outcome::Succeeded(_)) => AttemptOutcome::Succeeded,
@@ -589,9 +593,10 @@ impl ResultAssembler {
                     false,
                 )),
                 Vec::new(),
+                handler_duration_ms,
             ));
         }
-        Ok((outcome, self.objects))
+        Ok((outcome, self.objects, handler_duration_ms))
     }
 }
 
@@ -671,8 +676,8 @@ pub(crate) async fn receive_uploads<S>(
     }
     if let Some(finish) = pending_finish {
         let reply = match results.finish(finish) {
-            Ok((outcome, outputs)) => runtime
-                .finish_attempt(&link, outcome, outputs)
+            Ok((outcome, outputs, handler_duration_ms)) => runtime
+                .finish_attempt_with_duration(&link, outcome, outputs, handler_duration_ms)
                 .await
                 .map(finish_to_proto)
                 .map_err(Status::from),

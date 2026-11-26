@@ -1432,6 +1432,7 @@ mod tests {
                     let finish = pb::AttemptUp {
                         msg: Some(pb::attempt_up::Msg::Finish(pb::Finish {
                             outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+                            handler_duration_ms: None,
                         })),
                     };
                     attempt_ws
@@ -2266,6 +2267,7 @@ mod tests {
                 pb::AttemptUp {
                     msg: Some(pb::attempt_up::Msg::Finish(pb::Finish {
                         outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+                        handler_duration_ms: None,
                     })),
                 }
                 .encode_to_vec(),

@@ -420,8 +420,8 @@ export type FinishOutcomeInput =
   | { case: "succeeded"; value?: Succeeded }
   | { case: "failed"; value: ErrorInfoInput }
   | { case: "cancelled"; value?: Cancelled };
-export interface Finish { outcome?: FinishOutcome }
-export interface FinishInput { outcome?: FinishOutcomeInput }
+export interface Finish { outcome?: FinishOutcome; handlerDurationMs?: bigint }
+export interface FinishInput { outcome?: FinishOutcomeInput; handlerDurationMs?: bigint }
 
 /** Note: `AttemptUp` oneof field numbers are open=1, frame=2, result=3, finish=5. */
 export type AttemptUpVariant =
@@ -1004,9 +1004,10 @@ const RENUM = 13; // packed repeated enum
 const OPT32 = 14; // proto3 `optional uint32`
 const ONEOF = 15; // `[no, prop, ONEOF, [[no, case, schema], ...]]`
 const VARIANT = 16; // internal: decode-side entry for one oneof member
+const OPT64 = 17; // proto3 `optional uint64`
 
 /** Expected wire type per kind (index = kind). */
-const WIRE_OF = [2, 2, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2];
+const WIRE_OF = [2, 2, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2, 0];
 
 interface Field {
   no: number;
@@ -1049,7 +1050,7 @@ function def(defs: FieldDef[], c: Codec | null = null): Schema {
     const f: Field = { no, name, kind, sub: (sub as Schema | undefined) ?? null };
     s.fields.push(f);
     s.byNo[no] = f;
-    if (kind === MSG || kind === OPT32) continue;
+    if (kind === MSG || kind === OPT32 || kind === OPT64) continue;
     if (kind >= RSTR && kind <= RENUM) {
       s.tpl[name] = undefined;
       s.containers.push(f);
@@ -1102,6 +1103,7 @@ function lenMsg(s: Schema, m: any, L: number[] | null): number {
       case SMAP: case IMAP: case DMAP: n += mapLen(no, v, f.kind); break;
       case RENUM: n += renumLen(no, v); break;
       case OPT32: n += tagLen(no) + varint32Len(v >>> 0); break;
+      case OPT64: n += tagLen(no) + varint64Len(BigInt(v)); break;
       case MSG: n += lenSub(no, f.sub!, v, L); break;
       case RMSG: for (let j = 0; j < v.length; j++) n += lenSub(no, f.sub!, v[j], L); break;
       case ONEOF: {
@@ -1134,6 +1136,7 @@ function writeMsg(w: ProtoWriter, s: Schema, m: any): void {
       case SMAP: case IMAP: case DMAP: w.map(no, v, f.kind); break;
       case RENUM: w.renum(no, v); break;
       case OPT32: w.tag(no, WIRE_VARINT); w.v32(v >>> 0); break;
+      case OPT64: w.tag(no, WIRE_VARINT); w.v64(BigInt(v)); break;
       case MSG: writeSub(w, no, f.sub!, v); break;
       case RMSG: for (let j = 0; j < v.length; j++) writeSub(w, no, f.sub!, v[j]); break;
       case ONEOF: {
@@ -1171,7 +1174,7 @@ function readMsg(s: Schema, r: ProtoReader, end: number, out?: any): any {
       case STR: out[name] = r.readString(end); break;
       case BYTES: out[name] = r.readBytes(end); break;
       case U32: case OPT32: out[name] = r.readUint32(end); break;
-      case U64: out[name] = r.readUint64(end); break;
+      case U64: case OPT64: out[name] = r.readUint64(end); break;
       case BOOL: out[name] = r.readBool(end); break;
       case ENUM: out[name] = r.readEnum(end); break;
       case DBL: out[name] = r.readDouble(end); break;
@@ -1390,7 +1393,7 @@ const S_ServerMessage = def([[0, "msg", ONEOF, [[1, "welcome", S_Welcome], [2, "
 const S_AttemptOpen = def([[1, "leaseId", STR], [2, "generation", U64], [3, "resumeAfterSequence", U64]]);
 const S_Frame = def([], frameCodec);
 const S_ResultChunk = def([], resultChunkCodec);
-const S_Finish = def([[0, "outcome", ONEOF, [[1, "succeeded", S_Empty], [2, "failed", S_ErrorInfo], [3, "cancelled", S_Empty]]]]);
+const S_Finish = def([[0, "outcome", ONEOF, [[1, "succeeded", S_Empty], [2, "failed", S_ErrorInfo], [3, "cancelled", S_Empty]]], [4, "handlerDurationMs", OPT64]]);
 const S_AttemptUp = def([[0, "msg", ONEOF, [[1, "open", S_AttemptOpen], [2, "frame", S_Frame], [3, "result", S_ResultChunk], [5, "finish", S_Finish]]]]);
 const S_AttemptOpened = def([[1, "resumeFromSequence", U64], [2, "terminalReplay", BOOL]]);
 const S_InputData = def([], inputDataCodec);

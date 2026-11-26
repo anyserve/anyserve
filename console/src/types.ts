@@ -142,7 +142,8 @@ export interface JobDetail extends Omit<JobSummary, "latest_worker_id" | "attemp
 
 export interface AttemptSummary {
   attempt_id: string; state: AttemptState; worker_id: string | null;
-  created_at_ms: number; finished_at_ms: number | null; duration_ms: number | null; last_error: string | null;
+  created_at_ms: number; finished_at_ms: number | null; duration_ms: number | null;
+  handler_duration_ms?: number | null; last_error: string | null;
 }
 
 export interface JobEventSummary {

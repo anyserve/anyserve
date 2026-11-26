@@ -480,8 +480,13 @@ impl WorkerAttempt {
             })
         })
     }
-    #[pyo3(signature = (outputs=None))]
-    fn complete(&self, py: Python<'_>, outputs: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    #[pyo3(signature = (outputs=None, handler_duration_ms=None))]
+    fn complete(
+        &self,
+        py: Python<'_>,
+        outputs: Option<&Bound<'_, PyAny>>,
+        handler_duration_ms: Option<u64>,
+    ) -> PyResult<()> {
         let outputs = match outputs {
             Some(items) => objects_from_py(items)?,
             None => Vec::new(),
@@ -490,15 +495,17 @@ impl WorkerAttempt {
             py,
             outputs,
             v2::finish::Outcome::Succeeded(v2::Succeeded {}),
+            handler_duration_ms,
         )
     }
-    #[pyo3(signature = (message, retryable=false, code=None))]
+    #[pyo3(signature = (message, retryable=false, code=None, handler_duration_ms=None))]
     fn fail(
         &self,
         py: Python<'_>,
         message: String,
         retryable: bool,
         code: Option<String>,
+        handler_duration_ms: Option<u64>,
     ) -> PyResult<()> {
         let code = code
             .filter(|c| !c.trim().is_empty())
@@ -511,6 +518,7 @@ impl WorkerAttempt {
                 message,
                 retryable,
             }),
+            handler_duration_ms,
         )
     }
 }
@@ -520,6 +528,7 @@ impl WorkerAttempt {
         py: Python<'_>,
         outputs: Vec<v2::Object>,
         outcome: v2::finish::Outcome,
+        handler_duration_ms: Option<u64>,
     ) -> PyResult<()> {
         if *self.cancelled.borrow() {
             return Err(error("attempt cancelled"));
@@ -531,6 +540,9 @@ impl WorkerAttempt {
                 .lock()
                 .map_err(|_| error("worker attempt lock poisoned"))?;
             let (attempt, cancelled) = &mut *inner;
+            if let Some(ms) = handler_duration_ms {
+                attempt.set_handler_duration_ms(ms);
+            }
             self.runtime.block_on(async {
                 tokio::select! {
                     biased;

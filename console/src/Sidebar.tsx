@@ -9,6 +9,7 @@ import {
   IconExplore,
   IconInterfaces,
   IconJobs,
+  IconKey,
   IconMoon,
   IconOverview,
   IconPools,
@@ -139,6 +140,13 @@ export const Sidebar = memo(function Sidebar({
         </div>
 
         <div className="sidebar__controls">
+          {safePortalUrl ? (
+            <a className="ctrl-pill ctrl-pill--full" href={safePortalUrl} target="_blank" rel="noopener noreferrer">
+              <IconKey />
+              <span>Manage Tokens</span>
+            </a>
+          ) : null}
+
           {onRefresh ? (
             <button type="button" className="ctrl-pill ctrl-pill--icon" title="Refresh" aria-label="Refresh" onClick={onRefresh}>
               <IconRefresh />
@@ -149,12 +157,6 @@ export const Sidebar = memo(function Sidebar({
             {theme === "dark" ? <IconSun /> : <IconMoon />}
             <span>{theme === "dark" ? "Light" : "Dark"}</span>
           </button>
-
-          {safePortalUrl ? (
-            <a className="ctrl-pill" href={safePortalUrl} target="_blank" rel="noopener noreferrer">
-              <span>Manage Tokens</span>
-            </a>
-          ) : null}
 
           {authenticated ? (
             <button type="button" className="ctrl-pill ctrl-pill--danger" title="Disconnect" aria-label="Disconnect" onClick={onDisconnect}>

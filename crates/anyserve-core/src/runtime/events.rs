@@ -626,6 +626,7 @@ mod tests {
                     state: super::super::api::JobState::Succeeded,
                     outputs: Vec::new(),
                     error: None,
+                    handler_duration_ms: None,
                 },
                 0,
             )
@@ -683,6 +684,7 @@ mod tests {
                 state: super::super::api::JobState::Succeeded,
                 outputs: Vec::new(),
                 error: None,
+                handler_duration_ms: None,
             },
             0,
         );
@@ -724,6 +726,7 @@ mod tests {
                 state: super::super::api::JobState::Succeeded,
                 outputs: vec![super::super::api::Object::inline(vec![0u8; 1 << 20])],
                 error: None,
+                handler_duration_ms: None,
             },
             0,
         );

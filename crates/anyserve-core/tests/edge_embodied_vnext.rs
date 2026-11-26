@@ -189,6 +189,7 @@ impl TestWorker {
         tx.send(pb::AttemptUp {
             msg: Some(pb::attempt_up::Msg::Finish(pb::Finish {
                 outcome: Some(pb::finish::Outcome::Succeeded(pb::Succeeded {})),
+                handler_duration_ms: None,
             })),
         })
         .await
@@ -232,6 +233,7 @@ impl TestWorker {
                     message: msg.into(),
                     retryable: true,
                 })),
+                handler_duration_ms: None,
             })),
         })
         .await

@@ -1666,6 +1666,7 @@ impl Inner {
                 state: plan.state,
                 outputs,
                 error: plan.error,
+                handler_duration_ms: plan.handler_duration_ms,
             },
             now,
         );

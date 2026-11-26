@@ -338,6 +338,7 @@ pub enum EventKind {
         state: JobState,
         outputs: Vec<Object>,
         error: Option<ErrorInfo>,
+        handler_duration_ms: Option<u64>,
     },
 }
 

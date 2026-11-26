@@ -970,6 +970,7 @@ async fn upload_8mib_with_mid_hibernate(
         .send(v2::AttemptUp {
             msg: Some(v2::attempt_up::Msg::Finish(v2::Finish {
                 outcome: Some(v2::finish::Outcome::Succeeded(v2::Succeeded {})),
+                handler_duration_ms: None,
             })),
         })
         .await

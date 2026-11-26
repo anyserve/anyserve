@@ -214,6 +214,7 @@ pub(crate) fn attempts_from_events(events: &[ExecutionEvent]) -> Vec<AttemptSumm
                         created_at_ms: event.at_ms,
                         finished_at_ms: None,
                         duration_ms: None,
+                        handler_duration_ms: None,
                         last_error: None,
                     });
                 }
@@ -235,7 +236,12 @@ pub(crate) fn attempts_from_events(events: &[ExecutionEvent]) -> Vec<AttemptSumm
                     );
                 }
             }
-            EventKind::Finished { state, error, .. } => {
+            EventKind::Finished {
+                state,
+                error,
+                handler_duration_ms,
+                ..
+            } => {
                 if let Some(attempt) = attempts
                     .iter_mut()
                     .rev()
@@ -247,6 +253,7 @@ pub(crate) fn attempts_from_events(events: &[ExecutionEvent]) -> Vec<AttemptSumm
                         event.at_ms,
                         error.as_ref().map(|error| error.message.clone()),
                     );
+                    attempt.handler_duration_ms = *handler_duration_ms;
                 }
             }
             _ => {}
