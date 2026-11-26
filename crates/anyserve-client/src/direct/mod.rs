@@ -37,6 +37,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 pub use iroh::EndpointId;
+pub use iroh::endpoint::Connection as IrohConnection;
 
 pub use endpoint::{
     DIRECT_ALPN, DefaultPathClassifier, DirectEndpoint, LazyDirectEndpoint, ObservedPath,
@@ -153,6 +154,10 @@ pub struct DirectConfig {
     pub relay_url: Option<String>,
     /// When `true`, disables all relays (`RelayMode::Disabled`, local/LAN direct IP only).
     pub disable_relays: bool,
+    /// Optional explicit local socket address to bind exclusively (clearing default
+    /// `0.0.0.0:0` / `[::]:0` transports). Useful for binding to a specific interface
+    /// or restricting hermetic tests strictly to loopback (`127.0.0.1:0`).
+    pub bind_addr: Option<std::net::SocketAddr>,
     /// Optional path to a `0600` Ed25519 secret key file (`ANYSERVE_DIRECT_SECRET_KEY_PATH`
     /// fallback) so this endpoint keeps a stable `EndpointId` across restarts for `allowed_peers`.
     /// When unset, an ephemeral per-process identity is generated.
@@ -206,6 +211,7 @@ impl Default for DirectConfig {
         Self {
             relay_url,
             disable_relays: false,
+            bind_addr: None,
             secret_key_path,
             allowed_peers: None,
             advertise_direct_addrs: true,
@@ -230,6 +236,7 @@ impl fmt::Debug for DirectConfig {
         f.debug_struct("DirectConfig")
             .field("relay_url", &self.relay_url)
             .field("disable_relays", &self.disable_relays)
+            .field("bind_addr", &self.bind_addr)
             .field(
                 "secret_key_path",
                 &self.secret_key_path.as_ref().map(|_| "[configured]"),

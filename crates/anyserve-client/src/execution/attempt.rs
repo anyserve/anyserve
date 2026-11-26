@@ -73,14 +73,282 @@ struct ReceivedObject {
     metadata: HashMap<String, String>,
 }
 
+/// Failure returned by [`Attempt::open_with_direct`] or [`DirectAttempt`] completion.
+#[cfg(feature = "direct")]
+#[derive(Debug)]
+pub enum DirectAttemptError {
+    /// Control-plane gRPC/WebSocket status error.
+    Rpc(Status),
+    /// Direct data-plane transfer/validation error. When returned from
+    /// [`Attempt::open_with_direct`], the attempt has **already** been finished on
+    /// the control plane with [`crate::direct::DirectError::to_attempt_failure_outcome`]
+    /// so the user handler is never invoked and non-retryable errors consume zero
+    /// retry attempts.
+    Direct(crate::direct::DirectError),
+}
+
+#[cfg(feature = "direct")]
+impl std::fmt::Display for DirectAttemptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rpc(status) => write!(f, "control-plane RPC error: {status}"),
+            Self::Direct(err) => write!(f, "direct data-plane error: {err}"),
+        }
+    }
+}
+
+#[cfg(feature = "direct")]
+impl std::error::Error for DirectAttemptError {}
+
+#[cfg(feature = "direct")]
+impl From<Status> for DirectAttemptError {
+    fn from(status: Status) -> Self {
+        Self::Rpc(status)
+    }
+}
+
+#[cfg(feature = "direct")]
+impl From<crate::direct::DirectError> for DirectAttemptError {
+    fn from(err: crate::direct::DirectError) -> Self {
+        Self::Direct(err)
+    }
+}
+
+#[cfg(feature = "direct")]
+impl DirectAttemptError {
+    pub fn into_status(self) -> Status {
+        match self {
+            Self::Rpc(status) => status,
+            Self::Direct(err) => err.into_status(),
+        }
+    }
+}
+
+/// An attempt opened via [`Attempt::open_with_direct`] or
+/// [`crate::execution::DirectWorkerSession::open_attempt`].
+///
+/// Guarantees that every `anyserve+iroh://` input has been fetched and SHA-256
+/// verified into inline bytes **before** handler execution begins, and pairs
+/// completion with automatic capability-negotiated output staging.
+#[cfg(feature = "direct")]
+pub struct DirectAttempt {
+    attempt: Attempt,
+    direct: std::sync::Arc<crate::direct::DirectEndpoint>,
+    input_reports: Vec<crate::direct::DirectTransferReport>,
+}
+
+#[cfg(feature = "direct")]
+impl DirectAttempt {
+    /// Resolved input objects (guaranteed to contain zero unresolved `anyserve+iroh://` URIs).
+    pub fn inputs(&self) -> &[v2::Object] {
+        &self.attempt.inputs
+    }
+
+    /// Job parameters.
+    pub fn params(&self) -> &Bytes {
+        &self.attempt.params
+    }
+
+    /// Assignment metadata copied from `Assign.metadata`.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.attempt.metadata
+    }
+
+    /// Whether this lease was reopened solely to validate a repeated terminal receipt.
+    pub fn terminal_replay(&self) -> bool {
+        self.attempt.terminal_replay
+    }
+
+    /// Returns `true` when the caller advertised `anyserve.direct = "1"` in `Assign.metadata`.
+    pub fn client_supports_direct(&self) -> bool {
+        self.attempt.client_supports_direct()
+    }
+
+    /// Telemetry reports for every direct input fetched during `open_with_direct`.
+    pub fn input_reports(&self) -> &[crate::direct::DirectTransferReport] {
+        &self.input_reports
+    }
+
+    /// Records monotonic handler execution time in milliseconds.
+    pub fn set_handler_duration_ms(&mut self, duration_ms: u64) {
+        self.attempt.set_handler_duration_ms(duration_ms);
+    }
+
+    /// Emits a streamed inline output/progress frame (never a direct URI).
+    pub async fn frame(
+        &mut self,
+        data: Bytes,
+        metadata: HashMap<String, String>,
+        progress: bool,
+    ) -> Result<(), Status> {
+        self.attempt.frame(data, metadata, progress).await
+    }
+
+    /// Finishes the attempt with `Succeeded`, automatically staging each output
+    /// into an `anyserve+iroh://` URI (in the worker's bounded post-finish LRU)
+    /// when `client_supports_direct()` is true and `data.len() >= threshold_bytes`,
+    /// or returning standard inline objects for small payloads and legacy callers.
+    pub async fn finish_succeeded(
+        &mut self,
+        outputs: Vec<(Bytes, HashMap<String, String>)>,
+    ) -> Result<(), DirectAttemptError> {
+        let objects = self.stage_outputs(outputs)?;
+        self.attempt
+            .finish(&objects, v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+            .await?;
+        Ok(())
+    }
+
+    /// Reconnect-safe variant of [`DirectAttempt::finish_succeeded`] using [`Attempt::commit`].
+    pub async fn commit_succeeded(
+        &mut self,
+        data: &mut AttemptClient,
+        assignment: &v2::Assign,
+        limits: &v2::Limits,
+        outputs: Vec<(Bytes, HashMap<String, String>)>,
+    ) -> Result<(), DirectAttemptError> {
+        let objects = self.stage_outputs(outputs)?;
+        self.attempt
+            .commit(
+                data,
+                assignment,
+                limits,
+                &objects,
+                v2::finish::Outcome::Succeeded(v2::Succeeded {}),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Finishes the attempt with a structured failure outcome.
+    pub async fn finish_failed(&mut self, info: v2::ErrorInfo) -> Result<(), Status> {
+        self.attempt
+            .finish(&[], v2::finish::Outcome::Failed(info))
+            .await
+    }
+
+    /// Reconnect-safe variant of [`DirectAttempt::finish_failed`] using [`Attempt::commit`].
+    pub async fn commit_failed(
+        &mut self,
+        data: &mut AttemptClient,
+        assignment: &v2::Assign,
+        limits: &v2::Limits,
+        info: v2::ErrorInfo,
+    ) -> Result<(), Status> {
+        self.attempt
+            .commit(
+                data,
+                assignment,
+                limits,
+                &[],
+                v2::finish::Outcome::Failed(info),
+            )
+            .await
+    }
+
+    fn stage_outputs(
+        &self,
+        outputs: Vec<(Bytes, HashMap<String, String>)>,
+    ) -> Result<Vec<v2::Object>, crate::direct::DirectError> {
+        outputs
+            .into_iter()
+            .map(|(data, metadata)| {
+                self.attempt.stage_direct_output_inner(
+                    data,
+                    metadata,
+                    &self.direct,
+                    &self.input_reports,
+                )
+            })
+            .collect()
+    }
+}
+
 impl Attempt {
+    /// Opens an attempt for a standard (non-direct) worker.
+    ///
+    /// Defense-in-depth: if any input carries an `anyserve+iroh://` URI (and this
+    /// is not a `terminal_replay`), this method immediately finishes the attempt
+    /// on the control plane with non-retryable `direct_unsupported` (`retryable: false`)
+    /// and returns `Err(Status::failed_precondition(...))`, so a non-direct worker
+    /// (or a direct worker that mistakenly calls `Attempt::open`) can never silently
+    /// hand an unresolved direct URI to its user handler.
+    ///
+    /// Direct-capable workers MUST open assignments through [`Attempt::open_with_direct`]
+    /// or [`crate::execution::DirectWorkerSession::open_attempt`].
     pub async fn open(
         client: &mut AttemptClient,
         assignment: &v2::Assign,
         limits: &v2::Limits,
         heartbeat_timeout: Duration,
     ) -> Result<Self, Status> {
-        Self::open_mode(client, assignment, limits, heartbeat_timeout, true).await
+        let mut attempt =
+            Self::open_mode(client, assignment, limits, heartbeat_timeout, true).await?;
+        if !attempt.terminal_replay && attempt.has_direct_inputs() {
+            let _ = attempt
+                .commit(
+                    client,
+                    assignment,
+                    limits,
+                    &[],
+                    Self::direct_unsupported_outcome(),
+                )
+                .await;
+            return Err(Status::failed_precondition(
+                "worker cannot resolve anyserve+iroh:// input without direct data-plane support (direct_unsupported)",
+            ));
+        }
+        Ok(attempt)
+    }
+
+    /// Safe entry point for direct-capable workers: opens the attempt, resolves
+    /// and SHA-256 verifies all `anyserve+iroh://` inputs **before** returning a
+    /// [`DirectAttempt`], and on any direct fetch error (including
+    /// `PublicRelayThrottled`) immediately commits
+    /// [`crate::direct::DirectError::to_attempt_failure_outcome`] on the control
+    /// plane before returning `Err`.
+    ///
+    /// Because no [`DirectAttempt`] is returned on error, the user handler cannot
+    /// execute with unresolved direct URIs or trigger side effects when an input
+    /// fetch fails. Pair with [`crate::execution::DirectWorkerSession::connect`]
+    /// (which automatically advertises `anyserve.direct = "1"` on `Hello.attributes`).
+    #[cfg(feature = "direct")]
+    pub async fn open_with_direct(
+        client: &mut AttemptClient,
+        assignment: &v2::Assign,
+        limits: &v2::Limits,
+        heartbeat_timeout: Duration,
+        direct: std::sync::Arc<crate::direct::DirectEndpoint>,
+        cancel: &crate::direct::DirectCancel,
+    ) -> Result<DirectAttempt, DirectAttemptError> {
+        let mut attempt =
+            Self::open_mode(client, assignment, limits, heartbeat_timeout, true).await?;
+        if attempt.terminal_replay {
+            return Ok(DirectAttempt {
+                attempt,
+                direct,
+                input_reports: Vec::new(),
+            });
+        }
+        match attempt.resolve_direct_inputs_inner(&direct, cancel).await {
+            Ok(input_reports) => Ok(DirectAttempt {
+                attempt,
+                direct,
+                input_reports,
+            }),
+            Err(err) => {
+                let _ = attempt
+                    .commit(
+                        client,
+                        assignment,
+                        limits,
+                        &[],
+                        err.to_attempt_failure_outcome(),
+                    )
+                    .await;
+                Err(DirectAttemptError::Direct(err))
+            }
+        }
     }
 
     /// Open without waiting for InputEnd, for duplex handlers such as video.
@@ -325,14 +593,8 @@ impl Attempt {
         })
     }
 
-    /// Resolves any `anyserve+iroh://` URI objects in `self.inputs` into inline
-    /// bytes **before** the user handler executes, verifying `anyserve.size_bytes`
-    /// and `anyserve.sha256`. On error (including `PublicRelayThrottled`), the
-    /// caller should immediately finish the attempt with
-    /// [`crate::direct::DirectError::to_attempt_failure_outcome`] without
-    /// invoking the user handler.
     #[cfg(feature = "direct")]
-    pub async fn resolve_direct_inputs(
+    async fn resolve_direct_inputs_inner(
         &mut self,
         direct: &crate::direct::DirectEndpoint,
         cancel: &crate::direct::DirectCancel,
@@ -350,15 +612,8 @@ impl Attempt {
         Ok(reports)
     }
 
-    /// Builds an output [`v2::Object`] for [`Attempt::finish`]. When the caller
-    /// declared `anyserve.direct = "1"` and `data.len() >= direct.config().threshold_bytes`,
-    /// stages `data` in the worker's bounded post-finish LRU cache and returns an
-    /// `anyserve+iroh://` URI object with `anyserve.sha256`, `anyserve.size_bytes`,
-    /// `anyserve.direct_path`, and `anyserve.direct_bytes` (SDK-reported).
-    /// Otherwise returns a standard inline object (attaching observed direct input
-    /// telemetry if `input_reports` is non-empty).
     #[cfg(feature = "direct")]
-    pub fn stage_direct_output(
+    fn stage_direct_output_inner(
         &self,
         data: Bytes,
         mut metadata: HashMap<String, String>,

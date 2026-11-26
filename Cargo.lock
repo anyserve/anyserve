@@ -164,6 +164,7 @@ dependencies = [
  "anyserve-proto",
  "axum",
  "base64 0.22.1",
+ "bytes",
  "clap",
  "futures",
  "reqwest 0.12.28",

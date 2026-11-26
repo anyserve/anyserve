@@ -11,7 +11,10 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Code, Request, Response, Status, Streaming};
 
 use super::*;
-use crate::execution::{Attempt, DirectExecutionEvents, ExecutionClient, WorkerSession, v2};
+use crate::execution::{
+    Attempt, DirectAttemptError, DirectExecutionEvents, DirectWorkerSession, ExecutionClient,
+    WorkerSession, v2,
+};
 use crate::{
     DIRECT_BYTES_METADATA_KEY, DIRECT_PATH_METADATA_KEY, ERROR_CODE_DIRECT_PUBLIC_RELAY_THROTTLED,
     ERROR_CODE_DIRECT_UNSUPPORTED, OBJECT_SHA256_METADATA_KEY, OBJECT_SIZE_METADATA_KEY,
@@ -34,6 +37,7 @@ impl PathClassifier for AlwaysPublicRelayClassifier {
 fn local_direct_config() -> DirectConfig {
     DirectConfig {
         disable_relays: true,
+        bind_addr: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
         relay_url: None,
         secret_key_path: None,
         threshold_bytes: 1024,
@@ -570,6 +574,14 @@ async fn direct_uri_redaction_and_advertise_direct_addrs_option() {
     let ep_ip = DirectEndpoint::bind(local_direct_config()).await.unwrap();
     let (with_ip_uri, _, _, _g2) = ep_ip.stage_input(Bytes::from_static(b"hi"), 3).unwrap();
     let parsed = decode_direct_uri(&with_ip_uri).unwrap();
+    assert!(
+        parsed.addrs.iter().any(|a| matches!(
+            a,
+            iroh::TransportAddr::Ip(sa) if sa.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        )),
+        "expected 127.0.0.1 in addrs: {:?}",
+        parsed.addrs
+    );
     let dbg = format!("{parsed:?}");
     assert!(dbg.contains("[redacted]"), "{dbg}");
     assert!(!dbg.contains(&parsed.token), "token leaked in Debug: {dbg}");
@@ -851,22 +863,23 @@ async fn end_to_end_direct_roundtrip_failover_retry_and_capability_negotiation()
             msg: Some(v2::server_message::Msg::Assign(assign)),
         })) = s_non_direct.messages.message().await
         {
-            let mut att = Attempt::open(
+            // Plain Attempt::open automatically detects anyserve+iroh:// inputs,
+            // commits non-retryable direct_unsupported pre-handler, and returns Err
+            // so the user handler is NEVER reachable!
+            let mut att = match Attempt::open(
                 &mut s_non_direct.data,
                 &assign,
                 &non_direct_limits,
                 Duration::from_secs(5),
             )
             .await
-            .unwrap();
-            if att.has_direct_inputs() {
-                // Defense-in-depth: fail pre-handler with direct_unsupported without running handler.
-                nd_flag.store(true, Ordering::SeqCst);
-                att.finish(&[], Attempt::direct_unsupported_outcome())
-                    .await
-                    .unwrap();
-                continue;
-            }
+            {
+                Ok(att) => att,
+                Err(_) => {
+                    nd_flag.store(true, Ordering::SeqCst);
+                    continue;
+                }
+            };
             nd_handler_calls.fetch_add(1, Ordering::SeqCst);
             let data = match &att.inputs[0].body {
                 Some(v2::object::Body::Inline(b)) => b.clone(),
@@ -884,19 +897,23 @@ async fn end_to_end_direct_roundtrip_failover_retry_and_capability_negotiation()
         }
     });
 
-    // Worker 1 (direct-capable): fetches direct input then crashes with retryable=true BEFORE output!
+    // Worker 1 (direct-capable): connects via DirectWorkerSession (auto-advertises
+    // anyserve.direct=1), opens safely via open_attempt, then fails retryably BEFORE output!
     let w1_ep = DirectEndpoint::bind(local_direct_config()).await.unwrap();
-    let mut h1 = v2::Hello {
-        worker_id: "w-direct-1".into(),
-        interfaces: vec!["direct.echo".into()],
-        max_concurrency: 2,
-        ..Default::default()
-    };
-    DirectEndpoint::apply_worker_attributes(&mut h1);
-    let mut s1 = WorkerSession::connect(&endpoint_url, None, h1)
-        .await
-        .unwrap();
-    let welcome1 = match s1.messages.message().await.unwrap().unwrap().msg {
+    let mut s1 = DirectWorkerSession::connect(
+        &endpoint_url,
+        None,
+        v2::Hello {
+            worker_id: "w-direct-1".into(),
+            interfaces: vec!["direct.echo".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+        Arc::clone(&w1_ep),
+    )
+    .await
+    .unwrap();
+    let welcome1 = match s1.session.messages.message().await.unwrap().unwrap().msg {
         Some(v2::server_message::Msg::Welcome(w)) => w,
         other => panic!("expected welcome, got {other:?}"),
     };
@@ -904,17 +921,20 @@ async fn end_to_end_direct_roundtrip_failover_retry_and_capability_negotiation()
 
     // Worker 2 (direct-capable): re-fetches same input URI on Attempt #2 and returns direct output!
     let w2_ep = DirectEndpoint::bind(local_direct_config()).await.unwrap();
-    let mut h2 = v2::Hello {
-        worker_id: "w-direct-2".into(),
-        interfaces: vec!["direct.echo".into()],
-        max_concurrency: 2,
-        ..Default::default()
-    };
-    DirectEndpoint::apply_worker_attributes(&mut h2);
-    let mut s2 = WorkerSession::connect(&endpoint_url, None, h2)
-        .await
-        .unwrap();
-    let welcome2 = match s2.messages.message().await.unwrap().unwrap().msg {
+    let mut s2 = DirectWorkerSession::connect(
+        &endpoint_url,
+        None,
+        v2::Hello {
+            worker_id: "w-direct-2".into(),
+            interfaces: vec!["direct.echo".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+        Arc::clone(&w2_ep),
+    )
+    .await
+    .unwrap();
+    let welcome2 = match s2.session.messages.message().await.unwrap().unwrap().msg {
         Some(v2::server_message::Msg::Welcome(w)) => w,
         other => panic!("expected welcome, got {other:?}"),
     };
@@ -922,66 +942,57 @@ async fn end_to_end_direct_roundtrip_failover_retry_and_capability_negotiation()
 
     let w1_fetched_bytes = Arc::new(AtomicUsize::new(0));
     let w1_fetched_clone = w1_fetched_bytes.clone();
-    let w1_ep_task = w1_ep.clone();
     let w1_task = tokio::spawn(async move {
         if let Ok(Some(v2::ServerMessage {
             msg: Some(v2::server_message::Msg::Assign(assign)),
-        })) = s1.messages.message().await
+        })) = s1.session.messages.message().await
         {
-            let mut att = Attempt::open(&mut s1.data, &assign, &limits1, Duration::from_secs(5))
+            let mut att = s1
+                .open_attempt(
+                    &assign,
+                    &limits1,
+                    Duration::from_secs(5),
+                    &DirectCancel::new(),
+                )
                 .await
                 .unwrap();
-            let reports = att
-                .resolve_direct_inputs(&w1_ep_task, &DirectCancel::new())
-                .await
-                .unwrap();
-            w1_fetched_clone.store(reports[0].bytes as usize, Ordering::SeqCst);
+            w1_fetched_clone.store(att.input_reports()[0].bytes as usize, Ordering::SeqCst);
             // Simulate worker crash before emitting any output -> retryable failure.
-            att.finish(
-                &[],
-                v2::finish::Outcome::Failed(v2::ErrorInfo {
-                    code: "worker_lost".into(),
-                    message: "simulated crash on attempt 1".into(),
-                    retryable: true,
-                }),
-            )
+            att.finish_failed(v2::ErrorInfo {
+                code: "worker_lost".into(),
+                message: "simulated crash on attempt 1".into(),
+                retryable: true,
+            })
             .await
             .unwrap();
         }
     });
 
-    let w2_ep_task = w2_ep.clone();
     let w2_task = tokio::spawn(async move {
         // Handle 2 jobs: (1) retry of direct client job, (2) legacy non-direct client job.
         for _ in 0..2 {
             let Some(Ok(v2::ServerMessage {
                 msg: Some(v2::server_message::Msg::Assign(assign)),
-            })) = s2.messages.message().await.transpose()
+            })) = s2.session.messages.message().await.transpose()
             else {
                 break;
             };
-            let mut att = Attempt::open(&mut s2.data, &assign, &limits2, Duration::from_secs(5))
+            let mut att = s2
+                .open_attempt(
+                    &assign,
+                    &limits2,
+                    Duration::from_secs(5),
+                    &DirectCancel::new(),
+                )
                 .await
                 .unwrap();
-            let reports = att
-                .resolve_direct_inputs(&w2_ep_task, &DirectCancel::new())
-                .await
-                .unwrap();
-            let input_bytes = match &att.inputs[0].body {
+            let input_bytes = match &att.inputs()[0].body {
                 Some(v2::object::Body::Inline(b)) => b.clone(),
                 other => panic!("expected resolved inline input, got {other:?}"),
             };
             let mut out_bytes = input_bytes.to_vec();
             out_bytes.reverse();
-            let out_obj = att
-                .stage_direct_output(
-                    Bytes::from(out_bytes),
-                    HashMap::new(),
-                    &w2_ep_task,
-                    &reports,
-                )
-                .unwrap();
-            att.finish(&[out_obj], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+            att.finish_succeeded(vec![(Bytes::from(out_bytes), HashMap::new())])
                 .await
                 .unwrap();
         }
@@ -1168,17 +1179,28 @@ async fn public_relay_only_fallback_fail_fast_server_limit_and_direct_unsupporte
         ..local_direct_config()
     };
     let w_ep = DirectEndpoint::bind(worker_cfg).await.unwrap();
-    let mut hello = v2::Hello {
-        worker_id: "w-throttled".into(),
-        interfaces: vec!["throttled.echo".into()],
-        max_concurrency: 2,
-        ..Default::default()
-    };
-    DirectEndpoint::apply_worker_attributes(&mut hello);
-    let mut session = WorkerSession::connect(&endpoint_url, None, hello)
+    let mut session = DirectWorkerSession::connect(
+        &endpoint_url,
+        None,
+        v2::Hello {
+            worker_id: "w-throttled".into(),
+            interfaces: vec!["throttled.echo".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+        Arc::clone(&w_ep),
+    )
+    .await
+    .unwrap();
+    let limits = match session
+        .session
+        .messages
+        .message()
         .await
-        .unwrap();
-    let limits = match session.messages.message().await.unwrap().unwrap().msg {
+        .unwrap()
+        .unwrap()
+        .msg
+    {
         Some(v2::server_message::Msg::Welcome(w)) => w.limits.unwrap(),
         other => panic!("expected welcome, got {other:?}"),
     };
@@ -1189,53 +1211,48 @@ async fn public_relay_only_fallback_fail_fast_server_limit_and_direct_unsupporte
     let total_attempts_w = total_attempts_seen.clone();
     let saw_direct_cap_on_fallback = Arc::new(AtomicBool::new(false));
     let saw_cap_w = saw_direct_cap_on_fallback.clone();
-    let w_ep_task = w_ep.clone();
 
     let worker_task = tokio::spawn(async move {
         // Expect exactly 4 attempts across the 3 client invokes (proving non-retryable
         // direct_public_relay_throttled NEVER consumes max_attempts retries!):
-        // 1) 4 KiB direct -> throttled pre-handler (handler NOT called!)
+        // 1) 4 KiB direct -> throttled pre-handler inside open_attempt (handler NOT called!)
         // 2) 4 KiB inline fallback -> succeeds (handler called ONCE, anyserve.direct stripped!)
-        // 3) 20 KiB direct -> throttled pre-handler (handler NOT called!; client fallback rejected by 16 KiB server cap)
-        // 4) 80 KiB direct (with max_attempts=3) -> throttled pre-handler (1 attempt only, handler NOT called!; client fails fast)
+        // 3) 20 KiB direct -> throttled pre-handler inside open_attempt (handler NOT called!; client fallback rejected by 16 KiB server cap)
+        // 4) 80 KiB direct (with max_attempts=3) -> throttled pre-handler inside open_attempt (1 attempt only, handler NOT called!; client fails fast)
         for _ in 0..4 {
             let Some(Ok(v2::ServerMessage {
                 msg: Some(v2::server_message::Msg::Assign(assign)),
-            })) = session.messages.message().await.transpose()
+            })) = session.session.messages.message().await.transpose()
             else {
                 break;
             };
             total_attempts_w.fetch_add(1, Ordering::SeqCst);
-            let mut att =
-                Attempt::open(&mut session.data, &assign, &limits, Duration::from_secs(5))
-                    .await
-                    .unwrap();
-            let reports = match att
-                .resolve_direct_inputs(&w_ep_task, &DirectCancel::new())
+            let mut att = match session
+                .open_attempt(
+                    &assign,
+                    &limits,
+                    Duration::from_secs(5),
+                    &DirectCancel::new(),
+                )
                 .await
             {
-                Ok(r) => r,
-                Err(err) => {
-                    // MUST return pre-handler without executing user handler!
-                    att.finish(&[], err.to_attempt_failure_outcome())
-                        .await
-                        .unwrap();
+                Ok(att) => att,
+                Err(DirectAttemptError::Direct(DirectError::PublicRelayThrottled { .. })) => {
+                    // open_attempt ALREADY finished the attempt non-retryably before returning Err!
                     continue;
                 }
+                Err(other) => panic!("unexpected open_attempt error: {other:?}"),
             };
-            // Handler executes ONLY when input resolution succeeded.
+            // Handler executes ONLY when open_attempt succeeded.
             handler_calls_w.fetch_add(1, Ordering::SeqCst);
             if att.client_supports_direct() {
                 saw_cap_w.store(true, Ordering::SeqCst);
             }
-            let data = match &att.inputs[0].body {
+            let data = match &att.inputs()[0].body {
                 Some(v2::object::Body::Inline(b)) => b.clone(),
                 _ => Bytes::new(),
             };
-            let out = att
-                .stage_direct_output(data, HashMap::new(), &w_ep_task, &reports)
-                .unwrap();
-            att.finish(&[out], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+            att.finish_succeeded(vec![(data, HashMap::new())])
                 .await
                 .unwrap();
         }
@@ -1271,6 +1288,10 @@ async fn public_relay_only_fallback_fail_fast_server_limit_and_direct_unsupporte
     let fin1 = consume_terminal(&mut ev1).await.unwrap();
     assert_eq!(fin1.state, v2::JobState::Succeeded as i32);
     assert!(ev1.fell_back_inline());
+    assert!(
+        ev1.fallback_from_job_id().is_some(),
+        "fallback_from_job_id must record the initial throttled job id"
+    );
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
     assert!(
         !saw_direct_cap_on_fallback.load(Ordering::SeqCst),

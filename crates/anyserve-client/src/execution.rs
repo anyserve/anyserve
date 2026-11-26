@@ -27,6 +27,8 @@ use crate::{
 
 mod attempt;
 pub use attempt::Attempt;
+#[cfg(feature = "direct")]
+pub use attempt::{DirectAttempt, DirectAttemptError};
 mod events;
 pub use events::{ExecutionEvents, RpcStream};
 
@@ -395,10 +397,20 @@ impl ExecutionClient {
     ///   over direct, also sets `demand.required_attributes["anyserve.direct"] = "1"`
     ///   so the scheduler routes only to direct-capable workers (queuing until
     ///   `queue_timeout` if none are online).
-    /// - If the worker reports `direct_public_relay_throttled` pre-handler and
-    ///   total staged input bytes `<= inline_fallback_limit_bytes`, automatically
-    ///   re-invokes once inline (stripping `anyserve.direct`). Any server error
-    ///   (e.g. `max_inline_object_bytes`) is propagated unchanged.
+    /// - Memory cost: `spec` is cloned for inline fallback **only** when total
+    ///   staged inline input bytes `<= inline_fallback_limit_bytes` (default
+    ///   `8 MiB`). Larger non-fallbackable payloads are never cloned or retained
+    ///   in a fallback copy.
+    /// - Fallback stream semantics: if the worker reports pre-handler
+    ///   `direct_public_relay_throttled` and total staged input bytes
+    ///   `<= inline_fallback_limit_bytes`, [`DirectExecutionEvents::message`]
+    ///   intercepts that terminal failure and transparently opens one new inline
+    ///   `Invoke` (stripping `anyserve.direct`). Callers may therefore have
+    ///   observed `Accepted`/`Assigned` events for the initial throttled
+    ///   `job_id` before subsequent events carry the fallback `job_id`; inspect
+    ///   [`DirectExecutionEvents::fell_back_inline`] and
+    ///   [`DirectExecutionEvents::fallback_from_job_id`] to detect this transition.
+    ///   Any server error (e.g. `max_inline_object_bytes`) is propagated unchanged.
     #[cfg(feature = "direct")]
     pub async fn invoke_direct(
         &mut self,
@@ -428,7 +440,19 @@ impl ExecutionClient {
         let max_fetches =
             crate::direct::derive_input_max_fetches(spec.policy.as_ref().map(|p| p.max_attempts));
 
-        let original_spec = spec.clone();
+        let staged_inline_total: usize = spec
+            .inputs
+            .iter()
+            .filter_map(|obj| match &obj.body {
+                Some(v2::object::Body::Inline(data)) if data.len() >= threshold => Some(data.len()),
+                _ => None,
+            })
+            .fold(0usize, usize::saturating_add);
+        let fallback_spec = (inline_fallback_limit > 0
+            && staged_inline_total > 0
+            && staged_inline_total <= inline_fallback_limit)
+            .then(|| spec.clone());
+
         let mut direct_spec = spec;
         let mut guards = Vec::new();
         let mut total_staged_bytes = 0usize;
@@ -475,10 +499,6 @@ impl ExecutionClient {
         }
 
         let events = self.invoke(direct_spec).await?;
-        let fallback_spec = (!guards.is_empty()
-            && inline_fallback_limit > 0
-            && total_staged_bytes <= inline_fallback_limit)
-            .then_some(original_spec);
 
         Ok(DirectExecutionEvents {
             events,
@@ -489,6 +509,7 @@ impl ExecutionClient {
             total_staged_bytes,
             fallback_attempted: false,
             fell_back_inline: false,
+            fallback_from_job_id: None,
             cancel: crate::direct::DirectCancel::new(),
             output_reports: Vec::new(),
         })
@@ -519,6 +540,13 @@ pub struct Invocation {
 /// transparently resolves `anyserve+iroh://` terminal outputs with SHA-256
 /// verification, and handles bounded pre-handler inline fallback on
 /// `direct_public_relay_throttled`.
+///
+/// **Inline fallback stream transition**: if automatic inline fallback fires
+/// (`<= inline_fallback_limit_bytes`), callers may already have observed
+/// `Accepted`/`Assigned` events for the initial throttled `job_id` before
+/// subsequent events switch to the fallback `Invoke`'s `job_id`. Use
+/// [`DirectExecutionEvents::fell_back_inline`] and
+/// [`DirectExecutionEvents::fallback_from_job_id`] to observe that switch.
 #[cfg(feature = "direct")]
 pub struct DirectExecutionEvents {
     events: ExecutionEvents,
@@ -529,6 +557,7 @@ pub struct DirectExecutionEvents {
     total_staged_bytes: usize,
     fallback_attempted: bool,
     fell_back_inline: bool,
+    fallback_from_job_id: Option<String>,
     cancel: crate::direct::DirectCancel,
     output_reports: Vec<crate::direct::DirectTransferReport>,
 }
@@ -550,6 +579,13 @@ impl DirectExecutionEvents {
     /// hitting `direct_public_relay_throttled`.
     pub fn fell_back_inline(&self) -> bool {
         self.fell_back_inline
+    }
+
+    /// When [`DirectExecutionEvents::fell_back_inline`] is `true`, returns the
+    /// initial throttled `job_id` whose terminal failure triggered the inline
+    /// fallback `Invoke` stream.
+    pub fn fallback_from_job_id(&self) -> Option<&str> {
+        self.fallback_from_job_id.as_deref()
     }
 
     /// Reads the next execution event, resolving `anyserve+iroh://` terminal
@@ -577,6 +613,7 @@ impl DirectExecutionEvents {
                                 .required_attributes
                                 .remove(crate::DIRECT_CAPABILITY_KEY);
                         }
+                        self.fallback_from_job_id = Some(event.job_id.clone());
                         // Propagate any server rejection (e.g. max_inline_*) verbatim.
                         self.events = self.client.invoke(inline_spec).await?;
                         self.fell_back_inline = true;
@@ -727,6 +764,84 @@ impl WorkerSession {
             })
             .await
             .map_err(|_| Status::unavailable("worker control stream closed"))
+    }
+}
+
+/// Safe worker session bound to a [`crate::direct::DirectEndpoint`].
+///
+/// Connecting via [`DirectWorkerSession::connect`] automatically injects
+/// `anyserve.direct = "1"` into `Hello.attributes`, and
+/// [`DirectWorkerSession::open_attempt`] opens assignments through
+/// [`Attempt::open_with_direct`] so direct inputs are resolved pre-handler and
+/// failures commit non-retryably before any user handler can execute.
+#[cfg(feature = "direct")]
+pub struct DirectWorkerSession {
+    pub session: WorkerSession,
+    direct: Arc<crate::direct::DirectEndpoint>,
+}
+
+#[cfg(feature = "direct")]
+impl DirectWorkerSession {
+    pub async fn connect(
+        endpoint: &str,
+        token: Option<&str>,
+        hello: v2::Hello,
+        direct: Arc<crate::direct::DirectEndpoint>,
+    ) -> Result<Self> {
+        Self::connect_with_namespace(endpoint, token, None, hello, direct).await
+    }
+
+    pub async fn connect_with_namespace(
+        endpoint: &str,
+        token: Option<&str>,
+        namespace: Option<&str>,
+        mut hello: v2::Hello,
+        direct: Arc<crate::direct::DirectEndpoint>,
+    ) -> Result<Self> {
+        crate::direct::DirectEndpoint::apply_worker_attributes(&mut hello);
+        let session =
+            WorkerSession::connect_with_namespace(endpoint, token, namespace, hello).await?;
+        Ok(Self { session, direct })
+    }
+
+    pub fn direct_endpoint(&self) -> &Arc<crate::direct::DirectEndpoint> {
+        &self.direct
+    }
+
+    /// Opens an assignment safely via [`Attempt::open_with_direct`].
+    pub async fn open_attempt(
+        &mut self,
+        assignment: &v2::Assign,
+        limits: &v2::Limits,
+        heartbeat_timeout: std::time::Duration,
+        cancel: &crate::direct::DirectCancel,
+    ) -> Result<DirectAttempt, DirectAttemptError> {
+        Attempt::open_with_direct(
+            &mut self.session.data,
+            assignment,
+            limits,
+            heartbeat_timeout,
+            Arc::clone(&self.direct),
+            cancel,
+        )
+        .await
+    }
+
+    pub fn drain(
+        &self,
+        preempting: bool,
+    ) -> impl std::future::Future<Output = Result<(), Status>> + Send + 'static {
+        let control = self.session.control.clone();
+        async move {
+            control
+                .send(v2::WorkerMessage {
+                    msg: Some(v2::worker_message::Msg::Draining(v2::Draining {
+                        preempting,
+                    })),
+                })
+                .await
+                .map_err(|_| Status::unavailable("worker control stream closed"))
+        }
     }
 }
 

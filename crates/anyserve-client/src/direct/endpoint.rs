@@ -117,6 +117,11 @@ impl DirectEndpoint {
         let mut builder = Endpoint::builder(presets::Minimal)
             .relay_mode(relay_mode)
             .alpns(vec![DIRECT_ALPN.to_vec()]);
+        if let Some(addr) = config.bind_addr {
+            builder = builder.clear_ip_transports().bind_addr(addr).map_err(|e| {
+                DirectError::InvalidConfig(format!("invalid bind_addr {addr}: {e}"))
+            })?;
+        }
         if let Some(sk) = secret_key {
             builder = builder.secret_key(sk);
         }
@@ -206,6 +211,11 @@ impl DirectEndpoint {
 
     /// Advertises `anyserve.direct = "1"` on a worker's `Hello.attributes` so
     /// the scheduler routes direct-input jobs only to direct-capable workers.
+    ///
+    /// Prefer [`crate::execution::DirectWorkerSession::connect`] +
+    /// [`crate::execution::DirectWorkerSession::open_attempt`] (or
+    /// [`crate::execution::Attempt::open_with_direct`]), which binds capability
+    /// advertisement and pre-handler direct input resolution into a single path.
     pub fn apply_worker_attributes(hello: &mut crate::v2::Hello) {
         hello.attributes.insert(
             DIRECT_CAPABILITY_KEY.to_owned(),

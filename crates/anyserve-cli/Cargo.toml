@@ -8,6 +8,7 @@ repository.workspace = true
 [features]
 default = []
 embed-console = []
+direct = ["anyserve-client/direct"]
 
 [dependencies]
 anyhow.workspace = true
@@ -28,5 +29,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+bytes.workspace = true
 futures.workspace = true
 tokio-stream.workspace = true
