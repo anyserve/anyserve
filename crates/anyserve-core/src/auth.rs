@@ -27,6 +27,11 @@ pub const NAMESPACE_HEADER: &str = "x-anyserve-namespace";
 pub const SIGNED_TOKEN_PREFIX: &str = "asv1.";
 /// Comma-separated token signing keys, newest (signing) key first.
 pub const SIGNING_KEYS_ENV: &str = "ANYSERVE_TOKEN_SIGNING_KEY";
+/// Negotiated WebSocket subprotocol echoed on 101 upgrades for browser clients/workers.
+pub const WS_SUBPROTOCOL_V2: &str = "anyserve.v2";
+/// Prefix for base64url-encoded bearer token carried in `Sec-WebSocket-Protocol`
+/// (browser WebSocket API cannot set custom `Authorization` headers).
+pub const WS_BEARER_SUBPROTOCOL_PREFIX: &str = "anyserve.bearer.";
 
 /// Splits a comma-separated signing-key list, dropping blank entries; the first key signs.
 pub fn parse_signing_keys(raw: &str) -> Vec<Vec<u8>> {
@@ -623,6 +628,46 @@ impl AuthPolicy {
         self.verify_role_headers(headers, Role::Worker)
     }
 
+    /// Authenticates a WebSocket upgrade for a client endpoint (`/ws/v2/client/*`),
+    /// accepting either `Authorization: Bearer <token>` or browser subprotocols
+    /// `Sec-WebSocket-Protocol: anyserve.v2, anyserve.bearer.<base64url_nopad(token)>`.
+    pub fn verify_ws_client_headers(&self, headers: &HeaderMap) -> Result<WsAuthResult, Status> {
+        self.verify_ws_role_headers(headers, Role::Client)
+    }
+
+    /// Authenticates a WebSocket upgrade for a worker endpoint (`/ws/v2/worker/*`),
+    /// accepting either `Authorization: Bearer <token>` or browser subprotocols
+    /// `Sec-WebSocket-Protocol: anyserve.v2, anyserve.bearer.<base64url_nopad(token)>`.
+    pub fn verify_ws_worker_headers(&self, headers: &HeaderMap) -> Result<WsAuthResult, Status> {
+        self.verify_ws_role_headers(headers, Role::Worker)
+    }
+
+    fn verify_ws_role_headers(
+        &self,
+        headers: &HeaderMap,
+        expected: Role,
+    ) -> Result<WsAuthResult, Status> {
+        let (selected_protocol, subprotocol_token) = match parse_ws_subprotocols(headers) {
+            Ok(parsed) => parsed,
+            Err(status) => return self.reject(status),
+        };
+        if !self.is_enabled() {
+            let principal = Self::unauthenticated_principal(expected, headers)?;
+            return Ok(WsAuthResult {
+                principal,
+                selected_protocol,
+            });
+        }
+        let token = subprotocol_token
+            .as_deref()
+            .or_else(|| bearer_token(headers));
+        let principal = self.verify_role_token(token, expected)?;
+        Ok(WsAuthResult {
+            principal,
+            selected_protocol,
+        })
+    }
+
     fn verify_role_headers(
         &self,
         headers: &HeaderMap,
@@ -631,7 +676,11 @@ impl AuthPolicy {
         if !self.is_enabled() {
             return Self::unauthenticated_principal(expected, headers);
         }
-        match bearer_token(headers).and_then(|token| self.principal_for_token(token)) {
+        self.verify_role_token(bearer_token(headers), expected)
+    }
+
+    fn verify_role_token(&self, token: Option<&str>, expected: Role) -> Result<Principal, Status> {
+        match token.and_then(|token| self.principal_for_token(token)) {
             Some(principal) if principal.role == expected => Ok(principal),
             Some(_) => self.reject(Status::permission_denied(match expected {
                 Role::Client => "worker token cannot be used for client requests",
@@ -640,6 +689,77 @@ impl AuthPolicy {
             None => self.reject(Status::unauthenticated("missing or invalid bearer token")),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsAuthResult {
+    pub principal: Principal,
+    pub selected_protocol: Option<&'static str>,
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_ws_subprotocols(
+    headers: &HeaderMap,
+) -> Result<(Option<&'static str>, Option<String>), Status> {
+    let mut has_v2 = false;
+    let mut bearer_encoded: Option<&str> = None;
+
+    for raw in headers.get_all(http::header::SEC_WEBSOCKET_PROTOCOL) {
+        let value = raw
+            .to_str()
+            .map_err(|_| Status::invalid_argument("invalid Sec-WebSocket-Protocol header"))?;
+        for part in value.split(',') {
+            let proto = part.trim();
+            if proto.is_empty() {
+                continue;
+            }
+            if proto == WS_SUBPROTOCOL_V2 {
+                has_v2 = true;
+            } else if let Some(encoded) = proto.strip_prefix(WS_BEARER_SUBPROTOCOL_PREFIX) {
+                if bearer_encoded.is_some() {
+                    return Err(Status::invalid_argument(
+                        "duplicate WebSocket bearer subprotocol",
+                    ));
+                }
+                bearer_encoded = Some(encoded);
+            }
+        }
+    }
+
+    let decoded_token = match bearer_encoded {
+        Some(encoded) => {
+            if headers.contains_key(http::header::AUTHORIZATION) {
+                return Err(Status::invalid_argument(
+                    "cannot supply both Authorization header and WebSocket bearer subprotocol",
+                ));
+            }
+            if !has_v2 {
+                return Err(Status::invalid_argument(
+                    "WebSocket bearer subprotocol requires 'anyserve.v2' subprotocol",
+                ));
+            }
+            if encoded.is_empty() {
+                return Err(Status::invalid_argument(
+                    "invalid WebSocket bearer subprotocol",
+                ));
+            }
+            let bytes = URL_SAFE_NO_PAD
+                .decode(encoded)
+                .map_err(|_| Status::invalid_argument("invalid WebSocket bearer subprotocol"))?;
+            let decoded = String::from_utf8(bytes)
+                .map_err(|_| Status::invalid_argument("invalid WebSocket bearer subprotocol"))?;
+            let trimmed = decoded.trim();
+            if trimmed.is_empty() {
+                return Err(Status::invalid_argument(
+                    "invalid WebSocket bearer subprotocol",
+                ));
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+
+    Ok((has_v2.then_some(WS_SUBPROTOCOL_V2), decoded_token))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

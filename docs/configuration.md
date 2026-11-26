@@ -124,7 +124,18 @@ nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, the scheduler defa
 (per-key serialization within each namespace).
 
 TLS protects gRPC; terminate management HTTP TLS at your ingress or proxy. CORS
-origins control browser access independently of authentication.
+origins control browser access independently of authentication: when
+`allowed_origins` (or `ANYSERVE_ALLOWED_ORIGINS`) is configured, matched origins
+receive `Access-Control-Expose-Headers: x-anyserve-grpc-code` on `/api/*` and
+`/rpc/v2/*` responses; when unset, no `Vary` or `Access-Control-*` headers are
+emitted.
+
+Browser WebSocket clients and workers on `/ws/v2/*` (which cannot attach custom
+`Authorization` headers) authenticate using `Sec-WebSocket-Protocol`: pass
+`["anyserve.v2", "anyserve.bearer." + base64url_nopad(token)]`. The server runs
+the exact same role, namespace, expiry, and revocation checks as `Authorization:
+Bearer`, echoes only `anyserve.v2` in the 101 response, and rejects conflicting
+`Authorization` + `anyserve.bearer.*` headers with HTTP `400` (`INVALID_ARGUMENT`).
 
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
@@ -135,7 +146,13 @@ private CA.
 
 `max_queue` limits queued/accepting jobs per interface; `max_pending_jobs` limits
 unfinished jobs in the active Runtime. Admission beyond these limits returns
-`RESOURCE_EXHAUSTED`. Heartbeat timeout closes a silent session, then gives its
+`RESOURCE_EXHAUSTED`. Application-level protobuf `Heartbeat` messages are the
+sole liveness signal for worker sessions: RFC 6455 WebSocket `Ping`/`Pong`
+frames are transport keepalives only and intentionally do **not** extend
+`heartbeat_timeout` (a wedged worker event loop can still reply with Pong).
+Browser workers should run their session and heartbeat timer inside a Dedicated
+Web Worker so background tab timer throttling does not starve heartbeats.
+Heartbeat timeout closes a silent session, then gives its
 leases `reconnect_grace_ms` (per-tier `pool_tiers.reconnect_grace_ms`, else
 `[runtime].reconnect_grace_ms`, defaulting to `heartbeat_timeout_ms`) to reconnect.
 Cancellation keeps a worker reservation until acknowledgement or `cancel_grace_ms` expires.

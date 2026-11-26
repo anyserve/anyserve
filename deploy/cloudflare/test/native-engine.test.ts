@@ -5080,4 +5080,185 @@ describe("Phase 3 & 4 parity: /api/info, worker drain, tenant redaction, /rpc/v2
     );
     expect(platform.engine.sessions.get(welcome.sessionId)?.utilization).toBe(0);
   });
+
+  it("aligns CORS headers on /api/* and /rpc/v2/client/* and supports WS bearer subprotocol auth", async () => {
+    const toB64Url = (s: string) =>
+      Buffer.from(s, "utf8")
+        .toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=+$/g, "");
+
+    // 1. Empty ANYSERVE_ALLOWED_ORIGINS emits no Vary or Access-Control-* headers (Rust parity).
+    const noCors = new SimulatedNativePlatform({
+      env: {
+        ANYSERVE_CLIENT_TOKENS: "cli-tok",
+        ANYSERVE_WORKER_TOKENS: "wrk-tok",
+      },
+    });
+    const noCorsApi = await noCors.engine.fetch(
+      new Request("https://anyserve.example.com/api/overview", {
+        headers: {
+          Authorization: "Bearer cli-tok",
+          Origin: "https://browser.example.com",
+        },
+      }),
+    );
+    expect(noCorsApi.status).toBe(200);
+    expect(noCorsApi.headers.get("Vary")).toBeNull();
+    expect(noCorsApi.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(noCorsApi.headers.get("Access-Control-Expose-Headers")).toBeNull();
+
+    const noCorsRpc = await noCors.engine.fetch(
+      new Request("https://anyserve.example.com/rpc/v2/client/list_jobs", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer cli-tok",
+          Origin: "https://browser.example.com",
+          "Content-Type": "application/x-protobuf",
+        },
+        body: new Uint8Array(0),
+      }),
+    );
+    expect(noCorsRpc.status).toBe(200);
+    expect(noCorsRpc.headers.get("Vary")).toBeNull();
+    expect(noCorsRpc.headers.get("Access-Control-Allow-Origin")).toBeNull();
+
+    // 2. Configured ANYSERVE_ALLOWED_ORIGINS sets CORS + Expose-Headers on /rpc/v2/client/* and /api/*.
+    const platform = new SimulatedNativePlatform({
+      env: {
+        ANYSERVE_CLIENT_TOKENS: "cli-tok",
+        ANYSERVE_WORKER_TOKENS: "wrk-tok",
+        ANYSERVE_ALLOWED_ORIGINS: "https://browser.example.com",
+      },
+    });
+
+    const preflight = await platform.engine.fetch(
+      new Request("https://anyserve.example.com/rpc/v2/client/list_jobs", {
+        method: "OPTIONS",
+        headers: { Origin: "https://browser.example.com" },
+      }),
+    );
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("Vary")).toBe("Origin");
+    expect(preflight.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://browser.example.com",
+    );
+    expect(preflight.headers.get("Access-Control-Allow-Methods")).toBe(
+      "GET, POST, OPTIONS",
+    );
+    expect(preflight.headers.get("Access-Control-Expose-Headers")).toBeNull();
+
+    const rpcOk = await platform.engine.fetch(
+      new Request("https://anyserve.example.com/rpc/v2/client/list_jobs", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer cli-tok",
+          Origin: "https://browser.example.com",
+          "Content-Type": "application/x-protobuf",
+        },
+        body: new Uint8Array(0),
+      }),
+    );
+    expect(rpcOk.status).toBe(200);
+    expect(rpcOk.headers.get("Vary")).toBe("Origin");
+    expect(rpcOk.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://browser.example.com",
+    );
+    expect(rpcOk.headers.get("Access-Control-Expose-Headers")).toBe(
+      "x-anyserve-grpc-code",
+    );
+
+    const rpcErr = await platform.engine.fetch(
+      new Request("https://anyserve.example.com/rpc/v2/client/list_jobs", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer wrk-tok",
+          Origin: "https://browser.example.com",
+          "Content-Type": "application/x-protobuf",
+        },
+        body: new Uint8Array(0),
+      }),
+    );
+    expect(rpcErr.status).toBe(403);
+    expect(rpcErr.headers.get("x-anyserve-grpc-code")).toBe("7");
+    expect(rpcErr.headers.get("Access-Control-Allow-Origin")).toBe(
+      "https://browser.example.com",
+    );
+    expect(rpcErr.headers.get("Access-Control-Expose-Headers")).toBe(
+      "x-anyserve-grpc-code",
+    );
+
+    const disallowed = await platform.engine.fetch(
+      new Request("https://anyserve.example.com/rpc/v2/client/list_jobs", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer cli-tok",
+          Origin: "https://evil.example.com",
+          "Content-Type": "application/x-protobuf",
+        },
+        body: new Uint8Array(0),
+      }),
+    );
+    expect(disallowed.status).toBe(200);
+    expect(disallowed.headers.get("Vary")).toBe("Origin");
+    expect(disallowed.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(disallowed.headers.get("Access-Control-Expose-Headers")).toBeNull();
+
+    // 3. WS Sec-WebSocket-Protocol bearer auth parity
+    const wrkB64 = toB64Url("wrk-tok");
+    const cliB64 = toB64Url("cli-tok");
+
+    const okWs = await platform.openWs("/ws/v2/worker/session", {
+      "Sec-WebSocket-Protocol": `anyserve.v2, anyserve.bearer.${wrkB64}`,
+    });
+    expect(okWs.status).toBe(101);
+    expect(okWs.response.headers.get("Sec-WebSocket-Protocol")).toBe("anyserve.v2");
+
+    const okClientWs = await platform.openWs("/ws/v2/client/invoke", {
+      "Sec-WebSocket-Protocol": `anyserve.v2, anyserve.bearer.${cliB64}`,
+    });
+    expect(okClientWs.status).toBe(101);
+    expect(okClientWs.response.headers.get("Sec-WebSocket-Protocol")).toBe("anyserve.v2");
+
+    const wrongRole = await platform.openWs("/ws/v2/worker/session", {
+      "Sec-WebSocket-Protocol": `anyserve.v2, anyserve.bearer.${cliB64}`,
+    });
+    expect(wrongRole.status).toBe(403);
+    expect(wrongRole.response.headers.get("x-anyserve-grpc-code")).toBe("7");
+
+    const badTok = await platform.openWs("/ws/v2/worker/session", {
+      "Sec-WebSocket-Protocol": `anyserve.v2, anyserve.bearer.${toB64Url("nope")}`,
+    });
+    expect(badTok.status).toBe(401);
+    expect(badTok.response.headers.get("x-anyserve-grpc-code")).toBe("16");
+
+    const conflict = await platform.openWs("/ws/v2/worker/session", {
+      Authorization: "Bearer wrk-tok",
+      "Sec-WebSocket-Protocol": `anyserve.v2, anyserve.bearer.${wrkB64}`,
+    });
+    expect(conflict.status).toBe(400);
+    expect(conflict.response.headers.get("x-anyserve-grpc-code")).toBe("3");
+
+    for (const badProto of [
+      `anyserve.bearer.${wrkB64}`,
+      `anyserve.v2, anyserve.bearer.${wrkB64}, anyserve.bearer.${wrkB64}`,
+      "anyserve.v2, anyserve.bearer.not+valid=",
+      "anyserve.v2, anyserve.bearer.",
+    ]) {
+      const badRes = await platform.openWs("/ws/v2/worker/session", {
+        "Sec-WebSocket-Protocol": badProto,
+      });
+      expect(badRes.status, badProto).toBe(400);
+      expect(badRes.response.headers.get("x-anyserve-grpc-code"), badProto).toBe("3");
+    }
+
+    // Anonymous mode echoes anyserve.v2
+    const anon = new SimulatedNativePlatform();
+    const anonWs = await anon.openWs("/ws/v2/worker/session", {
+      "Sec-WebSocket-Protocol": "anyserve.v2",
+    });
+    expect(anonWs.status).toBe(101);
+    expect(anonWs.response.headers.get("Sec-WebSocket-Protocol")).toBe("anyserve.v2");
+  });
 });

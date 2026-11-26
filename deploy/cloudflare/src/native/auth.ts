@@ -13,9 +13,15 @@ export { DEFAULT_NAMESPACE };
 export const NAMESPACE_HEADER = "x-anyserve-namespace";
 export const GRPC_CODE_HEADER = "x-anyserve-grpc-code";
 export const SIGNED_TOKEN_PREFIX = "asv1.";
+export const WS_SUBPROTOCOL_V2 = "anyserve.v2";
+export const WS_BEARER_SUBPROTOCOL_PREFIX = "anyserve.bearer.";
 
 const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
+const utf8FatalDecoder = new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: false,
+});
 const NODE_INSPECT_CUSTOM = Symbol.for("nodejs.util.inspect.custom");
 
 export interface SignedTokenClaims {
@@ -525,6 +531,81 @@ function extractBearerToken(headers: HeaderBag): string | null {
   return raw.startsWith("Bearer ") || raw.startsWith("bearer ") ? raw.slice(7).trim() : null;
 }
 
+export interface WsAuthResult {
+  principal: Principal;
+  selectedProtocol: string | null;
+}
+
+function parseWsSubprotocols(headers: HeaderBag): {
+  selectedProtocol: string | null;
+  bearerToken: string | null;
+} {
+  let hasV2 = false;
+  let bearerEncoded: string | null = null;
+  const raw = getHeader(headers, "sec-websocket-protocol");
+  if (raw !== undefined) {
+    for (const part of raw.split(",")) {
+      const proto = part.trim();
+      if (!proto) continue;
+      if (proto === WS_SUBPROTOCOL_V2) {
+        hasV2 = true;
+      } else if (proto.startsWith(WS_BEARER_SUBPROTOCOL_PREFIX)) {
+        if (bearerEncoded !== null) {
+          throw GrpcStatusError.invalidArgument(
+            "duplicate WebSocket bearer subprotocol",
+          );
+        }
+        bearerEncoded = proto.slice(WS_BEARER_SUBPROTOCOL_PREFIX.length);
+      }
+    }
+  }
+
+  let decodedToken: string | null = null;
+  if (bearerEncoded !== null) {
+    if (getHeader(headers, "authorization") !== undefined) {
+      throw GrpcStatusError.invalidArgument(
+        "cannot supply both Authorization header and WebSocket bearer subprotocol",
+      );
+    }
+    if (!hasV2) {
+      throw GrpcStatusError.invalidArgument(
+        "WebSocket bearer subprotocol requires 'anyserve.v2' subprotocol",
+      );
+    }
+    if (bearerEncoded.length === 0 || bearerEncoded.length % 4 === 1) {
+      throw GrpcStatusError.invalidArgument(
+        "invalid WebSocket bearer subprotocol",
+      );
+    }
+    const bytes = base64UrlDecode(bearerEncoded);
+    if (bytes === null || base64UrlEncode(bytes) !== bearerEncoded) {
+      throw GrpcStatusError.invalidArgument(
+        "invalid WebSocket bearer subprotocol",
+      );
+    }
+    let decoded: string;
+    try {
+      decoded = utf8FatalDecoder.decode(bytes);
+    } catch {
+      throw GrpcStatusError.invalidArgument(
+        "invalid WebSocket bearer subprotocol",
+      );
+    }
+    const trimmed = decoded.trim();
+    if (trimmed.length === 0) {
+      throw GrpcStatusError.invalidArgument(
+        "invalid WebSocket bearer subprotocol",
+      );
+    }
+    decodedToken = trimmed;
+  }
+
+  return {
+    selectedProtocol: hasV2 ? WS_SUBPROTOCOL_V2 : null,
+    bearerToken: decodedToken,
+  };
+}
+
 function parseCommaTokens(raw: string | undefined): string[] {
   if (!raw) return [];
   return raw
@@ -958,6 +1039,43 @@ export class AuthPolicy {
 
   verifyWorkerHeaders(headers: HeaderBag): Promise<Principal> {
     return this.#authorize(headers, Role.Worker, (p) =>
+      p.role === Role.Worker ? null : "client token cannot be used for worker requests",
+    );
+  }
+
+  async #authorizeWs(
+    headers: HeaderBag,
+    anonymousRole: Role,
+    deny: (principal: Principal) => string | null,
+  ): Promise<WsAuthResult> {
+    const { selectedProtocol, bearerToken: subprotocolToken } =
+      parseWsSubprotocols(headers);
+    if (!this.isEnabled()) {
+      return {
+        principal: this.#unauthenticatedPrincipal(anonymousRole, headers),
+        selectedProtocol,
+      };
+    }
+    const token = subprotocolToken ?? extractBearerToken(headers);
+    const principal = token === null ? null : await this.principalForTokenAsync(token);
+    if (principal === null) {
+      throw GrpcStatusError.unauthenticated("missing or invalid bearer token");
+    }
+    const reason = deny(principal);
+    if (reason !== null) {
+      throw GrpcStatusError.permissionDenied(reason);
+    }
+    return { principal, selectedProtocol };
+  }
+
+  verifyWsClientHeaders(headers: HeaderBag): Promise<WsAuthResult> {
+    return this.#authorizeWs(headers, Role.Client, (p) =>
+      p.role === Role.Client ? null : "worker token cannot be used for client requests",
+    );
+  }
+
+  verifyWsWorkerHeaders(headers: HeaderBag): Promise<WsAuthResult> {
+    return this.#authorizeWs(headers, Role.Worker, (p) =>
       p.role === Role.Worker ? null : "client token cannot be used for worker requests",
     );
   }
