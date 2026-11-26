@@ -175,6 +175,71 @@ the control plane must persist and replay durable outputs.
   WebRTC P2P's value is zero control-plane relayed payload bytes and end-to-end
   direct transport, not higher raw throughput.
 
+**Optional Native `iroh` Direct Data Plane (`anyserve+iroh://`, v1)**: off by
+default via the `direct` Cargo feature on `anyserve-client` (zero changes to the
+Rust control plane, protobuf schema, Cloudflare Durable Object engine, or the
+`anyserve` server binary). Static large objects are passed opaquely through
+existing `Object::Uri` (inputs) and terminal `ResultChunk::uri` (outputs) with
+`anyserve.sha256` and `anyserve.size_bytes` metadata; live streaming URIs and
+`iroh-blobs` are intentionally excluded from v1.
+- *Scope & lifecycle*: auto-enabled only on live ephemeral
+  `ExecutionClient::invoke_direct` (`Submit` / durable jobs stay off by default
+  because direct object availability is tied to the holding process lifetime).
+  Input tokens are 128-bit CSPRNG, multi-fetchable across retries up to
+  `max_attempts.clamp(3, 20)`, and revoked immediately on terminal event,
+  cancellation, drop, or TTL (`300 s`). Worker outputs live in a bounded
+  post-finish LRU cache (`512 MiB` / `60 s` TTL) evicted immediately upon
+  client `1 B ACK` after SHA-256 verification.
+- *Trust boundary & identity*:
+  - Without `DirectConfig::allowed_peers`: payload bytes **bypass control-plane
+    forwarding/egress**, but any party holding the capability URI during its TTL
+    (including the control-plane operator) can dial and fetch the object — do
+    not treat this mode as confidential against the control plane.
+  - With `DirectConfig::allowed_peers` + persistent Ed25519 identity
+    (`DirectConfig::secret_key_path` / `ANYSERVE_DIRECT_SECRET_KEY_PATH`,
+    created with `0600` permissions on Unix; logs only the public `EndpointId`,
+    never key bytes): `iroh`'s Ed25519 TLS handshake cryptographically rejects
+    any peer outside the allowlist, including the control-plane operator.
+- *Redaction, journal retention, & IP privacy*: SDK logs/debug formatting and
+  Console UI redact both `<token>` and `addr=` values
+  (`anyserve+iroh://<endpoint-id>/[redacted]?relay=...&addr=[redacted]`).
+  Ephemeral `Invoke` URIs are never written to the journal (retained only in
+  memory up to `terminal_retention`); if explicitly opted into durable `Submit`,
+  the URI persists in the journal until `journal.retention` (default `24 h`) and
+  relies on short token TTL and `allowed_peers`. Setting
+  `DirectConfig::advertise_direct_addrs = false` omits `addr=` IP candidates
+  from the URI (hole-punching still works via `relay=`).
+- *Capability negotiation*: direct workers advertise `anyserve.direct = "1"` in
+  `Hello.attributes`; `invoke_direct` sets `metadata["anyserve.direct"] = "1"`
+  (telling workers direct outputs are supported; callers without it always
+  receive inline outputs) and sets `required_attributes["anyserve.direct"] = "1"`
+  whenever staging direct inputs (if no direct worker is online, the job queues
+  until `queue_timeout` rather than silently downgrading). Non-direct workers
+  that unexpectedly receive an `anyserve+iroh://` input fail pre-handler with
+  non-retryable `direct_unsupported`.
+- *Public n0 relay protection & trade-off*: n0's free public relay
+  (`*.relay.n0.iroh.link`) is rate-limited (~0.12 MB/s measured). When a
+  connection remains on a public n0 relay past `upgrade_window` (`1.5 s`), the
+  worker fails **pre-handler** (zero handler side effects) with non-retryable
+  `direct_public_relay_throttled` (v1 intentionally trades away trying another
+  worker so `max_attempts` is not wasted). If staged input bytes
+  `<= inline_fallback_limit_bytes` (default `8 MiB`), `invoke_direct`
+  automatically strips `anyserve.direct` and re-invokes once inline (propagating
+  any server `max_inline_*` rejection verbatim); larger inputs fail fast.
+  Output-side public-relay-only transfers fail fast (no retroactive inline
+  fallback after `Finish`). For symmetric-NAT production deployments, configure
+  a self-hosted `iroh-relay` via `ANYSERVE_DIRECT_RELAY_URL`.
+- *Observability, build cost, & WAN status*: `anyserve.direct_path`
+  (`direct | relay`) and `anyserve.direct_bytes` on `ResultChunk.metadata` are
+  **SDK-reported** (not server-audited). Enabling `direct` pulls `iroh 1.5`
+  (`tls-ring`, `presets::Minimal`, no n0 DNS/Pkarr discovery), adding ~117
+  compiled Linux crates, ~+68 s cold release build, dual `reqwest 0.12/0.13`,
+  `sha2 0.10/0.11`, and `noq 1.5` alongside `quinn 0.11`, and ~+4.1 MiB gzipped
+  (~+10.7 MiB raw `.so`) if enabled on `clients/python` (default PyPI wheels do
+  not bundle `iroh`; build optionally with `maturin build --features direct`).
+  Cross-WAN two-host transfer is **untested** in the current CI/sandbox
+  environment; local loopback measurements do not represent WAN throughput.
+
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
 certificate trusted by those roots, or supply a custom Rust transport for a

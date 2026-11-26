@@ -33,7 +33,14 @@ metadata=None)` builds `{"inline": bytes, "metadata": dict}`;
 `uri_object(uri, metadata=None, *, sha256=None, size_bytes=None, content_type=None)`
 attaches content digests (`anyserve.sha256` / `anyserve.size_bytes`) so
 transient presigned URLs still deduplicate under `job_id` idempotency. Set
-`@worker(..., uri_resolver=...)` to resolve URI inputs into bytes.
+`@worker(..., uri_resolver=...)` to resolve URI inputs into bytes. Default
+`anyserve-runtime` wheels do **not** bundle `iroh` (~+4.1 MiB gzipped wheel /
++117 compiled Linux crates / +68 s cold build); the native crate exposes an
+optional Cargo feature `direct` (`maturin build --features direct`) for custom
+builds, and Python workers without a `uri_resolver` explicitly reject unexpected
+`anyserve+iroh://` inputs pre-handler with non-retryable `direct_unsupported`
+(see [configuration.md](configuration.md) for the full `anyserve+iroh://` trust
+boundary and trade-offs).
 
 | Method | Result |
 |---|---|

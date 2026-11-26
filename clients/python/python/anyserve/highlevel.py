@@ -647,6 +647,12 @@ def _process_assignment(
         else:
             inputs = attempt.inputs
             if spec.uri_resolver is None:
+                if any(str(item.get("uri") or "").startswith("anyserve+iroh://") for item in inputs):
+                    raise WorkerError(
+                        "anyserve+iroh:// input requires a worker with direct data-plane support",
+                        retryable=False,
+                        code="direct_unsupported",
+                    )
                 if len(inputs) == 1:
                     item = inputs[0]
                     if "inline" not in item:
