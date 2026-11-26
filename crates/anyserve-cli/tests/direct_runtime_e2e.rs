@@ -842,3 +842,200 @@ async fn real_runtime_public_relay_throttled_attempts_fallback_and_output_fail_f
         .close()
         .await;
 }
+
+#[tokio::test]
+async fn real_runtime_open_stream_and_input_chunk_reject_direct_uris_as_direct_unsupported() {
+    // Part A: default assign_inline_limit -> anyserve+iroh:// arrives in assignment.inline_inputs;
+    //         Attempt::open_stream must commit non-retryable direct_unsupported pre-handler!
+    let server_inline = start_real_runtime(RuntimeConfig::default()).await;
+    let mut s_inline = WorkerSession::connect(
+        &server_inline.url,
+        None,
+        v2::Hello {
+            worker_id: "stream-w-inline".into(),
+            interfaces: vec!["stream.direct.inline".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let limits_inline = match s_inline.messages.message().await.unwrap().unwrap().msg {
+        Some(v2::server_message::Msg::Welcome(w)) => w.limits.unwrap(),
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    send_credit(&s_inline.control, 1).await;
+
+    let inline_handler_calls = Arc::new(AtomicUsize::new(0));
+    let inline_handlers_t = Arc::clone(&inline_handler_calls);
+    let w_inline_task = tokio::spawn(async move {
+        if let Ok(Some(v2::ServerMessage {
+            msg: Some(v2::server_message::Msg::Assign(assign)),
+        })) = s_inline.messages.message().await
+        {
+            assert!(
+                !assign.inputs_via_attempt,
+                "expected URI object in assignment.inline_inputs"
+            );
+            accept_assign(&s_inline.control, &assign.lease_id).await;
+            let _att = match Attempt::open_stream(
+                &mut s_inline.data,
+                &assign,
+                &limits_inline,
+                Duration::from_secs(5),
+            )
+            .await
+            {
+                Ok(att) => att,
+                Err(status) => {
+                    assert_eq!(status.code(), Code::FailedPrecondition);
+                    assert!(status.message().contains("direct_unsupported"), "{status}");
+                    return;
+                }
+            };
+            inline_handlers_t.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let mut c_inline = ExecutionClient::connect(&server_inline.url).await.unwrap();
+    let mut st_inline = c_inline
+        .invoke(v2::JobSpec {
+            demand: Some(v2::Demand {
+                interface: "stream.direct.inline".into(),
+                ..Default::default()
+            }),
+            inputs: vec![v2::Object {
+                body: Some(v2::object::Body::Uri(
+                    "anyserve+iroh://0000000000000000000000000000000000000000000000000000000000000001/0123456789abcdef0123456789abcdef".into(),
+                )),
+                ..Default::default()
+            }],
+            policy: Some(v2::ExecutionPolicy {
+                max_attempts: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut inline_job_id = String::new();
+    let mut inline_fin = None;
+    while let Some(ev) = st_inline.message().await.unwrap() {
+        inline_job_id = ev.job_id;
+        if let Some(v2::execution_event::Event::Finished(f)) = ev.event {
+            inline_fin = Some(f);
+        }
+    }
+    let inline_fin = inline_fin.unwrap();
+    assert_eq!(inline_fin.state, v2::JobState::Failed as i32);
+    let inline_err = inline_fin.error.unwrap();
+    assert_eq!(inline_err.code, ERROR_CODE_DIRECT_UNSUPPORTED);
+    assert!(!inline_err.retryable);
+    assert_eq!(inline_handler_calls.load(Ordering::SeqCst), 0);
+    let inline_job = c_inline.get(&inline_job_id, false).await.unwrap();
+    assert_eq!(
+        inline_job.attempt_count, 1,
+        "open_stream direct_unsupported must consume exactly 1 attempt even with max_attempts=3"
+    );
+    w_inline_task.await.unwrap();
+
+    // Part B: assign_inline_limit = 1 -> real Runtime sets inputs_via_attempt = true and delivers
+    //         anyserve+iroh:// via InputData.uri; Attempt::input_chunk must reject it as non-retryable
+    //         direct_unsupported!
+    let mut cfg_stream = RuntimeConfig::default();
+    cfg_stream.limits.assign_inline_limit = 1;
+    let server_chunk = start_real_runtime(cfg_stream).await;
+    let mut s_chunk = WorkerSession::connect(
+        &server_chunk.url,
+        None,
+        v2::Hello {
+            worker_id: "stream-w-chunk".into(),
+            interfaces: vec!["stream.direct.chunk".into()],
+            max_concurrency: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let limits_chunk = match s_chunk.messages.message().await.unwrap().unwrap().msg {
+        Some(v2::server_message::Msg::Welcome(w)) => w.limits.unwrap(),
+        other => panic!("expected welcome, got {other:?}"),
+    };
+    send_credit(&s_chunk.control, 1).await;
+
+    let chunk_handler_calls = Arc::new(AtomicUsize::new(0));
+    let chunk_handlers_t = Arc::clone(&chunk_handler_calls);
+    let w_chunk_task = tokio::spawn(async move {
+        if let Ok(Some(v2::ServerMessage {
+            msg: Some(v2::server_message::Msg::Assign(assign)),
+        })) = s_chunk.messages.message().await
+        {
+            assert!(
+                assign.inputs_via_attempt,
+                "assign_inline_limit=1 must force URI delivery over Attempt stream (InputData.uri)"
+            );
+            accept_assign(&s_chunk.control, &assign.lease_id).await;
+            let mut att = Attempt::open_stream(
+                &mut s_chunk.data,
+                &assign,
+                &limits_chunk,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            match att.input_chunk().await {
+                Ok(_) => {
+                    chunk_handlers_t.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(status) => {
+                    assert_eq!(status.code(), Code::FailedPrecondition);
+                    assert!(status.message().contains("direct_unsupported"), "{status}");
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let mut c_chunk = ExecutionClient::connect(&server_chunk.url).await.unwrap();
+    let mut st_chunk = c_chunk
+        .invoke(v2::JobSpec {
+            demand: Some(v2::Demand {
+                interface: "stream.direct.chunk".into(),
+                ..Default::default()
+            }),
+            inputs: vec![v2::Object {
+                body: Some(v2::object::Body::Uri(
+                    "anyserve+iroh://0000000000000000000000000000000000000000000000000000000000000001/fedcba9876543210fedcba9876543210".into(),
+                )),
+                ..Default::default()
+            }],
+            policy: Some(v2::ExecutionPolicy {
+                max_attempts: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut chunk_job_id = String::new();
+    let mut chunk_fin = None;
+    while let Some(ev) = st_chunk.message().await.unwrap() {
+        chunk_job_id = ev.job_id;
+        if let Some(v2::execution_event::Event::Finished(f)) = ev.event {
+            chunk_fin = Some(f);
+        }
+    }
+    let chunk_fin = chunk_fin.unwrap();
+    assert_eq!(chunk_fin.state, v2::JobState::Failed as i32);
+    let chunk_err = chunk_fin.error.unwrap();
+    assert_eq!(chunk_err.code, ERROR_CODE_DIRECT_UNSUPPORTED);
+    assert!(!chunk_err.retryable);
+    assert_eq!(chunk_handler_calls.load(Ordering::SeqCst), 0);
+    let chunk_job = c_chunk.get(&chunk_job_id, false).await.unwrap();
+    assert_eq!(
+        chunk_job.attempt_count, 1,
+        "input_chunk direct_unsupported must consume exactly 1 attempt even with max_attempts=3"
+    );
+    w_chunk_task.await.unwrap();
+}

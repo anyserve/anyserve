@@ -8,6 +8,7 @@ repository.workspace = true
 [features]
 default = []
 embed-console = []
+# Test-only feature gate for `tests/direct_runtime_e2e.rs`; do NOT enable on release server binaries.
 direct = ["anyserve-client/direct"]
 
 [dependencies]

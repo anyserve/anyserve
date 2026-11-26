@@ -37,7 +37,9 @@ def run_worker(endpoint: str, interface: str, kind: str, marker: str | None = No
     else:
         @worker(interface=interface, max_active_leases=4, pass_context=True)
         def handler(payload, context):
-            if kind == "slow":
+            if kind == "mark" and marker:
+                Path(marker).write_text(context.attempt_id)
+            elif kind == "slow":
                 if marker:
                     Path(marker).write_text(context.attempt_id)
                 until = time.monotonic() + 2
@@ -526,6 +528,55 @@ serve([async_unary, async_stream], sys.argv[1], token="worker", worker_id="py-as
             self.fail("forked child deadlocked using shared_runtime()")
         self.assertEqual(proc.exitcode, 0)
         self.assertEqual(queue.get(timeout=1), ("ok", True))
+
+    def test_direct_uri_rejected_by_default_python_worker_as_direct_unsupported(self):
+        interface = f"test.python.direct_unsupported.{uuid.uuid4().hex[:8]}"
+        marker = self.path / f"handler-called-{uuid.uuid4().hex[:8]}.txt"
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
+            target=run_worker,
+            args=(self.endpoint, interface, "mark", str(marker)),
+        )
+        proc.start()
+        try:
+            job = self.client.submit(
+                interface,
+                [
+                    uri_object(
+                        "anyserve+iroh://0000000000000000000000000000000000000000000000000000000000000001/0123456789abcdef0123456789abcdef",
+                        sha256="0" * 64,
+                        size_bytes=128,
+                    )
+                ],
+                options=ExecutionOptions(max_attempts=3, total_timeout_ms=10_000),
+            )
+            done = eventually(
+                lambda: (
+                    g if (g := self.client.get(job["job_id"]))["state"] == "failed" else None
+                ),
+                timeout=10,
+            )
+            self.assertEqual(done["error"]["code"], "direct_unsupported")
+            self.assertFalse(done["error"]["retryable"])
+            self.assertEqual(done["attempt_count"], 1)
+            self.assertFalse(
+                marker.exists(),
+                "Python handler must NOT be invoked when anyserve+iroh:// input is rejected",
+            )
+            # Worker session stays healthy and serves subsequent normal inline work.
+            reply = self.client.call(
+                interface,
+                b"still-healthy",
+                options=ExecutionOptions(total_timeout_ms=10_000),
+            )
+            self.assertEqual(reply, b"still-healthy")
+            self.assertTrue(marker.exists())
+        finally:
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
 
 
 if __name__ == "__main__":

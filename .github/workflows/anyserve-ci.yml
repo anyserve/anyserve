@@ -79,8 +79,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: direct
-      - run: cargo clippy --locked -p anyserve-client -p anyserve-python --features direct --all-targets -- -D warnings
+      - run: cargo clippy --locked -p anyserve-client -p anyserve --features direct --all-targets -- -D warnings
       - run: cargo test --locked -p anyserve-client --features direct
+      - run: cargo test --locked -p anyserve --features direct --test direct_runtime_e2e
 
   python:
     runs-on: ubuntu-latest

@@ -535,31 +535,6 @@ class HighLevelTests(unittest.TestCase):
         _process_assignment(resolve_custom, resolve_custom.spec, a)
         self.assertEqual(a.attempt.outputs, [{"inline": b"TENSOR-BLOB", "metadata": {}}])
 
-    def test_direct_uri_without_resolver_fails_pre_handler_as_direct_unsupported(self):
-        called = False
-
-        @worker(interface="uri.nodirect")
-        def handler(data):
-            nonlocal called
-            called = True
-            return data
-
-        a = Assignment()
-        a.attempt.inputs = [
-            uri_object(
-                "anyserve+iroh://abc123endpoint/deadbeef0123456789abcdef01234567",
-                sha256="0" * 64,
-                size_bytes=128,
-            )
-        ]
-        _process_assignment(handler, handler.spec, a)
-        self.assertFalse(called, "handler must not execute when direct input is unsupported")
-        self.assertIsNotNone(a.attempt.failure)
-        msg, retryable = a.attempt.failure
-        self.assertIn("anyserve+iroh://", msg)
-        self.assertFalse(retryable)
-        self.assertEqual(a.attempt.failure_code, "direct_unsupported")
-
     def test_multi_interface_serve_routes_by_interface_and_merges_capacity(self):
         @worker(interface="iface.a", capacity={"slot": 1}, max_active_leases=1)
         def ha(payload):

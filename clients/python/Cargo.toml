@@ -9,10 +9,6 @@ repository.workspace = true
 name = "_native"
 crate-type = ["cdylib"]
 
-[features]
-default = []
-direct = ["anyserve-client/direct"]
-
 [dependencies]
 anyhow.workspace = true
 anyserve-client = { path = "../../crates/anyserve-client" }

@@ -352,13 +352,36 @@ impl Attempt {
     }
 
     /// Open without waiting for InputEnd, for duplex handlers such as video.
+    ///
+    /// Note: v1 `anyserve+iroh://` direct data-plane transfers do not support
+    /// streaming-input handlers. If `assignment.inline_inputs` contains an
+    /// `anyserve+iroh://` URI (and this is not a `terminal_replay`), this method
+    /// immediately commits non-retryable `direct_unsupported` and returns `Err`;
+    /// streamed `InputData.uri` carrying `anyserve+iroh://` is likewise rejected
+    /// in [`Attempt::input_chunk`].
     pub async fn open_stream(
         client: &mut AttemptClient,
         assignment: &v2::Assign,
         limits: &v2::Limits,
         heartbeat_timeout: Duration,
     ) -> Result<Self, Status> {
-        Self::open_mode(client, assignment, limits, heartbeat_timeout, false).await
+        let mut attempt =
+            Self::open_mode(client, assignment, limits, heartbeat_timeout, false).await?;
+        if !attempt.terminal_replay && attempt.has_direct_inputs() {
+            let _ = attempt
+                .commit(
+                    client,
+                    assignment,
+                    limits,
+                    &[],
+                    Self::direct_unsupported_outcome(),
+                )
+                .await;
+            return Err(Status::failed_precondition(
+                "streaming-input handlers do not support anyserve+iroh:// inputs in v1 (direct_unsupported)",
+            ));
+        }
+        Ok(attempt)
     }
 
     async fn open_mode(
@@ -549,6 +572,13 @@ impl Attempt {
                     if input.last {
                         self.input_done = true;
                         return Ok(None);
+                    }
+                    if crate::is_direct_uri(&input.uri) {
+                        self.discard_input = true;
+                        let _ = self.finish(&[], Self::direct_unsupported_outcome()).await;
+                        return Err(Status::failed_precondition(
+                            "streaming-input handlers do not support anyserve+iroh:// inputs in v1 (direct_unsupported)",
+                        ));
                     }
                     return Ok(Some(input));
                 }

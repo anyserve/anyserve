@@ -175,16 +175,30 @@ the control plane must persist and replay durable outputs.
   WebRTC P2P's value is zero control-plane relayed payload bytes and end-to-end
   direct transport, not higher raw throughput.
 
-**Optional Native `iroh` Direct Data Plane (`anyserve+iroh://`, v1)**: off by
-default via the `direct` Cargo feature on `anyserve-client` (zero changes to the
-Rust control plane, protobuf schema, Cloudflare Durable Object engine, or the
-`anyserve` server binary). Static large objects are passed opaquely through
-existing `Object::Uri` (inputs) and terminal `ResultChunk::uri` (outputs) with
-`anyserve.sha256` and `anyserve.size_bytes` metadata; live streaming URIs and
-`iroh-blobs` are intentionally excluded from v1.
-- *Scope & lifecycle*: auto-enabled only on live ephemeral
+**Optional Native `iroh` Direct Data Plane (`anyserve+iroh://`, v1 — Rust SDK only)**:
+off by default via the `direct` Cargo feature on `anyserve-client` (zero changes
+to the Rust control plane, protobuf schema, Cloudflare Durable Object engine,
+default `anyserve` server binary, or Python SDK — v1 `direct` is **Rust SDK
+only**, not supported in the Python SDK). Static large objects are passed
+opaquely through existing `Object::Uri` (inputs) and terminal `ResultChunk::uri`
+(outputs) with `anyserve.sha256` and `anyserve.size_bytes` metadata; live
+streaming URIs, streaming-input handlers, and `iroh-blobs` are intentionally
+excluded from v1.
+- *Scope, safe worker path, & lifecycle*: auto-enabled only on live ephemeral
   `ExecutionClient::invoke_direct` (`Submit` / durable jobs stay off by default
   because direct object availability is tied to the holding process lifetime).
+  Direct Rust workers **must** connect with `DirectWorkerSession::connect`
+  (auto-advertising `Hello.attributes["anyserve.direct"] = "1"`) and open
+  assignments through `DirectWorkerSession::open_attempt` /
+  `Attempt::open_with_direct` → `DirectAttempt::finish_succeeded` (which resolves
+  and SHA-256 verifies all `anyserve+iroh://` inputs before returning a handle
+  and auto-commits a non-retryable failure on error so the handler can never
+  execute). Plain `Attempt::open`, `Attempt::open_stream`, and
+  `Attempt::input_chunk` automatically commit non-retryable `direct_unsupported`
+  and return `Err` on `anyserve+iroh://` inputs — **v1 direct does not support
+  streaming-input handlers**, and feature-OFF workers (both Rust and default
+  Python `serve()` via PyO3) cannot accidentally pass an unresolved direct URI
+  to user handlers (`attempt_count = 1`, zero retries, zero handler calls).
   Input tokens are 128-bit CSPRNG, multi-fetchable across retries up to
   `max_attempts.clamp(3, 20)`, and revoked immediately on terminal event,
   cancellation, drop, or TTL (`300 s`). Worker outputs live in a bounded
@@ -215,30 +229,41 @@ existing `Object::Uri` (inputs) and terminal `ResultChunk::uri` (outputs) with
   receive inline outputs) and sets `required_attributes["anyserve.direct"] = "1"`
   whenever staging direct inputs (if no direct worker is online, the job queues
   until `queue_timeout` rather than silently downgrading). Non-direct workers
-  that unexpectedly receive an `anyserve+iroh://` input fail pre-handler with
-  non-retryable `direct_unsupported`.
-- *Public n0 relay protection & trade-off*: n0's free public relay
-  (`*.relay.n0.iroh.link`) is rate-limited (~0.12 MB/s measured). When a
-  connection remains on a public n0 relay past `upgrade_window` (`1.5 s`), the
-  worker fails **pre-handler** (zero handler side effects) with non-retryable
-  `direct_public_relay_throttled` (v1 intentionally trades away trying another
-  worker so `max_attempts` is not wasted). If staged input bytes
-  `<= inline_fallback_limit_bytes` (default `8 MiB`), `invoke_direct`
-  automatically strips `anyserve.direct` and re-invokes once inline (propagating
-  any server `max_inline_*` rejection verbatim); larger inputs fail fast.
-  Output-side public-relay-only transfers fail fast (no retroactive inline
-  fallback after `Finish`). For symmetric-NAT production deployments, configure
-  a self-hosted `iroh-relay` via `ANYSERVE_DIRECT_RELAY_URL`.
-- *Observability, build cost, & WAN status*: `anyserve.direct_path`
+  (and streaming-input handlers) that unexpectedly receive an `anyserve+iroh://`
+  input fail pre-handler with non-retryable `direct_unsupported` (`attempt_count = 1`).
+- *Public n0 relay protection, fallback stream semantics, & trade-offs*: n0's
+  free public relay (`*.relay.n0.iroh.link`) is rate-limited (~0.12 MB/s
+  measured). When a connection remains on a public n0 relay past
+  `upgrade_window` (`1.5 s`), `Attempt::open_with_direct` fails **pre-handler**
+  (zero handler side effects) with non-retryable `direct_public_relay_throttled`
+  (v1 intentionally trades away trying another worker so `max_attempts` is not
+  wasted). `invoke_direct` clones the original spec for fallback **only** when
+  staged input bytes `<= inline_fallback_limit_bytes` (default `8 MiB`, avoiding
+  extra retention for large non-fallbackable payloads): on
+  `direct_public_relay_throttled`, `DirectExecutionEvents::message` strips
+  `anyserve.direct` and transparently opens one new inline `Invoke` (callers may
+  have already observed `Accepted`/`Assigned` events for the initial throttled
+  `job_id` before subsequent events switch to the fallback `job_id`; inspect
+  `fell_back_inline()` / `fallback_from_job_id()`, and any server `max_inline_*`
+  rejection is propagated verbatim); larger inputs fail fast. Output-side
+  public-relay-only transfers fail fast (no retroactive inline fallback after
+  `Finish`). For symmetric-NAT production deployments, configure a self-hosted
+  `iroh-relay` via `ANYSERVE_DIRECT_RELAY_URL`.
+- *Observability, dependency impact, & WAN status*: `anyserve.direct_path`
   (`direct | relay`) and `anyserve.direct_bytes` on `ResultChunk.metadata` are
-  **SDK-reported** (not server-audited). Enabling `direct` pulls `iroh 1.5`
-  (`tls-ring`, `presets::Minimal`, no n0 DNS/Pkarr discovery), adding ~117
-  compiled Linux crates, ~+68 s cold release build, dual `reqwest 0.12/0.13`,
-  `sha2 0.10/0.11`, and `noq 1.5` alongside `quinn 0.11`, and ~+4.1 MiB gzipped
-  (~+10.7 MiB raw `.so`) if enabled on `clients/python` (default PyPI wheels do
-  not bundle `iroh`; build optionally with `maturin build --features direct`).
-  Cross-WAN two-host transfer is **untested** in the current CI/sandbox
-  environment; local loopback measurements do not represent WAN throughput.
+  **SDK-reported** (not server-audited). Enabling `direct` on `anyserve-client`
+  pulls `iroh 1.5` (`tls-ring`, `presets::Minimal`, no n0 DNS/Pkarr discovery;
+  ~117 compiled Linux crates, ~+68 s cold release build, optional-only dual
+  `reqwest 0.13`, `sha2 0.11`, `noq 1.5`). In workspace `Cargo.lock`, `iroh 1.5`
+  strictly requires 4 semver-compatible bumps to shared crates (verified
+  non-revertible via `cargo update --precise`): `zeroize 1.8.2 → 1.9.2`
+  (`iroh-base 1.5.0`), `indexmap 2.13.1 → 2.14.2` (`plist 1.10.4 ← netdev ←
+  netwatch ← iroh`), `hashbrown 0.16.1 → 0.17.2` (`indexmap 2.14.2`), and
+  `webpki-roots 1.0.6 → 1.0.12` (`n0-dns-resolver 0.1.1 ← iroh-dns ← iroh`);
+  `tokio` remains `1.51.0` and default `anyserve` / `anyserve-client` /
+  `anyserve-python` dependency trees contain `0` `iroh` crates. Cross-WAN
+  two-host transfer is **untested** in the current CI/sandbox environment; local
+  loopback measurements do not represent WAN throughput.
 
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
