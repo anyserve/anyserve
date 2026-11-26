@@ -4,11 +4,14 @@ Run after cargo build -p anyserve and installing the current wheel. No GPU,
 external database, Redis, or additional Python dependency is required.
 """
 from __future__ import annotations
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import multiprocessing
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -577,6 +580,76 @@ serve([async_unary, async_stream], sys.argv[1], token="worker", worker_id="py-as
             if proc.is_alive():
                 proc.kill()
                 proc.join(timeout=2)
+
+    def test_local_model_worker_example_executes_against_stub_http_backend(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        example_script = repo_root / "examples" / "python" / "local_model_worker.py"
+        self.assertTrue(example_script.is_file(), f"missing example script: {example_script}")
+
+        received: list[tuple[str, str | None, bytes]] = []
+
+        class StubHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                received.append((self.path, self.headers.get("Content-Type"), body))
+                payload = json.loads(body.decode("utf-8"))
+                out = json.dumps({"backend": "stub-http", "echo": payload}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+        stub_port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        interface = f"test.local_model.{uuid.uuid4().hex[:8]}"
+        env = os.environ.copy()
+        env["ANYSERVE_ENDPOINT"] = self.endpoint
+        env["ANYSERVE_TOKEN"] = "worker"
+        env["ANYSERVE_INTERFACE"] = interface
+        env["MODEL_URL"] = f"http://127.0.0.1:{stub_port}/predict"
+        worker_proc = subprocess.Popen(
+            [sys.executable, str(example_script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            request_body = json.dumps({"prompt": "ping", "tokens": 4}).encode("utf-8")
+            reply = self.client.call(
+                interface,
+                request_body,
+                options=ExecutionOptions(total_timeout_ms=15_000),
+            )
+            self.assertEqual(
+                json.loads(reply.decode("utf-8")),
+                {"backend": "stub-http", "echo": {"prompt": "ping", "tokens": 4}},
+            )
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0][0], "/predict")
+            self.assertEqual(received[0][1], "application/json")
+            self.assertEqual(received[0][2], request_body)
+        finally:
+            worker_proc.terminate()
+            try:
+                worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                worker_proc.kill()
+                worker_proc.wait(timeout=2)
+            if worker_proc.stdout:
+                worker_proc.stdout.close()
+            if worker_proc.stderr:
+                worker_proc.stderr.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=3)
 
 
 if __name__ == "__main__":
