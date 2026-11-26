@@ -980,4 +980,22 @@ max_total_pending_jobs = 200
     assert_eq!(vps_guest.max_total_pending_jobs, Some(400));
     assert!(vps_guest.max_total_sessions.unwrap() * 10 <= vps.runtime.max_sessions);
     assert!(vps_guest.max_total_pending_jobs.unwrap() * 5 <= vps.runtime.max_pending_jobs);
+    assert_eq!(vps.runtime.reconnect_grace, None);
+    for iface in ["browser.echo.v1", "browser.llm.v1"] {
+        let policy = vps
+            .runtime
+            .interfaces
+            .get(iface)
+            .unwrap_or_else(|| panic!("deploy/vps/server.toml must configure {iface}"));
+        let browser_tier = policy
+            .pool_tiers
+            .iter()
+            .find(|t| t.pool == "browser")
+            .unwrap_or_else(|| panic!("{iface} must configure browser pool tier"));
+        assert_eq!(browser_tier.reconnect_grace, Some(Duration::from_secs(1)));
+        assert!(
+            policy.pool_tiers.iter().any(|t| t.pool.is_empty()),
+            "{iface} must preserve default-pool fallback tier"
+        );
+    }
 }

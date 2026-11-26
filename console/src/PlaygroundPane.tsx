@@ -154,7 +154,12 @@ export function PlaygroundPane({
     hasRemoteLlm;
   const effectiveWorkerToken = authEnabled ? workerToken.trim() : "";
   const needsWorkerToken = authEnabled && effectiveWorkerToken.length === 0;
-  const reconnectGraceMs = controlPlane?.reconnect_grace_ms ?? controlPlane?.heartbeat_timeout_ms ?? 15_000;
+  const browserPoolGraceMs =
+    remoteInterfaces
+      .find((iface) => iface.name === ECHO_INTERFACE)
+      ?.policy?.pool_tiers?.find((tier) => tier.pool === "browser")?.reconnect_grace_ms ?? null;
+  const defaultGraceMs = controlPlane?.reconnect_grace_ms ?? controlPlane?.heartbeat_timeout_ms ?? 15_000;
+  const reconnectGraceMs = browserPoolGraceMs ?? defaultGraceMs;
   const failoverKillTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(
@@ -718,12 +723,14 @@ export function PlaygroundPane({
               <strong>Real failover (no faked errors):</strong> starts primary + standby workers, routes attempt #1 to{" "}
               <code>browser-worker-1</code> via <code>preferred_attributes</code>, and calls real{" "}
               <code>worker.terminate()</code> during prefill (before the first output token). The control plane detects
-              the dropped WebSocket, holds the lease for <code>reconnect_grace_ms</code> (currently{" "}
-              <strong className="mono">{formatDuration(reconnectGraceMs)}</strong>; configurable via{" "}
-              <code>[runtime].reconnect_grace_ms</code> or per-pool <code>pool_tiers.reconnect_grace_ms</code>), then
-              automatically retries attempt #2 on <code>browser-worker-2</code>. Once tokens have streamed to the
-              caller, AnyServe intentionally fails fast with <code>output_interrupted</code> instead of splicing two
-              streams.
+              the immediate WebSocket EOF, holds the lease for <code>reconnect_grace_ms</code> (currently{" "}
+              <strong className="mono">{formatDuration(reconnectGraceMs)}</strong>
+              {browserPoolGraceMs != null
+                ? ` via browser pool tier; global default stays ${formatDuration(defaultGraceMs)}`
+                : "; default config holds 15.0 s so transient disconnects can reconnect — configure pool_tiers.reconnect_grace_ms (e.g. 1.0 s in deploy/vps/server.toml) for fast browser-pool failover"}
+              ), then automatically retries attempt #2 on <code>browser-worker-2</code>. Once tokens have streamed to
+              the caller, AnyServe intentionally fails fast with <code>output_interrupted</code> instead of splicing
+              two streams.
             </p>
 
             {invokeError ? (

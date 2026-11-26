@@ -56,3 +56,23 @@ max_pending_jobs_per_namespace = 10
 max_interfaces_per_namespace = 4
 max_total_sessions = 400
 max_total_pending_jobs = 400
+
+# Fast failover for ephemeral browser Playground workers (`pool = "browser"`):
+# `worker.terminate()` / tab close triggers immediate WebSocket EOF, so a 1 s
+# reconnect grace lowers failover from the 15 s global default to ~1.5 s while
+# keeping default 15 s reconnect grace for standard workers (`pool = ""`).
+[[runtime.interfaces."browser.echo.v1".pool_tiers]]
+pool = "browser"
+reconnect_grace_ms = 1000
+
+[[runtime.interfaces."browser.echo.v1".pool_tiers]]
+pool = ""
+spillover_after_ms = 0
+
+[[runtime.interfaces."browser.llm.v1".pool_tiers]]
+pool = "browser"
+reconnect_grace_ms = 1000
+
+[[runtime.interfaces."browser.llm.v1".pool_tiers]]
+pool = ""
+spillover_after_ms = 0

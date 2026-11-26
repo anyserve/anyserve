@@ -447,4 +447,68 @@ describe("BrowserWorkerManager & PlaygroundPane", () => {
     expect(invokeRelay).toHaveBeenCalledTimes(1);
     expect(invokeWebRtc).toHaveBeenCalledTimes(1);
   });
+
+  it("displays effective browser pool reconnect_grace_ms (1.0 s override vs 15.0 s default)", () => {
+    const baseControlPlane = {
+      grpc_enabled: false,
+      grpc_listen: "",
+      grpc_tls_enabled: false,
+      console_listen: "127.0.0.1:3001",
+      auth_enabled: false,
+      generation: 1,
+      retained_jobs: 0,
+      sessions: 0,
+      max_sessions: 100,
+      priority_levels: 4,
+      default_max_attempts: 3,
+      heartbeat_interval_ms: 5000,
+      heartbeat_timeout_ms: 15000,
+      reconnect_grace_ms: null,
+    };
+
+    const manager1 = new BrowserWorkerManager(() => makeFakeWorker() as unknown as Worker);
+    const { unmount } = render(
+      <PlaygroundPane
+        controlPlane={baseControlPlane}
+        remoteInterfaces={[]}
+        manager={manager1}
+        onOpenJobInJobs={vi.fn()}
+        onOpenWorkers={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("15.0 s")).toBeTruthy();
+    expect(screen.getByText(/default config holds 15\.0 s/i)).toBeTruthy();
+    unmount();
+
+    const manager2 = new BrowserWorkerManager(() => makeFakeWorker() as unknown as Worker);
+    render(
+      <PlaygroundPane
+        controlPlane={baseControlPlane}
+        remoteInterfaces={[
+          {
+            name: ECHO_INTERFACE,
+            queued: 0,
+            running: 0,
+            oldest_queued_age_ms: 0,
+            sessions: 0,
+            free_slots: 0,
+            policy: {
+              max_queue: null,
+              queue_timeout_ms: null,
+              max_in_flight_per_key: null,
+              pool_tiers: [
+                { pool: "browser", spillover_after_ms: 0, reconnect_grace_ms: 1000 },
+                { pool: "", spillover_after_ms: 0, reconnect_grace_ms: null },
+              ],
+            },
+          },
+        ]}
+        manager={manager2}
+        onOpenJobInJobs={vi.fn()}
+        onOpenWorkers={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("1.0 s")).toBeTruthy();
+    expect(screen.getByText(/via browser pool tier; global default stays 15\.0 s/i)).toBeTruthy();
+  });
 });
