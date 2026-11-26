@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,26 +34,48 @@ const GUEST_MAX_TRACKED_IPS: usize = 4_096;
 #[derive(Default)]
 struct GuestRateLimiterInner {
     global: VecDeque<Instant>,
+    /// Expirations of all unexpired guest sandboxes minted across the configured TTL window.
+    active_expirations: VecDeque<Instant>,
     per_ip: HashMap<String, VecDeque<Instant>>,
 }
 
 pub struct GuestRateLimiter {
     per_ip_limit: usize,
     global_limit: usize,
+    max_active: usize,
+    ttl: Duration,
     inner: Mutex<GuestRateLimiterInner>,
 }
 
 impl GuestRateLimiter {
-    fn new(per_ip_limit: u32, global_limit: u32) -> Self {
+    fn new(per_ip_limit: u32, global_limit: u32, max_active: u32, ttl_secs: u64) -> Self {
         Self {
             per_ip_limit: per_ip_limit.max(1) as usize,
             global_limit: global_limit.max(1) as usize,
+            max_active: max_active.max(1) as usize,
+            ttl: Duration::from_secs(ttl_secs.max(1)),
             inner: Mutex::new(GuestRateLimiterInner::default()),
         }
     }
 
-    fn check_and_record(&self, ip: &str, now: Instant) -> Result<(), u64> {
+    fn check_and_record(&self, key: &str, now: Instant) -> Result<(), u64> {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while guard
+            .active_expirations
+            .front()
+            .is_some_and(|exp| *exp <= now)
+        {
+            guard.active_expirations.pop_front();
+        }
+        if guard.active_expirations.len() >= self.max_active {
+            let wait = guard
+                .active_expirations
+                .front()
+                .map(|exp| exp.saturating_duration_since(now).as_secs().max(1))
+                .unwrap_or(1);
+            return Err(wait);
+        }
+
         while guard
             .global
             .front()
@@ -75,7 +97,7 @@ impl GuestRateLimiter {
             return Err(wait);
         }
 
-        if let Some(bucket) = guard.per_ip.get_mut(ip) {
+        if let Some(bucket) = guard.per_ip.get_mut(key) {
             while bucket
                 .front()
                 .is_some_and(|t| now.saturating_duration_since(*t) >= GUEST_PER_IP_WINDOW)
@@ -115,10 +137,11 @@ impl GuestRateLimiter {
             }
         }
 
+        guard.active_expirations.push_back(now + self.ttl);
         guard.global.push_back(now);
         guard
             .per_ip
-            .entry(ip.to_owned())
+            .entry(key.to_owned())
             .or_default()
             .push_back(now);
         Ok(())
@@ -151,6 +174,8 @@ impl AppState {
         let guest_limiter = Arc::new(GuestRateLimiter::new(
             config.guest_rate_limit_per_ip,
             config.guest_rate_limit_global,
+            config.guest_max_active,
+            config.guest_ttl_secs,
         ));
         Ok(Self {
             config: Arc::new(config),
@@ -524,21 +549,60 @@ async fn api_me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     .into_response()
 }
 
+/// Normalizes a client IP string into a rate-limit bucket key:
+/// - IPv4-mapped IPv6 (`::ffff:a.b.c.d`) collapses to IPv4 `a.b.c.d`.
+/// - Global/unicast IPv6 collapses to its `/64` prefix so rotating host bits
+///   within the same `/64` allocation cannot bypass per-client rate limits.
+/// - Non-IP fallback strings are trimmed and lowercased.
+fn normalize_rate_limit_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let parsed = trimmed
+        .parse::<IpAddr>()
+        .or_else(|_| trimmed.parse::<SocketAddr>().map(|sa| sa.ip()))
+        .or_else(|_| {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .ok_or(())
+                .and_then(|inner| inner.parse::<IpAddr>().map_err(|_| ()))
+        });
+    match parsed {
+        Ok(IpAddr::V4(v4)) => v4.to_string(),
+        Ok(IpAddr::V6(v6)) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.to_string();
+            }
+            let s = v6.segments();
+            let prefix = Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            format!("{prefix}/64")
+        }
+        Err(_) => trimmed.to_ascii_lowercase(),
+    }
+}
+
 fn extract_client_ip(req: &Request, trust_proxy: bool) -> String {
-    if trust_proxy
-        && let Some(xff) = req
+    if trust_proxy {
+        // Inspect ALL `X-Forwarded-For` header lines (last header line first) and
+        // pick the rightmost non-empty entry appended by the reverse proxy.
+        // Client-supplied earlier lines or leftmost entries are untrusted.
+        let xff_lines: Vec<&str> = req
             .headers()
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-    {
-        // Only trust the rightmost hop written by our reverse proxy (e.g. Caddy);
-        // client-supplied leftmost X-Forwarded-For entries are untrusted and ignored.
-        if let Some(last) = xff.rsplit(',').map(str::trim).find(|part| !part.is_empty()) {
-            return last.to_owned();
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        for line in xff_lines.into_iter().rev() {
+            if let Some(last) = line
+                .rsplit(',')
+                .map(str::trim)
+                .find(|part| !part.is_empty())
+            {
+                return normalize_rate_limit_key(last);
+            }
         }
     }
     if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return addr.ip().to_string();
+        return normalize_rate_limit_key(&addr.ip().to_string());
     }
     "direct".to_owned()
 }
@@ -847,6 +911,7 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_plugin_with_guest(
         mock_gh: &str,
         min_age_days: u64,
@@ -854,6 +919,7 @@ mod tests {
         guest_enabled: bool,
         guest_per_ip: u32,
         guest_global: u32,
+        guest_max_active: u32,
         trust_proxy: bool,
     ) -> (String, Config, SqliteStore) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -885,6 +951,7 @@ mod tests {
             guest_ttl_secs: 1_800,
             guest_rate_limit_per_ip: guest_per_ip,
             guest_rate_limit_global: guest_global,
+            guest_max_active,
             trust_proxy,
         };
         let store = SqliteStore::open_in_memory().await.unwrap();
@@ -905,7 +972,8 @@ mod tests {
         allowed: Vec<String>,
     ) -> (String, Config) {
         let (base_url, cfg, _store) =
-            spawn_plugin_with_guest(mock_gh, min_age_days, allowed, false, 10, 120, false).await;
+            spawn_plugin_with_guest(mock_gh, min_age_days, allowed, false, 10, 30, 200, false)
+                .await;
         (base_url, cfg)
     }
 
@@ -1288,7 +1356,8 @@ mod tests {
             guest_enabled: false,
             guest_ttl_secs: 1_800,
             guest_rate_limit_per_ip: 10,
-            guest_rate_limit_global: 120,
+            guest_rate_limit_global: 30,
+            guest_max_active: 200,
             trust_proxy: false,
         };
         assert!(cfg.cookie_secure());
@@ -1402,7 +1471,7 @@ mod tests {
     async fn guest_sandbox_mints_stateless_pair_zero_sqlite_writes_and_enforces_rate_limits() {
         let mock_gh = spawn_mock_github(2, "nobody", "2020-01-01T00:00:00Z").await;
         let (base, cfg, store) =
-            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 100, true).await;
+            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 30, 200, true).await;
         let client = reqwest::Client::new();
 
         // /auth/api/me advertises guest sandbox availability.
@@ -1513,7 +1582,7 @@ mod tests {
         let mock_gh = spawn_mock_github(3, "nobody", "2020-01-01T00:00:00Z").await;
         // trust_proxy=false (fail-closed default): X-Forwarded-For must be ignored completely.
         let (base, _cfg, _store) =
-            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 100, false).await;
+            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 30, 200, false).await;
         let client = reqwest::Client::new();
 
         for spoof in ["198.51.100.1", "198.51.100.2"] {
@@ -1536,5 +1605,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn guest_rate_limit_blocks_multiline_xff_empty_tail_ipv6_rotation_and_max_active() {
+        let mock_gh = spawn_mock_github(4, "nobody", "2020-01-01T00:00:00Z").await;
+        let (base, _cfg, _store) =
+            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 2, 30, 200, true).await;
+        let client = reqwest::Client::new();
+
+        // 1. Multi-line X-Forwarded-For: attacker sends forged first line + proxy appends second line.
+        for forged in ["10.0.0.1", "10.0.0.2"] {
+            let resp = client
+                .post(format!("{base}/auth/api/guest"))
+                .header("x-requested-with", "fetch")
+                .header("x-forwarded-for", forged)
+                .header("x-forwarded-for", "203.0.113.77, , ")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        // 3rd request with a different forged first line + same rightmost second line MUST be 429.
+        let multi_blocked = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "10.0.0.3")
+            .header("x-forwarded-for", "203.0.113.77")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(multi_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 2. Whitespace-only XFF falls back cleanly to real socket peer IP (127.0.0.1).
+        for _ in 0..2 {
+            let resp = client
+                .post(format!("{base}/auth/api/guest"))
+                .header("x-requested-with", "fetch")
+                .header("x-forwarded-for", "  ,   ")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let ws_blocked = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "   ")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ws_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 3. IPv6 /64 rotation: distinct host addresses inside the same /64 share one bucket.
+        for addr in ["2001:db8:1:1::1", "2001:db8:1:1::2"] {
+            let resp = client
+                .post(format!("{base}/auth/api/guest"))
+                .header("x-requested-with", "fetch")
+                .header("x-forwarded-for", addr)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let v6_blocked = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "2001:db8:1:1::3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(v6_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Different /64 prefix succeeds.
+        let v6_other = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "2001:db8:1:2::1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(v6_other.status(), StatusCode::CREATED);
+
+        // 4. IPv4-mapped IPv6 normalizes to IPv4 and shares the same bucket.
+        let r_v4 = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "198.51.100.50")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_v4.status(), StatusCode::CREATED);
+        let r_mapped = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "::ffff:198.51.100.50")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mapped.status(), StatusCode::CREATED);
+        let r_mapped_blocked = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "[::ffff:198.51.100.50]")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_mapped_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 5. Invalid/non-IP string falls back cleanly to trimmed lowercased raw string.
+        for raw_label in ["Unparseable-Proxy-Tag", "  unparseable-proxy-tag  "] {
+            let resp = client
+                .post(format!("{base}/auth/api/guest"))
+                .header("x-requested-with", "fetch")
+                .header("x-forwarded-for", raw_label)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let invalid_blocked = client
+            .post(format!("{base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "UNPARSEABLE-PROXY-TAG")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // 6. Total active-TTL ceiling (`guest_max_active`) caps aggregate guests across distinct IPs.
+        let (cap_base, _cap_cfg, _cap_store) =
+            spawn_plugin_with_guest(&mock_gh, 0, Vec::new(), true, 10, 30, 3, true).await;
+        for ip in ["198.51.100.10", "198.51.100.11", "198.51.100.12"] {
+            let resp = client
+                .post(format!("{cap_base}/auth/api/guest"))
+                .header("x-requested-with", "fetch")
+                .header("x-forwarded-for", ip)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let cap_blocked = client
+            .post(format!("{cap_base}/auth/api/guest"))
+            .header("x-requested-with", "fetch")
+            .header("x-forwarded-for", "198.51.100.13")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cap_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(cap_blocked.headers().contains_key(RETRY_AFTER));
     }
 }

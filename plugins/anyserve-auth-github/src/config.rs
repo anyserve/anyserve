@@ -66,9 +66,12 @@ pub struct Args {
     /// Max guest sandboxes minted per client IP per 10-minute window (ANYSERVE_AUTH_GUEST_RATE_LIMIT_PER_IP, default 10).
     #[arg(long)]
     pub guest_rate_limit_per_ip: Option<u32>,
-    /// Max guest sandboxes minted globally per minute (ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL, default 120).
+    /// Max guest sandboxes minted globally per minute (ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL, default 30).
     #[arg(long)]
     pub guest_rate_limit_global: Option<u32>,
+    /// Max total unexpired guest sandboxes concurrently active across the guest TTL window (ANYSERVE_AUTH_GUEST_MAX_ACTIVE, default 200).
+    #[arg(long)]
+    pub guest_max_active: Option<u32>,
     /// Trust rightmost X-Forwarded-For hop written by a reverse proxy such as Caddy (ANYSERVE_AUTH_TRUST_PROXY, default false).
     #[arg(long)]
     pub trust_proxy: Option<bool>,
@@ -96,6 +99,7 @@ pub struct Config {
     pub guest_ttl_secs: u64,
     pub guest_rate_limit_per_ip: u32,
     pub guest_rate_limit_global: u32,
+    pub guest_max_active: u32,
     pub trust_proxy: bool,
 }
 
@@ -120,6 +124,7 @@ impl std::fmt::Debug for Config {
             .field("guest_ttl_secs", &self.guest_ttl_secs)
             .field("guest_rate_limit_per_ip", &self.guest_rate_limit_per_ip)
             .field("guest_rate_limit_global", &self.guest_rate_limit_global)
+            .field("guest_max_active", &self.guest_max_active)
             .field("trust_proxy", &self.trust_proxy)
             .finish()
     }
@@ -261,7 +266,12 @@ impl Config {
             .clamp(1, 10_000) as u32,
             guest_rate_limit_global: (match args.guest_rate_limit_global {
                 Some(v) => v as u64,
-                None => parse_u64_env("ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL", 120)?,
+                None => parse_u64_env("ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL", 30)?,
+            })
+            .clamp(1, 100_000) as u32,
+            guest_max_active: (match args.guest_max_active {
+                Some(v) => v as u64,
+                None => parse_u64_env("ANYSERVE_AUTH_GUEST_MAX_ACTIVE", 200)?,
             })
             .clamp(1, 100_000) as u32,
             trust_proxy: match args.trust_proxy {

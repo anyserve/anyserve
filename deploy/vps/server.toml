@@ -37,6 +37,9 @@ max_inline_total_bytes = 25165824
 
 # Per-namespace quotas enforced for every tenant, including ephemeral `guest-*`
 # sandboxes when ANYSERVE_AUTH_GUEST_ENABLED=true on the auth plugin.
+# Note: `guest-*` sandboxes share the global `[runtime]` ceilings above
+# (`max_sessions`, `max_pending_jobs`, `max_terminal_jobs`) with `gh-*` tenants;
+# bound active guest count via ANYSERVE_AUTH_GUEST_MAX_ACTIVE when enabling guests.
 [runtime.tenant_quotas]
 max_sessions_per_namespace = 32
 max_pending_jobs_per_namespace = 200
