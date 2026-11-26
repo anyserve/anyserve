@@ -1455,7 +1455,7 @@ impl Runtime {
             }
         };
         if let Some((job, spec, log)) = retained {
-            let (events, _) = log.read_after(0).map_err(RuntimeError::cursor_expired)?;
+            let events = log.inspect_events();
             return Ok(Some(JobInspection {
                 job,
                 spec: Some(spec),

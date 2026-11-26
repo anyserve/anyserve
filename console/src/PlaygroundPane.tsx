@@ -16,13 +16,15 @@ import { invokeWebRtcOrFallback, type RtcInvokeOptions } from "./browser-worker/
 import type { WorkerSlotRole } from "./browser-worker/worker";
 import { formatDuration } from "./format";
 import { IconArrowRight, IconKey, IconPlayground } from "./icons";
-import type { ControlPlaneSummary } from "./types";
+import type { ControlPlaneSummary, InterfaceSummary } from "./types";
 
 interface PlaygroundPaneProps {
   controlPlane?: ControlPlaneSummary;
   authPortalUrl?: string | null;
   lockedNamespace?: string | null;
   initialWorkerToken?: string | null;
+  remoteWorkersOnline?: number;
+  remoteInterfaces?: InterfaceSummary[];
   manager?: BrowserWorkerManager;
   invokeRelay?: (options: StreamingInvokeOptions) => Promise<StreamingInvokeResult>;
   invokeWebRtc?: (options: RtcInvokeOptions) => Promise<StreamingInvokeResult>;
@@ -101,6 +103,8 @@ export function PlaygroundPane({
   authPortalUrl,
   lockedNamespace,
   initialWorkerToken,
+  remoteWorkersOnline = 0,
+  remoteInterfaces = [],
   manager = browserWorkerManager,
   invokeRelay = invokeStreamingJob,
   invokeWebRtc = invokeWebRtcOrFallback,
@@ -142,8 +146,12 @@ export function PlaygroundPane({
   const primaryOnline = primary.status === "online" || primary.status === "busy";
   const standbyOnline = standby.status === "online" || standby.status === "busy";
   const anyOnline = primaryOnline || standbyOnline;
+  const hasReachableWorker = anyOnline || remoteWorkersOnline > 0;
+  const hasRemoteLlm = remoteInterfaces.some((i) => i.name === LLM_INTERFACE && i.sessions > 0);
   const anyModelReady =
-    (primaryOnline && primary.modelStatus === "ready") || (standbyOnline && standby.modelStatus === "ready");
+    (primaryOnline && primary.modelStatus === "ready") ||
+    (standbyOnline && standby.modelStatus === "ready") ||
+    hasRemoteLlm;
   const effectiveWorkerToken = authEnabled ? workerToken.trim() : "";
   const needsWorkerToken = authEnabled && effectiveWorkerToken.length === 0;
   const reconnectGraceMs = controlPlane?.reconnect_grace_ms ?? controlPlane?.heartbeat_timeout_ms ?? 15_000;
@@ -220,7 +228,7 @@ export function PlaygroundPane({
         setInvokeError("Paste a worker token above to start both primary and standby browser workers for the failover demo.");
         return;
       }
-      if (!failoverDemo && !anyOnline) {
+      if (!failoverDemo && !hasReachableWorker) {
         if (needsWorkerToken) {
           setInvokeError("Paste a worker token above and start a browser worker first.");
           return;
@@ -322,7 +330,7 @@ export function PlaygroundPane({
       needsWorkerToken,
       primaryOnline,
       standbyOnline,
-      anyOnline,
+      hasReachableWorker,
       anyModelReady,
       selectedInterface,
       transportMode,
@@ -345,7 +353,7 @@ export function PlaygroundPane({
     setLiveTimeline([]);
     setActiveJobId(null);
 
-    if (!anyOnline) {
+    if (!hasReachableWorker) {
       if (needsWorkerToken) {
         setInvokeError("Paste a worker token above and start a browser worker before running the Relay vs P2P benchmark.");
         return;
@@ -411,7 +419,7 @@ export function PlaygroundPane({
       }
       setRunning(false);
     }
-  }, [anyOnline, needsWorkerToken, ensureSlotOnline, invokeRelay, invokeWebRtc, wsBaseUrl, onRefresh]);
+  }, [hasReachableWorker, needsWorkerToken, ensureSlotOnline, invokeRelay, invokeWebRtc, wsBaseUrl, onRefresh]);
 
   const handleOpenPeerTab = useCallback(() => {
     const url = buildPeerTabUrl(window.location.origin, authEnabled, getConsoleToken());
@@ -575,6 +583,11 @@ export function PlaygroundPane({
           ) : (
             <span className="tag tag--ok">Auth disabled (local anonymous mode) — ready to connect</span>
           )}
+          {!anyOnline && remoteWorkersOnline > 0 ? (
+            <span className="tag tag--ok">
+              Peer mode · {remoteWorkersOnline} remote worker{remoteWorkersOnline === 1 ? "" : "s"} online (no local worker token needed)
+            </span>
+          ) : null}
           <span className="tag mono">WS: {wsBaseUrl}</span>
         </div>
 

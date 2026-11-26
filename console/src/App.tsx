@@ -468,6 +468,13 @@ export default function App() {
   const jumpToJobs = useCallback((opts: { scope?: JobScope; status?: JobStatusFilter; iface?: string; ns?: string; worker?: string; jobId?: string; q?: string }) => {
     const scope = opts.scope ?? "all";
     resetExtraJobs();
+    if (opts.jobId && !loadedJobs.some((j) => j.job_id === opts.jobId)) {
+      // Force a fresh /api/jobs load so the selection-fallback effect does not
+      // overwrite the newly requested jobId with a stale job from an earlier visit.
+      setJobsPage(EMPTY_JOBS);
+      setJobDetail(null);
+      setManualRefreshSeq((s) => s + 1);
+    }
     if (opts.worker && opts.worker !== "all") rememberWorkers([opts.worker]);
     const nextQ = opts.q ?? "";
     setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: lockedTenantNs ?? opts.ns ?? "all", worker: opts.worker ?? "all", q: nextQ });
@@ -479,7 +486,7 @@ export default function App() {
     setActiveTab("jobs");
     const nextPath = routePath("jobs", scope);
     if (window.location.pathname !== nextPath) window.history.pushState(null, "", nextPath);
-  }, [rememberWorkers, lockedTenantNs]);
+  }, [rememberWorkers, lockedTenantNs, loadedJobs]);
 
   const openInterface = useCallback((name: string) => {
     setSelectedInterface(name);
@@ -769,6 +776,8 @@ export default function App() {
               authPortalUrl={authPortalUrl}
               lockedNamespace={lockedTenantNs}
               initialWorkerToken={guestWorkerToken}
+              remoteWorkersOnline={overview?.workers.healthy ?? 0}
+              remoteInterfaces={overview?.interfaces ?? []}
               onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
               onOpenWorkers={() => navigateTo("workers")}
               onRefresh={handleRefresh}

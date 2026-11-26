@@ -363,4 +363,88 @@ describe("BrowserWorkerManager & PlaygroundPane", () => {
     fireEvent.click(waterfallBtns[1]!);
     expect(onOpenJobInJobs).toHaveBeenCalledWith("job-bench-p2p", undefined);
   });
+
+  it("allows a peer tab without a worker token to invoke & benchmark remote online workers", async () => {
+    const workers: ReturnType<typeof makeFakeWorker>[] = [];
+    const manager = new BrowserWorkerManager(() => {
+      const w = makeFakeWorker();
+      workers.push(w);
+      return w;
+    });
+    const invokeRelay = vi.fn().mockResolvedValue({
+      jobId: "job-peer-relay",
+      state: "succeeded",
+      text: "",
+      error: null,
+      workerId: "browser-worker-1",
+      attempts: 1,
+      restarted: false,
+      failoverMs: null,
+      ttftMs: 10,
+      totalMs: 30,
+      transportActual: "relay",
+      fallbackReason: null,
+      iceMs: null,
+      p2pBytes: 0,
+      relayedPayloadBytes: 524_288,
+      streamDurationMs: 20,
+      framesReceived: 32,
+      timeline: [],
+    });
+    const invokeWebRtc = vi.fn().mockResolvedValue({
+      jobId: "job-peer-p2p",
+      state: "succeeded",
+      text: "",
+      error: null,
+      workerId: "browser-worker-1",
+      attempts: 1,
+      restarted: false,
+      failoverMs: null,
+      ttftMs: 45,
+      totalMs: 60,
+      transportActual: "p2p",
+      fallbackReason: null,
+      iceMs: 35,
+      p2pBytes: 524_288,
+      relayedPayloadBytes: 0,
+      streamDurationMs: 10,
+      framesReceived: 32,
+      timeline: [],
+    });
+
+    render(
+      <PlaygroundPane
+        controlPlane={{
+          grpc_enabled: false,
+          grpc_listen: "",
+          grpc_tls_enabled: false,
+          console_listen: "127.0.0.1:3001",
+          auth_enabled: true,
+          generation: 1,
+          retained_jobs: 0,
+          sessions: 1,
+          max_sessions: 100,
+          priority_levels: 4,
+          default_max_attempts: 3,
+          heartbeat_interval_ms: 5000,
+          heartbeat_timeout_ms: 15000,
+          reconnect_grace_ms: 15000,
+        }}
+        remoteWorkersOnline={1}
+        manager={manager}
+        invokeRelay={invokeRelay}
+        invokeWebRtc={invokeWebRtc}
+        onOpenJobInJobs={vi.fn()}
+        onOpenWorkers={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/Peer mode · 1 remote worker online/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Benchmark: Relay vs P2P/i }));
+    await waitFor(() => expect(screen.getByLabelText(/Relay vs WebRTC P2P benchmark/i)).toBeTruthy());
+    // Must NOT spawn any local worker on Tab 2.
+    expect(workers.length).toBe(0);
+    expect(invokeRelay).toHaveBeenCalledTimes(1);
+    expect(invokeWebRtc).toHaveBeenCalledTimes(1);
+  });
 });
