@@ -264,12 +264,20 @@ impl Inner {
         if st.unfinished_jobs >= self.config.max_pending_jobs {
             return Err(RuntimeError::exhausted("unfinished job limit reached"));
         }
-        let quotas = &self.config.tenant_quotas;
+        let quotas = self.config.tenant_quotas.resolve_for(namespace);
         if let Some(ns_pending_limit) = quotas.max_pending_jobs_per_namespace
             && st.job_index.namespace_pending_count(namespace) >= ns_pending_limit
         {
             return Err(RuntimeError::exhausted(format!(
                 "unfinished job limit reached for namespace '{namespace}'"
+            )));
+        }
+        if let (Some(prefix), Some(prefix_pending_limit)) =
+            (quotas.matched_prefix, quotas.max_total_pending_jobs)
+            && st.job_index.prefix_pending_count(prefix) >= prefix_pending_limit
+        {
+            return Err(RuntimeError::exhausted(format!(
+                "unfinished job limit reached for namespace prefix '{prefix}'"
             )));
         }
         let interface = &spec.demand.interface;
@@ -721,16 +729,16 @@ impl Inner {
                     .or_default()
                     .insert(interface.to_string(), next_cursor);
                 rotation_pending = true;
-            } else if let Some(m) = st.scan_cursor.get_mut(namespace) {
-                m.remove(interface);
+            } else {
+                State::remove_nested(&mut st.scan_cursor, namespace, interface);
             }
             {
                 let seen: HashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
                 window.retain(|k| !seen.contains(k.job_id.as_str()));
             }
             keys.extend(window);
-        } else if let Some(m) = st.scan_cursor.get_mut(namespace) {
-            m.remove(interface);
+        } else {
+            State::remove_nested(&mut st.scan_cursor, namespace, interface);
         }
         let priority_cap = self.config.priority_levels.saturating_sub(1);
         let policy = self.config.interfaces.get(interface);

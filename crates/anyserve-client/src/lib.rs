@@ -1,8 +1,70 @@
 //! Native clients and outbound worker sessions for the execution protocol.
+#[cfg(feature = "direct")]
+pub mod direct;
 pub mod execution;
 pub(crate) mod ws_transport;
 pub use anyserve_proto::v2;
 pub use execution::ExecutionClient;
+
+/// URI scheme for AnyServe's optional `iroh` peer-to-peer direct object transfer.
+pub const DIRECT_URI_SCHEME: &str = "anyserve+iroh";
+/// Capability flag carried in `Hello.attributes`, `Demand.required_attributes`,
+/// and `JobSpec.metadata` to negotiate direct data-plane support without core changes.
+pub const DIRECT_CAPABILITY_KEY: &str = "anyserve.direct";
+pub const DIRECT_CAPABILITY_VALUE: &str = "1";
+/// Content-addressed metadata keys matching `anyserve-core` and Cloudflare DO identity hashing.
+pub const OBJECT_SHA256_METADATA_KEY: &str = "anyserve.sha256";
+pub const OBJECT_SIZE_METADATA_KEY: &str = "anyserve.size_bytes";
+/// SDK-reported observability metadata keys attached to `ResultChunk.metadata`.
+pub const DIRECT_PATH_METADATA_KEY: &str = "anyserve.direct_path";
+pub const DIRECT_BYTES_METADATA_KEY: &str = "anyserve.direct_bytes";
+/// Non-retryable attempt error codes produced before handler execution.
+pub const ERROR_CODE_DIRECT_UNSUPPORTED: &str = "direct_unsupported";
+pub const ERROR_CODE_DIRECT_PUBLIC_RELAY_THROTTLED: &str = "direct_public_relay_throttled";
+
+/// Returns `true` when `uri` uses the `anyserve+iroh://` scheme.
+pub fn is_direct_uri(uri: &str) -> bool {
+    uri.starts_with("anyserve+iroh://")
+}
+
+/// Redacts the capability token path segment and any `addr=` IP query values of
+/// an `anyserve+iroh://` URI for safe logging and UI display while preserving
+/// endpoint ID and `relay=` URLs. Non-direct URIs are returned unchanged.
+pub fn redact_direct_uri(uri: &str) -> String {
+    let Some(rest) = uri.strip_prefix("anyserve+iroh://") else {
+        return uri.to_owned();
+    };
+    let (without_frag, frag) = match rest.find('#') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    let (authority_and_path, query) = match without_frag.find('?') {
+        Some(idx) => (&without_frag[..idx], Some(&without_frag[idx + 1..])),
+        None => (without_frag, None),
+    };
+    let redacted_authority_path = match authority_and_path.split_once('/') {
+        Some((authority, path)) if !path.is_empty() => format!("{authority}/[redacted]"),
+        _ => authority_and_path.to_owned(),
+    };
+    let redacted_query = query.map(|q| {
+        q.split('&')
+            .map(|pair| {
+                if pair.starts_with("addr=") {
+                    "addr=[redacted]".to_owned()
+                } else {
+                    pair.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    });
+    match redacted_query {
+        Some(q) if !q.is_empty() => {
+            format!("anyserve+iroh://{redacted_authority_path}?{q}{frag}")
+        }
+        _ => format!("anyserve+iroh://{redacted_authority_path}{frag}"),
+    }
+}
 
 use anyhow::{Context, Result, anyhow};
 use std::time::Duration;

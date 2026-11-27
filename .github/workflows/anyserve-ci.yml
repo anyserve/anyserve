@@ -65,6 +65,24 @@ jobs:
         env:
           ANYSERVE_TEST_POSTGRES_URL: postgresql://anyserve_ci:anyserve_ci@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/anyserve_ci
 
+  rust-direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: direct
+      - run: cargo clippy --locked -p anyserve-client -p anyserve --features direct --all-targets -- -D warnings
+      - run: cargo test --locked -p anyserve-client --features direct
+      - run: cargo test --locked -p anyserve --features direct --test direct_runtime_e2e
+
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 20

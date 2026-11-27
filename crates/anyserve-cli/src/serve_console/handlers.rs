@@ -4,13 +4,14 @@ use std::sync::atomic::Ordering;
 
 use anyserve_core::auth::{AuthPolicy, DEFAULT_NAMESPACE, Principal};
 use anyserve_core::error::{ErrorKind, RuntimeError};
+use anyserve_core::http_ws_service::GRPC_CODE_HEADER;
 use anyserve_core::now_ms;
 use anyserve_core::runtime::api::{JobQuery, JobScan, JobState};
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    ORIGIN, VARY,
+    ACCESS_CONTROL_EXPOSE_HEADERS, ORIGIN, VARY,
 };
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -460,6 +461,11 @@ async fn cors_middleware(
                 HeaderValue::from_static(
                     "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
                 ),
+            );
+        } else {
+            headers.insert(
+                ACCESS_CONTROL_EXPOSE_HEADERS,
+                HeaderValue::from_static(GRPC_CODE_HEADER),
             );
         }
     }

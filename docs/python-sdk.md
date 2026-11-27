@@ -33,7 +33,17 @@ metadata=None)` builds `{"inline": bytes, "metadata": dict}`;
 `uri_object(uri, metadata=None, *, sha256=None, size_bytes=None, content_type=None)`
 attaches content digests (`anyserve.sha256` / `anyserve.size_bytes`) so
 transient presigned URLs still deduplicate under `job_id` idempotency. Set
-`@worker(..., uri_resolver=...)` to resolve URI inputs into bytes.
+`@worker(..., uri_resolver=...)` to resolve non-direct URI inputs (e.g. `s3://`,
+`https://`) into bytes; without `uri_resolver`, non-direct URIs fail pre-handler
+with `code="worker_failed"`, `retryable=False` (`attempt_count=1`, zero retries).
+The optional `anyserve+iroh://` direct data plane (v1) is **Rust SDK only**
+(`anyserve-client --features direct`); `anyserve-runtime` Python wheels do not
+bundle `iroh`. Normal `invoke_direct` traffic never routes to Python workers
+(which do not advertise `anyserve.direct=1`), and if an `anyserve+iroh://` URI
+is sent manually to a Python worker, the underlying Rust `Attempt::open` /
+`open_stream` / `input_chunk` rejects it pre-handler with non-retryable
+`direct_unsupported` (`retryable=False`, `attempt_count=1`, handler never called;
+see [configuration.md](configuration.md)).
 
 | Method | Result |
 |---|---|

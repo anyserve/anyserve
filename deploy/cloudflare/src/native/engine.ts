@@ -16,6 +16,7 @@ import {
 import {
   formatAnalyticsNextCursor,
   handleConsoleOrHealthRequest,
+  withCorsHeaders,
   type AdminResetResult,
   type ConsoleAnalyticsResult,
   type ConsoleAnalyticsScan,
@@ -694,10 +695,11 @@ export class NativeEngine implements ConsoleBackend {
 
     // Unary protobuf routes (/rpc/v2/client/*)
     if (path.startsWith("/rpc/v2/client/") && method === "POST") {
-      return await this.handleUnaryClientRpc(request, path, nowMs);
+      const res = await this.handleUnaryClientRpc(request, path, nowMs);
+      return withCorsHeaders(request, res, this.host.env);
     }
 
-    return new Response("Not Found", { status: 404 });
+    return withCorsHeaders(request, new Response("Not Found", { status: 404 }), this.host.env);
   }
 
   countOpenSocketsByKind(): {
@@ -770,10 +772,13 @@ export class NativeEngine implements ConsoleBackend {
 
     // Pre-upgrade authentication (HTTP 401/16, 403/7, 400/3)
     let principal: Principal;
+    let selectedProtocol: string | null = null;
     try {
-      principal = isWorker
-        ? await this.auth.verifyWorkerHeaders(request.headers)
-        : await this.auth.verifyClientHeaders(request.headers);
+      const authRes = isWorker
+        ? await this.auth.verifyWsWorkerHeaders(request.headers)
+        : await this.auth.verifyWsClientHeaders(request.headers);
+      principal = authRes.principal;
+      selectedProtocol = authRes.selectedProtocol;
     } catch (err) {
       if (err instanceof GrpcStatusError) {
         return grpcErrorResponse(err);
@@ -865,7 +870,9 @@ export class NativeEngine implements ConsoleBackend {
     // All WebSocket handshakes (session/attempt/invoke/watch) expire at heartbeatTimeoutMs if initial frame never arrives.
     await this.refreshAlarm(nowMs);
 
-    return pair.toUpgradeResponse();
+    return pair.toUpgradeResponse(
+      selectedProtocol ? { "Sec-WebSocket-Protocol": selectedProtocol } : undefined,
+    );
   }
 
   noteConnId(connId: number): void {

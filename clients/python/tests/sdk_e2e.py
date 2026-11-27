@@ -4,11 +4,14 @@ Run after cargo build -p anyserve and installing the current wheel. No GPU,
 external database, Redis, or additional Python dependency is required.
 """
 from __future__ import annotations
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import multiprocessing
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,7 +40,9 @@ def run_worker(endpoint: str, interface: str, kind: str, marker: str | None = No
     else:
         @worker(interface=interface, max_active_leases=4, pass_context=True)
         def handler(payload, context):
-            if kind == "slow":
+            if kind == "mark" and marker:
+                Path(marker).write_text(context.attempt_id)
+            elif kind == "slow":
                 if marker:
                     Path(marker).write_text(context.attempt_id)
                 until = time.monotonic() + 2
@@ -526,6 +531,125 @@ serve([async_unary, async_stream], sys.argv[1], token="worker", worker_id="py-as
             self.fail("forked child deadlocked using shared_runtime()")
         self.assertEqual(proc.exitcode, 0)
         self.assertEqual(queue.get(timeout=1), ("ok", True))
+
+    def test_direct_uri_rejected_by_default_python_worker_as_direct_unsupported(self):
+        interface = f"test.python.direct_unsupported.{uuid.uuid4().hex[:8]}"
+        marker = self.path / f"handler-called-{uuid.uuid4().hex[:8]}.txt"
+        ctx = multiprocessing.get_context("spawn")
+        proc = ctx.Process(
+            target=run_worker,
+            args=(self.endpoint, interface, "mark", str(marker)),
+        )
+        proc.start()
+        try:
+            job = self.client.submit(
+                interface,
+                [
+                    uri_object(
+                        "anyserve+iroh://0000000000000000000000000000000000000000000000000000000000000001/0123456789abcdef0123456789abcdef",
+                        sha256="0" * 64,
+                        size_bytes=128,
+                    )
+                ],
+                options=ExecutionOptions(max_attempts=3, total_timeout_ms=10_000),
+            )
+            done = eventually(
+                lambda: (
+                    g if (g := self.client.get(job["job_id"]))["state"] == "failed" else None
+                ),
+                timeout=10,
+            )
+            self.assertEqual(done["error"]["code"], "direct_unsupported")
+            self.assertFalse(done["error"]["retryable"])
+            self.assertEqual(done["attempt_count"], 1)
+            self.assertFalse(
+                marker.exists(),
+                "Python handler must NOT be invoked when anyserve+iroh:// input is rejected",
+            )
+            # Worker session stays healthy and serves subsequent normal inline work.
+            reply = self.client.call(
+                interface,
+                b"still-healthy",
+                options=ExecutionOptions(total_timeout_ms=10_000),
+            )
+            self.assertEqual(reply, b"still-healthy")
+            self.assertTrue(marker.exists())
+        finally:
+            proc.terminate()
+            proc.join(timeout=5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=2)
+
+    def test_local_model_worker_example_executes_against_stub_http_backend(self):
+        repo_root = Path(__file__).resolve().parents[3]
+        example_script = repo_root / "examples" / "python" / "local_model_worker.py"
+        self.assertTrue(example_script.is_file(), f"missing example script: {example_script}")
+
+        received: list[tuple[str, str | None, bytes]] = []
+
+        class StubHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                received.append((self.path, self.headers.get("Content-Type"), body))
+                payload = json.loads(body.decode("utf-8"))
+                out = json.dumps({"backend": "stub-http", "echo": payload}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+        stub_port = server.server_address[1]
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+
+        interface = f"test.local_model.{uuid.uuid4().hex[:8]}"
+        env = os.environ.copy()
+        env["ANYSERVE_ENDPOINT"] = self.endpoint
+        env["ANYSERVE_TOKEN"] = "worker"
+        env["ANYSERVE_INTERFACE"] = interface
+        env["MODEL_URL"] = f"http://127.0.0.1:{stub_port}/predict"
+        worker_proc = subprocess.Popen(
+            [sys.executable, str(example_script)],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            request_body = json.dumps({"prompt": "ping", "tokens": 4}).encode("utf-8")
+            reply = self.client.call(
+                interface,
+                request_body,
+                options=ExecutionOptions(total_timeout_ms=15_000),
+            )
+            self.assertEqual(
+                json.loads(reply.decode("utf-8")),
+                {"backend": "stub-http", "echo": {"prompt": "ping", "tokens": 4}},
+            )
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0][0], "/predict")
+            self.assertEqual(received[0][1], "application/json")
+            self.assertEqual(received[0][2], request_body)
+        finally:
+            worker_proc.terminate()
+            try:
+                worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                worker_proc.kill()
+                worker_proc.wait(timeout=2)
+            if worker_proc.stdout:
+                worker_proc.stdout.close()
+            if worker_proc.stderr:
+                worker_proc.stderr.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=3)
 
 
 if __name__ == "__main__":

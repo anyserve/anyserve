@@ -5,6 +5,7 @@ COPY console/package.json console/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci
 COPY console/ ./
+COPY deploy/cloudflare/src/native/proto.ts /src/deploy/cloudflare/src/native/proto.ts
 RUN npm run build
 
 FROM rust:1.99.1-bookworm AS build

@@ -46,16 +46,44 @@ struct NamespaceIndex {
 #[derive(Default)]
 pub(crate) struct JobIndex {
     namespaces: HashMap<String, NamespaceIndex>,
+    /// Maintained only when at least one `prefix_overrides` entry configures
+    /// `max_total_pending_jobs`; deployments without it pay zero map/alloc cost.
+    track_pending_namespaces: bool,
+    /// Unfinished (queued + running) counts for namespaces with `pending > 0`,
+    /// ordered lexicographically so prefix aggregate lookups run in
+    /// `O(log N_active + K_active)` instead of scanning jobs or terminal namespaces.
+    pending_namespaces: BTreeMap<String, usize>,
     counts: [usize; 5],
 }
 
 impl JobIndex {
+    pub(crate) fn with_pending_namespace_tracking(enabled: bool) -> Self {
+        Self {
+            track_pending_namespaces: enabled,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracks_pending_namespaces(&self) -> bool {
+        self.track_pending_namespaces
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_namespaces_is_empty(&self) -> bool {
+        self.pending_namespaces.is_empty()
+    }
     #[cfg(test)]
     pub(crate) fn unfinished_ids(&self) -> impl Iterator<Item = &str> + Clone {
         self.namespaces
             .values()
             .flat_map(|ns| ns.jobs[0].iter().chain(ns.jobs[1].iter()))
             .map(|(_, id)| id.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn namespace_count(&self) -> usize {
+        self.namespaces.len()
     }
 
     pub(crate) fn position(job: &Job) -> Position {
@@ -72,6 +100,10 @@ impl JobIndex {
     }
 
     pub(crate) fn insert_state(&mut self, job: &Job) {
+        self.insert_state_inner(job, true);
+    }
+
+    fn insert_state_inner(&mut self, job: &Job, sync_pending: bool) {
         let state = slot(job.state());
         let key = (Reverse(job.updated_at_ms), job.id.clone());
         self.counts[state] += 1;
@@ -87,6 +119,26 @@ impl JobIndex {
                 .queued_since
                 .insert((job.queued_since_ms, job.id.clone()));
         }
+        if self.track_pending_namespaces && sync_pending && state <= 1 {
+            let pending = ns.jobs[0].len() + ns.jobs[1].len();
+            if let Some(count) = self.pending_namespaces.get_mut(&job.namespace) {
+                *count = pending;
+            } else {
+                self.pending_namespaces
+                    .insert(job.namespace.clone(), pending);
+            }
+        }
+    }
+
+    /// Moves a job whose public state or ordering timestamp changed. Skips
+    /// `pending_namespaces` updates when the job stays unfinished (e.g.
+    /// `Queued -> Running`) or stays terminal.
+    pub(crate) fn move_position(&mut self, job: &Job, previous: Position) {
+        let prev_pending = slot(previous.0) <= 1;
+        let next_pending = slot(job.state()) <= 1;
+        let pending_changed = prev_pending != next_pending;
+        self.remove_position_inner(job, previous, false, pending_changed && prev_pending);
+        self.insert_state_inner(job, pending_changed && next_pending);
     }
 
     pub(crate) fn remove(&mut self, job: &Job, prune: bool) {
@@ -173,6 +225,16 @@ impl JobIndex {
     }
 
     pub(crate) fn remove_position(&mut self, job: &Job, position: Position, prune: bool) {
+        self.remove_position_inner(job, position, prune, true);
+    }
+
+    fn remove_position_inner(
+        &mut self,
+        job: &Job,
+        position: Position,
+        prune: bool,
+        sync_pending: bool,
+    ) {
         let (previous_state, updated_at_ms, queued_since_ms) = position;
         let state = slot(previous_state);
         self.counts[state] = self.counts[state].saturating_sub(1);
@@ -189,6 +251,14 @@ impl JobIndex {
                 }
                 if prune && ns_iface.jobs.iter().all(BTreeSet::is_empty) {
                     ns.interfaces.remove(name);
+                }
+            }
+            if self.track_pending_namespaces && sync_pending && state <= 1 {
+                let pending = ns.jobs[0].len() + ns.jobs[1].len();
+                if pending == 0 {
+                    self.pending_namespaces.remove(&job.namespace);
+                } else if let Some(count) = self.pending_namespaces.get_mut(&job.namespace) {
+                    *count = pending;
                 }
             }
         }
@@ -391,6 +461,21 @@ impl JobIndex {
             .map_or(0, |ns| ns.jobs[0].len() + ns.jobs[1].len())
     }
 
+    /// Counts unfinished (queued + running) jobs across all namespaces matching
+    /// `prefix` via the active-namespace `BTreeMap` range (populated only when
+    /// a `prefix_overrides` rule sets `max_total_pending_jobs`).
+    /// Complexity: `O(log N_active + K_active)`, where `N_active` is the number
+    /// of namespaces with `>= 1` unfinished job and `K_active` is the matching
+    /// subset (independent of total job count and retained terminal namespaces).
+    pub(crate) fn prefix_pending_count(&self, prefix: &str) -> usize {
+        debug_assert!(self.track_pending_namespaces);
+        self.pending_namespaces
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|(ns, _)| ns.starts_with(prefix))
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
     pub(crate) fn interfaces(&self, now: u64) -> BTreeMap<String, InterfaceStats> {
         let mut merged: BTreeMap<String, InterfaceStats> = BTreeMap::new();
         for ns in self.namespaces.values() {
@@ -480,6 +565,19 @@ pub(crate) fn assert_matches_jobs(st: &super::state::State) {
     }
     assert_eq!(st.job_index.counts(), expected_counts);
     assert_eq!(st.job_index.interfaces(now), expected_interfaces);
+    if st.job_index.tracks_pending_namespaces() {
+        let mut expected_pending_namespaces: BTreeMap<String, usize> = BTreeMap::new();
+        for job in st.jobs.values() {
+            if !job.is_terminal() {
+                *expected_pending_namespaces
+                    .entry(job.namespace.clone())
+                    .or_default() += 1;
+            }
+        }
+        assert_eq!(st.job_index.pending_namespaces, expected_pending_namespaces);
+    } else {
+        assert!(st.job_index.pending_namespaces.is_empty());
+    }
     let interfaces = [None, Some("missing".to_string())]
         .into_iter()
         .chain(expected_interfaces.keys().cloned().map(Some));
@@ -658,5 +756,94 @@ mod tests {
                 .map(|(_, id)| id)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn pending_namespace_index_tracks_only_when_prefix_aggregate_configured() {
+        use super::super::api::{NamespaceQuotaOverride, TenantQuotas};
+
+        let runtime = Runtime::start(RuntimeConfig {
+            max_terminal_jobs: 2,
+            tenant_quotas: TenantQuotas {
+                prefix_overrides: vec![NamespaceQuotaOverride {
+                    prefix: "guest-".into(),
+                    max_total_pending_jobs: Some(10),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert!(runtime.inner.lock().job_index.tracks_pending_namespaces());
+        let mut ids = Vec::new();
+        for (ns, raw) in [
+            ("guest-a", "j1"),
+            ("guest-a", "j2"),
+            ("guest-b", "j3"),
+            ("gh-1", "j4"),
+        ] {
+            let mut spec = JobSpec::default();
+            spec.demand.interface = "demo".into();
+            spec.policy.durability = Some(Durability::Ephemeral);
+            runtime
+                .submit(SubmitRequest {
+                    namespace: Some(ns.into()),
+                    job_id: Some(raw.into()),
+                    spec,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            ids.push((
+                ns.to_string(),
+                raw.to_string(),
+                super::super::identity::encode_scoped_id(ns, raw),
+            ));
+        }
+        {
+            let mut st = runtime.inner.lock();
+            assert_matches_jobs(&st);
+            assert_eq!(st.job_index.prefix_pending_count("guest-"), 3);
+            assert_eq!(st.job_index.prefix_pending_count("gh-"), 1);
+
+            // Walk through every unfinished phase transition (Queued <-> Running) via move_position.
+            for phase in [
+                Phase::Starting,
+                Phase::Assigned,
+                Phase::Running,
+                Phase::Queued,
+                Phase::Running,
+            ] {
+                st.update_job(&ids[2].2, |job| {
+                    job.phase = phase;
+                    job.updated_at_ms += 1;
+                });
+                assert_matches_jobs(&st);
+                assert_eq!(st.job_index.prefix_pending_count("guest-"), 3);
+            }
+            let mut plan = TerminalPlan::new(JobState::Succeeded, None);
+            *plan.previous = Phase::Running;
+            st.update_job(&ids[2].2, |job| {
+                job.phase = Phase::Terminating(Box::new(plan));
+            });
+            assert_matches_jobs(&st);
+            assert_eq!(st.job_index.prefix_pending_count("guest-"), 3);
+            st.update_job(&ids[2].2, |job| {
+                job.phase = Phase::Queued;
+            });
+            assert_matches_jobs(&st);
+        }
+
+        // Cancelling every job drains pending_namespaces completely to empty.
+        for (ns, raw, _) in &ids {
+            runtime.cancel_in(ns, raw, "done".into()).await.unwrap();
+            assert_matches_jobs(&runtime.inner.lock());
+        }
+        let st = runtime.inner.lock();
+        assert_eq!(st.job_index.prefix_pending_count("guest-"), 0);
+        assert!(st.job_index.pending_namespaces_is_empty());
     }
 }

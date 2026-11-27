@@ -699,12 +699,25 @@ impl JournalConfigFile {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NamespaceQuotaOverrideFile {
+    prefix: String,
+    max_sessions_per_namespace: Option<usize>,
+    max_pending_jobs_per_namespace: Option<usize>,
+    max_interfaces_per_namespace: Option<usize>,
+    max_total_sessions: Option<usize>,
+    max_total_pending_jobs: Option<usize>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TenantQuotasFile {
     max_sessions_per_namespace: Option<usize>,
     max_pending_jobs_per_namespace: Option<usize>,
     max_interfaces_per_namespace: Option<usize>,
+    #[serde(default)]
+    prefix_overrides: Vec<NamespaceQuotaOverrideFile>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -839,10 +852,35 @@ impl RuntimeConfigFile {
             }
         }
         if let Some(quotas) = self.tenant_quotas {
+            let mut seen_prefixes = std::collections::HashSet::new();
+            let mut prefix_overrides = Vec::with_capacity(quotas.prefix_overrides.len());
+            for entry in quotas.prefix_overrides {
+                if anyserve_core::auth::validate_namespace(&entry.prefix).is_err() {
+                    anyhow::bail!(
+                        "runtime.tenant_quotas.prefix_overrides[].prefix '{}' must be 1..=64 ASCII characters in [a-zA-Z0-9._-]",
+                        entry.prefix
+                    );
+                }
+                if !seen_prefixes.insert(entry.prefix.clone()) {
+                    anyhow::bail!(
+                        "duplicate runtime.tenant_quotas.prefix_overrides prefix '{}'",
+                        entry.prefix
+                    );
+                }
+                prefix_overrides.push(anyserve_core::runtime::api::NamespaceQuotaOverride {
+                    prefix: entry.prefix,
+                    max_sessions_per_namespace: entry.max_sessions_per_namespace,
+                    max_pending_jobs_per_namespace: entry.max_pending_jobs_per_namespace,
+                    max_interfaces_per_namespace: entry.max_interfaces_per_namespace,
+                    max_total_sessions: entry.max_total_sessions,
+                    max_total_pending_jobs: entry.max_total_pending_jobs,
+                });
+            }
             config.tenant_quotas = anyserve_core::runtime::api::TenantQuotas {
                 max_sessions_per_namespace: quotas.max_sessions_per_namespace,
                 max_pending_jobs_per_namespace: quotas.max_pending_jobs_per_namespace,
                 max_interfaces_per_namespace: quotas.max_interfaces_per_namespace,
+                prefix_overrides,
             };
         }
         for name in self.interfaces.keys() {

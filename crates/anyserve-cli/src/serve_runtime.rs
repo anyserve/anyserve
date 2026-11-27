@@ -102,6 +102,53 @@ fn connectable_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+fn percent_encode_uri_component(input: &str) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn console_http_base_url(console_addr: SocketAddr, public_endpoint: Option<&str>) -> String {
+    if let Some(raw) = public_endpoint {
+        let trimmed = raw.trim();
+        let without_fragment = trimmed.split('#').next().unwrap_or(trimmed).trim();
+        let base = without_fragment.trim_end_matches('/');
+        if let Some((scheme, rest)) = base.split_once("://")
+            && !rest.is_empty()
+        {
+            if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss") {
+                return format!("https://{rest}");
+            }
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("ws") {
+                return format!("http://{rest}");
+            }
+        }
+    }
+    format!("http://{}", connectable_socket_addr(console_addr))
+}
+
+fn console_login_url(summary: &StartupSummary<'_>) -> Option<String> {
+    let console_addr = summary.console_addr?;
+    let auto = summary.auto_tokens?;
+    let token = auto.client_token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let base = console_http_base_url(console_addr, summary.public_endpoint);
+    Some(format!(
+        "{base}/#token={}",
+        percent_encode_uri_component(token)
+    ))
+}
+
 pub(crate) fn format_startup_summary(summary: &StartupSummary<'_>) -> String {
     use std::fmt::Write;
 
@@ -153,6 +200,9 @@ pub(crate) fn format_startup_summary(summary: &StartupSummary<'_>) -> String {
         };
         let _ = writeln!(out, "  Auth:     {state}");
     }
+    if let Some(login_url) = console_login_url(summary) {
+        let _ = writeln!(out, "  Console login: {login_url}");
+    }
 
     let endpoint = summary
         .public_endpoint
@@ -180,6 +230,38 @@ pub(crate) fn format_startup_summary(summary: &StartupSummary<'_>) -> String {
     }
 
     out.trim_end_matches('\n').to_owned()
+}
+
+fn emit_startup_ready(summary: &StartupSummary<'_>, json_logs: bool) {
+    if json_logs {
+        let grpc_str = summary.grpc_addr.map(|a| a.to_string());
+        let console_str = summary.console_addr.map(|a| a.to_string());
+        let auto_token_source =
+            summary
+                .auto_tokens
+                .map(|auto| match (&auto.persisted_path, auto.reused_existing) {
+                    (Some(_), true) => "reloaded",
+                    (Some(_), false) => "persisted",
+                    (None, _) => "ephemeral",
+                });
+        let auto_token_path = summary
+            .auto_tokens
+            .and_then(|auto| auto.persisted_path.as_ref())
+            .map(|p| p.display().to_string());
+        info!(
+            grpc = grpc_str.as_deref(),
+            grpc_tls = summary.grpc_tls_enabled,
+            console = console_str.as_deref(),
+            embedded_ui = summary.embedded_console_ui,
+            public_endpoint = summary.public_endpoint,
+            auth_enabled = summary.auth_enabled,
+            auto_token_source,
+            auto_token_path = auto_token_path.as_deref(),
+            "anyserve relay ready"
+        );
+    } else {
+        eprintln!("{}", format_startup_summary(summary));
+    }
 }
 
 pub(crate) fn validate_listeners(config: &ResolvedServeConfig) -> Result<()> {
@@ -412,46 +494,16 @@ pub(crate) async fn run(args: ServeArgs, json_logs: bool) -> Result<()> {
         );
     }
 
-    if json_logs {
-        let grpc_str = grpc_bound_addr.map(|a| a.to_string());
-        let console_str = console_bound_addr.map(|a| a.to_string());
-        let auto_token_source =
-            auto_tokens
-                .as_ref()
-                .map(|auto| match (&auto.persisted_path, auto.reused_existing) {
-                    (Some(_), true) => "reloaded",
-                    (Some(_), false) => "persisted",
-                    (None, _) => "ephemeral",
-                });
-        let auto_token_path = auto_tokens
-            .as_ref()
-            .and_then(|auto| auto.persisted_path.as_ref())
-            .map(|p| p.display().to_string());
-        info!(
-            grpc = grpc_str.as_deref(),
-            grpc_tls = tls,
-            console = console_str.as_deref(),
-            embedded_ui = cfg!(feature = "embed-console"),
-            public_endpoint = public_endpoint.as_deref(),
-            auth_enabled = auth.is_enabled(),
-            auto_token_source,
-            auto_token_path = auto_token_path.as_deref(),
-            "anyserve relay ready"
-        );
-    } else {
-        eprintln!(
-            "{}",
-            format_startup_summary(&StartupSummary {
-                grpc_addr: grpc_bound_addr,
-                grpc_tls_enabled: tls,
-                console_addr: console_bound_addr,
-                embedded_console_ui: cfg!(feature = "embed-console"),
-                public_endpoint: public_endpoint.as_deref(),
-                auth_enabled: auth.is_enabled(),
-                auto_tokens: auto_tokens.as_ref(),
-            })
-        );
-    }
+    let summary = StartupSummary {
+        grpc_addr: grpc_bound_addr,
+        grpc_tls_enabled: tls,
+        console_addr: console_bound_addr,
+        embedded_console_ui: cfg!(feature = "embed-console"),
+        public_endpoint: public_endpoint.as_deref(),
+        auth_enabled: auth.is_enabled(),
+        auto_tokens: auto_tokens.as_ref(),
+    };
+    emit_startup_ready(&summary, json_logs);
 
     let mut lease_lost = false;
     let failure = tokio::select! {
@@ -943,6 +995,135 @@ mod grpc_toggle_tests {
             Some(&ephemeral),
         );
         assert!(ephemeral_banner.contains("Auth:     enabled (auto-generated, ephemeral)"));
+        assert!(!anonymous.contains("Console login:"));
+        assert!(!static_auth.contains("Console login:"));
+        assert!(!reloaded_banner.contains("Console login:"));
+        assert!(!ephemeral_banner.contains("Console login:"));
+        assert!(auto_saved.contains(
+            "Console login: http://127.0.0.1:3001/#token=as_c_0123456789abcdef0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn startup_summary_formats_console_login_url_variants_and_encodes_token() {
+        let auto = AutoTokens {
+            client_token: "as_c_a+b/c=d&e#f%g h".into(),
+            worker_token: "as_w_secret".into(),
+            persisted_path: None,
+            reused_existing: false,
+        };
+
+        let ipv6_wildcard = format_startup_summary(&StartupSummary {
+            grpc_addr: None,
+            grpc_tls_enabled: false,
+            console_addr: Some("[::]:3001".parse().unwrap()),
+            embedded_console_ui: true,
+            public_endpoint: None,
+            auth_enabled: true,
+            auto_tokens: Some(&auto),
+        });
+        assert!(
+            ipv6_wildcard.contains(
+                "Console login: http://[::1]:3001/#token=as_c_a%2Bb%2Fc%3Dd%26e%23f%25g%20h"
+            ),
+            "{ipv6_wildcard}"
+        );
+
+        let wss_public = format_startup_summary(&StartupSummary {
+            grpc_addr: None,
+            grpc_tls_enabled: false,
+            console_addr: Some("127.0.0.1:3001".parse().unwrap()),
+            embedded_console_ui: true,
+            public_endpoint: Some("wss://demo.trycloudflare.com/"),
+            auth_enabled: true,
+            auto_tokens: Some(&auto),
+        });
+        assert!(
+            wss_public.contains(
+                "Console login: https://demo.trycloudflare.com/#token=as_c_a%2Bb%2Fc%3Dd%26e%23f%25g%20h"
+            ),
+            "{wss_public}"
+        );
+
+        let http_public = format_startup_summary(&StartupSummary {
+            grpc_addr: Some("127.0.0.1:50052".parse().unwrap()),
+            grpc_tls_enabled: false,
+            console_addr: Some("0.0.0.0:3001".parse().unwrap()),
+            embedded_console_ui: true,
+            public_endpoint: Some("http://relay.local:8080/console/"),
+            auth_enabled: true,
+            auto_tokens: Some(&auto),
+        });
+        assert!(
+            http_public.contains(
+                "Console login: http://relay.local:8080/console/#token=as_c_a%2Bb%2Fc%3Dd%26e%23f%25g%20h"
+            ),
+            "{http_public}"
+        );
+    }
+
+    #[test]
+    fn startup_json_log_never_leaks_auto_tokens_or_login_url() {
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let auto = AutoTokens {
+            client_token: "as_c_supersecretclient+token".into(),
+            worker_token: "as_w_supersecretworker+token".into(),
+            persisted_path: Some(PathBuf::from(".anyserve/tokens.env")),
+            reused_existing: false,
+        };
+        let summary = StartupSummary {
+            grpc_addr: None,
+            grpc_tls_enabled: false,
+            console_addr: Some("0.0.0.0:3001".parse().unwrap()),
+            embedded_console_ui: true,
+            public_endpoint: Some("wss://demo.example.com"),
+            auth_enabled: true,
+            auto_tokens: Some(&auto),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            emit_startup_ready(&summary, true);
+        });
+
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("anyserve relay ready"), "{logged}");
+        assert!(logged.contains("auth_enabled=true"), "{logged}");
+        assert!(
+            logged.contains("auto_token_source=\"persisted\""),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("public_endpoint=\"wss://demo.example.com\""),
+            "{logged}"
+        );
+        for secret in [
+            "as_c_supersecretclient+token",
+            "as_c_supersecretclient%2Btoken",
+            "as_w_supersecretworker+token",
+            "#token=",
+        ] {
+            assert!(!logged.contains(secret), "leaked {secret} in {logged}");
+        }
     }
 
     #[test]

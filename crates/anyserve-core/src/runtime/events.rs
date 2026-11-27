@@ -131,6 +131,12 @@ pub(crate) struct JobLog {
 
 struct LogInner {
     events: VecDeque<(ExecutionEvent, usize)>,
+    /// Pre-`Finished` lifecycle events (`Accepted`, `Assigned`, `AttemptRestarted`),
+    /// retained separately from the compactable output stream so management inspection
+    /// (e.g. Console Execution Waterfall) still reconstructs attempts and retry gaps
+    /// after `compact_finished` frees streaming output chunks. Bounded to
+    /// `<= 2 * max_attempts_limit + 1` tiny structs with zero payload bytes.
+    lifecycle: Vec<ExecutionEvent>,
     bytes: usize,
     last_sequence: u64,
     /// Highest sequence no longer readable; 0 when nothing was dropped.
@@ -171,6 +177,7 @@ impl JobLog {
             job_id,
             inner: Mutex::new(LogInner {
                 events: VecDeque::new(),
+                lifecycle: Vec::new(),
                 bytes: 0,
                 last_sequence: base_sequence,
                 evicted_through: 0,
@@ -245,11 +252,15 @@ impl JobLog {
     /// at most 2N + 1 of them: Accepted, Finished, one Assigned per attempt
     /// and one AttemptRestarted per retried attempt. Only unfinished and
     /// retained terminal jobs have logs, so with M = `max_attempts_limit` the
-    /// allowance stays below `(max_pending_jobs + max_terminal_jobs) ×
-    /// (2M + 1) × EVENT_OVERHEAD`: 110 000 × 41 × 96 B ≈ 433 MB with the
-    /// defaults, under the default `max_event_bytes`. Outputs carried by
-    /// `Finished` share their buffers with the job's result, which the result
-    /// budget covers.
+    /// `event_bytes` allowance stays below `(max_pending_jobs + max_terminal_jobs)
+    /// × (2M + 1) × EVENT_OVERHEAD`: 110 000 × 41 × 96 B ≈ 433 MB with the
+    /// defaults, under the default `max_event_bytes`. Pre-`Finished` events are
+    /// also cloned into `inner.lifecycle` (kept outside `event_bytes` compaction
+    /// so inspection still reconstructs attempts after `compact_finished`), which
+    /// adds at most `2M` tiny zero-payload `ExecutionEvent` structs per retained
+    /// job (`<= (max_pending_jobs + max_terminal_jobs) × 2M` structs total).
+    /// Outputs carried by `Finished` share their buffers with the job's result,
+    /// which the result budget covers.
     pub(crate) fn append(&self, attempt_id: Option<String>, kind: EventKind, at_ms: u64) -> u64 {
         let mut inner = self.lock();
         if inner.finished {
@@ -268,6 +279,9 @@ impl JobLog {
             at_ms,
             kind,
         };
+        if !finished {
+            inner.lifecycle.push(event.clone());
+        }
         self.push(&mut inner, event, size);
         inner.finished = finished;
         drop(inner);
@@ -328,6 +342,31 @@ impl JobLog {
     /// Wakes followers for output appended up to `sequence`.
     pub(crate) fn notify_appended(&self, sequence: u64) {
         self.changed.send_replace(sequence);
+    }
+
+    /// Management inspection snapshot: preserves lifecycle events (`Accepted`,
+    /// `Assigned`, `AttemptRestarted`) even after `compact_finished` drops
+    /// streaming `Output` chunks from `events`, while leaving `read_after` /
+    /// `Watch` cursor semantics untouched.
+    pub(crate) fn inspect_events(&self) -> Vec<ExecutionEvent> {
+        let inner = self.lock();
+        if inner.evicted_through == 0 {
+            return inner
+                .events
+                .iter()
+                .map(|(event, _)| event.clone())
+                .collect();
+        }
+        let mut out = Vec::with_capacity(inner.lifecycle.len() + inner.events.len());
+        for event in &inner.lifecycle {
+            if event.sequence <= inner.evicted_through {
+                out.push(event.clone());
+            }
+        }
+        for (event, _) in &inner.events {
+            out.push(event.clone());
+        }
+        out
     }
 
     /// Events after `after`, and whether the log is finished. `after == 0`
@@ -766,5 +805,73 @@ mod tests {
         );
         assert!(log.read_after(seqs[4]).unwrap().0.is_empty());
         assert!(log.read_after(seqs[4] + 10).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn inspect_events_preserves_lifecycle_after_compaction_frees_outputs() {
+        let log = log(10, 1 << 20, 1 << 20);
+        log.append(None, EventKind::Accepted, 1_000);
+        log.append(
+            Some("att-1".into()),
+            EventKind::Assigned {
+                worker_id: "w-1".into(),
+                attempt_number: 1,
+            },
+            1_010,
+        );
+        output(&log, 4_096).unwrap();
+        log.append(
+            None,
+            EventKind::AttemptRestarted {
+                previous_attempt_id: "att-1".into(),
+                reason: super::super::api::ErrorInfo::new("worker_lost", "session ended", true),
+            },
+            1_200,
+        );
+        log.append(
+            Some("att-2".into()),
+            EventKind::Assigned {
+                worker_id: "w-2".into(),
+                attempt_number: 2,
+            },
+            1_220,
+        );
+        output(&log, 4_096).unwrap();
+        log.append(
+            Some("att-2".into()),
+            EventKind::Finished {
+                state: super::super::api::JobState::Succeeded,
+                outputs: Vec::new(),
+                error: None,
+                handler_duration_ms: Some(42),
+            },
+            1_300,
+        );
+        log.compact_finished();
+
+        // Watch / read_after only sees Finished (streaming output bytes freed).
+        let (stream_events, finished) = log.read_after(0).unwrap();
+        assert!(finished);
+        assert_eq!(stream_events.len(), 1);
+        assert!(matches!(stream_events[0].kind, EventKind::Finished { .. }));
+        assert_eq!(log.bytes(), EVENT_OVERHEAD);
+
+        // Management inspection reconstructs the full lifecycle for Execution Waterfall.
+        let inspected = log.inspect_events();
+        assert_eq!(inspected.len(), 5);
+        assert!(matches!(inspected[0].kind, EventKind::Accepted));
+        assert!(matches!(inspected[1].kind, EventKind::Assigned { .. }));
+        assert!(matches!(
+            inspected[2].kind,
+            EventKind::AttemptRestarted { .. }
+        ));
+        assert!(matches!(inspected[3].kind, EventKind::Assigned { .. }));
+        assert!(matches!(
+            inspected[4].kind,
+            EventKind::Finished {
+                handler_duration_ms: Some(42),
+                ..
+            }
+        ));
     }
 }

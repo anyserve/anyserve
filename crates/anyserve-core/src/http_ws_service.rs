@@ -28,7 +28,7 @@ use prost::Message as ProstMessage;
 use tokio::sync::{Notify, mpsc};
 use tonic::Status;
 
-use crate::auth::{AuthPolicy, Principal, Role, wait_credential_invalidated};
+use crate::auth::{AuthPolicy, Principal, Role, WsAuthResult, wait_credential_invalidated};
 use crate::client_service::{
     cancel_request, event_to_proto, get_job_request, handle_invoke_message, list_jobs_request,
     start_invoke, submit_request,
@@ -134,6 +134,33 @@ fn authorize_http(
         .ensure_active_leader()
         .map_err(|err| status_response(Status::from(err)))?;
     Ok(principal)
+}
+
+fn authorize_ws(
+    state: &HttpWsState,
+    headers: &HeaderMap,
+    role: Role,
+) -> Result<WsAuthResult, Response> {
+    let result = match role {
+        Role::Client => state.auth.verify_ws_client_headers(headers),
+        Role::Worker => state.auth.verify_ws_worker_headers(headers),
+    }
+    .map_err(status_response)?;
+    state
+        .runtime
+        .ensure_active_leader()
+        .map_err(|err| status_response(Status::from(err)))?;
+    Ok(result)
+}
+
+fn apply_ws_subprotocol(
+    ws: WebSocketUpgrade,
+    selected_protocol: Option<&'static str>,
+) -> WebSocketUpgrade {
+    match selected_protocol {
+        Some(proto) => ws.protocols([proto]),
+        None => ws,
+    }
 }
 
 async fn handle_unary_client<Req, Resp, F, Fut>(
@@ -312,18 +339,19 @@ async fn ws_worker_session(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let principal = match authorize_http(&state, &headers, Role::Worker) {
-        Ok(principal) => principal,
+    let auth_res = match authorize_ws(&state, &headers, Role::Worker) {
+        Ok(res) => res,
         Err(response) => return response,
     };
     let max_ctrl = state.runtime.config().limits.max_control_message_bytes as usize;
-    ws.max_frame_size(max_ctrl)
+    apply_ws_subprotocol(ws, auth_res.selected_protocol)
+        .max_frame_size(max_ctrl)
         .max_message_size(max_ctrl)
         .on_upgrade(move |socket| {
             handle_worker_session(
                 state.runtime,
                 state.auth,
-                principal,
+                auth_res.principal,
                 socket,
                 state.ping_interval,
             )
@@ -335,17 +363,18 @@ async fn ws_worker_attempt(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let principal = match authorize_http(&state, &headers, Role::Worker) {
-        Ok(principal) => principal,
+    let auth_res = match authorize_ws(&state, &headers, Role::Worker) {
+        Ok(res) => res,
         Err(response) => return response,
     };
-    ws.max_frame_size(WS_MAX_FRAME_SIZE)
+    apply_ws_subprotocol(ws, auth_res.selected_protocol)
+        .max_frame_size(WS_MAX_FRAME_SIZE)
         .max_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
             handle_worker_attempt(
                 state.runtime,
                 state.auth,
-                principal,
+                auth_res.principal,
                 socket,
                 state.ping_interval,
             )
@@ -357,18 +386,19 @@ async fn ws_client_invoke(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let principal = match authorize_http(&state, &headers, Role::Client) {
-        Ok(principal) => principal,
+    let auth_res = match authorize_ws(&state, &headers, Role::Client) {
+        Ok(res) => res,
         Err(response) => return response,
     };
     let trace_headers = extract_http_trace_headers(&headers);
-    ws.max_frame_size(WS_MAX_FRAME_SIZE)
+    apply_ws_subprotocol(ws, auth_res.selected_protocol)
+        .max_frame_size(WS_MAX_FRAME_SIZE)
         .max_message_size(anyserve_proto::MAX_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
             handle_client_invoke(
                 state.runtime,
                 state.auth,
-                principal,
+                auth_res.principal,
                 socket,
                 state.ping_interval,
                 trace_headers,
@@ -381,17 +411,18 @@ async fn ws_client_watch(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let principal = match authorize_http(&state, &headers, Role::Client) {
-        Ok(principal) => principal,
+    let auth_res = match authorize_ws(&state, &headers, Role::Client) {
+        Ok(res) => res,
         Err(response) => return response,
     };
-    ws.max_frame_size(WS_WATCH_MAX_BYTES)
+    apply_ws_subprotocol(ws, auth_res.selected_protocol)
+        .max_frame_size(WS_WATCH_MAX_BYTES)
         .max_message_size(WS_WATCH_MAX_BYTES)
         .on_upgrade(move |socket| {
             handle_client_watch(
                 state.runtime,
                 state.auth,
-                principal,
+                auth_res.principal,
                 socket,
                 state.ping_interval,
             )
@@ -2434,5 +2465,162 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert_eq!(watch_code, tonic::Code::Unauthenticated as u8);
+    }
+
+    #[tokio::test]
+    async fn ws_subprotocol_bearer_auth_negotiates_v2_and_rejects_conflicts_and_bad_tokens() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let auth = AuthPolicy::new(["client-secret".into()], ["worker-secret".into()]);
+        let server = TestServer::start(RuntimeConfig::default(), auth).await;
+
+        let connect_proto = |path: &str, auth_hdr: Option<&str>, protocols: Option<&str>| {
+            let url = format!("{}{path}", server.base_ws);
+            let auth_hdr = auth_hdr.map(str::to_owned);
+            let protocols = protocols.map(str::to_owned);
+            async move {
+                let mut req = url.into_client_request().unwrap();
+                if let Some(a) = auth_hdr {
+                    req.headers_mut()
+                        .insert(header::AUTHORIZATION, a.parse().unwrap());
+                }
+                if let Some(p) = protocols {
+                    req.headers_mut()
+                        .insert(header::SEC_WEBSOCKET_PROTOCOL, p.parse().unwrap());
+                }
+                match tokio_tungstenite::connect_async(req).await {
+                    Ok((ws, resp)) => {
+                        let echoed = resp
+                            .headers()
+                            .get(header::SEC_WEBSOCKET_PROTOCOL)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        Ok((ws, echoed))
+                    }
+                    Err(tungstenite::Error::Http(resp)) => {
+                        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+                        let code = resp.headers()[GRPC_CODE_HEADER]
+                            .to_str()
+                            .unwrap()
+                            .parse::<i32>()
+                            .unwrap();
+                        Err((status, code))
+                    }
+                    Err(other) => panic!("unexpected ws error: {other}"),
+                }
+            }
+        };
+
+        let worker_b64 = URL_SAFE_NO_PAD.encode("worker-secret");
+        let client_b64 = URL_SAFE_NO_PAD.encode("client-secret");
+        let bad_b64 = URL_SAFE_NO_PAD.encode("wrong-secret");
+
+        // 1. Valid worker subprotocol upgrades and echoes ONLY `anyserve.v2`.
+        let (mut ws, echoed) = connect_proto(
+            "/ws/v2/worker/session",
+            None,
+            Some(&format!("anyserve.v2, anyserve.bearer.{worker_b64}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(echoed.as_deref(), Some("anyserve.v2"));
+        let _ = ws.close(None).await;
+
+        // 2. Valid client subprotocol upgrades on /ws/v2/client/invoke.
+        let (mut cws, c_echoed) = connect_proto(
+            "/ws/v2/client/invoke",
+            None,
+            Some(&format!("anyserve.v2, anyserve.bearer.{client_b64}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c_echoed.as_deref(), Some("anyserve.v2"));
+        let _ = cws.close(None).await;
+
+        // 3. Cross-role client token on worker WS -> 403 / PermissionDenied (7).
+        assert_eq!(
+            connect_proto(
+                "/ws/v2/worker/session",
+                None,
+                Some(&format!("anyserve.v2, anyserve.bearer.{client_b64}")),
+            )
+            .await
+            .unwrap_err(),
+            (StatusCode::FORBIDDEN, tonic::Code::PermissionDenied as i32)
+        );
+
+        // 4. Unknown token via subprotocol -> 401 / Unauthenticated (16).
+        assert_eq!(
+            connect_proto(
+                "/ws/v2/worker/session",
+                None,
+                Some(&format!("anyserve.v2, anyserve.bearer.{bad_b64}")),
+            )
+            .await
+            .unwrap_err(),
+            (
+                StatusCode::UNAUTHORIZED,
+                tonic::Code::Unauthenticated as i32
+            )
+        );
+
+        // 5. Conflict: Authorization header + bearer subprotocol -> 400 / InvalidArgument (3).
+        assert_eq!(
+            connect_proto(
+                "/ws/v2/worker/session",
+                Some("Bearer worker-secret"),
+                Some(&format!("anyserve.v2, anyserve.bearer.{worker_b64}")),
+            )
+            .await
+            .unwrap_err(),
+            (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument as i32)
+        );
+
+        // 6. Missing `anyserve.v2` alongside bearer subprotocol -> 400 / InvalidArgument (3).
+        assert_eq!(
+            connect_proto(
+                "/ws/v2/worker/session",
+                None,
+                Some(&format!("anyserve.bearer.{worker_b64}")),
+            )
+            .await
+            .unwrap_err(),
+            (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument as i32)
+        );
+
+        // 7. Duplicate bearer subprotocols or malformed base64url -> 400 / InvalidArgument (3).
+        for bad in [
+            format!("anyserve.v2, anyserve.bearer.{worker_b64}, anyserve.bearer.{worker_b64}"),
+            "anyserve.v2, anyserve.bearer.not+valid=".to_string(),
+            "anyserve.v2, anyserve.bearer.".to_string(),
+        ] {
+            assert_eq!(
+                connect_proto("/ws/v2/worker/session", None, Some(&bad))
+                    .await
+                    .unwrap_err(),
+                (StatusCode::BAD_REQUEST, tonic::Code::InvalidArgument as i32),
+                "case {bad}"
+            );
+        }
+
+        // 8. Anonymous mode with `anyserve.v2` subprotocol echoes `anyserve.v2`.
+        let anon = TestServer::start(RuntimeConfig::default(), AuthPolicy::default()).await;
+        let mut req = format!("{}/ws/v2/worker/session", anon.base_ws)
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            "anyserve.v2".parse().unwrap(),
+        );
+        let (mut aws, aresp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        assert_eq!(
+            aresp
+                .headers()
+                .get(header::SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|v| v.to_str().ok()),
+            Some("anyserve.v2")
+        );
+        let _ = aws.close(None).await;
     }
 }

@@ -823,6 +823,11 @@ impl Runtime {
         let standby_backend = (!initially_active)
             .then(|| journal.as_ref().cloned())
             .flatten();
+        let track_pending_namespaces = config
+            .tenant_quotas
+            .prefix_overrides
+            .iter()
+            .any(|entry| entry.max_total_pending_jobs.is_some());
         let inner = Arc::new_cyclic(|me| Inner {
             generation: AtomicU64::new(generation),
             leader_active: AtomicBool::new(initially_active),
@@ -833,6 +838,9 @@ impl Runtime {
             lease_handle: Mutex::new(None),
             state: Mutex::new(State {
                 generation,
+                job_index: index::JobIndex::with_pending_namespace_tracking(
+                    track_pending_namespaces,
+                ),
                 rng: generation ^ 0x5DEE_CE66_D1CE_4E5B,
                 ..State::default()
             }),
@@ -1455,7 +1463,7 @@ impl Runtime {
             }
         };
         if let Some((job, spec, log)) = retained {
-            let (events, _) = log.read_after(0).map_err(RuntimeError::cursor_expired)?;
+            let events = log.inspect_events();
             return Ok(Some(JobInspection {
                 job,
                 spec: Some(spec),

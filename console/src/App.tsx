@@ -1,11 +1,13 @@
-import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import {
   AuthenticationError,
   AuthorizationError,
   cancelJob,
   clearConsoleToken,
+  createGuestSandbox,
   drainWorker,
+  fetchGuestStatus,
   fetchInfo,
   getJob,
   getJobs,
@@ -20,6 +22,7 @@ import {
   JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, QUEUE_STATES,
   resolveEffectiveStates, routePath, scopeMap, WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type Theme, type TimeFilterState,
 } from "./app-constants";
+import { browserWorkerManager } from "./browser-worker/manager";
 import { ConnectWorkerModal } from "./ConnectWorkerModal";
 import { asErrorMessage, formatPool, poolKey, sameHistogram, sameJobs, sameWorkers, sortJobs, sortWorkers, toSelectOptions } from "./format";
 import { InterfacesPane } from "./InterfacesPane";
@@ -27,6 +30,7 @@ import { TIME_PRESET_MS } from "./JobsHistogram";
 import { JobsPane } from "./JobsPane";
 import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
+import { PlaygroundPane } from "./PlaygroundPane";
 import { PoolsPane, type PoolFilterSeed } from "./PoolsPane";
 import { Sidebar } from "./Sidebar";
 import type { InfoResponse, JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
@@ -123,6 +127,9 @@ export default function App() {
   const [authRequired, setAuthRequired] = useState(false);
   const [authenticated, setAuthenticated] = useState(() => consumeHashToken() || hasConsoleToken());
   const [info, setInfo] = useState<InfoResponse | null>(null);
+  const [guestStatus, setGuestStatus] = useState<{ enabled: boolean; ttlSecs: number }>({ enabled: false, ttlSecs: 1800 });
+  const [guestStarting, setGuestStarting] = useState(false);
+  const [guestWorkerToken, setGuestWorkerToken] = useState<string | null>(null);
   const [token, setToken] = useState("");
   const [manualRefreshSeq, setManualRefreshSeq] = useState(0);
   const loadMoreAbort = useRef<AbortController | null>(null);
@@ -461,6 +468,13 @@ export default function App() {
   const jumpToJobs = useCallback((opts: { scope?: JobScope; status?: JobStatusFilter; iface?: string; ns?: string; worker?: string; jobId?: string; q?: string }) => {
     const scope = opts.scope ?? "all";
     resetExtraJobs();
+    if (opts.jobId && !loadedJobs.some((j) => j.job_id === opts.jobId)) {
+      // Force a fresh /api/jobs load so the selection-fallback effect does not
+      // overwrite the newly requested jobId with a stale job from an earlier visit.
+      setJobsPage(EMPTY_JOBS);
+      setJobDetail(null);
+      setManualRefreshSeq((s) => s + 1);
+    }
     if (opts.worker && opts.worker !== "all") rememberWorkers([opts.worker]);
     const nextQ = opts.q ?? "";
     setFilters({ status: opts.status ?? "all", iface: opts.iface ?? "all", ns: lockedTenantNs ?? opts.ns ?? "all", worker: opts.worker ?? "all", q: nextQ });
@@ -472,7 +486,7 @@ export default function App() {
     setActiveTab("jobs");
     const nextPath = routePath("jobs", scope);
     if (window.location.pathname !== nextPath) window.history.pushState(null, "", nextPath);
-  }, [rememberWorkers, lockedTenantNs]);
+  }, [rememberWorkers, lockedTenantNs, loadedJobs]);
 
   const openInterface = useCallback((name: string) => {
     setSelectedInterface(name);
@@ -522,9 +536,11 @@ export default function App() {
   }, [activeTab, filters.ns, jobScope, jumpToJobs, openPoolsByTarget]);
 
   const handleDisconnect = useCallback(() => {
+    browserWorkerManager.stopAll();
     loadMoreAbort.current?.abort();
     loadMoreAbort.current = null;
     clearConsoleToken();
+    setGuestWorkerToken(null);
     setAuthenticated(false); setOverview(null); setWorkers([]); setWorkersResponse(null);
     setKnownWorkers([]); setFilters(EMPTY_FILTERS); setServerSearch("");
     setSelectedJobByScope(EMPTY_SCOPE_SELECTION); setPinnedJobByScope(EMPTY_SCOPE_SELECTION);
@@ -532,17 +548,80 @@ export default function App() {
     setJobsPage(EMPTY_JOBS); setJobDetail(null); setError(null); requireAuth();
   }, [requireAuth]);
 
+  const browserWorkerSnap = useSyncExternalStore(
+    browserWorkerManager.subscribe,
+    browserWorkerManager.getSnapshot,
+    browserWorkerManager.getSnapshot,
+  );
+  const browserWorkersLive = Object.values(browserWorkerSnap.slots).filter(
+    (s) => s.status === "online" || s.status === "busy",
+  ).length;
+
   const handleToggleTheme = useCallback(() => setTheme((c) => (c === "light" ? "dark" : "light")), []);
   const handleRefresh = useCallback(() => setManualRefreshSeq((s) => s + 1), []);
   const handleSelectTab = useCallback((tab: ConsoleTab) => navigateTo(tab), [navigateTo]);
 
   const loginAuthPortalUrl = safeHttpUrl(info?.auth_portal_url);
 
+  useEffect(() => {
+    if (!authRequired || !loginAuthPortalUrl) {
+      setGuestStatus({ enabled: false, ttlSecs: 1800 });
+      return;
+    }
+    const ctrl = new AbortController();
+    void fetchGuestStatus(loginAuthPortalUrl, ctrl.signal).then((res) => {
+      if (!ctrl.signal.aborted) {
+        setGuestStatus({ enabled: res.guest_enabled, ttlSecs: res.guest_ttl_secs ?? 1800 });
+      }
+    });
+    return () => ctrl.abort();
+  }, [authRequired, loginAuthPortalUrl]);
+
+  const handleStartGuestDemo = useCallback(async () => {
+    if (!loginAuthPortalUrl || guestStarting) return;
+    setGuestStarting(true);
+    setError(null);
+    try {
+      const sandbox = await createGuestSandbox(loginAuthPortalUrl);
+      setConsoleToken(sandbox.client_token);
+      setGuestWorkerToken(sandbox.worker_token);
+      setToken("");
+      setAuthenticated(true);
+      authRequiredRef.current = false;
+      setAuthRequired(false);
+      setActiveTab("playground");
+      const nextPath = routePath("playground", jobScope);
+      if (window.location.pathname !== nextPath) {
+        window.history.pushState(null, "", nextPath);
+      }
+    } catch (err) {
+      setError(asErrorMessage(err));
+    } finally {
+      setGuestStarting(false);
+    }
+  }, [loginAuthPortalUrl, guestStarting, jobScope]);
+
   if (authRequired) {
+    const guestMinutes = Math.max(1, Math.round(guestStatus.ttlSecs / 60));
     return (
       <main className="auth">
-        <form className="auth__form" onSubmit={(e) => { e.preventDefault(); setConsoleToken(token); setToken(""); setAuthenticated(true); setError(null); authRequiredRef.current = false; setAuthRequired(false); }}>
+        <form className="auth__form" onSubmit={(e) => { e.preventDefault(); setConsoleToken(token); setGuestWorkerToken(null); setToken(""); setAuthenticated(true); setError(null); authRequiredRef.current = false; setAuthRequired(false); }}>
           <div className="auth__head"><h1>AnyServe Console</h1><p className="auth__sub">Authenticate with a client token to inspect the control plane.</p></div>
+          {guestStatus.enabled ? (
+            <div className="auth__guest">
+              <button
+                type="button"
+                className="auth__guest-btn"
+                disabled={guestStarting}
+                onClick={() => void handleStartGuestDemo()}
+              >
+                {guestStarting ? "Creating Guest Sandbox…" : `Try Live Demo (No Login · ${guestMinutes}m Sandbox)`}
+              </button>
+              <p className="auth__guest-note">
+                Mints an isolated stateless <code>guest-*</code> namespace with ephemeral client + browser worker tokens.
+              </p>
+            </div>
+          ) : null}
           <label htmlFor="client-token">Client token</label>
           <input id="client-token" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} required />
           {error ? <p className="auth__error" role="alert">{error}</p> : null}
@@ -566,6 +645,7 @@ export default function App() {
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
         overview={overview}
+        browserWorkersLive={browserWorkersLive}
         theme={theme}
         onToggleTheme={handleToggleTheme}
         onRefresh={handleRefresh}
@@ -689,6 +769,19 @@ export default function App() {
                 onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
               />
             </Suspense>
+          ) : null}
+          {activeTab === "playground" ? (
+            <PlaygroundPane
+              controlPlane={overview?.control_plane}
+              authPortalUrl={authPortalUrl}
+              lockedNamespace={lockedTenantNs}
+              initialWorkerToken={guestWorkerToken}
+              remoteWorkersOnline={overview?.workers.healthy ?? 0}
+              remoteInterfaces={overview?.interfaces ?? []}
+              onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
+              onOpenWorkers={() => navigateTo("workers")}
+              onRefresh={handleRefresh}
+            />
           ) : null}
         </main>
       </div>

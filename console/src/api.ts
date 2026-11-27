@@ -89,6 +89,73 @@ export function getOverview(signal?: AbortSignal): Promise<OverviewResponse> {
   return request("/api/overview", { signal });
 }
 
+export interface GuestStatusResponse {
+  guest_enabled: boolean;
+  guest_ttl_secs?: number;
+}
+
+export interface GuestSandboxResponse {
+  namespace: string;
+  client_token: string;
+  worker_token: string;
+  expires_at: number;
+  ttl_secs: number;
+}
+
+function sameOriginAuthPath(authPortalUrl: string | null | undefined, path: string): string | null {
+  const safe = safeHttpUrl(authPortalUrl);
+  if (!safe || typeof window === "undefined") return null;
+  try {
+    const portal = new URL(safe);
+    if (portal.origin !== window.location.origin) return null;
+    return `${portal.origin}${path}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchGuestStatus(
+  authPortalUrl: string | null | undefined,
+  signal?: AbortSignal,
+): Promise<GuestStatusResponse> {
+  const url = sameOriginAuthPath(authPortalUrl, "/auth/api/me");
+  if (!url) return { guest_enabled: false };
+  try {
+    const resp = await fetch(url, {
+      signal,
+      headers: { Accept: "application/json" },
+    });
+    if (!resp.ok) return { guest_enabled: false };
+    const body = (await resp.json()) as { guest_enabled?: boolean; guest_ttl_secs?: number };
+    return {
+      guest_enabled: Boolean(body.guest_enabled),
+      guest_ttl_secs: typeof body.guest_ttl_secs === "number" ? body.guest_ttl_secs : undefined,
+    };
+  } catch {
+    return { guest_enabled: false };
+  }
+}
+
+export async function createGuestSandbox(authPortalUrl: string | null | undefined): Promise<GuestSandboxResponse> {
+  const url = sameOriginAuthPath(authPortalUrl, "/auth/api/guest");
+  if (!url) throw new Error("Guest sandbox is only available when the auth portal shares the Console origin.");
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "X-Requested-With": "fetch",
+    },
+  });
+  const body = (await resp.json().catch(() => ({}))) as Partial<GuestSandboxResponse> & { error?: string };
+  if (!resp.ok) {
+    throw new Error(body.error || `${resp.status} ${resp.statusText}`);
+  }
+  if (!body.client_token || !body.worker_token || !body.namespace) {
+    throw new Error("Invalid guest sandbox response from auth portal");
+  }
+  return body as GuestSandboxResponse;
+}
+
 export function fetchInfo(signal?: AbortSignal): Promise<InfoResponse> {
   return request("/api/info", { signal });
 }

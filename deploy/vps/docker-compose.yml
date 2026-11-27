@@ -63,6 +63,14 @@ services:
       - ANYSERVE_AUTH_MIN_ACCOUNT_AGE_DAYS=${ANYSERVE_AUTH_MIN_ACCOUNT_AGE_DAYS:-0}
       - ANYSERVE_AUTH_TOKEN_TTL_DAYS=${ANYSERVE_AUTH_TOKEN_TTL_DAYS:-30}
       - ANYSERVE_AUTH_MAX_TOKENS_PER_USER=${ANYSERVE_AUTH_MAX_TOKENS_PER_USER:-20}
+      # Optional zero-login ephemeral guest sandbox (default disabled):
+      - ANYSERVE_AUTH_GUEST_ENABLED=${ANYSERVE_AUTH_GUEST_ENABLED:-false}
+      - ANYSERVE_AUTH_GUEST_TTL_SECS=${ANYSERVE_AUTH_GUEST_TTL_SECS:-1800}
+      - ANYSERVE_AUTH_GUEST_RATE_LIMIT_PER_IP=${ANYSERVE_AUTH_GUEST_RATE_LIMIT_PER_IP:-10}
+      - ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL=${ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL:-30}
+      - ANYSERVE_AUTH_GUEST_MAX_ACTIVE=${ANYSERVE_AUTH_GUEST_MAX_ACTIVE:-200}
+      # auth-github is only reachable via Caddy on the internal bridge; trust Caddy's rightmost X-Forwarded-For hop.
+      - ANYSERVE_AUTH_TRUST_PROXY=${ANYSERVE_AUTH_TRUST_PROXY:-true}
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3002 && printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q ' 204 ' <&3"]
       interval: 15s

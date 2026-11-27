@@ -1,7 +1,15 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ExecutionWaterfall, buildExecutionWaterfall, parseW3cTrace } from "./trace-waterfall";
+import {
+  ExecutionWaterfall,
+  buildExecutionWaterfall,
+  parseDirectTransfer,
+  parseJobTransport,
+  parseW3cTrace,
+} from "./trace-waterfall";
+import { redactDirectUri } from "./format";
+import { JobInspector } from "./pane-inspector";
 import type { JobDetailResponse } from "./types";
 
 afterEach(() => {
@@ -215,5 +223,132 @@ describe("ExecutionWaterfall component", () => {
 
     fireEvent.click(screen.getByText("worker-b"));
     expect(onOpenWorker).toHaveBeenCalledWith("worker-b");
+  });
+
+  it("renders WebRTC P2P and fallback transport badges from output metadata", () => {
+    const p2pDetail = makeDetail();
+    p2pDetail.job.metadata = { "anyserve.transport": "webrtc" };
+    p2pDetail.job.outputs = [
+      {
+        kind: "inline",
+        size_bytes: 64,
+        uri: null,
+        content_type: "application/json",
+        preview: "{}",
+        truncated: false,
+        metadata: {
+          "anyserve.transport_actual": "p2p",
+          "anyserve.p2p_bytes": "524288",
+          "anyserve.relayed_payload_bytes": "0",
+          "anyserve.ice_ms": "84",
+        },
+      },
+    ];
+    expect(parseJobTransport(p2pDetail)).toEqual({
+      requested: "webrtc",
+      actual: "p2p",
+      p2pBytes: 524288,
+      relayedPayloadBytes: 0,
+      iceMs: 84,
+      fallbackReason: null,
+    });
+    render(<ExecutionWaterfall detail={p2pDetail} />);
+    expect(screen.getByText("WebRTC P2P")).toBeTruthy();
+    expect(screen.getByText(/512\.0 KB \(worker-reported\) · ICE 84 ms/)).toBeTruthy();
+
+    cleanup();
+    const fallbackDetail = makeDetail();
+    fallbackDetail.job.metadata = { "anyserve.transport": "webrtc" };
+    fallbackDetail.job.outputs = [
+      {
+        kind: "inline",
+        size_bytes: 48,
+        uri: null,
+        content_type: "application/json",
+        preview: "{}",
+        truncated: false,
+        metadata: {
+          "anyserve.transport_actual": "relay",
+          "anyserve.fallback_reason": "ice_timeout",
+          "anyserve.relayed_payload_bytes": "524288",
+        },
+      },
+    ];
+    render(<ExecutionWaterfall detail={fallbackDetail} />);
+    expect(screen.getByText("WS Relay")).toBeTruthy();
+    expect(screen.getByText(/fallback: ice_timeout/)).toBeTruthy();
+  });
+
+  it("renders SDK-reported iroh direct/relay badges and redacts anyserve+iroh tokens and addrs in JobInspector", () => {
+    const rawIn = "anyserve+iroh://ep123node/secretTokABC?relay=https://r.example/&addr=10.0.0.8:4433&addr=[::1]:55";
+    const rawOut = "anyserve+iroh://ep456node/secretTokXYZ?addr=192.168.1.9:9999";
+    expect(redactDirectUri(rawIn)).toBe(
+      "anyserve+iroh://ep123node/[redacted]?relay=https://r.example/&addr=[redacted]&addr=[redacted]",
+    );
+    expect(redactDirectUri(rawOut)).toBe("anyserve+iroh://ep456node/[redacted]?addr=[redacted]");
+    expect(redactDirectUri("anyserve+iroh://ep789node?addr=10.0.0.9:5555")).toBe(
+      "anyserve+iroh://ep789node?addr=[redacted]",
+    );
+    expect(redactDirectUri("s3://my-bucket/obj?sig=1")).toBe("s3://my-bucket/obj?sig=1");
+
+    const directDetail = makeDetail();
+    directDetail.job.inputs = [
+      {
+        kind: "uri",
+        size_bytes: null,
+        uri: rawIn,
+        content_type: null,
+        preview: null,
+        truncated: false,
+        metadata: { "anyserve.sha256": "aa".repeat(32), "anyserve.size_bytes": "131072" },
+      },
+    ];
+    directDetail.job.outputs = [
+      {
+        kind: "uri",
+        size_bytes: null,
+        uri: rawOut,
+        content_type: null,
+        preview: null,
+        truncated: false,
+        metadata: {
+          "anyserve.direct_path": "direct",
+          "anyserve.direct_bytes": "262144",
+        },
+      },
+    ];
+    expect(parseDirectTransfer(directDetail)).toEqual({ path: "direct", bytes: 262144 });
+
+    render(<JobInspector detail={directDetail} />);
+    expect(screen.getByText("iroh direct")).toBeTruthy();
+    expect(screen.getByText(/256\.0 KB \(SDK-reported\)/)).toBeTruthy();
+    const html = document.body.textContent ?? "";
+    expect(html).toContain("anyserve+iroh://ep123node/[redacted]?relay=https://r.example/&addr=[redacted]&addr=[redacted]");
+    expect(html).toContain("anyserve+iroh://ep456node/[redacted]?addr=[redacted]");
+    expect(html).not.toContain("secretTokABC");
+    expect(html).not.toContain("secretTokXYZ");
+    expect(html).not.toContain("10.0.0.8");
+    expect(html).not.toContain("192.168.1.9");
+
+    cleanup();
+    const relayDetail = makeDetail();
+    relayDetail.job.outputs = [
+      {
+        kind: "uri",
+        size_bytes: null,
+        uri: null,
+        content_type: null,
+        preview: null,
+        truncated: false,
+        metadata: {
+          "anyserve.direct_path": "relay",
+          "anyserve.direct_bytes": "1048576",
+        },
+      },
+    ];
+    expect(parseDirectTransfer(relayDetail)).toEqual({ path: "relay", bytes: 1048576 });
+    render(<ExecutionWaterfall detail={relayDetail} />);
+    expect(screen.getByText("iroh relay")).toBeTruthy();
+    expect(screen.getByText(/1\.00 MB \(SDK-reported\)/)).toBeTruthy();
   });
 });

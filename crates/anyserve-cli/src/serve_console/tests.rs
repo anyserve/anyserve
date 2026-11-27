@@ -1576,6 +1576,10 @@ async fn cors_middleware_allows_only_configured_origins() {
         allowed.headers()["access-control-allow-origin"],
         "http://console.test"
     );
+    assert_eq!(
+        allowed.headers()["access-control-expose-headers"],
+        "x-anyserve-grpc-code"
+    );
     let disallowed = c
         .http
         .get(format!("{}/api/overview", c.base))
@@ -1589,6 +1593,54 @@ async fn cors_middleware_allows_only_configured_origins() {
             .get("access-control-allow-origin")
             .is_none()
     );
+    assert!(
+        disallowed
+            .headers()
+            .get("access-control-expose-headers")
+            .is_none()
+    );
+
+    // Empty allowed_origins emits zero Vary / Access-Control-* headers.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = AppState {
+        runtime: test_runtime().await,
+        auth: Arc::new(AuthPolicy::default()),
+        revocation_sync_ok: None,
+        allowed_origins: Arc::new(BTreeSet::new()),
+        mode: runtime_mode_summary(RuntimeMode::Memory),
+        control_plane: Arc::new(ControlPlaneStatic {
+            grpc_enabled: false,
+            grpc_listen: "127.0.0.1:50052".into(),
+            grpc_tls_enabled: false,
+            console_listen: addr.to_string(),
+            public_endpoint: None,
+            auth_portal_url: None,
+        }),
+    };
+    let handle = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+    let empty_resp = c
+        .http
+        .get(format!("http://{addr}/api/overview"))
+        .header("origin", "http://console.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty_resp.status().as_u16(), 200);
+    assert!(empty_resp.headers().get("vary").is_none());
+    assert!(
+        empty_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+    assert!(
+        empty_resp
+            .headers()
+            .get("access-control-expose-headers")
+            .is_none()
+    );
+    handle.abort();
 }
 
 #[tokio::test]
@@ -1657,6 +1709,7 @@ async fn console_mounts_http_ws_outside_operator_middleware_and_allows_namespace
         .http
         .post(format!("{}/rpc/v2/client/list_jobs", c.base))
         .bearer_auth("tenant-client")
+        .header("origin", "http://console.test")
         .header("content-type", "application/x-protobuf")
         .body(Vec::<u8>::new())
         .send()
@@ -1664,12 +1717,21 @@ async fn console_mounts_http_ws_outside_operator_middleware_and_allows_namespace
         .unwrap();
     assert_eq!(rpc_ok.status().as_u16(), 200);
     assert_eq!(rpc_ok.headers()["content-type"], "application/x-protobuf");
+    assert_eq!(
+        rpc_ok.headers()["access-control-allow-origin"],
+        "http://console.test"
+    );
+    assert_eq!(
+        rpc_ok.headers()["access-control-expose-headers"],
+        "x-anyserve-grpc-code"
+    );
 
-    // Worker token is rejected on /rpc/v2/client/list_jobs with 403 + x-anyserve-grpc-code: 7.
+    // Worker token is rejected on /rpc/v2/client/list_jobs with 403 + x-anyserve-grpc-code: 7 + CORS expose.
     let rpc_denied = c
         .http
         .post(format!("{}/rpc/v2/client/list_jobs", c.base))
         .bearer_auth("tenant-worker")
+        .header("origin", "http://console.test")
         .header("content-type", "application/x-protobuf")
         .body(Vec::<u8>::new())
         .send()
@@ -1677,6 +1739,14 @@ async fn console_mounts_http_ws_outside_operator_middleware_and_allows_namespace
         .unwrap();
     assert_eq!(rpc_denied.status().as_u16(), 403);
     assert_eq!(rpc_denied.headers()["x-anyserve-grpc-code"], "7");
+    assert_eq!(
+        rpc_denied.headers()["access-control-allow-origin"],
+        "http://console.test"
+    );
+    assert_eq!(
+        rpc_denied.headers()["access-control-expose-headers"],
+        "x-anyserve-grpc-code"
+    );
 
     // Mounted WS route upgrades cleanly for worker token and rejects client token pre-upgrade.
     let ws_denied = c

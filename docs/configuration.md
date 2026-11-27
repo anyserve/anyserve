@@ -81,11 +81,25 @@ max_terminal_jobs = 10000
 event_log_max_events = 8192
 event_log_max_bytes = 8388608
 
-# Optional per-tenant fairness/noisy-neighbor caps:
+# Optional per-tenant fairness/noisy-neighbor caps (Rust control plane only;
+# not implemented in the Cloudflare Workers/DO native engine):
 # [runtime.tenant_quotas]
 # max_sessions_per_namespace = 32
 # max_pending_jobs_per_namespace = 200
 # max_interfaces_per_namespace = 32
+#
+# Optional longest-prefix overrides (e.g. tighter per-namespace and aggregate
+# caps for ephemeral `guest-*` sandboxes so they cannot crowd out `gh-*` tenants;
+# empty, invalid, or duplicate `prefix` entries are rejected at config load).
+# Prefer a trailing delimiter such as `"guest-"` rather than `"guest"` or `"gh"`
+# so an override cannot accidentally match unrelated namespaces like `"ghost-"`.
+# [[runtime.tenant_quotas.prefix_overrides]]
+# prefix = "guest-"
+# max_sessions_per_namespace = 4
+# max_pending_jobs_per_namespace = 10
+# max_interfaces_per_namespace = 4
+# max_total_sessions = 400
+# max_total_pending_jobs = 400
 
 # Optional per-interface overrides; quote names containing dots.
 # [runtime.interfaces."demo.echo.v1"]
@@ -124,7 +138,136 @@ nor `runtime.interfaces.<name>.max_in_flight_per_key` is set, the scheduler defa
 (per-key serialization within each namespace).
 
 TLS protects gRPC; terminate management HTTP TLS at your ingress or proxy. CORS
-origins control browser access independently of authentication.
+origins control browser access independently of authentication: when
+`allowed_origins` (or `ANYSERVE_ALLOWED_ORIGINS`) is configured, matched origins
+receive `Access-Control-Expose-Headers: x-anyserve-grpc-code` on `/api/*` and
+`/rpc/v2/*` responses; when unset, no `Vary` or `Access-Control-*` headers are
+emitted.
+
+Browser WebSocket clients and workers on `/ws/v2/*` (which cannot attach custom
+`Authorization` headers) authenticate using `Sec-WebSocket-Protocol`: pass
+`["anyserve.v2", "anyserve.bearer." + base64url_nopad(token)]`. The server runs
+the exact same role, namespace, expiry, and revocation checks as `Authorization:
+Bearer`, echoes only `anyserve.v2` in the 101 response, and rejects conflicting
+`Authorization` + `anyserve.bearer.*` headers with HTTP `400` (`INVALID_ARGUMENT`).
+
+**Optional Browser WebRTC P2P data-plane bypass** (Console Playground): default
+traffic always uses the WebSocket relay, and the core runtime/protocol never
+depends on WebRTC. Callers may opt in per job with metadata
+`anyserve.transport=webrtc` on **EPHEMERAL** streaming `/ws/v2/client/invoke`
+requests only — durable and `Submit` jobs reject or fall back to relay because
+the control plane must persist and replay durable outputs.
+- *Trust boundary*: in P2P mode, payload bytes flow directly over
+  `RTCDataChannel` (client-counted `0 B` payload relayed over `/ws/v2/client/invoke`;
+  SDP/ICE signaling and summary metadata still traverse the control plane); the
+  control plane only sees scheduling, lease liveness, and worker-reported summary
+  metadata (`anyserve.transport_actual`, `anyserve.p2p_bytes`, `anyserve.ice_ms`),
+  which are not server-audited or replayable.
+- *NAT & fallback*: public STUN only (`stun.l.google.com:19302`,
+  `stun.cloudflare.com:3478`), **no TURN** — symmetric NATs and restrictive
+  corporate firewalls automatically fall back to WebSocket relay after 3.5 s.
+- *Failover consistency*: if the P2P peer drops before any output chunk is
+  exposed to the caller, the client automatically re-schedules on another worker;
+  once output has been exposed, disconnects fail fast with `output_interrupted`
+  (matching relay semantics). Short text streams pay cold ICE setup (~50–200 ms);
+  on localhost/loopback, browser WebRTC DataChannel throughput is lower than
+  plain TCP WebSocket relay (Chromium userspace SCTP + DTLS-over-UDP ceiling).
+  WebRTC P2P's value is zero control-plane relayed payload bytes and end-to-end
+  direct transport, not higher raw throughput.
+
+**Optional Native `iroh` Direct Data Plane (`anyserve+iroh://`, v1 — Rust SDK only)**:
+off by default via the `direct` Cargo feature on `anyserve-client` (zero changes
+to the Rust control plane, protobuf schema, Cloudflare Durable Object engine,
+default `anyserve` server binary, or Python SDK — v1 `direct` is **Rust SDK
+only**, not supported in the Python SDK). Static large objects are passed
+opaquely through existing `Object::Uri` (inputs) and terminal `ResultChunk::uri`
+(outputs) with `anyserve.sha256` and `anyserve.size_bytes` metadata; live
+streaming URIs, streaming-input handlers, and `iroh-blobs` are intentionally
+excluded from v1.
+- *Scope, safe worker path, & lifecycle*: auto-enabled only on live ephemeral
+  `ExecutionClient::invoke_direct` (`Submit` / durable jobs stay off by default
+  because direct object availability is tied to the holding process lifetime).
+  Direct Rust workers **must** connect with `DirectWorkerSession::connect`
+  (auto-advertising `Hello.attributes["anyserve.direct"] = "1"`) and open
+  assignments through `DirectWorkerSession::open_attempt` /
+  `Attempt::open_with_direct` → `DirectAttempt::finish_succeeded` (which resolves
+  and SHA-256 verifies all `anyserve+iroh://` inputs before returning a handle
+  and auto-commits a non-retryable failure on error so the handler can never
+  execute). Plain `Attempt::open`, `Attempt::open_stream`, and
+  `Attempt::input_chunk` automatically commit non-retryable `direct_unsupported`
+  and return `Err` on `anyserve+iroh://` inputs — **v1 direct does not support
+  streaming-input handlers**, and feature-OFF workers (both Rust and default
+  Python `serve()` via PyO3) cannot accidentally pass an unresolved direct URI
+  to user handlers (`attempt_count = 1`, zero retries, zero handler calls).
+  Input tokens are 128-bit CSPRNG, multi-fetchable across retries up to
+  `max_attempts.clamp(3, 20)`, and revoked immediately on terminal event,
+  cancellation, drop, or TTL (`300 s`). Worker outputs live in a bounded
+  post-finish LRU cache (`512 MiB` / `60 s` TTL) evicted immediately upon
+  client `1 B ACK` after SHA-256 verification.
+- *Trust boundary & identity*:
+  - Without `DirectConfig::allowed_peers`: payload bytes **bypass control-plane
+    forwarding/egress**, but any party holding the capability URI during its TTL
+    (including the control-plane operator) can dial and fetch the object — do
+    not treat this mode as confidential against the control plane.
+  - With `DirectConfig::allowed_peers` + persistent Ed25519 identity
+    (`DirectConfig::secret_key_path` / `ANYSERVE_DIRECT_SECRET_KEY_PATH`,
+    created with `0600` permissions on Unix; logs only the public `EndpointId`,
+    never key bytes): `iroh`'s Ed25519 TLS handshake cryptographically rejects
+    any peer outside the allowlist, including the control-plane operator.
+- *Redaction, journal retention, & IP privacy*: Rust SDK logging/debug
+  formatting (`redact_direct_uri`) and the Console UI display layer
+  (`redactDirectUri`) both redact `<token>` and `addr=` values
+  (`anyserve+iroh://<endpoint-id>/[redacted]?relay=...&addr=[redacted]`).
+  Console redaction is **display-layer only** — raw `/api/jobs` management API
+  responses still return the full URI (do not treat Console UI redaction as an
+  API-level confidentiality boundary).
+  Ephemeral `Invoke` URIs are never written to the journal (retained only in
+  memory up to `terminal_retention`); if explicitly opted into durable `Submit`,
+  the URI persists in the journal until `journal.retention` (default `24 h`) and
+  relies on short token TTL and `allowed_peers`. Setting
+  `DirectConfig::advertise_direct_addrs = false` omits `addr=` IP candidates
+  from the URI (hole-punching still works via `relay=`).
+- *Capability negotiation*: direct workers advertise `anyserve.direct = "1"` in
+  `Hello.attributes`; `invoke_direct` sets `metadata["anyserve.direct"] = "1"`
+  (telling workers direct outputs are supported; callers without it always
+  receive inline outputs) and sets `required_attributes["anyserve.direct"] = "1"`
+  whenever staging direct inputs (if no direct worker is online, the job queues
+  until `queue_timeout` rather than silently downgrading). Non-direct workers
+  (and streaming-input handlers) that unexpectedly receive an `anyserve+iroh://`
+  input fail pre-handler with non-retryable `direct_unsupported` (`attempt_count = 1`).
+- *Public n0 relay protection, fallback stream semantics, & trade-offs*: n0's
+  free public relay (`*.relay.n0.iroh.link`) is rate-limited (~0.12 MB/s
+  measured). When a connection remains on a public n0 relay past
+  `upgrade_window` (`1.5 s`), `Attempt::open_with_direct` fails **pre-handler**
+  (zero handler side effects) with non-retryable `direct_public_relay_throttled`
+  (v1 intentionally trades away trying another worker so `max_attempts` is not
+  wasted). `invoke_direct` clones the original spec for fallback **only** when
+  staged input bytes `<= inline_fallback_limit_bytes` (default `8 MiB`, avoiding
+  extra retention for large non-fallbackable payloads): on
+  `direct_public_relay_throttled`, `DirectExecutionEvents::message` strips
+  `anyserve.direct` and transparently opens one new inline `Invoke` (callers may
+  have already observed `Accepted`/`Assigned` events for the initial throttled
+  `job_id` before subsequent events switch to the fallback `job_id`; inspect
+  `fell_back_inline()` / `fallback_from_job_id()`, and any server `max_inline_*`
+  rejection is propagated verbatim); larger inputs fail fast. Output-side
+  public-relay-only transfers fail fast (no retroactive inline fallback after
+  `Finish`). For symmetric-NAT production deployments, configure a self-hosted
+  `iroh-relay` via `ANYSERVE_DIRECT_RELAY_URL`.
+- *Observability, dependency impact, & WAN status*: `anyserve.direct_path`
+  (`direct | relay`) and `anyserve.direct_bytes` on `ResultChunk.metadata` are
+  **SDK-reported** (not server-audited). Enabling `direct` on `anyserve-client`
+  pulls `iroh 1.5` (`tls-ring`, `presets::Minimal`, no n0 DNS/Pkarr discovery;
+  ~117 compiled Linux crates, ~+68 s cold release build, optional-only dual
+  `reqwest 0.13`, `sha2 0.11`, `noq 1.5`). In workspace `Cargo.lock`, `iroh 1.5`
+  strictly requires 4 semver-compatible bumps to shared crates (verified
+  non-revertible via `cargo update --precise`): `zeroize 1.8.2 → 1.9.2`
+  (`iroh-base 1.5.0`), `indexmap 2.13.1 → 2.14.2` (`plist 1.10.4 ← netdev ←
+  netwatch ← iroh`), `hashbrown 0.16.1 → 0.17.2` (`indexmap 2.14.2`), and
+  `webpki-roots 1.0.6 → 1.0.12` (`n0-dns-resolver 0.1.1 ← iroh-dns ← iroh`);
+  `tokio` remains `1.51.0` and default `anyserve` / `anyserve-client` /
+  `anyserve-python` dependency trees contain `0` `iroh` crates. Cross-WAN
+  two-host transfer is **untested** in the current CI/sandbox environment; local
+  loopback measurements do not represent WAN throughput.
 
 TLS clients use an `https://` endpoint. The supplied Rust/Python clients trust
 their built-in public CA roots; they do not expose a custom CA option. Use a
@@ -135,7 +278,13 @@ private CA.
 
 `max_queue` limits queued/accepting jobs per interface; `max_pending_jobs` limits
 unfinished jobs in the active Runtime. Admission beyond these limits returns
-`RESOURCE_EXHAUSTED`. Heartbeat timeout closes a silent session, then gives its
+`RESOURCE_EXHAUSTED`. Application-level protobuf `Heartbeat` messages are the
+sole liveness signal for worker sessions: RFC 6455 WebSocket `Ping`/`Pong`
+frames are transport keepalives only and intentionally do **not** extend
+`heartbeat_timeout` (a wedged worker event loop can still reply with Pong).
+Browser workers should run their session and heartbeat timer inside a Dedicated
+Web Worker so background tab timer throttling does not starve heartbeats.
+Heartbeat timeout closes a silent session, then gives its
 leases `reconnect_grace_ms` (per-tier `pool_tiers.reconnect_grace_ms`, else
 `[runtime].reconnect_grace_ms`, defaulting to `heartbeat_timeout_ms`) to reconnect.
 Cancellation keeps a worker reservation until acknowledgement or `cancel_grace_ms` expires.
@@ -250,6 +399,7 @@ mutually exclusive. Use each command's `--help` for accepted values.
 | `--console-listen ADDR` | — | Enables the management HTTP, WebSocket (`/ws/v2/*`), and embedded Console listener (e.g. `127.0.0.1:3001` or `0.0.0.0:3001`) without a TOML file; overrides `[console].listen`. |
 | `--public-endpoint URL` | `ANYSERVE_PUBLIC_ENDPOINT` | Advertised endpoint for `/api/overview` and the Console "Connect worker" dialog. Precedence: `--public-endpoint` > `ANYSERVE_PUBLIC_ENDPOINT` > `[console].public_endpoint`. |
 | — | `ANYSERVE_CONSOLE_AUTH_PORTAL_URL` | Optional portal URL exposed via unauthenticated `/api/info` and Console links ("Sign in with GitHub" / "Manage Tokens"); overrides `[console].auth_portal_url`. |
+| — | `ANYSERVE_AUTH_GUEST_ENABLED` | Opt-in toggle on `anyserve-auth-github` (default `false`). When `true`, enables `POST /auth/api/guest` to mint stateless 30-minute `asv1.` client+worker pairs in isolated `guest-<12hex>` namespaces with zero SQLite writes, bounded by per-client (`ANYSERVE_AUTH_GUEST_RATE_LIMIT_PER_IP`, default `10`/10m; IPv6 bucketed by `/64`, IPv4-mapped IPv6 normalized to IPv4), global burst (`ANYSERVE_AUTH_GUEST_RATE_LIMIT_GLOBAL`, default `30`/m), and total active-TTL ceiling (`ANYSERVE_AUTH_GUEST_MAX_ACTIVE`, default `200` concurrent unexpired sandboxes). TTL via `ANYSERVE_AUTH_GUEST_TTL_SECS` (default `1800`, clamped `60..=86400`). Set `ANYSERVE_AUTH_TRUST_PROXY=true` only behind a trusted reverse proxy (e.g. Caddy) so client IP extraction uses the rightmost non-empty entry of the last `X-Forwarded-For` header line; when `false` (default), forwarding headers are ignored and peer socket IP is used directly. Note: `guest-*` sandboxes share global `[runtime]` limits (`max_sessions`, `max_pending_jobs`, `max_terminal_jobs`) with authenticated tenants, so keep `ANYSERVE_AUTH_GUEST_MAX_ACTIVE` and `[runtime.tenant_quotas]` with a `[[runtime.tenant_quotas.prefix_overrides]]` rule for `prefix = "guest-"` (Rust control plane only) configured before enabling guests in production. |
 | `--memory-limit MB` | `ANYSERVE_MEMORY_LIMIT_MB` | Scales unspecified `max_pending_bytes` (25%), `max_result_bytes` (25%), and `max_event_bytes` (10%) from a total RAM budget while preserving explicit TOML limits. |
 | `--journal-max-bytes BYTES` | `ANYSERVE_JOURNAL_MAX_BYTES` | Sets the SQLite database byte cap (hard `PRAGMA max_page_count` ceiling + size-based terminal purge during maintenance/backpressure); overrides `[journal].max_bytes`. |
 | `--no-grpc` | — | Disables the gRPC listener without a TOML file. Requires management HTTP (`--console-listen` or `[console].enabled = true`). |

@@ -661,11 +661,79 @@ pub struct InterfacePolicy {
     pub pool_tiers: Vec<PoolTier>,
 }
 
+/// Per-namespace-prefix quota override enforced by the Rust control plane.
+/// Matched by longest prefix; omitted per-namespace fields inherit from
+/// [`TenantQuotas`], while `max_total_*` cap the aggregate across all
+/// namespaces starting with `prefix`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamespaceQuotaOverride {
+    pub prefix: String,
+    pub max_sessions_per_namespace: Option<usize>,
+    pub max_pending_jobs_per_namespace: Option<usize>,
+    pub max_interfaces_per_namespace: Option<usize>,
+    pub max_total_sessions: Option<usize>,
+    pub max_total_pending_jobs: Option<usize>,
+}
+
+/// Effective tenant quotas resolved for a single namespace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedNamespaceQuotas<'a> {
+    pub matched_prefix: Option<&'a str>,
+    pub max_sessions_per_namespace: Option<usize>,
+    pub max_pending_jobs_per_namespace: Option<usize>,
+    pub max_interfaces_per_namespace: Option<usize>,
+    pub max_total_sessions: Option<usize>,
+    pub max_total_pending_jobs: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TenantQuotas {
     pub max_sessions_per_namespace: Option<usize>,
     pub max_pending_jobs_per_namespace: Option<usize>,
     pub max_interfaces_per_namespace: Option<usize>,
+    pub prefix_overrides: Vec<NamespaceQuotaOverride>,
+}
+
+impl TenantQuotas {
+    /// Resolves effective quotas for `namespace` using longest-prefix match.
+    /// When `prefix_overrides` is empty, returns the base defaults directly
+    /// with no extra lookup.
+    pub fn resolve_for(&self, namespace: &str) -> ResolvedNamespaceQuotas<'_> {
+        let matched = if self.prefix_overrides.is_empty() {
+            None
+        } else {
+            self.prefix_overrides
+                .iter()
+                .filter(|entry| {
+                    !entry.prefix.is_empty() && namespace.starts_with(entry.prefix.as_str())
+                })
+                .max_by_key(|entry| entry.prefix.len())
+        };
+        match matched {
+            Some(entry) => ResolvedNamespaceQuotas {
+                matched_prefix: Some(entry.prefix.as_str()),
+                max_sessions_per_namespace: entry
+                    .max_sessions_per_namespace
+                    .or(self.max_sessions_per_namespace),
+                max_pending_jobs_per_namespace: entry
+                    .max_pending_jobs_per_namespace
+                    .or(self.max_pending_jobs_per_namespace),
+                max_interfaces_per_namespace: entry
+                    .max_interfaces_per_namespace
+                    .or(self.max_interfaces_per_namespace),
+                max_total_sessions: entry.max_total_sessions,
+                max_total_pending_jobs: entry.max_total_pending_jobs,
+            },
+            None => ResolvedNamespaceQuotas {
+                matched_prefix: None,
+                max_sessions_per_namespace: self.max_sessions_per_namespace,
+                max_pending_jobs_per_namespace: self.max_pending_jobs_per_namespace,
+                max_interfaces_per_namespace: self.max_interfaces_per_namespace,
+                max_total_sessions: None,
+                max_total_pending_jobs: None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

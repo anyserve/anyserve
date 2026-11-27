@@ -188,6 +188,36 @@ export function asErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
+/**
+ * Redacts the capability token path segment and any `addr=` IP candidates in
+ * `anyserve+iroh://` URIs so Console views never expose secret tokens or raw
+ * client/worker IP addresses while keeping endpoint ID and `relay=` visible.
+ */
+export function redactDirectUri(uri: string): string {
+  if (!uri.startsWith("anyserve+iroh://")) return uri;
+  const rest = uri.slice("anyserve+iroh://".length);
+  const fragIdx = rest.indexOf("#");
+  const withoutFrag = fragIdx >= 0 ? rest.slice(0, fragIdx) : rest;
+  const frag = fragIdx >= 0 ? rest.slice(fragIdx) : "";
+  const queryIdx = withoutFrag.indexOf("?");
+  const authorityAndPath = queryIdx >= 0 ? withoutFrag.slice(0, queryIdx) : withoutFrag;
+  const query = queryIdx >= 0 ? withoutFrag.slice(queryIdx + 1) : null;
+  const slashIdx = authorityAndPath.indexOf("/");
+  const redactedAuthorityPath =
+    slashIdx >= 0 && slashIdx < authorityAndPath.length - 1
+      ? `${authorityAndPath.slice(0, slashIdx)}/[redacted]`
+      : authorityAndPath;
+  const redactedQuery = query
+    ? query
+        .split("&")
+        .map((pair) => (pair.startsWith("addr=") ? "addr=[redacted]" : pair))
+        .join("&")
+    : null;
+  return redactedQuery
+    ? `anyserve+iroh://${redactedAuthorityPath}?${redactedQuery}${frag}`
+    : `anyserve+iroh://${redactedAuthorityPath}${frag}`;
+}
+
 /** Compact primitive JSON arrays inline with spaces so long vectors wrap cleanly at commas. */
 function formatJsonValue(value: unknown, indent = 0): string {
   if (Array.isArray(value)) {

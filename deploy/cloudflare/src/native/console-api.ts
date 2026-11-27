@@ -1,7 +1,13 @@
 // Management & Console HTTP API for AnyserveNativeDO (section 6.2, 7 of docs/cloudflare-native-do-plan.md).
 // Matches console/src/types.ts and crates/anyserve-cli/src/serve_console/{api,handlers,snapshot,metrics}.rs.
 
-import { GrpcCode, GrpcStatusError, type AuthPolicy, type Principal } from "./auth";
+import {
+  GRPC_CODE_HEADER,
+  GrpcCode,
+  GrpcStatusError,
+  type AuthPolicy,
+  type Principal,
+} from "./auth";
 import { DEFAULT_NAMESPACE, encodeScopedId, validateNamespaceSafe } from "./engine";
 import {
   MAX_IDENTIFIER_BYTES,
@@ -278,22 +284,34 @@ function parseAllowedOrigins(env: NativeEnvConfig): Set<string> {
   );
 }
 
+export function hasAllowedOrigins(env: NativeEnvConfig): boolean {
+  return parseAllowedOrigins(env).size > 0;
+}
+
 export function withCorsHeaders(
   request: Request,
   response: Response,
   env: NativeEnvConfig,
 ): Response {
   const allowed = parseAllowedOrigins(env);
+  if (allowed.size === 0) {
+    return response;
+  }
+  const isPreflight = request.method.toUpperCase() === "OPTIONS";
   const headers = new Headers(response.headers);
   headers.set("Vary", "Origin");
-  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  headers.set(
-    "Access-Control-Allow-Headers",
-    "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
-  );
   const reqOrigin = request.headers.get("Origin");
-  if (reqOrigin && allowed.size > 0 && allowed.has(reqOrigin)) {
+  if (reqOrigin && allowed.has(reqOrigin)) {
     headers.set("Access-Control-Allow-Origin", reqOrigin);
+    if (isPreflight) {
+      headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      headers.set(
+        "Access-Control-Allow-Headers",
+        "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",
+      );
+    } else {
+      headers.set("Access-Control-Expose-Headers", GRPC_CODE_HEADER);
+    }
   }
   return new Response(response.body, {
     status: response.status,
@@ -595,13 +613,13 @@ export async function handleConsoleOrHealthRequest(
     path.startsWith("/api/");
 
   if (!isKnownConsolePath) {
-    if (method === "OPTIONS") {
+    if (method === "OPTIONS" && hasAllowedOrigins(backend.env)) {
       return withCorsHeaders(request, new Response(null, { status: 204 }), backend.env);
     }
     return null;
   }
 
-  if (method === "OPTIONS") {
+  if (method === "OPTIONS" && hasAllowedOrigins(backend.env)) {
     return withCorsHeaders(request, new Response(null, { status: 204 }), backend.env);
   }
 

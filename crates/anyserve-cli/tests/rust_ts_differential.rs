@@ -56,10 +56,18 @@ struct RustServerProc {
 
 impl RustServerProc {
     async fn start() -> Self {
+        Self::start_with_allowed_origins(None).await
+    }
+
+    async fn start_with_allowed_origins(allowed_origins: Option<&str>) -> Self {
         let port = reserve_free_port().await;
         let grpc_port = reserve_free_port().await;
         let config_path = temp_path("rust-cfg", "toml");
         let journal_path = temp_path("rust-journal", "sqlite");
+        let origins_toml = match allowed_origins {
+            Some(origin) => format!("allowed_origins = [\"{origin}\"]\n"),
+            None => String::new(),
+        };
 
         let scoped_toml = format!(
             r#"
@@ -98,7 +106,7 @@ grpc_port = {grpc_port}
 enabled = true
 listen = "127.0.0.1:{port}"
 public_endpoint = "wss://diff.anyserve.example.com"
-
+{origins_toml}
 [journal]
 enabled = true
 backend = "sqlite"
@@ -162,6 +170,10 @@ struct TsGatewayProc {
 
 impl TsGatewayProc {
     async fn start() -> Self {
+        Self::start_with_allowed_origins(None).await
+    }
+
+    async fn start_with_allowed_origins(allowed_origins: Option<&str>) -> Self {
         let root = workspace_root();
         let script = root.join("deploy/cloudflare/src/node-native-gateway.ts");
         let scoped_tokens_json = serde_json::json!([
@@ -192,8 +204,8 @@ impl TsGatewayProc {
         ])
         .to_string();
 
-        let mut child = Command::new("node")
-            .arg("--experimental-strip-types")
+        let mut cmd = Command::new("node");
+        cmd.arg("--experimental-strip-types")
             .arg(&script)
             .current_dir(&root)
             .env("HOST", "127.0.0.1")
@@ -206,9 +218,11 @@ impl TsGatewayProc {
                 "wss://diff.anyserve.example.com",
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn node-native-gateway.ts");
+            .stderr(Stdio::piped());
+        if let Some(origin) = allowed_origins {
+            cmd.env("ANYSERVE_ALLOWED_ORIGINS", origin);
+        }
+        let mut child = cmd.spawn().expect("spawn node-native-gateway.ts");
 
         let stdout = child.stdout.take().expect("gateway stdout");
         let stderr = child.stderr.take().expect("gateway stderr");
@@ -2271,5 +2285,363 @@ async fn diff_seeded_randomized_workload_parity() {
 
         rw.abort();
         tw.abort();
+    }
+}
+
+#[tokio::test]
+async fn differential_cors_and_ws_subprotocol_bearer_auth_match_between_rust_and_ts() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let http = reqwest::Client::new();
+
+    // 1. Empty allowed_origins: neither Rust nor TS emits Vary or Access-Control-* headers.
+    let (rust_empty, ts_empty) = tokio::join!(
+        RustServerProc::start_with_allowed_origins(None),
+        TsGatewayProc::start_with_allowed_origins(None)
+    );
+    for (label, path, is_post) in [
+        ("overview", "/api/overview", false),
+        ("rpc_list", "/rpc/v2/client/list_jobs", true),
+    ] {
+        let req = |base: &str| {
+            let b = if is_post {
+                http.post(format!("{base}{path}"))
+                    .header("content-type", "application/x-protobuf")
+                    .body(Vec::<u8>::new())
+            } else {
+                http.get(format!("{base}{path}"))
+            };
+            b.bearer_auth(OPERATOR_CLIENT_TOKEN)
+                .header("origin", "https://browser.example.test")
+                .send()
+        };
+        let (rr, tr) = tokio::join!(req(&rust_empty.http_base), req(&ts_empty.http_base));
+        let (rr, tr) = (rr.unwrap(), tr.unwrap());
+        assert_eq!(
+            (rr.status().as_u16(), tr.status().as_u16()),
+            (200, 200),
+            "{label}"
+        );
+        for hdr in [
+            "vary",
+            "access-control-allow-origin",
+            "access-control-expose-headers",
+        ] {
+            assert_eq!(
+                (
+                    rr.headers().get(hdr).is_some(),
+                    tr.headers().get(hdr).is_some()
+                ),
+                (false, false),
+                "empty allowed_origins {label} header {hdr}"
+            );
+        }
+    }
+    drop((rust_empty, ts_empty));
+
+    // 2. Configured allowed_origins: Rust & TS match on preflight, /api/*, /rpc/v2/client/* (200 & 403), and disallowed origin.
+    let allowed_origin = "https://browser.example.test";
+    let (rust, ts) = tokio::join!(
+        RustServerProc::start_with_allowed_origins(Some(allowed_origin)),
+        TsGatewayProc::start_with_allowed_origins(Some(allowed_origin))
+    );
+
+    let header_val = |resp: &reqwest::Response, name: &str| -> Option<String> {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    let (r_pre, t_pre) = tokio::join!(
+        http.request(
+            reqwest::Method::OPTIONS,
+            format!("{}/rpc/v2/client/list_jobs", rust.http_base),
+        )
+        .header("origin", allowed_origin)
+        .send(),
+        http.request(
+            reqwest::Method::OPTIONS,
+            format!("{}/rpc/v2/client/list_jobs", ts.http_base),
+        )
+        .header("origin", allowed_origin)
+        .send(),
+    );
+    let (r_pre, t_pre) = (r_pre.unwrap(), t_pre.unwrap());
+    assert_eq!(
+        (r_pre.status().as_u16(), t_pre.status().as_u16()),
+        (204, 204)
+    );
+    for hdr in [
+        "vary",
+        "access-control-allow-origin",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+        "access-control-expose-headers",
+    ] {
+        assert_eq!(
+            header_val(&r_pre, hdr),
+            header_val(&t_pre, hdr),
+            "preflight header {hdr}"
+        );
+    }
+    assert_eq!(
+        header_val(&r_pre, "access-control-allow-origin").as_deref(),
+        Some(allowed_origin)
+    );
+    assert_eq!(header_val(&r_pre, "access-control-expose-headers"), None);
+
+    for (label, token, origin, expect_status, expect_grpc_code, expect_cors) in [
+        (
+            "rpc_ok",
+            OPERATOR_CLIENT_TOKEN,
+            allowed_origin,
+            200u16,
+            None,
+            true,
+        ),
+        (
+            "rpc_forbidden",
+            DEFAULT_WORKER_TOKEN,
+            allowed_origin,
+            403u16,
+            Some("7"),
+            true,
+        ),
+        (
+            "rpc_disallowed_origin",
+            OPERATOR_CLIENT_TOKEN,
+            "https://evil.example.test",
+            200u16,
+            None,
+            false,
+        ),
+    ] {
+        let send_rpc = |base: &str| {
+            http.post(format!("{base}/rpc/v2/client/list_jobs"))
+                .bearer_auth(token)
+                .header("origin", origin)
+                .header("content-type", "application/x-protobuf")
+                .body(Vec::<u8>::new())
+                .send()
+        };
+        let (rr, tr) = tokio::join!(send_rpc(&rust.http_base), send_rpc(&ts.http_base));
+        let (rr, tr) = (rr.unwrap(), tr.unwrap());
+        assert_eq!(
+            (rr.status().as_u16(), tr.status().as_u16()),
+            (expect_status, expect_status),
+            "{label}"
+        );
+        assert_eq!(
+            header_val(&rr, "x-anyserve-grpc-code").as_deref(),
+            expect_grpc_code,
+            "{label} rust grpc"
+        );
+        assert_eq!(
+            header_val(&tr, "x-anyserve-grpc-code").as_deref(),
+            expect_grpc_code,
+            "{label} ts grpc"
+        );
+        assert_eq!(
+            header_val(&rr, "vary"),
+            header_val(&tr, "vary"),
+            "{label} vary"
+        );
+        assert_eq!(
+            header_val(&rr, "access-control-allow-origin"),
+            header_val(&tr, "access-control-allow-origin"),
+            "{label} acao"
+        );
+        assert_eq!(
+            header_val(&rr, "access-control-expose-headers"),
+            header_val(&tr, "access-control-expose-headers"),
+            "{label} aceh"
+        );
+        if expect_cors {
+            assert_eq!(
+                header_val(&rr, "access-control-allow-origin").as_deref(),
+                Some(allowed_origin),
+                "{label}"
+            );
+            assert_eq!(
+                header_val(&rr, "access-control-expose-headers").as_deref(),
+                Some("x-anyserve-grpc-code"),
+                "{label}"
+            );
+        } else {
+            assert_eq!(
+                header_val(&rr, "access-control-allow-origin"),
+                None,
+                "{label}"
+            );
+            assert_eq!(
+                header_val(&rr, "access-control-expose-headers"),
+                None,
+                "{label}"
+            );
+        }
+    }
+
+    // 3. Raw HTTP/1.1 WebSocket upgrade parity for Sec-WebSocket-Protocol bearer auth.
+    let raw_ws_upgrade = |http_base: String,
+                          path: String,
+                          auth_hdr: Option<String>,
+                          proto_hdr: Option<String>| async move {
+        let addr = http_base.strip_prefix("http://").unwrap().to_owned();
+        let mut tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        );
+        if let Some(a) = auth_hdr {
+            req.push_str(&format!("Authorization: {a}\r\n"));
+        }
+        if let Some(p) = proto_hdr {
+            req.push_str(&format!("Sec-WebSocket-Protocol: {p}\r\n"));
+        }
+        req.push_str("\r\n");
+        tcp.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let mut total = 0usize;
+        while total < buf.len() {
+            let n = tcp.read(&mut buf[total..]).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = String::from_utf8_lossy(&buf[..total]).into_owned();
+        let mut lines = head.split("\r\n");
+        let status_line = lines.next().unwrap_or("");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut headers = HashMap::<String, String>::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
+            }
+        }
+        (status, headers)
+    };
+
+    let wrk_b64 = URL_SAFE_NO_PAD.encode(DEFAULT_WORKER_TOKEN);
+    let cli_b64 = URL_SAFE_NO_PAD.encode(OPERATOR_CLIENT_TOKEN);
+    let bad_b64 = URL_SAFE_NO_PAD.encode("wrong-token");
+
+    for (label, path, auth_hdr, proto_hdr, expect_status, expect_proto, expect_grpc) in [
+        (
+            "worker_ok",
+            "/ws/v2/worker/session",
+            None,
+            Some(format!("anyserve.v2, anyserve.bearer.{wrk_b64}")),
+            101u16,
+            Some("anyserve.v2"),
+            None,
+        ),
+        (
+            "client_ok",
+            "/ws/v2/client/invoke",
+            None,
+            Some(format!("anyserve.v2, anyserve.bearer.{cli_b64}")),
+            101u16,
+            Some("anyserve.v2"),
+            None,
+        ),
+        (
+            "cross_role_403",
+            "/ws/v2/worker/session",
+            None,
+            Some(format!("anyserve.v2, anyserve.bearer.{cli_b64}")),
+            403u16,
+            None,
+            Some("7"),
+        ),
+        (
+            "bad_token_401",
+            "/ws/v2/worker/session",
+            None,
+            Some(format!("anyserve.v2, anyserve.bearer.{bad_b64}")),
+            401u16,
+            None,
+            Some("16"),
+        ),
+        (
+            "conflict_400",
+            "/ws/v2/worker/session",
+            Some(format!("Bearer {DEFAULT_WORKER_TOKEN}")),
+            Some(format!("anyserve.v2, anyserve.bearer.{wrk_b64}")),
+            400u16,
+            None,
+            Some("3"),
+        ),
+        (
+            "missing_v2_400",
+            "/ws/v2/worker/session",
+            None,
+            Some(format!("anyserve.bearer.{wrk_b64}")),
+            400u16,
+            None,
+            Some("3"),
+        ),
+        (
+            "bad_b64_400",
+            "/ws/v2/worker/session",
+            None,
+            Some("anyserve.v2, anyserve.bearer.bad+chars=".to_string()),
+            400u16,
+            None,
+            Some("3"),
+        ),
+    ] {
+        let (r_res, t_res) = tokio::join!(
+            raw_ws_upgrade(
+                rust.http_base.clone(),
+                path.to_owned(),
+                auth_hdr.clone(),
+                proto_hdr.clone(),
+            ),
+            raw_ws_upgrade(
+                ts.http_base.clone(),
+                path.to_owned(),
+                auth_hdr.clone(),
+                proto_hdr.clone(),
+            ),
+        );
+        assert_eq!(
+            (r_res.0, t_res.0),
+            (expect_status, expect_status),
+            "ws {label}"
+        );
+        assert_eq!(
+            r_res.1.get("sec-websocket-protocol").map(String::as_str),
+            expect_proto,
+            "ws {label} rust proto"
+        );
+        assert_eq!(
+            t_res.1.get("sec-websocket-protocol").map(String::as_str),
+            expect_proto,
+            "ws {label} ts proto"
+        );
+        assert_eq!(
+            r_res.1.get("x-anyserve-grpc-code").map(String::as_str),
+            expect_grpc,
+            "ws {label} rust grpc"
+        );
+        assert_eq!(
+            t_res.1.get("x-anyserve-grpc-code").map(String::as_str),
+            expect_grpc,
+            "ws {label} ts grpc"
+        );
     }
 }

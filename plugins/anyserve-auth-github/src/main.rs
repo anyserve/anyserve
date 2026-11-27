@@ -44,10 +44,13 @@ async fn main() -> Result<()> {
     );
 
     let state = AppState::new(cfg, store)?;
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serve anyserve-auth-github")
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("serve anyserve-auth-github")
 }
 
 async fn shutdown_signal() {

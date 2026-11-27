@@ -136,7 +136,20 @@
     <div id="loggedOutCard" class="card" hidden>
       <h1>AnyServe Self-Service Tokens</h1>
       <p>Sign in with GitHub to mint isolated <strong>client</strong> and <strong>worker</strong> bearer tokens for your private namespace (<code>gh-&lt;id&gt;</code>).</p>
-      <a class="btn primary" href="/auth/github">Sign in with GitHub</a>
+      <div class="row" style="justify-content:flex-start">
+        <a class="btn primary" href="/auth/github">Sign in with GitHub</a>
+        <button id="guestBtn" class="btn" type="button" hidden>Try 30-min Guest Sandbox (No Login)</button>
+      </div>
+      <div id="guestBox" class="minted" hidden>
+        <div class="row">
+          <strong id="guestTitle">Guest Sandbox Ready</strong>
+          <div class="row">
+            <button id="copyGuestWorkerBtn" class="btn" type="button">Copy Worker Token</button>
+            <a id="openGuestConsoleBtn" class="btn primary" href="#" hidden>Open Playground in Console</a>
+          </div>
+        </div>
+        <pre id="guestSnippet"></pre>
+      </div>
     </div>
 
     <div id="portalRoot" hidden>
@@ -299,6 +312,14 @@
       if (!data.authenticated) {
         document.getElementById("loggedOutCard").hidden = false;
         document.getElementById("portalRoot").hidden = true;
+        const guestBtn = document.getElementById("guestBtn");
+        if (data.guest_enabled) {
+          const mins = Math.max(1, Math.round((data.guest_ttl_secs || 1800) / 60));
+          guestBtn.textContent = `Try ${mins}-min Guest Sandbox (No Login)`;
+          guestBtn.hidden = false;
+        } else {
+          guestBtn.hidden = true;
+        }
         return;
       }
       state.user = data.user;
@@ -369,6 +390,37 @@
         await refresh();
       } catch (err) {
         showError(err.message);
+      }
+    };
+
+    document.getElementById("guestBtn").onclick = async () => {
+      showError("");
+      const btn = document.getElementById("guestBtn");
+      btn.disabled = true;
+      try {
+        const res = await api("/auth/api/guest", { method: "POST" });
+        const mins = Math.max(1, Math.round((res.ttl_secs || 1800) / 60));
+        document.getElementById("guestTitle").textContent =
+          `Sandbox ${res.namespace} (expires in ${mins} min · stateless)`;
+        const lines = [];
+        if (res.ws_endpoint) lines.push(`export ANYSERVE_ENDPOINT=${res.ws_endpoint}`);
+        lines.push(`# Isolated namespace: ${res.namespace}`);
+        lines.push(`export ANYSERVE_CLIENT_TOKEN=${res.client_token}`);
+        lines.push(`export ANYSERVE_WORKER_TOKEN=${res.worker_token}`);
+        document.getElementById("guestSnippet").textContent = lines.join("\n");
+        const copyBtn = document.getElementById("copyGuestWorkerBtn");
+        copyBtn.onclick = async () => {
+          await navigator.clipboard.writeText(res.worker_token);
+        };
+        const openBtn = document.getElementById("openGuestConsoleBtn");
+        const consoleBase = (res.console_url || window.location.origin).replace(/\/$/, "");
+        openBtn.href = `${consoleBase}/playground#token=${encodeURIComponent(res.client_token)}`;
+        openBtn.hidden = false;
+        document.getElementById("guestBox").hidden = false;
+      } catch (err) {
+        showError(err.message);
+      } finally {
+        btn.disabled = false;
       }
     };
 
