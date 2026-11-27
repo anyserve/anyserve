@@ -181,7 +181,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
             <>
               <CopyableBlock
                 title="1. Install AnyServe binary on Linux x86_64"
-                code={`curl -fsSL https://github.com/anyserve/anyserve/releases/download/v0.5.0/anyserve-v0.5.0-x86_64-unknown-linux-gnu.tar.gz \\\n  | tar -xz\nsudo install -m 0755 anyserve-v0.5.0-x86_64-unknown-linux-gnu/anyserve /usr/local/bin/anyserve\nanyserve --version`}
+                code={`curl -fsSL https://github.com/anyserve/anyserve/releases/download/v0.6.0/anyserve-v0.6.0-x86_64-unknown-linux-gnu.tar.gz \\\n  | tar -xz\nsudo install -m 0755 anyserve-v0.6.0-x86_64-unknown-linux-gnu/anyserve /usr/local/bin/anyserve\nanyserve --version`}
               />
               <CopyableBlock
                 title="2. Provision Python runtime & verify control plane"

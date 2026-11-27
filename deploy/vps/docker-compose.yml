@@ -1,6 +1,6 @@
 services:
   anyserve:
-    image: ${ANYSERVE_IMAGE:-ghcr.io/anyserve/anyserve:v0.5.0}
+    image: ${ANYSERVE_IMAGE:-ghcr.io/anyserve/anyserve:v0.6.0}
     # Uncomment to build locally from a source checkout (embeds the Console UI):
     # build: ../..
     restart: unless-stopped
