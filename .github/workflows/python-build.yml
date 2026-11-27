@@ -93,6 +93,21 @@ jobs:
         run: |
           python -m pip install --no-index dist/*.whl
           python -m unittest discover -s clients/python/tests -p 'test_*.py'
+      - name: Smoke-test Linux wheel on Ubuntu 22.04 (Jetson Orin / RK3588 compatibility)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "${PWD}/dist:/dist:ro" \
+            -v "${PWD}/clients/python/tests:/tests:ro" \
+            ubuntu:22.04 bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends python3 python3-pip >/dev/null
+              python3 -m pip install --no-index /dist/*.whl
+              python3 -m unittest discover -s /tests -p "test_*.py"
+              echo "Ubuntu 22.04 ($(uname -m)) wheel smoke test passed."
+            '
       - uses: actions/upload-artifact@v4
         with:
           name: python-wheel-${{ matrix.target }}

@@ -66,14 +66,19 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            glibc: "2.28"
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            glibc: "2.28"
           - runner: macos-15
             target: aarch64-apple-darwin
+            glibc: ""
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            glibc: ""
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            glibc: ""
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
     steps:
@@ -85,6 +90,16 @@ jobs:
       - name: Install protoc on Linux
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Set up cargo-zigbuild on Linux (glibc 2.28 for Ubuntu 20.04/22.04/24.04, Jetson Orin, RK3588)
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: python -m pip install --upgrade cargo-zigbuild
 
       - name: Install protoc on macOS
         if: runner.os == 'macOS'
@@ -102,7 +117,7 @@ jobs:
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-glibc-${{ matrix.glibc || 'native' }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -113,9 +128,45 @@ jobs:
 
       - name: Package release archive
         shell: bash
+        env:
+          CARGO_ZIGBUILD_GLIBC: ${{ matrix.glibc }}
         run: |
           chmod +x scripts/package-release.sh
           scripts/package-release.sh "${RELEASE_TAG}" "${{ matrix.target }}" dist
+
+      - name: Smoke-test Linux archive on Ubuntu 22.04 (Jetson Orin / RK3588 compatibility)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run --rm -v "${PWD}/dist:/dist:ro" ubuntu:22.04 bash -euo pipefail -c '
+            mkdir -p /tmp/anyserve-smoke
+            tar -xzf /dist/anyserve-*.tar.gz -C /tmp/anyserve-smoke
+            bin=$(find /tmp/anyserve-smoke -maxdepth 2 -type f -name anyserve | head -n 1)
+            test -x "$bin"
+            "$bin" --version
+            "$bin" serve --no-grpc --ephemeral --console-listen 127.0.0.1:3001 --auto-token >/tmp/serve.log 2>&1 &
+            pid=$!
+            trap "kill -TERM $pid 2>/dev/null || true; wait $pid 2>/dev/null || true" EXIT
+            ready=0
+            for _ in $(seq 1 50); do
+              if exec 3<>/dev/tcp/127.0.0.1/3001 2>/dev/null; then
+                printf "GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&3
+                if grep -q " 204 " <&3; then
+                  ready=1
+                  break
+                fi
+              fi
+              sleep 0.1
+            done
+            if [[ "$ready" != "1" ]]; then
+              cat /tmp/serve.log >&2
+              exit 1
+            fi
+            exec 4<>/dev/tcp/127.0.0.1/3001
+            printf "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n" >&4
+            grep -q "<title>AnyServe Console</title>" <&4
+            echo "Ubuntu 22.04 ($(uname -m)) smoke test passed."
+          '
 
       - name: Upload packaged archive
         uses: actions/upload-artifact@v4
@@ -126,21 +177,33 @@ jobs:
             dist/*.zip
           if-no-files-found: error
 
-  image:
-    name: Container image
-    runs-on: ubuntu-latest
+  image-build:
+    name: Container image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
     needs: [validate, build, python]
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
     env:
       RELEASE_TAG: ${{ needs.validate.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.ref }}
+
       - uses: docker/setup-buildx-action@v3
+
       - uses: docker/metadata-action@v5
         id: metadata
         with:
@@ -150,20 +213,124 @@ jobs:
             type=raw,value=${{ env.RELEASE_TAG }}
             type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
             type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
+
+      - name: Resolve image repository
+        id: repo
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "name=ghcr.io/${REPO,,}" >> "$GITHUB_OUTPUT"
+
       - uses: docker/login-action@v3
         if: needs.validate.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+
+      - name: Build and push platform image by digest
+        id: push
+        if: needs.validate.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ needs.validate.outputs.publish == 'true' }}
-          tags: ${{ steps.metadata.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.metadata.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=release-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-image-${{ matrix.arch }}
+
+      - name: Export digest
+        if: needs.validate.outputs.publish == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          printf '%s\n' "${{ steps.push.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v4
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          name: image-digest-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Build and smoke-test image (dry-run)
+        if: needs.validate.outputs.publish != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: anyserve:release-check
+          cache-from: type=gha,scope=release-image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-image-${{ matrix.arch }}
+
+      - name: Verify image binary (dry-run)
+        if: needs.validate.outputs.publish != 'true'
+        run: docker run --rm anyserve:release-check --version
+
+  image:
+    name: Publish multi-arch container manifest
+    runs-on: ubuntu-24.04
+    needs: [validate, image-build]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - name: Merge amd64 and arm64 manifests
+        if: needs.validate.outputs.publish != 'true'
+        run: echo "Dry-run mode; skipping manifest push."
+
+      - uses: actions/download-artifact@v4
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          pattern: image-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+        if: needs.validate.outputs.publish == 'true'
+
+      - uses: docker/metadata-action@v5
+        id: metadata
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=raw,value=latest,enable=${{ !contains(env.RELEASE_TAG, '-') }}
+
+      - uses: docker/login-action@v3
+        if: needs.validate.outputs.publish == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest list
+        if: needs.validate.outputs.publish == 'true'
+        env:
+          REPO: ${{ github.repository }}
+          TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          IMAGE_NAME="ghcr.io/${REPO,,}"
+          AMD64_DIGEST="$(cat /tmp/digests/amd64)"
+          ARM64_DIGEST="$(cat /tmp/digests/arm64)"
+          tag_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              tag_args+=(--tag "$tag")
+            fi
+          done <<< "${TAGS}"
+          docker buildx imagetools create "${tag_args[@]}" \
+            "${IMAGE_NAME}@${AMD64_DIGEST}" \
+            "${IMAGE_NAME}@${ARM64_DIGEST}"
+          docker buildx imagetools inspect "${IMAGE_NAME}:${RELEASE_TAG}"
 
   python:
     needs: [validate, ci]
@@ -218,28 +385,28 @@ jobs:
       - name: Create or update GitHub release
         run: |
           VERSION="${RELEASE_TAG#v}"
-          cat > release-notes.md <<EOF
-          ## Install ${RELEASE_TAG}
+          sed -e "s|__RELEASE_TAG__|${RELEASE_TAG}|g" -e "s|__VERSION__|${VERSION}|g" <<'EOF' > release-notes.md
+          ## Install __RELEASE_TAG__
 
-          **macOS & Linux (x86_64 / arm64)**
-          \`\`\`bash
-          curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh -s -- --version ${RELEASE_TAG}
-          \`\`\`
+          **macOS & Linux (`x86_64` / `arm64`, glibc >= 2.28 — Ubuntu 20.04/22.04/24.04, Debian 11/12, Jetson Orin, RK3588)**
+          ```bash
+          curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh -s -- --version __RELEASE_TAG__
+          ```
 
           **Windows (PowerShell x86_64)**
-          \`\`\`powershell
-          \$env:ANYSERVE_VERSION="${RELEASE_TAG}"; irm https://anyserve.github.io/anyserve/install.ps1 | iex
-          \`\`\`
+          ```powershell
+          $env:ANYSERVE_VERSION="__RELEASE_TAG__"; irm https://anyserve.github.io/anyserve/install.ps1 | iex
+          ```
 
-          **Python SDK**
-          \`\`\`bash
-          pip install anyserve-runtime==${VERSION}
-          \`\`\`
+          **Python SDK (`manylinux_2_28` wheels for x86_64 & arm64)**
+          ```bash
+          pip install anyserve-runtime==__VERSION__
+          ```
 
-          **Docker (with embedded Console)**
-          \`\`\`bash
-          docker pull ghcr.io/anyserve/anyserve:${RELEASE_TAG}
-          \`\`\`
+          **Docker (multi-arch `linux/amd64` + `linux/arm64`, embedded Console)**
+          ```bash
+          docker pull ghcr.io/anyserve/anyserve:__RELEASE_TAG__
+          ```
 
           Docs: https://anyserve.github.io/anyserve/ · Live Demo: https://anyserve.arcosx.org
           EOF

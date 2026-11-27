@@ -41,10 +41,43 @@ if [[ "${SKIP_CONSOLE_BUILD:-0}" != "1" ]]; then
 fi
 
 rustup target add "${TARGET_TRIPLE}"
-cargo build --locked --release -p anyserve --features embed-console --target "${TARGET_TRIPLE}"
+
+if [[ -n "${CARGO_ZIGBUILD_GLIBC:-}" && "${TARGET_TRIPLE}" == *-unknown-linux-gnu ]]; then
+  cargo zigbuild --locked --release -p anyserve --features embed-console \
+    --target "${TARGET_TRIPLE}.${CARGO_ZIGBUILD_GLIBC}"
+else
+  cargo build --locked --release -p anyserve --features embed-console --target "${TARGET_TRIPLE}"
+fi
 
 cp "target/${TARGET_TRIPLE}/release/${BINARY_NAME}" "${STAGING_DIR}/${BINARY_NAME}"
 cp LICENSE README.md "${STAGING_DIR}/"
+
+MAX_GLIBC="${GLIBC_MAX_VERSION:-${CARGO_ZIGBUILD_GLIBC:-}}"
+if [[ -n "${MAX_GLIBC}" && "${TARGET_TRIPLE}" == *-unknown-linux-gnu ]]; then
+  command -v readelf >/dev/null 2>&1 || { echo "readelf is required to verify GLIBC ceiling" >&2; exit 1; }
+  python3 - "${STAGING_DIR}/${BINARY_NAME}" "${MAX_GLIBC}" <<'PY'
+import re
+import subprocess
+import sys
+
+binary = sys.argv[1]
+max_ver = tuple(int(p) for p in sys.argv[2].split("."))
+out = subprocess.check_output(["readelf", "-V", binary], text=True)
+versions = sorted(
+    {tuple(int(p) for p in m.split(".")) for m in re.findall(r"GLIBC_([0-9]+\.[0-9]+)", out)}
+)
+too_new = [v for v in versions if v > max_ver]
+fmt = lambda t: ".".join(str(x) for x in t)
+print(
+    f"ELF GLIBC symbols in {binary}: "
+    f"{', '.join(fmt(v) for v in versions) or 'none'} (max allowed: {fmt(max_ver)})"
+)
+if too_new:
+    sys.exit(
+        f"Binary requires GLIBC > {fmt(max_ver)}: {', '.join(fmt(v) for v in too_new)}"
+    )
+PY
+fi
 
 if [[ "${ARCHIVE_EXT}" == "zip" ]]; then
   pushd "$(dirname "${STAGING_DIR}")" >/dev/null

@@ -97,7 +97,7 @@ site-rack or cloud worker pool rather than operating multi-node PG HA on the edg
 
 ## Containers
 
-The official `Dockerfile` runs as non-root `anyserve` (`10001:10001`) and embeds the React Console UI out of the box (`--features embed-console`), so a single container serves gRPC, HTTP/WS, and the Web Console. Release images are published to `ghcr.io/anyserve/anyserve:vVERSION` (Linux amd64). If mounting an existing root-owned `/data` host directory or volume, fix ownership once with `chown -R 10001:10001 /data`.
+The official `Dockerfile` runs as non-root `anyserve` (`10001:10001`) and embeds the React Console UI out of the box (`--features embed-console`), so a single container serves gRPC, HTTP/WS, and the Web Console. Release images are published to `ghcr.io/anyserve/anyserve:vVERSION` as multi-arch manifests (`linux/amd64` and `linux/arm64`, including Jetson Orin and RK3588). If mounting an existing root-owned `/data` host directory or volume, fix ownership once with `chown -R 10001:10001 /data`.
 
 To build and run a local demo with the embedded Console on `http://127.0.0.1:3001`:
 

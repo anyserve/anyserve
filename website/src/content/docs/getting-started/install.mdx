@@ -11,7 +11,7 @@ Prebuilt binaries include the embedded Web Console and verify SHA-256 checksums 
 
 <Tabs>
   <TabItem label="macOS & Linux">
-    Supports `x86_64` and `arm64` (Apple Silicon & Linux ARM64). Installs to `~/.local/bin/anyserve` without `sudo`.
+    Supports `x86_64` and `arm64` (Apple Silicon & Linux ARM64). Linux binaries target `glibc >= 2.28`, supporting Ubuntu 20.04 / 22.04 / 24.04, Debian 11 / 12, **Jetson Orin (NX / Nano / AGX)**, and **RK3588** boards out of the box. Installs to `~/.local/bin/anyserve` without `sudo`.
 
     ```bash
     curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh
@@ -40,7 +40,7 @@ Prebuilt binaries include the embedded Web Console and verify SHA-256 checksums 
     ```
   </TabItem>
   <TabItem label="Docker">
-    Multi-stage non-root image (`10001:10001`) with embedded Console enabled:
+    Multi-arch (`linux/amd64` and `linux/arm64`) non-root image (`10001:10001`) with embedded Console enabled:
 
     ```bash
     docker pull ghcr.io/anyserve/anyserve:latest
