@@ -25,6 +25,9 @@ use super::api::{
     HistorySummary, InfoResponse, InterfaceSummary, JobDetailResponse, JobsQuery, JobsResponse,
     NamespaceQuery, OverviewResponse, PoolSummary, QueueSummary, WorkersResponse,
 };
+use super::settings::{
+    RuntimeSettingsDto, SettingsLimitsMeta, SettingsResponse, render_server_toml_snippet,
+};
 use super::snapshot::{
     duration_ms, health_summary, interface_policy_summary, job_detail_response, job_summary,
     jobs_histogram_summary, journal_stats_summary, worker_rollup, worker_summary,
@@ -46,6 +49,8 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/jobs/:job_id/cancel", post(cancel_job))
         .route("/api/workers", get(list_workers))
         .route("/api/workers/:session_id/drain", post(drain_worker))
+        .route("/api/settings", get(get_settings).put(update_settings))
+        .route("/api/settings/reset", post(reset_settings))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             auth,
@@ -138,12 +143,13 @@ async fn overview(
     let health = snapshot.health;
     let stats = snapshot.stats;
     let config = state.runtime.config();
+    let live = state.runtime.live_settings();
 
     let interface_names: BTreeSet<&str> = if principal.is_operator {
         stats
             .interfaces
             .keys()
-            .chain(config.interfaces.keys())
+            .chain(live.interfaces.keys())
             .map(String::as_str)
             .collect()
     } else {
@@ -162,7 +168,7 @@ async fn overview(
                 free_slots: current.map_or(0, |s| s.free_slots),
                 policy: principal
                     .is_operator
-                    .then(|| config.interfaces.get(name).map(interface_policy_summary))
+                    .then(|| live.interfaces.get(name).map(interface_policy_summary))
                     .flatten(),
             }
         })
@@ -211,7 +217,7 @@ async fn overview(
         (
             state.control_plane.grpc_listen.clone(),
             state.control_plane.console_listen.clone(),
-            config.max_sessions,
+            live.max_sessions,
         )
     } else {
         (String::new(), String::new(), 0)
@@ -238,10 +244,10 @@ async fn overview(
             sessions: stats.sessions,
             max_sessions,
             priority_levels: config.priority_levels,
-            default_max_attempts: config.default_max_attempts,
-            heartbeat_interval_ms: duration_ms(config.heartbeat_interval),
-            heartbeat_timeout_ms: duration_ms(config.heartbeat_timeout),
-            reconnect_grace_ms: config.reconnect_grace.map(duration_ms),
+            default_max_attempts: live.default_max_attempts,
+            heartbeat_interval_ms: duration_ms(live.heartbeat_interval),
+            heartbeat_timeout_ms: duration_ms(live.heartbeat_timeout),
+            reconnect_grace_ms: live.reconnect_grace.map(duration_ms),
             recommended_poll_ms: None,
         },
         scope,
@@ -418,6 +424,64 @@ async fn drain_worker(
     }))
 }
 
+fn build_settings_response(state: &AppState) -> SettingsResponse {
+    let config = state.runtime.config();
+    let live = state.runtime.live_settings();
+    let baseline = state.runtime.baseline_settings();
+    let storage_path = state.settings.path().map(|p| p.display().to_string());
+    SettingsResponse {
+        editable: true,
+        persisted: storage_path.is_some(),
+        storage_path,
+        modified: live != baseline,
+        server_toml: render_server_toml_snippet(&live),
+        settings: RuntimeSettingsDto::from(&live),
+        defaults: RuntimeSettingsDto::from(&baseline),
+        limits: SettingsLimitsMeta {
+            max_attempts_limit: config.max_attempts_limit,
+            priority_levels: config.priority_levels,
+        },
+    }
+}
+
+async fn get_settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+    state.runtime.ensure_active_leader().map_err(api_error)?;
+    Ok(Json(build_settings_response(&state)))
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(payload): Json<RuntimeSettingsDto>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    state.runtime.ensure_active_leader().map_err(api_error)?;
+    let next = payload.into_live();
+    let applied = state
+        .runtime
+        .update_live_settings(next)
+        .map_err(api_error)?;
+    if let Err(err) = state.settings.save(&applied) {
+        return Err(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("settings applied in memory but failed to persist: {err:#}"),
+        });
+    }
+    Ok(Json(build_settings_response(&state)))
+}
+
+async fn reset_settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+    state.runtime.ensure_active_leader().map_err(api_error)?;
+    let _ = state.runtime.reset_live_settings();
+    if let Err(err) = state.settings.remove() {
+        return Err(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!(
+                "settings reset in memory but failed to remove override file: {err:#}"
+            ),
+        });
+    }
+    Ok(Json(build_settings_response(&state)))
+}
+
 async fn cors_middleware(
     State(allowed_origins): State<Arc<BTreeSet<String>>>,
     request: Request<Body>,
@@ -454,7 +518,7 @@ async fn cors_middleware(
         if is_preflight {
             headers.insert(
                 ACCESS_CONTROL_ALLOW_METHODS,
-                HeaderValue::from_static("GET, POST, OPTIONS"),
+                HeaderValue::from_static("GET, POST, PUT, OPTIONS"),
             );
             headers.insert(
                 ACCESS_CONTROL_ALLOW_HEADERS,

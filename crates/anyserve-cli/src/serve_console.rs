@@ -3,12 +3,14 @@ mod api;
 mod embedded_ui;
 mod handlers;
 mod metrics;
+pub(crate) mod settings;
 mod snapshot;
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -32,6 +34,7 @@ pub struct ControlPlaneMetadata {
     pub public_endpoint: Option<String>,
     pub auth_portal_url: Option<String>,
     pub revocation_sync_ok: Option<Arc<AtomicBool>>,
+    pub settings_path: Option<PathBuf>,
 }
 
 pub(crate) fn format_host_port(host: &str, port: u16) -> String {
@@ -103,6 +106,7 @@ pub async fn run_server_with_listener(
             public_endpoint: control_plane.public_endpoint,
             auth_portal_url: control_plane.auth_portal_url,
         }),
+        settings: settings::SettingsStore::new(control_plane.settings_path),
     };
 
     serve(listener, router(state))

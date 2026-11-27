@@ -1,12 +1,20 @@
 import { memo } from "react";
 
 import { safeHttpUrl } from "./api";
-import type { ConsoleTab, Theme } from "./app-constants";
+import {
+  PROJECT_DOCS_URL,
+  PROJECT_GITHUB_URL,
+  type ConsoleTab,
+  type Theme,
+  type ThemeMode,
+} from "./app-constants";
 import { formatNumber, formatShortTime, formatTimestamp } from "./format";
 import {
   AnyServeLogo,
+  IconBook,
   IconDisconnect,
   IconExplore,
+  IconGitHub,
   IconInterfaces,
   IconJobs,
   IconKey,
@@ -15,6 +23,7 @@ import {
   IconPlayground,
   IconPools,
   IconRefresh,
+  IconSettings,
   IconSun,
   IconWorkers,
 } from "./icons";
@@ -26,6 +35,7 @@ interface SidebarProps {
   overview: OverviewResponse | null;
   browserWorkersLive?: number;
   theme: Theme;
+  themeMode?: ThemeMode;
   onToggleTheme: () => void;
   onRefresh?: () => void;
   authenticated: boolean;
@@ -59,6 +69,10 @@ const NAV_GROUPS: Array<{
       { tab: "playground", label: "Playground", Icon: IconPlayground },
     ],
   },
+  {
+    label: "System",
+    items: [{ tab: "settings", label: "Settings", Icon: IconSettings }],
+  },
 ];
 
 function badgeForTab(tab: ConsoleTab, overview: OverviewResponse | null, browserWorkersLive = 0): string | null {
@@ -77,6 +91,7 @@ export const Sidebar = memo(function Sidebar({
   overview,
   browserWorkersLive = 0,
   theme,
+  themeMode,
   onToggleTheme,
   onRefresh,
   authenticated,
@@ -160,9 +175,9 @@ export const Sidebar = memo(function Sidebar({
             </button>
           ) : null}
 
-          <button type="button" className="ctrl-pill" title="Switch theme" aria-label="Switch theme" onClick={onToggleTheme}>
+          <button type="button" className="ctrl-pill" title={`Theme: ${themeMode ?? theme}`} aria-label="Switch theme" onClick={onToggleTheme}>
             {theme === "dark" ? <IconSun /> : <IconMoon />}
-            <span>{theme === "dark" ? "Light" : "Dark"}</span>
+            <span>{themeMode === "system" ? "Auto" : theme === "dark" ? "Light" : "Dark"}</span>
           </button>
 
           {authenticated ? (
@@ -171,6 +186,17 @@ export const Sidebar = memo(function Sidebar({
               <span>Disconnect</span>
             </button>
           ) : null}
+        </div>
+
+        <div className="sidebar__project-links" aria-label="Project links">
+          <a href={PROJECT_DOCS_URL} target="_blank" rel="noopener noreferrer" className="sidebar__ext-link">
+            <IconBook />
+            <span>Docs</span>
+          </a>
+          <a href={PROJECT_GITHUB_URL} target="_blank" rel="noopener noreferrer" className="sidebar__ext-link">
+            <IconGitHub />
+            <span>GitHub</span>
+          </a>
         </div>
       </div>
     </aside>

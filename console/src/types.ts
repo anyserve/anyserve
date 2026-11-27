@@ -171,3 +171,50 @@ export interface JobDetailResponse {
 }
 
 export interface CancelJobResponse { job: JobSummary; }
+
+export interface PoolTierSettings {
+  pool: string;
+  spillover_after_ms: number;
+  reconnect_grace_ms: number | null;
+}
+
+export interface InterfacePolicySettings {
+  max_queue: number | null;
+  queue_timeout_ms: number | null;
+  max_in_flight_per_key: number | null;
+  pool_tiers: PoolTierSettings[];
+}
+
+export interface RuntimeSettings {
+  default_max_attempts: number;
+  default_max_queue: number;
+  default_max_in_flight_per_key: number | null;
+  max_pending_jobs: number;
+  max_terminal_jobs: number;
+  terminal_retention_secs: number;
+  max_sessions: number;
+  heartbeat_interval_ms: number;
+  heartbeat_timeout_ms: number;
+  reconnect_grace_ms: number | null;
+  default_initial_backoff_ms: number;
+  default_max_backoff_ms: number;
+  consumer_stall_timeout_ms: number;
+  cancel_grace_ms: number;
+  interfaces: Record<string, InterfacePolicySettings>;
+}
+
+export interface SettingsLimitsMeta {
+  max_attempts_limit: number;
+  priority_levels: number;
+}
+
+export interface SettingsResponse {
+  editable: boolean;
+  persisted: boolean;
+  storage_path: string | null;
+  modified: boolean;
+  settings: RuntimeSettings;
+  defaults: RuntimeSettings;
+  limits: SettingsLimitsMeta;
+  server_toml: string;
+}

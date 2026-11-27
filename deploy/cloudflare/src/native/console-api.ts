@@ -304,7 +304,7 @@ export function withCorsHeaders(
   if (reqOrigin && allowed.has(reqOrigin)) {
     headers.set("Access-Control-Allow-Origin", reqOrigin);
     if (isPreflight) {
-      headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
       headers.set(
         "Access-Control-Allow-Headers",
         "Accept, Content-Type, Authorization, x-anyserve-namespace, traceparent, tracestate, baggage, x-request-id",

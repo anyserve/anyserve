@@ -699,7 +699,8 @@ it("collapses large payloads by default and opens Connect Worker onboarding moda
   fireEvent.click(screen.getByRole("tab", { name: "AI Connectors" }));
   expect(screen.getByText(/anyserve\.universe\.git/)).toBeTruthy();
 
-  fireEvent.click(screen.getByRole("tab", { name: "Linux Install" }));
+  fireEvent.click(screen.getByRole("tab", { name: "CLI Install" }));
+  expect(screen.getByText(/install\.sh/)).toBeTruthy();
   expect(screen.getByText(/\/usr\/local\/bin\/anyserve/)).toBeTruthy();
 
   fireEvent.keyDown(window, { key: "Escape" });

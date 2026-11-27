@@ -258,7 +258,7 @@ impl Runtime {
                 });
         let quotas = inner.config.tenant_quotas.resolve_for(&namespace);
         if !resume {
-            if st.sessions.len() >= inner.config.max_sessions {
+            if st.sessions.len() >= inner.live().max_sessions {
                 return Err(RuntimeError::exhausted("worker session limit reached").into());
             }
             let check_ns = quotas.max_sessions_per_namespace.is_some();
@@ -425,15 +425,17 @@ impl Runtime {
             self.lease_lost_locked(&mut st, &lease_id, now);
         }
 
+        let (hb_interval, hb_timeout) = {
+            let live = inner.live();
+            (live.heartbeat_interval, live.heartbeat_timeout)
+        };
         let limits = &inner.config.limits;
         let welcome = pb::ServerMessage {
             msg: Some(pb::server_message::Msg::Welcome(pb::Welcome {
                 session_id: session_id.clone(),
                 generation: st.generation,
-                heartbeat_interval_ms: u32::try_from(inner.config.heartbeat_interval.as_millis())
-                    .unwrap_or(u32::MAX),
-                heartbeat_timeout_ms: u32::try_from(inner.config.heartbeat_timeout.as_millis())
-                    .unwrap_or(u32::MAX),
+                heartbeat_interval_ms: u32::try_from(hb_interval.as_millis()).unwrap_or(u32::MAX),
+                heartbeat_timeout_ms: u32::try_from(hb_timeout.as_millis()).unwrap_or(u32::MAX),
                 limits: Some(pb::Limits {
                     max_control_message_bytes: limits.max_control_message_bytes,
                     max_chunk_bytes: limits.max_chunk_bytes,
@@ -827,7 +829,7 @@ impl Runtime {
         if metadata_size(&metadata) > limits.max_metadata_bytes as usize {
             return Err(RuntimeError::invalid("frame metadata is too large"));
         }
-        let stall = self.inner.config.consumer_stall_timeout;
+        let stall = self.inner.live().consumer_stall_timeout;
         let deadline = tokio::time::Instant::now() + stall;
         // Terminal jobs are evicted for room at most once per frame.
         let mut reclaimed = false;

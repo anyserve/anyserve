@@ -6,6 +6,8 @@ import type {
   JobDetailResponse,
   JobsResponse,
   OverviewResponse,
+  RuntimeSettings,
+  SettingsResponse,
   WorkersResponse,
 } from "./types";
 
@@ -229,4 +231,20 @@ export function getWorkers(signal?: AbortSignal): Promise<WorkersResponse> {
 
 export function drainWorker(sessionId: string): Promise<{ session_id: string; draining: boolean }> {
   return request(`/api/workers/${encodeURIComponent(sessionId)}/drain`, { method: "POST" });
+}
+
+export function getSettings(signal?: AbortSignal): Promise<SettingsResponse> {
+  return request("/api/settings", { signal });
+}
+
+export function updateSettings(settings: RuntimeSettings): Promise<SettingsResponse> {
+  return request("/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  });
+}
+
+export function resetSettings(): Promise<SettingsResponse> {
+  return request("/api/settings/reset", { method: "POST" });
 }

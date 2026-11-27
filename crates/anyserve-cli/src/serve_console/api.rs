@@ -22,6 +22,7 @@ pub(crate) struct AppState {
     pub(crate) allowed_origins: Arc<BTreeSet<String>>,
     pub(crate) mode: RuntimeModeSummary,
     pub(crate) control_plane: Arc<ControlPlaneStatic>,
+    pub(crate) settings: super::settings::SettingsStore,
 }
 
 #[derive(Clone, Debug)]

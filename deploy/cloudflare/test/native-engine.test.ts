@@ -5145,7 +5145,7 @@ describe("Phase 3 & 4 parity: /api/info, worker drain, tenant redaction, /rpc/v2
       "https://browser.example.com",
     );
     expect(preflight.headers.get("Access-Control-Allow-Methods")).toBe(
-      "GET, POST, OPTIONS",
+      "GET, POST, PUT, OPTIONS",
     );
     expect(preflight.headers.get("Access-Control-Expose-Headers")).toBeNull();
 

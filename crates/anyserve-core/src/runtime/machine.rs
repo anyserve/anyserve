@@ -191,7 +191,7 @@ impl Inner {
 
     pub(crate) fn queue_timeout(&self, job: &Job) -> Option<Duration> {
         job.spec.policy.queue_timeout.or_else(|| {
-            self.config
+            self.live()
                 .interfaces
                 .get(&job.spec.demand.interface)
                 .and_then(|policy| policy.queue_timeout)
@@ -199,25 +199,26 @@ impl Inner {
     }
 
     pub(crate) fn max_queue(&self, interface: &str) -> usize {
-        self.config
-            .interfaces
+        let live = self.live();
+        live.interfaces
             .get(interface)
             .and_then(|policy| policy.max_queue)
-            .unwrap_or(self.config.default_max_queue)
+            .unwrap_or(live.default_max_queue)
     }
 
     pub(crate) fn max_in_flight_per_key(&self, interface: &str) -> Option<usize> {
-        self.config
-            .interfaces
+        let live = self.live();
+        live.interfaces
             .get(interface)
             .and_then(|policy| policy.max_in_flight_per_key)
-            .or(self.config.default_max_in_flight_per_key)
+            .or(live.default_max_in_flight_per_key)
     }
 
     pub(crate) fn session_reconnect_grace(&self, session: &super::state::Session) -> Duration {
+        let live = self.live();
         let mut override_grace: Option<Duration> = None;
         for interface in &session.interfaces {
-            if let Some(policy) = self.config.interfaces.get(interface)
+            if let Some(policy) = live.interfaces.get(interface)
                 && let Some(grace) = policy
                     .pool_tiers
                     .iter()
@@ -231,8 +232,8 @@ impl Inner {
             }
         }
         override_grace
-            .or(self.config.reconnect_grace)
-            .unwrap_or(self.config.heartbeat_timeout)
+            .or(live.reconnect_grace)
+            .unwrap_or(live.heartbeat_timeout)
     }
 
     pub(crate) fn release_attempt_concurrency_locked(&self, st: &mut State, job_id: &str) {
@@ -261,7 +262,7 @@ impl Inner {
         if st.shutting_down {
             return Err(RuntimeError::unavailable("runtime is shutting down"));
         }
-        if st.unfinished_jobs >= self.config.max_pending_jobs {
+        if st.unfinished_jobs >= self.live().max_pending_jobs {
             return Err(RuntimeError::exhausted("unfinished job limit reached"));
         }
         let quotas = self.config.tenant_quotas.resolve_for(namespace);
@@ -569,16 +570,19 @@ impl Inner {
         let spillover = (!job.spec.demand.preferred_attributes.is_empty())
             .then_some(job.spec.policy.spillover_after)
             .flatten();
-        let has_tier_spillovers = self
-            .config
+        let tier_spillovers: Vec<Duration> = self
+            .live()
             .interfaces
             .get(&interface)
-            .is_some_and(|policy| {
+            .map(|policy| {
                 policy
                     .pool_tiers
                     .iter()
-                    .any(|tier| !tier.spillover_after.is_zero())
-            });
+                    .filter(|tier| !tier.spillover_after.is_zero())
+                    .map(|tier| tier.spillover_after)
+                    .collect()
+            })
+            .unwrap_or_default();
         let not_before = job.not_before_ms;
         if let Some(timeout) = self.queue_timeout(job) {
             let timer = self.timers.schedule(
@@ -590,16 +594,11 @@ impl Inner {
             );
             job.timers.push(timer);
         }
-        if has_tier_spillovers && let Some(policy) = self.config.interfaces.get(&interface) {
-            for tier in &policy.pool_tiers {
-                if !tier.spillover_after.is_zero() {
-                    let timer = self.timers.schedule(
-                        now.saturating_add(ms(tier.spillover_after)),
-                        TimerKey::Dispatch,
-                    );
-                    job.timers.push(timer);
-                }
-            }
+        for spillover_after in tier_spillovers {
+            let timer = self
+                .timers
+                .schedule(now.saturating_add(ms(spillover_after)), TimerKey::Dispatch);
+            job.timers.push(timer);
         }
         if let Some(spillover) = spillover {
             let timer = self
@@ -742,7 +741,8 @@ impl Inner {
             State::remove_nested(&mut st.scan_cursor, namespace, interface);
         }
         let priority_cap = self.config.priority_levels.saturating_sub(1);
-        let policy = self.config.interfaces.get(interface);
+        let live = self.live();
+        let policy = live.interfaces.get(interface);
         for key in keys {
             let Some(job) = st.jobs.get(&key.job_id) else {
                 continue;
@@ -819,9 +819,11 @@ impl Inner {
                 return None;
             }
         }
-        let policy = self.config.interfaces.get(&spec_ref.demand.interface);
+        let live = self.live();
+        let policy = live.interfaces.get(&spec_ref.demand.interface);
         let mut rng = st.rng;
         let picked = pick_direct_session(st, namespace, spec_ref, policy, now, &mut rng);
+        drop(live);
         st.rng = rng;
         let session_id = picked?;
 
@@ -1443,8 +1445,9 @@ impl Inner {
     }
 
     fn backoff(&self, job: &Job) -> u64 {
-        let initial = ms(self.config.default_initial_backoff);
-        let max = ms(self.config.default_max_backoff);
+        let live = self.live();
+        let initial = ms(live.default_initial_backoff);
+        let max = ms(live.default_max_backoff);
         let exponent = job.attempt_count.saturating_sub(1).min(16);
         initial.saturating_mul(1 << exponent).min(max)
     }
@@ -1488,7 +1491,7 @@ impl Inner {
             now,
         );
         self.timers.schedule(
-            now.saturating_add(ms(self.config.cancel_grace)),
+            now.saturating_add(ms(self.live().cancel_grace)),
             TimerKey::CancelGrace {
                 lease_id: lease_id.to_string(),
             },
@@ -1734,7 +1737,8 @@ impl Inner {
         self.dispatch_locked(st, now);
         // Keep the count bound as jobs finish, one eviction each, instead of
         // leaving a second's worth to the maintenance pass.
-        while st.terminal_order.len() > self.config.max_terminal_jobs {
+        let max_terminal = self.live().max_terminal_jobs;
+        while st.terminal_order.len() > max_terminal {
             let Some(evicted) = self.evict_oldest_terminal_locked(st) else {
                 break;
             };
@@ -1781,7 +1785,7 @@ impl Inner {
     /// `MAINTENANCE_EVICTIONS` per pass. `max_terminal_jobs` is enforced as
     /// jobs finish.
     pub(crate) fn evict_terminal_locked(&self, st: &mut State, now: u64) {
-        let retention = ms(self.config.terminal_retention);
+        let retention = ms(self.live().terminal_retention);
         for _ in 0..MAINTENANCE_EVICTIONS {
             match st.terminal_order.front() {
                 Some((finished_at, _)) if now.saturating_sub(*finished_at) >= retention => {

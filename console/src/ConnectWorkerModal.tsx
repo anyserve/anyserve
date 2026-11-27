@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { PROJECT_INSTALL_PS1_URL, PROJECT_INSTALL_SH_URL } from "./app-constants";
 import { IconClose } from "./icons";
 import { CopyButton } from "./pane-tables";
 import type { ControlPlaneSummary } from "./types";
@@ -17,7 +18,7 @@ const TABS: Array<{ id: OnboardingTab; label: string }> = [
   { id: "connectors", label: "AI Connectors" },
   { id: "rust", label: "Rust SDK" },
   { id: "container", label: "Docker & Helm" },
-  { id: "linux", label: "Linux Install" },
+  { id: "linux", label: "CLI Install" },
 ];
 
 function resolveWildcardHost(listen: string, host: string): string {
@@ -180,12 +181,16 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
           {tab === "linux" ? (
             <>
               <CopyableBlock
-                title="1. Install AnyServe binary on Linux x86_64"
-                code={`curl -fsSL https://github.com/anyserve/anyserve/releases/download/v0.6.0/anyserve-v0.6.0-x86_64-unknown-linux-gnu.tar.gz \\\n  | tar -xz\nsudo install -m 0755 anyserve-v0.6.0-x86_64-unknown-linux-gnu/anyserve /usr/local/bin/anyserve\nanyserve --version`}
+                title="1. One-line install (macOS & Linux — x86_64 / arm64)"
+                code={`curl -fsSL ${PROJECT_INSTALL_SH_URL} | sh\nanyserve --version`}
               />
               <CopyableBlock
-                title="2. Provision Python runtime & verify control plane"
-                code={`python3 -m venv ~/.anyserve-venv && ~/.anyserve-venv/bin/pip install anyserve-runtime\n${clientTokenLine}ANYSERVE_ENDPOINT="${endpoint}" anyserve job ls`}
+                title="2. One-line install (Windows PowerShell — x86_64)"
+                code={`irm ${PROJECT_INSTALL_PS1_URL} | iex\nanyserve --version`}
+              />
+              <CopyableBlock
+                title="3. Pinned Linux x86_64 archive (direct download)"
+                code={`curl -fsSL https://github.com/anyserve/anyserve/releases/download/v0.6.0/anyserve-v0.6.0-x86_64-unknown-linux-gnu.tar.gz \\\n  | tar -xz\nsudo install -m 0755 anyserve-v0.6.0-x86_64-unknown-linux-gnu/anyserve /usr/local/bin/anyserve\n${clientTokenLine}ANYSERVE_ENDPOINT="${endpoint}" anyserve job ls`}
               />
             </>
           ) : null}

@@ -661,6 +661,205 @@ pub struct InterfacePolicy {
     pub pool_tiers: Vec<PoolTier>,
 }
 
+/// Hot-mutable operational runtime settings that can be updated live via the
+/// Console / management API without restarting the control plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveRuntimeSettings {
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub reconnect_grace: Option<Duration>,
+    pub default_max_attempts: u32,
+    pub default_initial_backoff: Duration,
+    pub default_max_backoff: Duration,
+    pub default_max_queue: usize,
+    pub default_max_in_flight_per_key: Option<usize>,
+    pub max_pending_jobs: usize,
+    pub consumer_stall_timeout: Duration,
+    pub cancel_grace: Duration,
+    pub terminal_retention: Duration,
+    pub max_terminal_jobs: usize,
+    pub max_sessions: usize,
+    pub interfaces: BTreeMap<String, InterfacePolicy>,
+}
+
+impl LiveRuntimeSettings {
+    pub fn from_config(config: &RuntimeConfig) -> Self {
+        Self {
+            heartbeat_interval: config.heartbeat_interval,
+            heartbeat_timeout: config.heartbeat_timeout,
+            reconnect_grace: config.reconnect_grace,
+            default_max_attempts: config.default_max_attempts,
+            default_initial_backoff: config.default_initial_backoff,
+            default_max_backoff: config.default_max_backoff,
+            default_max_queue: config.default_max_queue,
+            default_max_in_flight_per_key: config.default_max_in_flight_per_key,
+            max_pending_jobs: config.max_pending_jobs,
+            consumer_stall_timeout: config.consumer_stall_timeout,
+            cancel_grace: config.cancel_grace,
+            terminal_retention: config.terminal_retention,
+            max_terminal_jobs: config.max_terminal_jobs,
+            max_sessions: config.max_sessions,
+            interfaces: config.interfaces.clone(),
+        }
+    }
+
+    pub fn validate(&self, max_attempts_limit: u32) -> Result<(), crate::error::RuntimeError> {
+        use crate::error::RuntimeError;
+        let attempts_cap = max_attempts_limit.max(1);
+        if self.default_max_attempts == 0 || self.default_max_attempts > attempts_cap {
+            return Err(RuntimeError::invalid(format!(
+                "default_max_attempts must be between 1 and {attempts_cap}"
+            )));
+        }
+        if self.heartbeat_interval < Duration::from_millis(500)
+            || self.heartbeat_interval > Duration::from_secs(300)
+        {
+            return Err(RuntimeError::invalid(
+                "heartbeat_interval_ms must be between 500 and 300000",
+            ));
+        }
+        if self.heartbeat_timeout <= self.heartbeat_interval
+            || self.heartbeat_timeout > Duration::from_secs(900)
+        {
+            return Err(RuntimeError::invalid(
+                "heartbeat_timeout_ms must be greater than heartbeat_interval_ms and at most 900000",
+            ));
+        }
+        if let Some(grace) = self.reconnect_grace
+            && (grace < Duration::from_millis(100) || grace > Duration::from_secs(900))
+        {
+            return Err(RuntimeError::invalid(
+                "reconnect_grace_ms must be between 100 and 900000",
+            ));
+        }
+        if self.default_initial_backoff < Duration::from_millis(10)
+            || self.default_initial_backoff > Duration::from_secs(60)
+        {
+            return Err(RuntimeError::invalid(
+                "default_initial_backoff_ms must be between 10 and 60000",
+            ));
+        }
+        if self.default_max_backoff < self.default_initial_backoff
+            || self.default_max_backoff > Duration::from_secs(600)
+        {
+            return Err(RuntimeError::invalid(
+                "default_max_backoff_ms must be >= default_initial_backoff_ms and at most 600000",
+            ));
+        }
+        if self.default_max_queue == 0 || self.default_max_queue > 1_000_000 {
+            return Err(RuntimeError::invalid(
+                "default_max_queue must be between 1 and 1000000",
+            ));
+        }
+        if let Some(cap) = self.default_max_in_flight_per_key
+            && (cap == 0 || cap > 1_000_000)
+        {
+            return Err(RuntimeError::invalid(
+                "default_max_in_flight_per_key must be between 1 and 1000000",
+            ));
+        }
+        if self.max_pending_jobs == 0 || self.max_pending_jobs > 1_000_000 {
+            return Err(RuntimeError::invalid(
+                "max_pending_jobs must be between 1 and 1000000",
+            ));
+        }
+        if self.max_terminal_jobs > 1_000_000 {
+            return Err(RuntimeError::invalid(
+                "max_terminal_jobs must be at most 1000000",
+            ));
+        }
+        if self.terminal_retention > Duration::from_secs(365 * 24 * 3600) {
+            return Err(RuntimeError::invalid(
+                "terminal_retention_secs must be at most 31536000",
+            ));
+        }
+        if self.consumer_stall_timeout < Duration::from_secs(1)
+            || self.consumer_stall_timeout > Duration::from_secs(600)
+        {
+            return Err(RuntimeError::invalid(
+                "consumer_stall_timeout_ms must be between 1000 and 600000",
+            ));
+        }
+        if self.cancel_grace < Duration::from_secs(1)
+            || self.cancel_grace > Duration::from_secs(300)
+        {
+            return Err(RuntimeError::invalid(
+                "cancel_grace_ms must be between 1000 and 300000",
+            ));
+        }
+        if self.max_sessions == 0 || self.max_sessions > 100_000 {
+            return Err(RuntimeError::invalid(
+                "max_sessions must be between 1 and 100000",
+            ));
+        }
+        if self.interfaces.len() > 256 {
+            return Err(RuntimeError::invalid(
+                "at most 256 interface policy overrides are supported",
+            ));
+        }
+        for (iface, policy) in &self.interfaces {
+            if !is_valid_interface_name(iface) {
+                return Err(RuntimeError::invalid(format!(
+                    "interface '{iface}' must be 1..={MAX_INTERFACE_BYTES} bytes with no ASCII whitespace or control characters"
+                )));
+            }
+            if let Some(q) = policy.max_queue
+                && (q == 0 || q > 1_000_000)
+            {
+                return Err(RuntimeError::invalid(format!(
+                    "interface '{iface}' max_queue must be between 1 and 1000000"
+                )));
+            }
+            if let Some(qt) = policy.queue_timeout
+                && (qt.is_zero() || qt > Duration::from_secs(31 * 24 * 3600))
+            {
+                return Err(RuntimeError::invalid(format!(
+                    "interface '{iface}' queue_timeout_ms must be between 1 and 2678400000"
+                )));
+            }
+            if let Some(cap) = policy.max_in_flight_per_key
+                && (cap == 0 || cap > 1_000_000)
+            {
+                return Err(RuntimeError::invalid(format!(
+                    "interface '{iface}' max_in_flight_per_key must be between 1 and 1000000"
+                )));
+            }
+            if policy.pool_tiers.len() > 32 {
+                return Err(RuntimeError::invalid(format!(
+                    "interface '{iface}' may define at most 32 pool tiers"
+                )));
+            }
+            let mut seen_pools = std::collections::HashSet::new();
+            for tier in &policy.pool_tiers {
+                if tier.pool.len() > 256 || tier.pool.bytes().any(|b| b.is_ascii_control()) {
+                    return Err(RuntimeError::invalid(format!(
+                        "interface '{iface}' pool name is invalid"
+                    )));
+                }
+                if !seen_pools.insert(tier.pool.as_str()) {
+                    return Err(RuntimeError::invalid(format!(
+                        "interface '{iface}' has duplicate pool tier '{}'",
+                        tier.pool
+                    )));
+                }
+                if tier.spillover_after > Duration::from_secs(24 * 3600) {
+                    return Err(RuntimeError::invalid(format!(
+                        "interface '{iface}' spillover_after_ms must be at most 86400000"
+                    )));
+                }
+                if let Some(grace) = tier.reconnect_grace
+                    && (grace < Duration::from_millis(100) || grace > Duration::from_secs(900))
+                {
+                    return Err(RuntimeError::invalid(format!(
+                        "interface '{iface}' tier reconnect_grace_ms must be between 100 and 900000"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-namespace-prefix quota override enforced by the Rust control plane.
 /// Matched by longest prefix; omitted per-namespace fields inherit from
 /// [`TenantQuotas`], while `max_total_*` cap the aggregate across all

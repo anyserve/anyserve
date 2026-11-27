@@ -17,7 +17,7 @@ pub(crate) async fn require_client_token(
     if matches!(path, "/healthz" | "/readyz" | "/api/info") {
         return next.run(request).await;
     }
-    if path == "/metrics" {
+    if matches!(path, "/metrics" | "/api/settings" | "/api/settings/reset") {
         return match policy.authorize_operator_headers(request.headers()) {
             Ok(()) => next.run(request).await,
             Err(status) => auth_error_response(status),

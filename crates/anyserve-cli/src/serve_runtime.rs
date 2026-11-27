@@ -363,9 +363,42 @@ pub(crate) async fn run(args: ServeArgs, json_logs: bool) -> Result<()> {
         None
     };
 
+    let settings_path = config
+        .runtime
+        .journal
+        .as_ref()
+        .filter(|j| j.postgres.is_none() && j.cloudflare.is_none())
+        .map(|j| {
+            j.path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("runtime-settings.json")
+        });
+
     let runtime = Runtime::start(config.runtime.clone())
         .await
         .context("start execution runtime")?;
+    if let Some(ref path) = settings_path {
+        match crate::serve_console::settings::SettingsStore::load_file(path) {
+            Ok(Some(saved)) => match runtime.update_live_settings(saved) {
+                Ok(_) => {
+                    info!(path = %path.display(), "loaded persisted runtime settings overrides")
+                }
+                Err(error) => warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "ignoring invalid persisted runtime settings overrides"
+                ),
+            },
+            Ok(None) => {}
+            Err(error) => warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to read persisted runtime settings overrides; using startup config"
+            ),
+        }
+    }
     let auth = Arc::new(config.auth.clone());
     if !auth.is_enabled() {
         warn!(
@@ -454,6 +487,7 @@ pub(crate) async fn run(args: ServeArgs, json_logs: bool) -> Result<()> {
             .as_ref()
             .and_then(|c| c.auth_portal_url.clone()),
         revocation_sync_ok,
+        settings_path,
     };
 
     let mut servers = tokio::task::JoinSet::new();

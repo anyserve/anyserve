@@ -1,10 +1,26 @@
 import type { JobState, OverviewResponse } from "./types";
 
-export type ConsoleTab = "overview" | "jobs" | "interfaces" | "pools" | "workers" | "explore" | "playground";
+export type ConsoleTab = "overview" | "jobs" | "interfaces" | "pools" | "workers" | "explore" | "playground" | "settings";
 export type JobScope = "all" | "queue" | "history";
 export type JobStatusFilter = "all" | JobState;
 export type TimePreset = "all" | "5m" | "15m" | "1h" | "6h" | "24h" | "custom";
 export type Theme = "light" | "dark";
+export type ThemeMode = "system" | "light" | "dark";
+export type PollPreset = "live" | "2s" | "5s" | "10s" | "paused";
+
+export const POLL_PRESET_MS: Record<PollPreset, number | null> = {
+  live: null,
+  "2s": 2_000,
+  "5s": 5_000,
+  "10s": 10_000,
+  paused: 0,
+};
+
+export const PROJECT_GITHUB_URL = "https://github.com/anyserve/anyserve";
+export const PROJECT_DOCS_URL = "https://anyserve.github.io/anyserve/";
+export const PROJECT_RELEASES_URL = "https://github.com/anyserve/anyserve/releases";
+export const PROJECT_INSTALL_SH_URL = "https://anyserve.github.io/anyserve/install.sh";
+export const PROJECT_INSTALL_PS1_URL = "https://anyserve.github.io/anyserve/install.ps1";
 
 export interface TimeFilterState {
   preset: TimePreset;
@@ -35,6 +51,7 @@ export const TAB_PATHS: Record<ConsoleTab, string> = {
   workers: "/workers",
   explore: "/explore",
   playground: "/playground",
+  settings: "/settings",
 };
 
 export const JOB_SCOPE_PATHS: Record<JobScope, string> = {

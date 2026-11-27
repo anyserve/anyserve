@@ -58,6 +58,7 @@ impl ConsoleClient {
                 public_endpoint: meta.public_endpoint,
                 auth_portal_url: meta.auth_portal_url,
             }),
+            settings: super::settings::SettingsStore::new(meta.settings_path),
         };
         let app = router(state);
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -109,6 +110,7 @@ async fn spawn_console_auth(runtime: Runtime, auth: AuthPolicy) -> ConsoleClient
         public_endpoint: None,
         auth_portal_url: None,
         revocation_sync_ok: None,
+        settings_path: None,
     };
     ConsoleClient::spawn(runtime, auth, meta).await
 }
@@ -1136,6 +1138,7 @@ async fn overview_exposes_health_control_plane_budgets_journal_policies_and_pool
             public_endpoint: Some("wss://anyserve.example.com".into()),
             auth_portal_url: None,
             revocation_sync_ok: None,
+            settings_path: None,
         },
     )
     .await;
@@ -1263,6 +1266,7 @@ async fn run_server_serves_control_plane_metadata_and_shuts_down_cleanly() {
         public_endpoint: None,
         auth_portal_url: None,
         revocation_sync_ok: None,
+        settings_path: None,
     };
     let task = tokio::spawn(run_server(
         addr,
@@ -1617,6 +1621,7 @@ async fn cors_middleware_allows_only_configured_origins() {
             public_endpoint: None,
             auth_portal_url: None,
         }),
+        settings: super::settings::SettingsStore::default(),
     };
     let handle = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     let empty_resp = c
@@ -1963,6 +1968,7 @@ async fn console_info_worker_drain_tenant_overview_redaction_and_metrics_work() 
             public_endpoint: Some("https://relay.example.com".into()),
             auth_portal_url: Some("https://relay.example.com/tokens".into()),
             revocation_sync_ok: None,
+            settings_path: None,
         },
     )
     .await;
@@ -2184,6 +2190,7 @@ async fn metrics_output_is_strictly_contiguous_avoids_other_collision_and_expose
             public_endpoint: None,
             auth_portal_url: None,
             revocation_sync_ok: Some(Arc::clone(&sync_ok)),
+            settings_path: None,
         },
     )
     .await;
@@ -2547,4 +2554,149 @@ async fn drain_worker_enforces_auth_notifies_connected_and_preserves_drain_acros
     drop(w_reconn);
     drop(c);
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn settings_api_enforces_operator_auth_updates_live_persists_and_resets() {
+    let dir = temporary_path("console-settings");
+    let settings_path = dir.join("runtime-settings.json");
+    let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+    let auth = AuthPolicy::new(["op-tok".into()], ["worker-tok".into()]).with_scoped_tokens([
+        ScopedToken {
+            token: "tenant-tok".into(),
+            role: Role::Client,
+            namespace: "gh-42".into(),
+            subject: "alice".into(),
+            forced_pool: None,
+        },
+    ]);
+    let c = ConsoleClient::spawn(
+        runtime.clone(),
+        auth,
+        ControlPlaneMetadata {
+            grpc_enabled: true,
+            grpc_listen: "127.0.0.1:50052".into(),
+            grpc_tls_enabled: false,
+            public_endpoint: None,
+            auth_portal_url: None,
+            revocation_sync_ok: None,
+            settings_path: Some(settings_path.clone()),
+        },
+    )
+    .await;
+
+    // 1. Strict operator-only auth boundary (matches /metrics).
+    assert_eq!(c.status(Method::GET, "/api/settings", None).await, 401);
+    assert_eq!(
+        c.status(Method::GET, "/api/settings", Some("tenant-tok"))
+            .await,
+        403
+    );
+    assert_eq!(
+        c.status(Method::GET, "/api/settings", Some("worker-tok"))
+            .await,
+        403
+    );
+    assert_eq!(
+        c.status(Method::POST, "/api/settings/reset", Some("tenant-tok"))
+            .await,
+        403
+    );
+
+    // 2. Operator reads defaults.
+    let initial = c.json(Method::GET, "/api/settings", Some("op-tok")).await;
+    assert_eq!(initial["editable"], true);
+    assert_eq!(initial["persisted"], true);
+    assert_eq!(initial["modified"], false);
+    assert_eq!(initial["settings"]["default_max_attempts"], 3);
+
+    // 3. Invalid update is rejected with 400 and leaves live settings untouched.
+    let mut bad = initial["settings"].clone();
+    bad["heartbeat_timeout_ms"] = json!(1000);
+    bad["heartbeat_interval_ms"] = json!(5000);
+    let bad_resp = c
+        .http
+        .put(format!("{}/api/settings", c.base))
+        .bearer_auth("op-tok")
+        .json(&bad)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_resp.status().as_u16(), 400);
+
+    // 4. Valid live update updates Runtime immediately, reflects in /api/overview, and persists to disk.
+    let mut updated = initial["settings"].clone();
+    updated["default_max_attempts"] = json!(5);
+    updated["max_terminal_jobs"] = json!(250);
+    updated["terminal_retention_secs"] = json!(86400);
+    updated["reconnect_grace_ms"] = json!(2500);
+    updated["interfaces"] = json!({
+        "demo.fast.v1": {
+            "max_queue": 64,
+            "queue_timeout_ms": 5000,
+            "max_in_flight_per_key": 2,
+            "pool_tiers": [
+                { "pool": "browser", "spillover_after_ms": 0, "reconnect_grace_ms": 1000 },
+                { "pool": "", "spillover_after_ms": 500, "reconnect_grace_ms": null }
+            ]
+        }
+    });
+    let put_resp = c
+        .http
+        .put(format!("{}/api/settings", c.base))
+        .bearer_auth("op-tok")
+        .json(&updated)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status().as_u16(), 200);
+    let body: Value = put_resp.json().await.unwrap();
+    assert_eq!(body["modified"], true);
+    assert_eq!(body["settings"]["default_max_attempts"], 5);
+    assert_eq!(body["settings"]["max_terminal_jobs"], 250);
+    assert!(
+        body["server_toml"]
+            .as_str()
+            .unwrap()
+            .contains("default_max_attempts = 5")
+    );
+    assert!(
+        body["server_toml"]
+            .as_str()
+            .unwrap()
+            .contains("demo.fast.v1")
+    );
+
+    // /api/overview immediately reflects the live settings!
+    let overview = c.json(Method::GET, "/api/overview", Some("op-tok")).await;
+    assert_eq!(overview["control_plane"]["default_max_attempts"], 5);
+    assert_eq!(overview["control_plane"]["reconnect_grace_ms"], 2500);
+    assert!(
+        overview["interfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["name"] == "demo.fast.v1")
+    );
+
+    // Persisted file loads cleanly back into LiveRuntimeSettings.
+    assert!(settings_path.exists());
+    let reloaded = super::settings::SettingsStore::load_file(&settings_path)
+        .unwrap()
+        .expect("saved settings");
+    assert_eq!(reloaded.default_max_attempts, 5);
+    assert_eq!(reloaded.max_terminal_jobs, 250);
+    assert!(reloaded.interfaces.contains_key("demo.fast.v1"));
+
+    // 5. Reset restores startup baseline and removes override file.
+    let reset = c
+        .json(Method::POST, "/api/settings/reset", Some("op-tok"))
+        .await;
+    assert_eq!(reset["modified"], false);
+    assert_eq!(reset["settings"]["default_max_attempts"], 3);
+    assert!(!settings_path.exists());
+
+    drop(c);
+    runtime.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

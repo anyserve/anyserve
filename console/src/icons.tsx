@@ -152,3 +152,40 @@ export const IconClose = (p: IconProps) => (
     <path d="m4 4 8 8M12 4l-8 8" />
   </IconFrame>
 );
+
+export const IconSettings = (p: IconProps) => (
+  <IconFrame {...p}>
+    <circle cx={8} cy={8} r={2.2} />
+    <path d="M8 2.2v1.35M8 12.45v1.35M2.2 8h1.35M12.45 8h1.35M3.9 3.9l.95.95M11.15 11.15l.95.95M12.1 3.9l-.95.95M4.85 11.15l-.95.95" />
+  </IconFrame>
+);
+
+export const IconBook = (p: IconProps) => (
+  <IconFrame width={14} height={14} {...p}>
+    <path d="M3 3.25h4.25A1.75 1.75 0 0 1 9 5v8.25a1.5 1.5 0 0 0-1.5-1.5H3V3.25ZM13 3.25H8.75A1.75 1.75 0 0 0 7 5v8.25a1.5 1.5 0 0 1 1.5-1.5H13V3.25Z" />
+  </IconFrame>
+);
+
+export const IconGitHub = (p: IconProps) => (
+  <svg viewBox="0 0 16 16" width={14} height={14} fill="currentColor" aria-hidden="true" {...p}>
+    <path d="M8 1.25a6.75 6.75 0 0 0-2.13 13.15c.34.06.46-.15.46-.33v-1.15c-1.88.41-2.28-.9-2.28-.9-.31-.78-.75-.99-.75-.99-.62-.42.05-.41.05-.41.68.05 1.04.7 1.04.7.6 1.04 1.59.74 1.98.56.06-.44.24-.74.43-.91-1.5-.17-3.08-.75-3.08-3.34 0-.74.26-1.34.7-1.81-.07-.17-.3-.86.07-1.79 0 0 .57-.18 1.86.69a6.47 6.47 0 0 1 3.38 0c1.29-.87 1.86-.69 1.86-.69.37.93.14 1.62.07 1.79.44.47.7 1.07.7 1.81 0 2.6-1.58 3.17-3.09 3.33.24.21.46.63.46 1.26v1.87c0 .18.12.39.46.33A6.75 6.75 0 0 0 8 1.25Z" />
+  </svg>
+);
+
+export const IconExternalLink = (p: IconProps) => (
+  <IconFrame width={13} height={13} {...p}>
+    <path d="M9.5 3H13v3.5M13 3 7.5 8.5M11 9v3a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h3" />
+  </IconFrame>
+);
+
+export const IconTrash = (p: IconProps) => (
+  <IconFrame width={14} height={14} {...p}>
+    <path d="M3 4.5h10M6 4.5V3.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 .75.75V4.5M4.5 4.5l.6 8.1a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8.1" />
+  </IconFrame>
+);
+
+export const IconRotateCcw = (p: IconProps) => (
+  <IconFrame width={14} height={14} {...p}>
+    <path d="M3 8a5 5 0 1 0 1-3M4 2.5V5h2.5" />
+  </IconFrame>
+);

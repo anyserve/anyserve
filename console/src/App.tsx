@@ -19,8 +19,10 @@ import {
 } from "./api";
 import {
   buildJobStats, buildUrlSearch, DEFAULT_TIME_FILTER, DETAIL_POLL_MS, HISTORY_STATES,
-  JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, QUEUE_STATES,
-  resolveEffectiveStates, routePath, scopeMap, WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type Theme, type TimeFilterState,
+  JOBS_ACTIVE_POLL_MS, JOBS_HISTORY_POLL_MS, OVERVIEW_POLL_MS, parseUrlState, POLL_PRESET_MS,
+  PROJECT_DOCS_URL, PROJECT_GITHUB_URL, QUEUE_STATES, resolveEffectiveStates, routePath, scopeMap,
+  WORKERS_POLL_MS, type ConsoleTab, type JobScope, type JobStatusFilter, type PollPreset,
+  type Theme, type ThemeMode, type TimeFilterState,
 } from "./app-constants";
 import { browserWorkerManager } from "./browser-worker/manager";
 import { ConnectWorkerModal } from "./ConnectWorkerModal";
@@ -32,6 +34,7 @@ import { OverviewPane } from "./OverviewPane";
 import { JobInspector } from "./pane-inspector";
 import { PlaygroundPane } from "./PlaygroundPane";
 import { PoolsPane, type PoolFilterSeed } from "./PoolsPane";
+import { SettingsPane } from "./SettingsPane";
 import { Sidebar } from "./Sidebar";
 import type { InfoResponse, JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
@@ -39,6 +42,7 @@ import { WorkersPane, type HealthFilter, type WorkerFilterSeed } from "./Workers
 
 const ExplorePane = lazy(() => import("./ExplorePane"));
 const THEME_KEY = "anyserve.console.theme";
+const POLL_KEY = "anyserve.console.poll";
 interface JobsPageState {
   loadedKey: string | null;
   page1: JobSummary[];
@@ -68,9 +72,30 @@ const EMPTY_FILTERS = {
 };
 const EMPTY_SCOPE_SELECTION: Record<JobScope, string | null> = { all: null, queue: null, history: null };
 
-function readTheme(): Theme {
-  try { const s = localStorage.getItem(THEME_KEY); if (s === "dark" || s === "light") return s; } catch { /* ignore */ }
-  return "light";
+function readThemeMode(): ThemeMode {
+  try {
+    const s = localStorage.getItem(THEME_KEY);
+    if (s === "dark" || s === "light" || s === "system") return s;
+  } catch { /* ignore */ }
+  return "system";
+}
+
+function readSystemDark(): boolean {
+  try {
+    return typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false;
+  } catch {
+    return false;
+  }
+}
+
+function readPollPreset(): PollPreset {
+  try {
+    const s = localStorage.getItem(POLL_KEY);
+    if (s === "live" || s === "2s" || s === "5s" || s === "10s" || s === "paused") return s;
+  } catch { /* ignore */ }
+  return "live";
 }
 
 function consumeHashToken(): boolean {
@@ -91,7 +116,10 @@ export default function App() {
   const init = useMemo(() => parseUrlState(window.location.pathname, window.location.search), []);
   const [activeTab, setActiveTab] = useState<ConsoleTab>(init.tab);
   const [jobScope, setJobScope] = useState<JobScope>(init.jobScope);
-  const [theme, setTheme] = useState<Theme>(readTheme);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode);
+  const [systemDark, setSystemDark] = useState<boolean>(readSystemDark);
+  const theme: Theme = themeMode === "system" ? (systemDark ? "dark" : "light") : themeMode;
+  const [pollPreset, setPollPreset] = useState<PollPreset>(readPollPreset);
 
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [workersResponse, setWorkersResponse] = useState<WorkersResponse | null>(null);
@@ -137,9 +165,22 @@ export default function App() {
   const authRequiredRef = useRef(false);
 
   useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    setSystemDark(mq.matches);
+    mq.addEventListener?.("change", onChange);
+    return () => mq.removeEventListener?.("change", onChange);
+  }, []);
+
+  useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    try { localStorage.setItem(THEME_KEY, theme); } catch { /* ignore */ }
-  }, [theme]);
+    try { localStorage.setItem(THEME_KEY, themeMode); } catch { /* ignore */ }
+  }, [theme, themeMode]);
+
+  useEffect(() => {
+    try { localStorage.setItem(POLL_KEY, pollPreset); } catch { /* ignore */ }
+  }, [pollPreset]);
 
   useEffect(() => {
     const onPop = () => {
@@ -265,8 +306,11 @@ export default function App() {
   const jobsQueryKey = `${jobScope}|${filters.status}|${filters.iface}|${filters.ns}|${filters.worker}|${serverSearch}|${timeKey}`;
 
   const recommendedPollMs = overview?.control_plane?.recommended_poll_ms;
-  const resolvePollMs = (defaultMs: number): number =>
-    recommendedPollMs == null ? defaultMs : recommendedPollMs <= 0 ? 0 : recommendedPollMs;
+  const userPollMs = POLL_PRESET_MS[pollPreset];
+  const resolvePollMs = (defaultMs: number): number => {
+    if (userPollMs !== null) return userPollMs;
+    return recommendedPollMs == null ? defaultMs : recommendedPollMs <= 0 ? 0 : recommendedPollMs;
+  };
 
   usePollingEffect(
     getOverview,
@@ -557,7 +601,14 @@ export default function App() {
     (s) => s.status === "online" || s.status === "busy",
   ).length;
 
-  const handleToggleTheme = useCallback(() => setTheme((c) => (c === "light" ? "dark" : "light")), []);
+  const handleToggleTheme = useCallback(
+    () =>
+      setThemeMode((c) => {
+        const current = c === "system" ? (systemDark ? "dark" : "light") : c;
+        return current === "dark" ? "light" : "dark";
+      }),
+    [systemDark],
+  );
   const handleRefresh = useCallback(() => setManualRefreshSeq((s) => s + 1), []);
   const handleSelectTab = useCallback((tab: ConsoleTab) => navigateTo(tab), [navigateTo]);
 
@@ -631,6 +682,11 @@ export default function App() {
               Sign in with GitHub
             </a>
           ) : null}
+          <div className="auth__links">
+            <a href={PROJECT_DOCS_URL} target="_blank" rel="noopener noreferrer">Docs</a>
+            <span aria-hidden="true">·</span>
+            <a href={PROJECT_GITHUB_URL} target="_blank" rel="noopener noreferrer">GitHub</a>
+          </div>
         </form>
       </main>
     );
@@ -647,6 +703,7 @@ export default function App() {
         overview={overview}
         browserWorkersLive={browserWorkersLive}
         theme={theme}
+        themeMode={themeMode}
         onToggleTheme={handleToggleTheme}
         onRefresh={handleRefresh}
         authenticated={authenticated}
@@ -781,6 +838,21 @@ export default function App() {
               onOpenJobInJobs={(jobId, ns) => jumpToJobs({ jobId, ns, scope: "all" })}
               onOpenWorkers={() => navigateTo("workers")}
               onRefresh={handleRefresh}
+            />
+          ) : null}
+          {activeTab === "settings" ? (
+            <SettingsPane
+              overview={overview}
+              authPortalUrl={authPortalUrl}
+              themeMode={themeMode}
+              onThemeModeChange={setThemeMode}
+              pollPreset={pollPreset}
+              onPollPresetChange={setPollPreset}
+              authenticated={authenticated}
+              onDisconnect={handleDisconnect}
+              onOpenConnect={() => setConnectOpen(true)}
+              onSettingsApplied={handleRefresh}
+              onAuthenticationError={handleError}
             />
           ) : null}
         </main>

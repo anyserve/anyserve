@@ -17,7 +17,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Notify, oneshot, watch};
@@ -25,8 +25,8 @@ use tokio::sync::{Notify, oneshot, watch};
 use self::api::{
     Durability, ErrorInfo, EventKind, EventStream, Execution, ExecutionEvent, Health, InputMode,
     InputSink, InvokeRequest, JobFilter, JobInspection, JobPage, JobPreview, JobSpec, JobState,
-    JobView, ObjectPreview, PoolStats, RuntimeConfig, RuntimeSnapshot, RuntimeStats, SubmitOutcome,
-    SubmitRequest, WorkerStats, WorkerView, codes,
+    JobView, LiveRuntimeSettings, ObjectPreview, PoolStats, RuntimeConfig, RuntimeSnapshot,
+    RuntimeStats, SubmitOutcome, SubmitRequest, WorkerStats, WorkerView, codes,
 };
 use self::events::{ByteBudget, JobLog, Permit};
 use self::input::InputLog;
@@ -174,6 +174,7 @@ impl Timers {
 
 pub(crate) struct Inner {
     pub(crate) config: RuntimeConfig,
+    pub(crate) live: RwLock<LiveRuntimeSettings>,
     pub(crate) generation: AtomicU64,
     pub(crate) leader_active: AtomicBool,
     pub(crate) lease_lost: AtomicBool,
@@ -225,6 +226,10 @@ impl Drop for StateGuard<'_> {
 }
 
 impl Inner {
+    pub(crate) fn live(&self) -> RwLockReadGuard<'_, LiveRuntimeSettings> {
+        self.live.read().expect("live runtime settings poisoned")
+    }
+
     pub(crate) fn lock(&self) -> StateGuard<'_> {
         StateGuard {
             state: Some(self.state.lock().expect("runtime state poisoned")),
@@ -537,9 +542,12 @@ impl Inner {
                 self.fail_job_locked(&mut st, &job_id, codes::ATTEMPTS_EXHAUSTED, &message, now);
             }
         }
-        let retention = ms(self.config.terminal_retention);
+        let (retention, max_terminal) = {
+            let live = self.live();
+            (ms(live.terminal_retention), live.max_terminal_jobs)
+        };
         let cutoff = now.saturating_sub(retention);
-        if self.config.max_terminal_jobs > 0 && retention > 0 {
+        if max_terminal > 0 && retention > 0 {
             for stored in recovery.terminal {
                 if !stored.state.is_terminal()
                     || stored.updated_at_ms < cutoff
@@ -549,7 +557,7 @@ impl Inner {
                 }
                 self.insert_recovered_terminal_locked(&mut st, stored);
             }
-            while st.terminal_order.len() > self.config.max_terminal_jobs {
+            while st.terminal_order.len() > max_terminal {
                 let Some(evicted) = self.evict_oldest_terminal_locked(&mut st) else {
                     break;
                 };
@@ -853,6 +861,7 @@ impl Runtime {
             .prefix_overrides
             .iter()
             .any(|entry| entry.max_total_pending_jobs.is_some());
+        let live_initial = LiveRuntimeSettings::from_config(&config);
         let inner = Arc::new_cyclic(|me| Inner {
             generation: AtomicU64::new(generation),
             leader_active: AtomicBool::new(initially_active),
@@ -877,6 +886,7 @@ impl Runtime {
             result_budget: Arc::new(ByteBudget::new(result_budget)),
             me: me.clone(),
             config,
+            live: RwLock::new(live_initial),
         });
         if let Some(leadership) = initial_leadership {
             inner.activate_leadership(leadership);
@@ -894,6 +904,72 @@ impl Runtime {
 
     pub fn config(&self) -> &RuntimeConfig {
         &self.inner.config
+    }
+
+    pub fn baseline_settings(&self) -> LiveRuntimeSettings {
+        LiveRuntimeSettings::from_config(&self.inner.config)
+    }
+
+    pub fn live_settings(&self) -> LiveRuntimeSettings {
+        self.inner.live().clone()
+    }
+
+    /// Validates and applies updated operational settings immediately without
+    /// restarting the control plane.
+    pub fn update_live_settings(
+        &self,
+        next: LiveRuntimeSettings,
+    ) -> Result<LiveRuntimeSettings, RuntimeError> {
+        next.validate(self.inner.config.max_attempts_limit)?;
+        let max_terminal = next.max_terminal_jobs;
+        {
+            let mut guard = self
+                .inner
+                .live
+                .write()
+                .expect("live runtime settings poisoned");
+            *guard = next.clone();
+        }
+        {
+            let mut st = self.inner.lock();
+            let now = now_ms();
+            self.inner.evict_terminal_locked(&mut st, now);
+            while st.terminal_order.len() > max_terminal {
+                let Some(evicted) = self.inner.evict_oldest_terminal_locked(&mut st) else {
+                    break;
+                };
+                st.released.jobs.push(evicted);
+            }
+            self.inner.dispatch_locked(&mut st, now);
+        }
+        Ok(next)
+    }
+
+    /// Restores live operational settings back to the startup baseline.
+    pub fn reset_live_settings(&self) -> LiveRuntimeSettings {
+        let baseline = self.baseline_settings();
+        let max_terminal = baseline.max_terminal_jobs;
+        {
+            let mut guard = self
+                .inner
+                .live
+                .write()
+                .expect("live runtime settings poisoned");
+            *guard = baseline.clone();
+        }
+        {
+            let mut st = self.inner.lock();
+            let now = now_ms();
+            self.inner.evict_terminal_locked(&mut st, now);
+            while st.terminal_order.len() > max_terminal {
+                let Some(evicted) = self.inner.evict_oldest_terminal_locked(&mut st) else {
+                    break;
+                };
+                st.released.jobs.push(evicted);
+            }
+            self.inner.dispatch_locked(&mut st, now);
+        }
+        baseline
     }
 
     pub fn generation(&self) -> u64 {
@@ -1039,11 +1115,12 @@ impl Runtime {
             .policy
             .priority
             .min(self.inner.config.priority_levels.saturating_sub(1));
+        let default_max_attempts = self.inner.live().default_max_attempts;
         let max_attempts = spec
             .policy
             .max_attempts
             .filter(|attempts| *attempts > 0)
-            .unwrap_or(self.inner.config.default_max_attempts)
+            .unwrap_or(default_max_attempts)
             .clamp(1, self.inner.config.max_attempts_limit.max(1));
         Ok((spec, max_attempts))
     }
@@ -1896,6 +1973,7 @@ impl Runtime {
                 pool_entry.active_leases += active_leases;
             }
         }
+        let live = self.inner.live();
         for (namespace, ifaces) in &st.queues {
             if namespace_filter.is_some_and(|ns| namespace != ns) {
                 continue;
@@ -1904,9 +1982,7 @@ impl Runtime {
                 if queue.is_empty() {
                     continue;
                 }
-                let primary_pool = self
-                    .inner
-                    .config
+                let primary_pool = live
                     .interfaces
                     .get(interface)
                     .and_then(|policy| policy.pool_tiers.first())
@@ -1925,6 +2001,7 @@ impl Runtime {
                 ((ns.to_string(), iface.to_string(), pool.to_string()), stats)
             })
             .collect();
+        drop(live);
         let ((input_bytes, result_bytes, event_bytes), counters) = if namespace_filter.is_some() {
             Default::default()
         } else {
