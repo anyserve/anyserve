@@ -9,6 +9,9 @@ Python 3.10+ and Node.js 24+. Run commands from the repository root.
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo clippy --locked -p anyserve-client -p anyserve --features direct --all-targets -- -D warnings
+cargo test --locked -p anyserve-client --features direct
+cargo test --locked -p anyserve --features direct --test direct_runtime_e2e
 cargo test --locked -p anyserve --test rust_ts_differential
 cargo build --locked -p anyserve
 python3 -m venv .venv
@@ -20,6 +23,8 @@ python clients/python/tests/native_do_e2e.py -v
 npm --prefix console ci
 npm --prefix console test
 npm --prefix console run build
+cargo clippy --locked -p anyserve --features embed-console --all-targets -- -D warnings
+cargo test --locked -p anyserve --features embed-console serve_console
 npm --prefix deploy/cloudflare ci
 npm --prefix deploy/cloudflare run typecheck
 npm --prefix deploy/cloudflare test

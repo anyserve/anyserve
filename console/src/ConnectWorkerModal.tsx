@@ -155,7 +155,7 @@ export function ConnectWorkerModal({ open, controlPlane, onClose }: ConnectWorke
             <>
               <CopyableBlock
                 title="1. Run the repository Rust worker example"
-                code={`${tokenLine}cargo run --locked -p anyserve-rust-example -- \\\n  --mode worker \\\n  --endpoint "${endpoint}" \\\n  --worker-id rust-worker-01`}
+                code={`${tokenLine}cargo run --locked -p anyserve-demo -- \\\n  --mode worker \\\n  --endpoint "${endpoint}" \\\n  --worker-id rust-worker-01`}
               />
               <CopyableBlock
                 title="2. Embed anyserve-client in Rust"

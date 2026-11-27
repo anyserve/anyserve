@@ -66,9 +66,7 @@ export const QUOTA_SOFT_R2_CLASS_A_PER_MONTH = 900_000;
 export const QUOTA_SOFT_R2_CLASS_B_PER_MONTH = 9_000_000;
 export const QUOTA_SOFT_LARGE_JOBS_PER_DAY = 500;
 
-export const WS_READY_STATE_CONNECTING = 0;
 export const WS_READY_STATE_OPEN = 1;
-export const WS_READY_STATE_CLOSING = 2;
 export const WS_READY_STATE_CLOSED = 3;
 
 export type SocketKind = "session" | "attempt" | "invoke" | "watch";
@@ -188,10 +186,6 @@ export function decodeCompactAttachment(raw: unknown): SocketAttachment | null {
     utilization: typeof obj.u === "number" ? obj.u : 0,
     replay: obj.rp === 1 ? 1 : 0,
   };
-}
-
-export function attachmentByteLength(att: SocketAttachment): number {
-  return utf8ByteLen(JSON.stringify(encodeCompactAttachment(att)));
 }
 
 /**

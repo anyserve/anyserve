@@ -12,5 +12,6 @@ with `pip install ./clients/python`.
 - [Start a local server and worker](https://github.com/anyserve/anyserve#quick-start).
 - [Client, streaming and worker API reference](https://github.com/anyserve/anyserve/blob/main/docs/python-sdk.md).
 - [Build and test commands](https://github.com/anyserve/anyserve/blob/main/docs/contributing.md).
-- [Echo worker](https://github.com/anyserve/anyserve/blob/main/examples/python/worker.py) and
-  [submitter](https://github.com/anyserve/anyserve/blob/main/examples/python/submit.py).
+- [Echo worker](https://github.com/anyserve/anyserve/blob/main/examples/python/worker.py),
+  [local HTTP model worker](https://github.com/anyserve/anyserve/blob/main/examples/python/local_model_worker.py),
+  and [submitter](https://github.com/anyserve/anyserve/blob/main/examples/python/submit.py).

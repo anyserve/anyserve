@@ -10,6 +10,3 @@ anyhow.workspace = true
 anyserve-client = { path = "../../crates/anyserve-client" }
 clap.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true

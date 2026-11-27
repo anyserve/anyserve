@@ -1,4 +1,4 @@
-// Management & Console HTTP API for AnyserveNativeDO (section 6.2, 7 of docs/cloudflare-native-do-plan.md).
+// Management & Console HTTP API for AnyserveNativeDO.
 // Matches console/src/types.ts and crates/anyserve-cli/src/serve_console/{api,handlers,snapshot,metrics}.rs.
 
 import {

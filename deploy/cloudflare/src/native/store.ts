@@ -1,4 +1,4 @@
-// Native DO SQLite + R2 storage layer (sections 4, 6.4, 8, 9 of docs/cloudflare-native-do-plan.md).
+// Native DO SQLite + R2 storage layer.
 // Zero cloudflare:workers or node:* imports; never calls JournalStorage.
 
 import {

@@ -1,4 +1,4 @@
-// Native Durable Object Execution Engine (sections 4, 5, 6, 7, 8, 9 of docs/cloudflare-native-do-plan.md v4).
+// Native Durable Object Execution Engine.
 // Mirrors crates/anyserve-core/src/runtime/* and http_ws_service.rs without cloudflare:workers or node:* imports.
 
 import { attemptHandlers, type AttemptHandlers } from "./attempt-handlers";

@@ -72,7 +72,6 @@ pub(crate) fn finished(
     }))
 }
 
-#[allow(dead_code)]
 pub(crate) fn finish_to_proto(status: FinishStatus) -> pb::AttemptDown {
     match status {
         FinishStatus::Committed => finished(pb::attempt_finished::Status::Committed, ""),
