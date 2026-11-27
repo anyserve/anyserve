@@ -22,3 +22,10 @@ __pycache__/
 
 # Local runtime journal
 /.anyserve/
+
+# Docs website (Astro Starlight)
+/website/node_modules
+/website/dist
+/website/.astro
+/website/public/install.sh
+/website/public/install.ps1

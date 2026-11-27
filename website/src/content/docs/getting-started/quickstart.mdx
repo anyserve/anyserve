@@ -1,0 +1,71 @@
+---
+title: Quickstart
+description: Start a local authenticated control plane, connect a worker, and invoke a job in under two minutes.
+---
+
+## Option A: Local control plane
+
+### 1. Start the server
+
+`--auto-token` generates client (`as_c_*`) and worker (`as_w_*`) tokens, persists them in `.anyserve/tokens.env` (`0600`), and prints ready-to-copy commands:
+
+```bash
+anyserve serve --console-listen 127.0.0.1:3001 --auto-token
+```
+
+Open the embedded Web Console at `http://127.0.0.1:3001` and sign in with the printed client token.
+
+### 2. Connect an outbound worker
+
+```bash
+pip install anyserve-runtime
+```
+
+Save `worker.py`:
+
+```python
+from anyserve import serve, worker
+
+@worker(interface="demo.echo.v1", max_active_leases=4)
+def echo(payload: bytes) -> bytes:
+    return payload
+
+serve(echo)
+```
+
+Run it with the printed worker token:
+
+```bash
+ANYSERVE_TOKEN="<worker-token>" python worker.py
+```
+
+### 3. Invoke a job
+
+```bash
+ANYSERVE_TOKEN="<client-token>" anyserve invoke demo.echo.v1 --input "hello AnyServe"
+```
+
+Pass `--ephemeral` to `anyserve serve` to disable the SQLite journal, or expose `:3001` instantly over `wss://` with `cloudflared tunnel --url http://127.0.0.1:3001`.
+
+---
+
+## Option B: Try the Live Demo
+
+Skip running a server altogether:
+
+1. Open [https://anyserve.arcosx.org/tokens](https://anyserve.arcosx.org/tokens) and sign in with GitHub to mint scoped `client` and `worker` tokens in your own `gh-<id>` namespace.
+2. Connect your local worker over native gRPC or WebSocket:
+
+```bash
+ANYSERVE_ENDPOINT="https://anyserve.arcosx.org" \
+ANYSERVE_TOKEN="<worker-token>" \
+  python worker.py
+```
+
+3. Invoke from another terminal and inspect the job in the [Live Console](https://anyserve.arcosx.org):
+
+```bash
+ANYSERVE_ENDPOINT="https://anyserve.arcosx.org" \
+ANYSERVE_TOKEN="<client-token>" \
+  anyserve invoke demo.echo.v1 --input "hello from local GPU"
+```

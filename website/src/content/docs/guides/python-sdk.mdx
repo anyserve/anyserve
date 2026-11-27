@@ -1,0 +1,83 @@
+---
+title: Python SDK
+description: Build outbound Python workers and sync/async clients with anyserve-runtime.
+---
+
+Install `anyserve-runtime` (Python 3.10+):
+
+```bash
+pip install anyserve-runtime
+```
+
+## Client
+
+`AnyserveClient` (sync) and `AsyncAnyserveClient` (`asyncio`) resolve endpoints from `endpoint=` -> `ANYSERVE_ENDPOINT` -> `http://127.0.0.1:50052` (supports `http(s)://`, `ws(s)://`, or comma-separated leader lists), tokens from `token=` -> `ANYSERVE_TOKEN`, and namespaces from `namespace=` -> `ANYSERVE_NAMESPACE` -> `"default"`.
+
+```python
+from anyserve import AnyserveClient, ExecutionOptions
+
+client = AnyserveClient()
+out = client.call(
+    "demo.echo.v1",
+    b"hello",
+    options=ExecutionOptions(total_timeout_ms=5000),
+)
+```
+
+### Methods
+
+| Method | Behavior |
+|---|---|
+| `call(interface, payload=b"", *, options=None)` | Single inline bytes result (ephemeral `Invoke`). |
+| `execute(interface, inputs=b"", *, options=None)` | Terminal output objects of an ephemeral `Invoke`. |
+| `invoke(interface, inputs=b"", *, options=None)` | Live event iterator; closing cancels unfinished work. |
+| `invoke_stream(interface, *, options=None)` | Full-duplex stream with `send(data)` and `finish_input()`. |
+| `submit(interface, inputs=b"", *, job_id=None, durability="durable", conflict_policy=None, options=None)` | Durable (or ephemeral) job submission with `job_id` idempotency. |
+| `get(job_id)` / `list(...)` / `result(job_id)` | Inspect status, list retained jobs, or await terminal output. |
+| `watch(job_id, *, after_sequence=0)` | Stream events; closing leaves the job running. |
+| `cancel(job_id, reason=...)` | Request cooperative cancellation. |
+
+Use `inline_object(data, metadata=None)` or `uri_object(uri, sha256=..., size_bytes=...)` for multi-object inputs.
+
+### ExecutionOptions
+
+| Field | Purpose |
+|---|---|
+| `required_attributes` / `preferred_attributes` | Hard and soft worker attribute placement. |
+| `required_capacity` | Resource units reserved per attempt (e.g. `{"gpu": 1}`). |
+| `priority` | Higher runs first (`0..3` by default). |
+| `queue_timeout_ms` / `execution_timeout_ms` / `total_timeout_ms` | Queue, per-attempt, and end-to-end deadlines. |
+| `spillover_after_ms` | Hold for preferred workers before allowing partial matches. |
+| `max_attempts` | Total attempts including the first (`0` = server default, `1` = no retries). |
+| `affinity_key` | Bounded-load sticky routing preference. |
+| `fairness_key` | Per-key round-robin fairness within a priority level. |
+| `concurrency_key` | Cap concurrent in-flight jobs per key. |
+
+## Workers
+
+Handlers may be sync functions, sync generators, `async def` coroutines, or `async` generators.
+
+```python
+from anyserve import WorkerError, serve, worker
+
+@worker(
+    interface="demo.echo.v1",
+    pool="local-gpu",
+    attributes={"gpu": "rtx4090"},
+    capacity={"slot": 4},
+    max_active_leases=4,
+    pass_context=True,
+)
+def echo(payload: bytes, ctx) -> bytes:
+    if ctx.cancelled:
+        return b""
+    return payload
+
+serve(echo)  # multiplex multiple handlers: serve(h1, h2, endpoint=...)
+```
+
+- **Streaming input**: pass `streaming_input=True` to receive an iterator of chunk dicts (`data`, `object_index`, `uri`, `metadata`, `parameter_chunk`, `object_end`).
+- **JSON codec**: pass `codec="json"` for automatic JSON encode/decode.
+- **Retries**: raise `WorkerError("transient", retryable=True)` to reschedule; unhandled exceptions fail without retry.
+- **Graceful drain**: `SIGTERM` on the main thread triggers preemptive drain so unexposed in-flight jobs reschedule cleanly.
+- **Ready-made AI connectors**: vLLM, Ollama, Triton, YOLO, and VLA workers live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).

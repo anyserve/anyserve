@@ -1,0 +1,76 @@
+---
+title: Install
+description: Install the AnyServe CLI binary, Python SDK, or container image.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## CLI & Control Plane binary
+
+Prebuilt binaries include the embedded Web Console and verify SHA-256 checksums before installation.
+
+<Tabs>
+  <TabItem label="macOS & Linux">
+    Supports `x86_64` and `arm64` (Apple Silicon & Linux ARM64). Installs to `~/.local/bin/anyserve` without `sudo`.
+
+    ```bash
+    curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh
+    anyserve --version
+    ```
+
+    Pin a specific version or directory:
+
+    ```bash
+    curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh -s -- --version v0.6.0 --dir /usr/local/bin
+    ```
+  </TabItem>
+  <TabItem label="Windows (PowerShell)">
+    Supports `x86_64`. Installs to `%LOCALAPPDATA%\anyserve\bin` and adds it to your user `PATH`.
+
+    ```powershell
+    irm https://anyserve.github.io/anyserve/install.ps1 | iex
+    anyserve --version
+    ```
+
+    Pin a specific version:
+
+    ```powershell
+    $env:ANYSERVE_VERSION = "v0.6.0"
+    irm https://anyserve.github.io/anyserve/install.ps1 | iex
+    ```
+  </TabItem>
+  <TabItem label="Docker">
+    Multi-stage non-root image (`10001:10001`) with embedded Console enabled:
+
+    ```bash
+    docker pull ghcr.io/anyserve/anyserve:latest
+    ```
+  </TabItem>
+  <TabItem label="From source (Cargo)">
+    Requires the Rust toolchain in `rust-toolchain.toml` and `protoc`:
+
+    ```bash
+    git clone https://github.com/anyserve/anyserve.git
+    cd anyserve
+    cargo build --release --locked -p anyserve
+    ```
+
+    Add `--features embed-console` (after `npm --prefix console ci && npm --prefix console run build`) to bundle the Web Console into the binary.
+  </TabItem>
+</Tabs>
+
+## Python SDK
+
+Requires Python 3.10+. Install the SDK matching your server release:
+
+```bash
+pip install anyserve-runtime
+```
+
+## Rust SDK
+
+Add `anyserve-client` from the repository workspace (or pin a git tag) to embed clients or workers directly in Rust applications.
+
+## GitHub Releases
+
+All platform archives and `SHA256SUMS.txt` manifests are published on [GitHub Releases](https://github.com/anyserve/anyserve/releases).

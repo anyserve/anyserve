@@ -1,0 +1,77 @@
+/* Crisp monochrome high-contrast palette aligned with AnyServe Console */
+:root {
+  --sl-font: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --sl-font-mono: ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
+
+  /* Dark mode defaults (Starlight uses :root for dark, [data-theme='light'] for light) */
+  --sl-color-accent-low: #1e242c;
+  --sl-color-accent: #e5e7eb;
+  --sl-color-accent-high: #f9fafb;
+
+  --sl-color-white: #f8fafc;
+  --sl-color-gray-1: #e5e7eb;
+  --sl-color-gray-2: #cbd5e1;
+  --sl-color-gray-3: #94a3b8;
+  --sl-color-gray-4: #475569;
+  --sl-color-gray-5: #1f242c;
+  --sl-color-gray-6: #12151a;
+  --sl-color-black: #0a0c10;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #f1f5f9;
+  --sl-color-accent: #111827;
+  --sl-color-accent-high: #0f172a;
+
+  --sl-color-white: #0f172a;
+  --sl-color-gray-1: #1e293b;
+  --sl-color-gray-2: #334155;
+  --sl-color-gray-3: #64748b;
+  --sl-color-gray-4: #94a3b8;
+  --sl-color-gray-5: #e2e8f0;
+  --sl-color-gray-6: #f8fafc;
+  --sl-color-black: #ffffff;
+}
+
+/* Crisp typography & tighter spacing */
+.hero h1 {
+  letter-spacing: -0.03em;
+  font-weight: 700;
+}
+
+.hero .tagline {
+  font-size: clamp(1rem, 1.5vw, 1.15rem);
+  color: var(--sl-color-gray-2);
+}
+
+.sl-markdown-content h2 {
+  letter-spacing: -0.02em;
+  border-bottom: 1px solid var(--sl-color-gray-5);
+  padding-bottom: 0.35rem;
+}
+
+.sl-markdown-content table {
+  display: table;
+  width: 100%;
+  font-size: 0.92rem;
+}
+
+.sl-markdown-content code:not(pre code) {
+  border-radius: 4px;
+  font-size: 0.86em;
+}
+
+/* Primary action button contrast in both themes */
+.sl-link-button.primary {
+  background: var(--sl-color-accent);
+  color: var(--sl-color-black);
+  border-color: var(--sl-color-accent);
+}
+
+.sl-link-button.primary:hover {
+  opacity: 0.9;
+}
+
+.install-box {
+  margin: 1.5rem 0 2rem;
+}

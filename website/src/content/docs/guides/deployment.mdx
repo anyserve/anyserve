@@ -1,0 +1,85 @@
+---
+title: Deployment
+description: Run AnyServe via Quick Tunnel, VPS Compose + Caddy, Fly.io, Cloudflare, Docker, or Kubernetes.
+---
+
+AnyServe runs a single active in-memory scheduler backed by SQLite (single node) or PostgreSQL (leader-standby HA). No Redis or message broker is required.
+
+| Mode | Best for | Transport | Journal |
+|---|---|---|---|
+| **Local / Quick Tunnel** | Instant personal relay | `wss://` (+ local gRPC) | SQLite / Ephemeral |
+| **VPS (Compose + Caddy)** | Single-domain production relay | Native gRPC + `wss://` + Console | SQLite WAL |
+| **Fly.io** | Managed single VM with NVMe | Native gRPC + `wss://` + Console | SQLite WAL |
+| **Cloudflare Workers Free** | `$0` serverless relay (no Docker) | `wss://` + Console | DO SQLite + R2 |
+| **Kubernetes (Helm)** | Cluster or HA deployments | Native gRPC + `wss://` + Console | SQLite or PostgreSQL HA |
+
+## Zero-VPS Quick Tunnel
+
+Expose a local authenticated relay over `wss://` with no domain or server:
+
+```bash
+anyserve serve --console-listen 127.0.0.1:3001 --auto-token
+cloudflared tunnel --url http://127.0.0.1:3001
+```
+
+Point workers and clients at `wss://<random>.trycloudflare.com` using the generated tokens.
+
+## VPS (Docker Compose + Caddy)
+
+[`deploy/vps`](https://github.com/anyserve/anyserve/tree/main/deploy/vps) runs AnyServe behind Caddy with automatic HTTPS, routing gRPC to `:50052`, blocking external `/metrics`, and serving WSS + embedded Console on `:3001`.
+
+- Enable `--profile auth-github` (`plugins/anyserve-auth-github`) to let users sign in with GitHub and mint isolated `gh-<id>` client/worker tokens.
+- Keep local SQLite WAL on a single VPS; move to external PostgreSQL only when running 2+ control-plane replicas.
+
+## Docker
+
+The official image runs as non-root (`10001:10001`) with the Console embedded:
+
+```bash
+docker run -d --name anyserve --restart unless-stopped \
+  -p 127.0.0.1:50052:50052 -p 127.0.0.1:3001:3001 \
+  -v anyserve-data:/data \
+  -e ANYSERVE_CLIENT_TOKENS="<client-token>" \
+  -e ANYSERVE_WORKER_TOKENS="<worker-token>" \
+  ghcr.io/anyserve/anyserve:latest \
+  serve --grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --journal /data/journal.sqlite
+```
+
+## Fly.io
+
+[`deploy/fly`](https://github.com/anyserve/anyserve/tree/main/deploy/fly) deploys one persistent Fly Machine with an NVMe `/data` volume, gRPC on `:50052`, and WSS/Console on HTTPS, configured purely through Fly secrets.
+
+## Cloudflare Workers Free & Containers
+
+[`deploy/cloudflare`](https://github.com/anyserve/anyserve/tree/main/deploy/cloudflare) ships two configurations:
+
+- **Workers Free (`wrangler.jsonc`, default)**: Hibernatable Durable Object (`AnyserveNativeDO`) + DO SQLite + R2, no Docker required. Speaks WebSocket/HTTP (`wss://`) and serves the Console.
+- **Containers (`wrangler.containers.jsonc`, Workers Paid)**: Runs the Rust binary inside Cloudflare Containers backed by DO SQLite + R2.
+
+```bash
+npm --prefix console ci
+npm --prefix deploy/cloudflare ci
+npx --prefix deploy/cloudflare wrangler r2 bucket create anyserve-journal
+npx --prefix deploy/cloudflare wrangler secret put ANYSERVE_CLIENT_TOKENS --config deploy/cloudflare/wrangler.jsonc
+npx --prefix deploy/cloudflare wrangler secret put ANYSERVE_WORKER_TOKENS --config deploy/cloudflare/wrangler.jsonc
+npx --prefix deploy/cloudflare wrangler deploy --config deploy/cloudflare/wrangler.jsonc
+```
+
+## Kubernetes & PostgreSQL HA
+
+Deploy with the Helm chart in [`deploy/helm/anyserve`](https://github.com/anyserve/anyserve/tree/main/deploy/helm/anyserve):
+
+```bash
+# Single-node SQLite
+helm install anyserve deploy/helm/anyserve \
+  --set auth.existingSecret=anyserve-tokens
+
+# Leader-standby PostgreSQL HA
+helm install anyserve-pg deploy/helm/anyserve \
+  --set journal.backend=postgres \
+  --set journal.postgres.existingSecret=anyserve-pg \
+  --set replicaCount=2 \
+  --set auth.existingSecret=anyserve-tokens
+```
+
+With PostgreSQL, one replica holds the fenced `scheduler_lease`; standbys return `503` on `/readyz` and take over automatically on graceful shutdown or lease expiry. Clients without a readiness-aware LB can pass comma-separated URLs in `ANYSERVE_ENDPOINT`.

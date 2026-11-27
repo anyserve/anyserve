@@ -28,13 +28,18 @@ cargo test --locked -p anyserve --features embed-console serve_console
 npm --prefix deploy/cloudflare ci
 npm --prefix deploy/cloudflare run typecheck
 npm --prefix deploy/cloudflare test
-python scripts/check-doc-links.py
-python scripts/check-release-version.py
+npm --prefix website ci
+npm --prefix website run build
+python3 scripts/test-devex-scripts.py
+python3 scripts/check-doc-links.py
+python3 scripts/check-release-version.py
 ```
 
 Rebuild the Python extension after changing Rust bindings or the protocol.
 The SDK process suite uses temporary authenticated servers/workers;
 `ANYSERVE_BIN` overrides its default `target/debug/anyserve` binary.
+
+## PostgreSQL integration tests
 
 Run the real PostgreSQL integration suite with Docker:
 
@@ -44,15 +49,14 @@ python3 scripts/test-postgres.py
 
 It creates a disposable PostgreSQL 18 container and isolated schemas, covering
 single-leader lease acquisition, standby gating, crash/pause/graceful failover,
-fencing, dual-backend scheduling parity and bounded reads. The script removes its
-own container. Alternatively, set `ANYSERVE_TEST_POSTGRES_URL` to a disposable
-database with schema creation privileges and run serially:
+fencing, dual-backend scheduling parity and bounded reads. Alternatively, set
+`ANYSERVE_TEST_POSTGRES_URL` to a disposable database and run serially:
 
 ```bash
 cargo test --locked -p anyserve-core postgres_ -- --ignored --test-threads=1
 ```
 
-Deployment checks:
+## Deployment checks
 
 ```bash
 helm lint deploy/helm/anyserve
@@ -61,43 +65,20 @@ helm template anyserve deploy/helm/anyserve \
 docker build -t anyserve:local .
 ```
 
-See [deployment](deployment.md) for Worker images, kind and PostgreSQL setup.
+See [deployment](deployment.md) for worker images, kind, and PostgreSQL setup.
 
-## Benchmarks
+## Releases
 
-Build release binaries once and preserve them for comparisons:
-
-```bash
-cargo build --release --locked -p anyserve -p anyserve-bench
-```
-
-| Runner | Scope / entry point |
-|---|---|
-| `bench/load/run.sh` | Linux, fresh FULL-sync SQLite journal per case; `--repeat 2`, `--help` for options |
-| `bench/load/console.py` | SQLite business traffic with/without ten HTTP observers, plus cold 16 MiB result reads checked for 4 KiB previews |
-| `npm --prefix console run bench:analytics -- /tmp/analytics.json` | DuckDB-WASM imports/queries over 10k/100k synthetic metadata rows, three repetitions; excludes browser rendering/network |
-
-The native scenarios are S1 ephemeral Invoke, S2 streamed Invoke (64 × 1 KiB
-output frames), S3 durable Submit/Watch, S4 ephemeral Submit/Watch, and S5 mixed
-S1/S3. The Linux runner's repeatability gate defaults to comparing p50 within 10%
-(`--max-p50-drift 0.10`), while shared CI runners relax it via `--max-p50-drift`
-and `--drift-retries`; S5 gates its durable path. Throughput and errors must also
-be checked.
-
-Core scale checks measure queries over 10,000 jobs, dispatch with 129 workers
-and recovery of 2,048 durable jobs:
+Bump versions across Rust, Python, Helm, Compose, and Console in one command:
 
 ```bash
-cargo test --locked --release -p anyserve-core --test runtime_v2 scale_ -- --ignored --nocapture --test-threads=1
+python3 scripts/bump-version.py 0.7.0
+git commit -am "release: v0.7.0"
+git tag -a v0.7.0 -m "v0.7.0"
+git push origin main v0.7.0
 ```
 
-## CI and releases
-
-[CI](../.github/workflows/anyserve-ci.yml) runs these checks and uploads benchmark
-artifacts even when a gate fails. Its Rust job runs the real PG integration
-suite serially against a disposable PostgreSQL 18 service.
-
-Version tags build platform archives, container images and Python distributions.
-Tags must match Rust, Python and chart application versions. Manual runs without
-a tag validate the selected ref; supplying an existing tag republishes its
-artifacts, with existing PyPI files skipped.
+Pushing a `v*` tag triggers [Release](../.github/workflows/python-publish.yml),
+which builds platform archives (Linux x86_64/arm64, macOS arm64/x86_64, Windows x86_64),
+publishes the GHCR container image, publishes `anyserve-runtime` to PyPI, and creates
+the GitHub Release with `SHA256SUMS.txt` and install instructions.

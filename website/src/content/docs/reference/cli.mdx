@@ -1,0 +1,43 @@
+---
+title: CLI & Operations
+description: Command-line reference, health probes, and Prometheus metrics.
+---
+
+## Global flags
+
+All subcommands accept:
+
+- `--endpoint URL` (falls back to `ANYSERVE_ENDPOINT`, then `http://127.0.0.1:50052`; accepts comma-separated leader URLs)
+- `--log-level LEVEL` (`info` default; `RUST_LOG` takes precedence)
+- `--log-format text|json`
+- `-v, --verbose` (`debug` logs), `-h, --help`, `-V, --version`
+
+## Commands
+
+| Command | Summary |
+|---|---|
+| `anyserve serve` | Start the control plane (`--config`, `--grpc-host`, `--grpc-port`, `--no-grpc`, `--console-listen`, `--public-endpoint`, `--journal`, `--ephemeral`, `--client-token`, `--worker-token`, `--auto-token`, `--memory-limit`, `--journal-max-bytes`). |
+| `anyserve invoke <INTERFACE>` | Invoke an interface (`--input TEXT\|-\|@PATH`, `--json`, `--stream`, `--token`, `--namespace`, `--timeout-secs`). |
+| `anyserve job ls` | List retained jobs (`--state`, `--limit`, `--page-token`, `-o text\|json`). |
+| `anyserve job inspect <JOB_ID>` | Show full job state, attempts, metadata, and error details. |
+| `anyserve job cancel <JOB_ID...>` | Cancel one or more jobs (or `--stdin`). |
+| `anyserve token mint` | Mint stateless HMAC-signed `asv1.` tokens (`--namespace`, `--role`, `--subject`, `--ttl-secs`, `--forced-pool`, `--signing-key`). |
+| `anyserve token inspect <TOKEN>` | Decode and optionally verify an `asv1.` token. |
+| `anyserve doctor` | Probe `/healthz`, `/readyz`, `/api/info`, and `/api/overview` to verify connectivity and auth. |
+
+## Management HTTP endpoints
+
+When `--console-listen` / `[console]` is enabled:
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /healthz` | Public | Process liveness (`204`). |
+| `GET /readyz` | Public | Leader & journal readiness (`204` ready, `503` standby/draining). |
+| `GET /api/info` | Public | Auth requirement & optional token portal URL. |
+| `GET /metrics` | Operator only | Prometheus text exposition format. |
+| `GET/PUT /api/settings`, `POST /api/settings/reset` | Operator only | Read, update, or reset live runtime settings. |
+| `/api/overview`, `/api/jobs`, `/api/workers`, `/api/analytics/jobs` | Operator or tenant client | Console API (tenant tokens restricted to their namespace). |
+
+## Prometheus metrics
+
+`/metrics` exports runtime gauges (retained jobs by state, interfaces, pools, worker sessions, byte budgets, journal status) and cumulative counters (`anyserve_jobs_submitted_total`, `anyserve_jobs_completed_total`, `anyserve_attempts_started_total`, `anyserve_auth_rejections_total`, `anyserve_auth_revocation_sync_ok`, `anyserve_auth_revocation_last_sync_age_seconds`).

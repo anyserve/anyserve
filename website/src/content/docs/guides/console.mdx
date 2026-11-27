@@ -1,0 +1,28 @@
+---
+title: Web Console
+description: Monitor queues, workers, trace waterfalls, DuckDB SQL Explore, and live runtime settings.
+---
+
+The React Web Console is embedded directly in release binaries and the official Docker image. Enable it with `--console-listen 127.0.0.1:3001` (or `[console].enabled = true` in `server.toml`).
+
+## Views
+
+- **Overview (`/`)**: Live queue depth, worker health, interface activity, and recent jobs.
+- **Jobs (`/jobs`)**: Filter by status, interface, namespace, worker, time range, or search text; inspect inputs/outputs and the W3C Trace Waterfall separating scheduling/queue delay from handler runtime.
+- **Interfaces & Pools (`/interfaces`, `/pools`)**: Inspect registered interfaces, pool tiers, spillover policy, and active capacity.
+- **Workers (`/workers`)**: Live worker sessions, active leases, load metrics, one-click drain, and the **Connect Worker** onboarding modal (Python SDK, AI Connectors, Rust SDK, Docker/Helm, and CLI one-line install).
+- **Playground (`/playground`)**: Run an in-browser Dedicated Web Worker (`demo.browser_echo.v1`), test live failover, or compare WebSocket Relay vs. optional WebRTC P2P data-plane transfer.
+- **Explore (`/explore`)**: Load bounded job metadata into in-browser DuckDB-WASM and run read-only SQL queries with CSV export.
+- **Settings (`/settings`)**: Configure both local Console preferences and live server runtime settings.
+
+## Settings (`/settings`)
+
+The Settings workspace separates client preferences from operator server controls:
+
+- **Appearance & Console (all users)**: Theme mode (`System / Light / Dark`) and polling cadence (`Auto / 2s / 5s / 10s / Paused`), stored in `localStorage`.
+- **Runtime & Scheduling (operators only)**: Live-edit default max attempts, max queue, concurrency limit, pending/terminal job limits, retention window, session cap, heartbeats, reconnect grace, retry backoff, and cancellation/stall timeouts.
+- **Interface Routing Policies (operators only)**: Add, edit, or remove per-interface `max_queue`, `queue_timeout_ms`, `max_in_flight_per_key`, and ordered `pool_tiers` spillover rules.
+- **Export `server.toml`**: Copy a clean `[runtime]` TOML snippet reflecting your current live settings for GitOps or version control.
+- **Project & Quick Install**: Direct links to Docs, GitHub, Releases, and copyable one-line CLI installers.
+
+Scoped tenant tokens only see local Console preferences and connection info—server runtime settings require an operator token.

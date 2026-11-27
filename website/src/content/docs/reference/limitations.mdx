@@ -1,0 +1,15 @@
+---
+title: Limitations
+description: Architectural boundaries and when to choose another tool.
+---
+
+AnyServe is intentionally narrow so the control plane stays small, predictable, and easy to self-host. Keep these boundaries in mind:
+
+- **Single-leader control plane**: High availability uses active-standby failover backed by PostgreSQL leader leases, not multi-master active-active writes.
+- **At-least-once delivery**: Retries occur automatically only *before* output bytes are exposed to the caller. Once streamed output reaches the caller, a mid-stream failure fails fast with `output_interrupted` rather than splicing two attempts. Use caller-supplied `job_id` and idempotent handlers for end-to-end idempotency.
+- **Not a model host or LLM gateway**: AnyServe does not download, quantize, or shard model weights, nor enforce OpenAI-specific schemas in core. Workers wrap your local inference engines.
+- **Cloudflare Workers Free differences**: The native TypeScript Durable Object port speaks WebSocket/HTTP only (no native HTTP/2 gRPC) and does not implement per-tenant or prefix quotas (`tenant_quotas`).
+- **Experimental `anyserve+iroh://` direct transfer**: Opt-in via `--features direct` in the Rust SDK only (not bundled in default server builds or Python wheels), supports static large objects only, and is not cross-WAN verified.
+- **Browser WebRTC P2P (Playground)**: Opt-in ephemeral `Invoke` only, using public STUN with no TURN relay; restrictive firewalls fall back automatically to WebSocket relay. Its goal is bypassing control-plane payload relay rather than increasing localhost throughput.
+- **Guest sandbox off by default**: The stateless guest sandbox in `plugins/anyserve-auth-github` is disabled unless `ANYSERVE_AUTH_GUEST_ENABLED=true` is explicitly configured alongside tenant/prefix quotas.
+- **Startup-only security settings**: Auth tokens, HMAC signing keys, TLS certificates, and listen addresses cannot be edited through the Console `/settings` API—update them via environment variables, CLI flags, or `server.toml`.

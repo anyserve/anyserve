@@ -1,0 +1,95 @@
+---
+title: Configuration
+description: Configure anyserve serve via CLI flags, environment variables, server.toml, or live Console Settings.
+---
+
+`anyserve serve` runs either zero-TOML (CLI flags + environment variables) or with `--config server.toml`. Precedence: **CLI flags > environment variables > TOML file > defaults**.
+
+## Zero-TOML flags & env vars
+
+| Flag | Env fallback | Purpose |
+|---|---|---|
+| `--grpc-host`, `--grpc-port`, `--no-grpc` | — | Control the gRPC listener (default `127.0.0.1:50052`). |
+| `--console-listen ADDR` | — | Enable management HTTP, WebSocket (`/ws/v2/*`), and embedded Console. |
+| `--public-endpoint URL` | `ANYSERVE_PUBLIC_ENDPOINT` | Advertised endpoint shown in Console and `/api/overview`. |
+| `--client-token TOKEN` | `ANYSERVE_CLIENT_TOKENS` | Operator client tokens (comma-separated in env). |
+| `--worker-token TOKEN` | `ANYSERVE_WORKER_TOKENS` | Worker tokens (comma-separated in env). |
+| `--auto-token` | — | Generate & persist random `as_c_*` / `as_w_*` tokens when no auth is set. |
+| `--journal PATH` / `--ephemeral` | — | Choose SQLite path (default `.anyserve/journal.sqlite`) or disable persistence. |
+| `--journal-max-bytes BYTES` | `ANYSERVE_JOURNAL_MAX_BYTES` | Cap SQLite database size with automatic terminal eviction. |
+| `--memory-limit MB` | `ANYSERVE_MEMORY_LIMIT_MB` | Scale pending/result/event byte budgets from total RAM. |
+| — | `ANYSERVE_SCOPED_TOKENS` | JSON array of `{ token, role, namespace, subject?, forced_pool? }`. |
+| — | `ANYSERVE_TOKEN_SIGNING_KEY` | Comma-separated HMAC keys verifying `asv1.` stateless tokens. |
+| — | `ANYSERVE_CONSOLE_AUTH_PORTAL_URL` | Optional token portal link shown in the Console UI. |
+
+## `server.toml` reference
+
+```toml
+[server]
+grpc_host = "127.0.0.1"
+grpc_port = 50052
+# [server.tls]
+# enabled = true
+# cert_file = "/etc/anyserve/server.crt"
+# key_file = "/etc/anyserve/server.key"
+
+[auth]
+client_tokens_env = "ANYSERVE_CLIENT_TOKENS"
+worker_tokens_env = "ANYSERVE_WORKER_TOKENS"
+# signing_keys_env = "ANYSERVE_TOKEN_SIGNING_KEY"
+# revocation_url = "http://auth-github:3002/internal/revocations"
+
+[console]
+enabled = true
+listen = "127.0.0.1:3001"
+allowed_origins = []
+
+[journal]
+enabled = true
+backend = "sqlite"            # or "postgres" with url_env = "ANYSERVE_DATABASE_URL"
+path = ".anyserve/journal.sqlite"
+full_sync = true
+retention_secs = 604800
+
+[runtime]
+heartbeat_interval_ms = 5000
+heartbeat_timeout_ms = 15000
+max_attempts = 3
+max_queue = 10000
+max_pending_jobs = 100000
+max_sessions = 4096
+terminal_retention_secs = 600
+max_terminal_jobs = 10000
+
+# Optional per-tenant fairness quotas (Rust control plane):
+# [runtime.tenant_quotas]
+# max_sessions_per_namespace = 32
+# max_pending_jobs_per_namespace = 200
+# max_interfaces_per_namespace = 32
+
+# Optional per-interface queue limits and pool spillover tiers:
+# [runtime.interfaces."demo.echo.v1"]
+# max_queue = 100
+# queue_timeout_ms = 1000
+# [[runtime.interfaces."demo.echo.v1".pool_tiers]]
+# pool = "local-gpu"
+# spillover_after_ms = 0
+# reconnect_grace_ms = 1000
+# [[runtime.interfaces."demo.echo.v1".pool_tiers]]
+# pool = "cloud-burst"
+# spillover_after_ms = 200
+```
+
+## Live settings via Console
+
+Operators can edit runtime scheduling parameters, heartbeats, retention limits, and per-interface pool tiers live from **Console -> Settings** (`/settings`, backed by operator-only `GET/PUT /api/settings` and `POST /api/settings/reset`).
+
+- Changes apply immediately in memory without restarting the control plane.
+- On SQLite servers, overrides persist atomically to `<journal_dir>/runtime-settings.json` (`0600`) and reload on startup.
+- Auth tokens, TLS certificates, and bind addresses remain startup-only (file/CLI/env) and are never exposed or mutated over HTTP.
+
+## Authentication boundaries
+
+- If all token/signing-key lists are empty and `--auto-token` is omitted, auth is disabled.
+- Once enabled: `/healthz`, `/readyz`, and `/api/info` stay public; `/metrics` and `/api/settings*` require an **operator** token (`[auth].client_tokens`); Console `/api/*` accepts operator tokens (global view) or scoped/signed tenant `client` tokens (strictly restricted to their own namespace).
+- Terminate management HTTP TLS at your reverse proxy or ingress.

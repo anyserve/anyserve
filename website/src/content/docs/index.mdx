@@ -1,0 +1,81 @@
+---
+title: AnyServe
+description: Call the GPU under your desk from anywhere. Outbound-only execution and scheduling control plane.
+template: splash
+hero:
+  tagline: Call the GPU under your desk from anywhere. Workers and clients dial out over gRPC or WebSocket—zero open inbound ports.
+  actions:
+    - text: Quickstart
+      link: /anyserve/getting-started/quickstart/
+      icon: right-arrow
+      variant: primary
+    - text: Install
+      link: /anyserve/getting-started/install/
+      variant: secondary
+    - text: Live Demo
+      link: https://anyserve.arcosx.org
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, Tabs, TabItem } from '@astrojs/starlight/components';
+
+<div class="install-box">
+<Tabs>
+  <TabItem label="macOS & Linux">
+    ```bash
+    curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh
+    anyserve serve --console-listen 127.0.0.1:3001 --auto-token
+    ```
+  </TabItem>
+  <TabItem label="Windows (PowerShell)">
+    ```powershell
+    irm https://anyserve.github.io/anyserve/install.ps1 | iex
+    anyserve serve --console-listen 127.0.0.1:3001 --auto-token
+    ```
+  </TabItem>
+  <TabItem label="Python SDK">
+    ```bash
+    pip install anyserve-runtime
+    ```
+  </TabItem>
+  <TabItem label="Docker">
+    ```bash
+    docker run --rm -p 50052:50052 -p 3001:3001 ghcr.io/anyserve/anyserve:latest \
+      serve --grpc-host 0.0.0.0 --console-listen 0.0.0.0:3001 --auto-token
+    ```
+  </TabItem>
+</Tabs>
+</div>
+
+<CardGrid>
+  <Card title="Outbound-only connectivity" icon="rocket">
+    Workers dial out over HTTP/2 gRPC or WebSocket (`wss://`). Expose local GPUs, robots, or private clusters without punching firewall holes.
+  </Card>
+  <Card title="Scheduling & backpressure" icon="setting">
+    Capability and capacity routing, pool spillover, sticky affinity, fairness queues, concurrency keys, retries, and optional durable recovery.
+  </Card>
+  <Card title="Embedded Web Console" icon="laptop">
+    Inspect queues, workers, trace waterfalls, DuckDB-WASM SQL Explore, and live runtime settings from a single binary—no separate stack required.
+  </Card>
+  <Card title="Backend-agnostic" icon="puzzle">
+    Keep model and app logic in your workers. Wrap vLLM, Ollama, Triton, FastAPI, or any local script in a few lines of Python or Rust.
+  </Card>
+</CardGrid>
+
+## Connect any local model in 9 lines
+
+```python
+import os, urllib.request
+from anyserve import serve, worker
+
+MODEL_URL = os.environ.get("MODEL_URL", "http://127.0.0.1:8000/predict")
+
+@worker(interface="demo.local_model.v1", max_active_leases=4)
+def predict(payload: bytes) -> bytes:
+    req = urllib.request.Request(MODEL_URL, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+serve(predict)
+```
