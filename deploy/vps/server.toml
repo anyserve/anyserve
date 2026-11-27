@@ -27,6 +27,9 @@ max_bytes = 536870912
 max_queue = 500
 max_pending_jobs = 2000
 max_terminal_jobs = 1000
+# Keep up to max_terminal_jobs completed durable jobs visible in Console
+# Overview / History for the full 24h journal window (including across restarts).
+terminal_retention_secs = 86400
 # Pending/result/event byte budgets scale automatically from ANYSERVE_MEMORY_LIMIT_MB
 # (default 1024 in docker-compose.yml). Uncomment to pin explicit byte limits instead:
 # max_pending_bytes = 268435456

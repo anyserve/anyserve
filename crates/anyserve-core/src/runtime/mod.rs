@@ -537,6 +537,25 @@ impl Inner {
                 self.fail_job_locked(&mut st, &job_id, codes::ATTEMPTS_EXHAUSTED, &message, now);
             }
         }
+        let retention = ms(self.config.terminal_retention);
+        let cutoff = now.saturating_sub(retention);
+        if self.config.max_terminal_jobs > 0 && retention > 0 {
+            for stored in recovery.terminal {
+                if !stored.state.is_terminal()
+                    || stored.updated_at_ms < cutoff
+                    || st.jobs.contains_key(&stored.job_id)
+                {
+                    continue;
+                }
+                self.insert_recovered_terminal_locked(&mut st, stored);
+            }
+            while st.terminal_order.len() > self.config.max_terminal_jobs {
+                let Some(evicted) = self.evict_oldest_terminal_locked(&mut st) else {
+                    break;
+                };
+                st.released.jobs.push(evicted);
+            }
+        }
         self.dispatch_locked(&mut st, now);
     }
 }
@@ -783,12 +802,18 @@ impl Runtime {
     /// Starts the runtime, recovering durable jobs when leadership on a
     /// configured journal backend is acquired.
     pub async fn start(config: RuntimeConfig) -> anyhow::Result<Runtime> {
+        let terminal_recovery = crate::journal::TerminalRecovery {
+            limit: config.max_terminal_jobs,
+            retention: config.terminal_retention,
+        };
         let journal: Option<Arc<dyn JournalBackend>> = match &config.journal {
             Some(c) if c.cloudflare.is_some() => {
                 Some(crate::cloudflare_journal::CloudflareJournal::open(c).await?)
             }
-            Some(c) if c.postgres.is_some() => Some(crate::postgres::PgJournal::open(c).await?),
-            Some(c) => Some(SqliteJournal::open(c).await?),
+            Some(c) if c.postgres.is_some() => {
+                Some(crate::postgres::PgJournal::open_with_recovery(c, terminal_recovery).await?)
+            }
+            Some(c) => Some(SqliteJournal::open_with_recovery(c, terminal_recovery).await?),
             None => None,
         };
         Self::start_with_backend(config, journal).await
@@ -1269,7 +1294,9 @@ impl Runtime {
         let ns = check_namespace(namespace)?;
         let scoped_id = identity::encode_scoped_id(ns, job_id);
         let st = self.inner.lock();
-        if let Some(job) = st.jobs.get(&scoped_id) {
+        if let Some(job) = st.jobs.get(&scoped_id)
+            && !job.cold_terminal
+        {
             let changes = job.log.subscribe();
             return Ok(follow(
                 Arc::clone(&job.log),
@@ -1330,6 +1357,7 @@ impl Runtime {
                         "job '{job_id}' has an unknown commit outcome until restart"
                     )));
                 }
+                Some(job) if job.cold_terminal => None,
                 Some(job) => Some(Arc::clone(&job.log)),
                 None => None,
             }
@@ -1424,7 +1452,9 @@ impl Runtime {
                         "job '{job_id}' has an unknown commit outcome until restart"
                     )));
                 }
-                return Ok(job.view(include_outputs));
+                if !include_outputs || !job.cold_terminal {
+                    return Ok(job.view(include_outputs));
+                }
             }
         }
         let journal = self
@@ -1458,6 +1488,7 @@ impl Runtime {
                         "job '{raw_id}' has an unknown commit outcome until restart"
                     )));
                 }
+                Some(job) if job.cold_terminal => None,
                 Some(job) => Some((job.view(true), Arc::clone(&job.spec), Arc::clone(&job.log))),
                 None => None,
             }
@@ -2185,6 +2216,7 @@ mod tests {
                         recovery: Recovery {
                             generation: term,
                             active: vec![recovered],
+                            terminal: Vec::new(),
                         },
                         lease: LeaseHandle::new(lost_rx, move || {
                             Box::pin(async move {

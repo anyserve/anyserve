@@ -571,6 +571,10 @@ pub(crate) struct Job {
     /// A commit for this job had an unknown outcome; the id stays reserved
     /// and the job frozen until a restart reconciles it with the journal.
     pub indeterminate: bool,
+    /// Metadata-only terminal job restored from the journal on startup; its
+    /// outputs and replayable event history live on disk and must be read from
+    /// the journal on demand.
+    pub cold_terminal: bool,
     pub outputs: Option<Arc<Vec<Object>>>,
     pub error: Option<ErrorInfo>,
     pub log: Arc<JobLog>,

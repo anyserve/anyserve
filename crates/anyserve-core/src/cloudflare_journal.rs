@@ -211,6 +211,7 @@ impl JournalBackend for CloudflareJournal {
             let recovery = Recovery {
                 generation: term,
                 active,
+                terminal: Vec::new(),
             };
 
             let (lost_tx, lost_rx) = watch::channel(false);

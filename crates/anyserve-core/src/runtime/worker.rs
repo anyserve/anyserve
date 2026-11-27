@@ -2257,6 +2257,7 @@ mod tests {
                         recovery: Recovery {
                             generation: 1,
                             active: Vec::new(),
+                            terminal: Vec::new(),
                         },
                         lease: LeaseHandle::always_held(),
                     }))
@@ -2727,6 +2728,7 @@ mod tests {
                         recovery: Recovery {
                             generation: 1,
                             active: vec![recovered],
+                            terminal: Vec::new(),
                         },
                         lease: LeaseHandle::always_held(),
                     }))

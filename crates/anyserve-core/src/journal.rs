@@ -238,11 +238,20 @@ pub(crate) struct StoredJob {
     pub failed_workers: std::collections::BTreeSet<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TerminalRecovery {
+    pub limit: usize,
+    pub retention: Duration,
+}
+
 pub(crate) struct Recovery {
     pub generation: u64,
-    /// Unfinished jobs with their full input. Terminal jobs stay on disk and
-    /// are looked up on demand.
+    /// Unfinished jobs with their full input.
     pub active: Vec<StoredJob>,
+    /// Recent completed durable jobs (metadata only, ordered oldest-first by
+    /// `updated_at_ms`), restored into the in-memory read index without loading
+    /// output payloads into memory.
+    pub terminal: Vec<StoredJob>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -319,6 +328,8 @@ const SCHEMA: &[&str] = &[
         ON journal_jobs(created_at_ms, job_id) WHERE state = 'queued'",
     "CREATE INDEX IF NOT EXISTS journal_jobs_winner ON journal_jobs(winning_lease_id)",
     "CREATE INDEX IF NOT EXISTS journal_jobs_history ON journal_jobs(created_at_ms, job_id)
+        WHERE state IN ('succeeded', 'failed', 'cancelled')",
+    "CREATE INDEX IF NOT EXISTS journal_jobs_terminal_updated ON journal_jobs(updated_at_ms DESC, job_id DESC)
         WHERE state IN ('succeeded', 'failed', 'cancelled')",
     "CREATE TABLE IF NOT EXISTS journal_objects (
         job_id TEXT NOT NULL,
@@ -412,7 +423,15 @@ impl Journal {
 
     /// Opens (creating if needed) the journal, starts a new generation and
     /// loads what recovery needs. Only one process may hold a journal.
+    #[cfg(test)]
     pub(crate) async fn open(config: &JournalConfig) -> Result<(Journal, Recovery)> {
+        Self::open_with_recovery(config, TerminalRecovery::default()).await
+    }
+
+    pub(crate) async fn open_with_recovery(
+        config: &JournalConfig,
+        terminal_recovery: TerminalRecovery,
+    ) -> Result<(Journal, Recovery)> {
         if let Some(parent) = config.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -441,7 +460,7 @@ impl Journal {
         }
         migrate_namespace_column(&mut conn).await?;
         let generation = next_generation(&mut conn).await?;
-        let recovery = load_recovery(&mut conn, generation).await?;
+        let recovery = load_recovery(&mut conn, generation, terminal_recovery).await?;
         let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
             .fetch_one(&mut conn)
             .await
@@ -690,8 +709,11 @@ pub(crate) struct SqliteJournal {
 }
 
 impl SqliteJournal {
-    pub(crate) async fn open(config: &JournalConfig) -> Result<Arc<dyn JournalBackend>> {
-        let (inner, recovery) = Journal::open(config).await?;
+    pub(crate) async fn open_with_recovery(
+        config: &JournalConfig,
+        terminal_recovery: TerminalRecovery,
+    ) -> Result<Arc<dyn JournalBackend>> {
+        let (inner, recovery) = Journal::open_with_recovery(config, terminal_recovery).await?;
         let term = recovery.generation;
         Ok(Arc::new(Self {
             inner,
@@ -885,7 +907,11 @@ async fn load_job_record(conn: &mut SqliteConnection, job_id: &str) -> Result<Op
     row.as_ref().map(job_from_row).transpose()
 }
 
-async fn load_recovery(conn: &mut SqliteConnection, generation: u64) -> Result<Recovery> {
+async fn load_recovery(
+    conn: &mut SqliteConnection,
+    generation: u64,
+    terminal_recovery: TerminalRecovery,
+) -> Result<Recovery> {
     let mut active = Vec::new();
     let mut cursor: Option<(u64, String)> = None;
     loop {
@@ -948,7 +974,31 @@ async fn load_recovery(conn: &mut SqliteConnection, generation: u64) -> Result<R
             break;
         }
     }
-    Ok(Recovery { generation, active })
+    let mut terminal = Vec::new();
+    if terminal_recovery.limit > 0 && !terminal_recovery.retention.is_zero() {
+        let retention_ms =
+            u64::try_from(terminal_recovery.retention.as_millis()).unwrap_or(u64::MAX);
+        let cutoff_ms = crate::now_ms().saturating_sub(retention_ms);
+        let limit = i64::try_from(terminal_recovery.limit).unwrap_or(i64::MAX);
+        let mut query = QueryBuilder::<Sqlite>::new(JOB_COLUMNS);
+        query
+            .push(" WHERE state IN ('succeeded', 'failed', 'cancelled') AND updated_at_ms >= ")
+            .push_bind(cutoff_ms as i64)
+            .push(" ORDER BY updated_at_ms DESC, job_id DESC LIMIT ")
+            .push_bind(limit);
+        let rows = query
+            .build()
+            .fetch_all(&mut *conn)
+            .await
+            .context("load recent terminal jobs")?;
+        terminal = rows.iter().map(job_from_row).collect::<Result<_>>()?;
+        terminal.reverse();
+    }
+    Ok(Recovery {
+        generation,
+        active,
+        terminal,
+    })
 }
 
 pub(crate) fn state_text(state: JobState) -> &'static str {
@@ -1873,7 +1923,9 @@ mod tests {
         }
         tx.commit().await.unwrap();
         expected.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-        let recovery = load_recovery(&mut conn, 7).await.unwrap();
+        let recovery = load_recovery(&mut conn, 7, TerminalRecovery::default())
+            .await
+            .unwrap();
         assert_eq!(recovery.generation, 7);
         assert_eq!(recovery.active.len(), expected.len());
         for (job, (created, id, spec)) in recovery.active.iter().zip(&expected) {
@@ -1889,7 +1941,13 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
-        assert!(load_recovery(&mut conn, 8).await.unwrap().active.is_empty());
+        assert!(
+            load_recovery(&mut conn, 8, TerminalRecovery::default())
+                .await
+                .unwrap()
+                .active
+                .is_empty()
+        );
         conn.close().await.unwrap();
     }
 

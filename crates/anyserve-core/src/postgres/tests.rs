@@ -624,9 +624,24 @@ async fn run_unified_backend_suite(make_journal: impl Fn() -> JournalConfig) {
     server.runtime.shutdown().await;
     drop(server);
 
-    // Restart on the same journal -> generation advances, 50/50 durable jobs recover and finish!
+    // Restart on the same journal -> generation advances, recent terminal jobs
+    // (capped by max_terminal_jobs=2) and 50/50 durable active jobs recover!
     let server2 = start_grpc(Runtime::start(base_config()).await.unwrap()).await;
     assert!(server2.runtime.generation() > term1);
+    assert_eq!(
+        server2.runtime.stats().retained_jobs,
+        2,
+        "restart should restore up to max_terminal_jobs recent terminal jobs"
+    );
+    let recovered_terminal = server2
+        .runtime
+        .list_jobs(JobFilter {
+            states: vec![JobState::Succeeded, JobState::Failed, JobState::Cancelled],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovered_terminal.jobs.len(), 2);
     let rec_w1 = spawn_echo_worker(
         &server2.endpoint,
         "rec-w1",

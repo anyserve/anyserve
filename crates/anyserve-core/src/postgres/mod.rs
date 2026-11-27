@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::RuntimeError;
 use crate::journal::{
     BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle, Recovery,
-    StoredJob, StoredJobPreview, StoredSpecRef, job_from_row, metadata_to_json, object_from_row,
-    state_text,
+    StoredJob, StoredJobPreview, StoredSpecRef, TerminalRecovery, job_from_row, metadata_to_json,
+    object_from_row, state_text,
 };
 use crate::runtime::api::{
     INSPECTION_PREVIEW_BYTES, JobState, JournalConfig, JournalStats, Object, ObjectPreview,
@@ -152,6 +152,11 @@ const RECOVERY_NEXT_SQL: &str = "SELECT job_id, state, spec_hash, spec_json, att
     result_digest, last_attempt_id, last_worker_id FROM jobs
     WHERE state = 'queued' AND (created_at_ms, job_id) > ($1, $2)
     ORDER BY created_at_ms, job_id LIMIT $3";
+const RECOVERY_TERMINAL_SQL: &str = "SELECT job_id, state, spec_hash, spec_json, attempt_count,
+    max_attempts, created_at_ms, updated_at_ms, error_json, winning_lease_id,
+    result_digest, last_attempt_id, last_worker_id FROM jobs
+    WHERE state IN ('succeeded', 'failed', 'cancelled') AND updated_at_ms >= $1
+    ORDER BY updated_at_ms DESC, job_id DESC LIMIT $2";
 
 enum WriteRequest {
     Op {
@@ -170,6 +175,7 @@ pub(crate) struct PgJournal {
     read_pool: PgPool,
     lease_pool: PgPool,
     config: PostgresConfig,
+    terminal_recovery: TerminalRecovery,
     holder_id: String,
     tx: mpsc::Sender<WriteRequest>,
     pending: Arc<AtomicUsize>,
@@ -180,11 +186,22 @@ pub(crate) struct PgJournal {
 }
 
 impl PgJournal {
-    pub(crate) async fn open(journal: &JournalConfig) -> Result<Arc<dyn JournalBackend>> {
-        Ok(Self::open_concrete(journal).await?)
+    pub(crate) async fn open_with_recovery(
+        journal: &JournalConfig,
+        terminal_recovery: TerminalRecovery,
+    ) -> Result<Arc<dyn JournalBackend>> {
+        Ok(Self::open_concrete_with_recovery(journal, terminal_recovery).await?)
     }
 
+    #[cfg(test)]
     pub(crate) async fn open_concrete(journal: &JournalConfig) -> Result<Arc<Self>> {
+        Self::open_concrete_with_recovery(journal, TerminalRecovery::default()).await
+    }
+
+    pub(crate) async fn open_concrete_with_recovery(
+        journal: &JournalConfig,
+        terminal_recovery: TerminalRecovery,
+    ) -> Result<Arc<Self>> {
         let config = journal
             .postgres
             .as_ref()
@@ -320,6 +337,7 @@ impl PgJournal {
             read_pool,
             lease_pool,
             config: config.clone(),
+            terminal_recovery,
             holder_id,
             tx,
             pending,
@@ -372,7 +390,7 @@ impl JournalBackend for PgJournal {
                 }
             };
 
-            let recovery = load_recovery(&self.read_pool, term).await?;
+            let recovery = load_recovery(&self.read_pool, term, self.terminal_recovery).await?;
             // Confirm lease is still held after loading the recovery snapshot.
             let still_valid: Option<i32> = sqlx::query_scalar(
                 "SELECT 1 FROM scheduler_lease
@@ -844,7 +862,11 @@ async fn read_schema_version(pool: &PgPool) -> Result<Option<i64>> {
     )
 }
 
-async fn load_recovery(pool: &PgPool, generation: u64) -> Result<Recovery> {
+async fn load_recovery(
+    pool: &PgPool,
+    generation: u64,
+    terminal_recovery: TerminalRecovery,
+) -> Result<Recovery> {
     let mut active = Vec::new();
     let mut cursor: Option<(i64, String)> = None;
     loop {
@@ -904,7 +926,25 @@ async fn load_recovery(pool: &PgPool, generation: u64) -> Result<Recovery> {
             break;
         }
     }
-    Ok(Recovery { generation, active })
+    let mut terminal = Vec::new();
+    if terminal_recovery.limit > 0 && !terminal_recovery.retention.is_zero() {
+        let retention_ms =
+            u64::try_from(terminal_recovery.retention.as_millis()).unwrap_or(u64::MAX);
+        let cutoff_ms = crate::now_ms().saturating_sub(retention_ms);
+        let limit = i64::try_from(terminal_recovery.limit).unwrap_or(i64::MAX);
+        let rows = sqlx::query(RECOVERY_TERMINAL_SQL)
+            .bind(cutoff_ms as i64)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
+        terminal = rows.iter().map(job_from_row).collect::<Result<_>>()?;
+        terminal.reverse();
+    }
+    Ok(Recovery {
+        generation,
+        active,
+        terminal,
+    })
 }
 
 fn op_job_id(op: &JournalOp) -> Option<&str> {

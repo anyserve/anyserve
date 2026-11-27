@@ -362,6 +362,7 @@ impl Inner {
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
             indeterminate: false,
+            cold_terminal: false,
             outputs: None,
             error: None,
             log,
@@ -909,6 +910,7 @@ impl Inner {
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
             indeterminate: false,
+            cold_terminal: false,
             outputs: None,
             error: None,
             log: Arc::clone(&log),
@@ -1792,10 +1794,66 @@ impl Inner {
         }
     }
 
+    /// Restores a metadata-only terminal durable job recovered from the journal
+    /// into the in-memory read index without loading outputs or consuming byte
+    /// budgets.
+    pub(crate) fn insert_recovered_terminal_locked(
+        &self,
+        st: &mut State,
+        stored: crate::journal::StoredJob,
+    ) {
+        let (namespace, raw_id) = decode_scoped_id(&stored.job_id);
+        let namespace = namespace.to_string();
+        let raw_id = raw_id.to_string();
+        let log = self.new_log(st, &raw_id);
+        log.mark_lost_before_base();
+        let job_id = stored.job_id;
+        let updated_at_ms = stored.updated_at_ms;
+        let job = Job {
+            id: job_id.clone(),
+            raw_id,
+            namespace,
+            spec: Arc::new(without_payload(&stored.spec)),
+            durability: Durability::Durable,
+            spec_hash: stored.spec_hash,
+            max_attempts: stored.max_attempts,
+            phase: Phase::Terminal(stored.state),
+            created_at_ms: stored.created_at_ms,
+            updated_at_ms,
+            attempt_count: stored.attempt_count,
+            attempt: None,
+            last_attempt_id: stored.last_attempt_id,
+            last_worker_id: stored.last_worker_id,
+            queue_key: None,
+            queued_since_ms: stored.created_at_ms,
+            not_before_ms: 0,
+            timers: Vec::new(),
+            total_timer: None,
+            rejected_sessions: HashSet::new(),
+            failed_workers: BTreeSet::new(),
+            cancel_requested: None,
+            indeterminate: false,
+            cold_terminal: true,
+            outputs: None,
+            error: stored.error,
+            log,
+            streamed: false,
+            input: None,
+            input_permit: None,
+            output_bytes: 0,
+            accept_waiters: Vec::new(),
+            waiters: Vec::new(),
+            finish_waiters: Vec::new(),
+            finished_leases: Vec::new(),
+        };
+        st.insert_job(job);
+        st.terminal_order.push_back((updated_at_ms, job_id));
+    }
+
     /// Takes the oldest terminal job out of memory and returns it for the
     /// caller to free. Durable jobs, their receipts included, stay readable
     /// from the journal.
-    fn evict_oldest_terminal_locked(&self, st: &mut State) -> Option<Job> {
+    pub(crate) fn evict_oldest_terminal_locked(&self, st: &mut State) -> Option<Job> {
         loop {
             let (_, job_id) = st.terminal_order.pop_front()?;
             if !st.jobs.get(&job_id).is_some_and(|job| job.is_terminal()) {

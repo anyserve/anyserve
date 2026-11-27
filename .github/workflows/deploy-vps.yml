@@ -10,6 +10,7 @@ on:
 permissions:
   contents: read
   packages: write
+  deployments: write
 
 concurrency:
   group: deploy-vps
@@ -84,6 +85,9 @@ jobs:
     needs: [build-images]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment:
+      name: demo
+      url: ${{ vars.VPS_PUBLIC_URL || 'https://anyserve.arcosx.org' }}
     steps:
       - uses: actions/checkout@v4
         with:

@@ -2899,3 +2899,255 @@ async fn scale_journal_recovery() {
     report_scale("recover_2048_jobs", samples);
     std::fs::remove_dir_all(journal.path.parent().unwrap()).unwrap();
 }
+
+#[tokio::test]
+async fn recent_terminal_durable_jobs_survive_restart_in_memory_index() {
+    let journal = JournalConfig::new(journal_path("terminal-restart"));
+    let base_cfg = || RuntimeConfig {
+        journal: Some(journal.clone()),
+        max_terminal_jobs: 3,
+        terminal_retention: Duration::from_secs(600),
+        ..config()
+    };
+
+    let server = serve(base_cfg()).await;
+    let mut worker = TestWorker::connect(&server.url, "w-term", &[]).await;
+
+    // 1. Oldest durable succeeded job (will be pushed out of the 3-job cap on restart).
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("t-0".into()),
+            spec: spec(b"zero"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    worker
+        .attempt(&assign.lease_id, assign.generation)
+        .await
+        .succeed(b"out-0")
+        .await;
+    wait_state(&server.runtime, "t-0", JobState::Succeeded).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 2. Durable succeeded job with an 8 KiB output (tests cold output & preview fallback).
+    let payload_8k = vec![b'a'; 8 * 1024];
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("t-1".into()),
+            spec: spec(b"one"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    worker
+        .attempt(&assign.lease_id, assign.generation)
+        .await
+        .succeed(&payload_8k)
+        .await;
+    wait_state(&server.runtime, "t-1", JobState::Succeeded).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 3. Durable failed job (non-retryable).
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("t-2".into()),
+            spec: spec(b"two"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    worker
+        .attempt(&assign.lease_id, assign.generation)
+        .await
+        .finish(
+            b"",
+            pb::finish::Outcome::Failed(pb::ErrorInfo {
+                code: "BOOM".into(),
+                message: "terminal failure".into(),
+                retryable: false,
+            }),
+        )
+        .await;
+    wait_state(&server.runtime, "t-2", JobState::Failed).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // 4. Ephemeral job (must not survive restart).
+    let mut eph = spec(b"eph");
+    eph.policy.durability = Some(Durability::Ephemeral);
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("e-1".into()),
+            spec: eph,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let assign = worker.next_assign().await;
+    worker.reply(&assign.lease_id, true).await;
+    worker
+        .attempt(&assign.lease_id, assign.generation)
+        .await
+        .succeed(b"eph-out")
+        .await;
+    wait_state(&server.runtime, "e-1", JobState::Succeeded).await;
+    drop(worker);
+
+    // 5. Durable cancelled job (no worker connected so it stays queued until cancelled).
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    server
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("t-3".into()),
+            spec: spec(b"three"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    server
+        .runtime
+        .cancel("t-3", "user cancelled".into())
+        .await
+        .unwrap();
+    wait_state(&server.runtime, "t-3", JobState::Cancelled).await;
+
+    server.runtime.shutdown().await;
+    drop(server);
+
+    // Restart with max_terminal_jobs = 3 -> newest 3 durable terminal jobs restored into RAM index.
+    let server2 = serve(base_cfg()).await;
+    let stats = server2.runtime.stats();
+    assert_eq!(stats.retained_jobs, 3);
+    assert_eq!(stats.succeeded, 1);
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.cancelled, 1);
+    assert_eq!(stats.result_bytes, 0, "recovery must not load output blobs");
+
+    let listed = server2
+        .runtime
+        .list_jobs(api::JobFilter::default())
+        .await
+        .unwrap();
+    let ids: Vec<&str> = listed.jobs.iter().map(|j| j.job_id.as_str()).collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(&"t-1"));
+    assert!(ids.contains(&"t-2"));
+    assert!(ids.contains(&"t-3"));
+    assert!(!ids.contains(&"t-0"));
+    assert!(!ids.contains(&"e-1"));
+
+    // Metadata-only get_job uses RAM; include_outputs=true reads full 8 KiB output from SQLite.
+    let meta_only = server2.runtime.get_job("t-1", false).await.unwrap();
+    assert_eq!(meta_only.state, JobState::Succeeded);
+    assert!(meta_only.outputs.is_none());
+    assert_eq!(server2.runtime.stats().result_bytes, 0);
+
+    let full = server2.runtime.get_job("t-1", true).await.unwrap();
+    assert_eq!(
+        full.outputs.as_ref().unwrap(),
+        &vec![Object::inline(payload_8k.clone())]
+    );
+    drop(full);
+    assert_eq!(server2.runtime.stats().result_bytes, 0);
+
+    // inspect_job_preview reads bounded 4 KiB prefix directly from SQLite without touching result_bytes.
+    let preview = server2.runtime.inspect_job_preview("t-1").await.unwrap();
+    assert_eq!(preview.job.state, JobState::Succeeded);
+    assert_eq!(preview.outputs.len(), 1);
+    assert_eq!(preview.outputs[0].size_bytes, Some(8 * 1024));
+    assert_eq!(preview.outputs[0].prefix.inline_len(), 4096);
+    assert_eq!(server2.runtime.stats().result_bytes, 0);
+
+    // watch() and events() replay Accepted + Finished with full outputs from SQLite.
+    let watched = collect(server2.runtime.watch("t-1", 0).unwrap()).await;
+    assert!(matches!(watched.first(), Some(EventKind::Accepted)));
+    assert!(matches!(
+        watched.last(),
+        Some(EventKind::Finished {
+            state: JobState::Succeeded,
+            outputs,
+            ..
+        }) if outputs == &vec![Object::inline(payload_8k.clone())]
+    ));
+    let (ev_list, ended) = server2.runtime.events("t-1", 0).await.unwrap();
+    assert!(ended);
+    assert!(matches!(
+        ev_list.last().map(|e| &e.kind),
+        Some(EventKind::Finished {
+            state: JobState::Succeeded,
+            ..
+        })
+    ));
+
+    // Idempotent resubmission and conflict detection work on recovered terminal jobs.
+    let same = server2
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("t-1".into()),
+            spec: spec(b"one"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!same.created);
+    assert_eq!(same.job.state, JobState::Succeeded);
+
+    let conflict = server2
+        .runtime
+        .submit(SubmitRequest {
+            job_id: Some("t-1".into()),
+            spec: spec(b"different"),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.kind, anyserve_core::error::ErrorKind::Conflict);
+
+    // Oldest job evicted from the 3-job cap is still readable directly from SQLite.
+    let cold = server2.runtime.get_job("t-0", true).await.unwrap();
+    assert_eq!(cold.outputs.unwrap(), vec![Object::inline(&b"out-0"[..])]);
+
+    server2.runtime.shutdown().await;
+    drop(server2);
+
+    // Restart with max_terminal_jobs = 0 recovers zero terminal jobs into RAM.
+    let server3 = serve(RuntimeConfig {
+        max_terminal_jobs: 0,
+        ..base_cfg()
+    })
+    .await;
+    assert_eq!(server3.runtime.stats().retained_jobs, 0);
+    assert!(
+        server3
+            .runtime
+            .list_jobs(api::JobFilter::default())
+            .await
+            .unwrap()
+            .jobs
+            .is_empty()
+    );
+    server3.runtime.shutdown().await;
+    drop(server3);
+
+    // Restart with terminal_retention = 0 recovers zero terminal jobs into RAM.
+    let server4 = serve(RuntimeConfig {
+        terminal_retention: Duration::ZERO,
+        ..base_cfg()
+    })
+    .await;
+    assert_eq!(server4.runtime.stats().retained_jobs, 0);
+    server4.runtime.shutdown().await;
+    drop(server4);
+
+    std::fs::remove_dir_all(journal.path.parent().unwrap()).unwrap();
+}
