@@ -66,6 +66,8 @@ jobs:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
           - runner: macos-15
             target: aarch64-apple-darwin
           - runner: macos-15-intel
@@ -215,8 +217,34 @@ jobs:
 
       - name: Create or update GitHub release
         run: |
+          VERSION="${RELEASE_TAG#v}"
+          cat > release-notes.md <<EOF
+          ## Install ${RELEASE_TAG}
+
+          **macOS & Linux (x86_64 / arm64)**
+          \`\`\`bash
+          curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh -s -- --version ${RELEASE_TAG}
+          \`\`\`
+
+          **Windows (PowerShell x86_64)**
+          \`\`\`powershell
+          \$env:ANYSERVE_VERSION="${RELEASE_TAG}"; irm https://anyserve.github.io/anyserve/install.ps1 | iex
+          \`\`\`
+
+          **Python SDK**
+          \`\`\`bash
+          pip install anyserve-runtime==${VERSION}
+          \`\`\`
+
+          **Docker (with embedded Console)**
+          \`\`\`bash
+          docker pull ghcr.io/anyserve/anyserve:${RELEASE_TAG}
+          \`\`\`
+
+          Docs: https://anyserve.github.io/anyserve/ · Live Demo: https://anyserve.arcosx.org
+          EOF
           if gh release view "${RELEASE_TAG}" --repo "${GH_REPO}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" dist/* --repo "${GH_REPO}" --clobber
           else
-            gh release create "${RELEASE_TAG}" dist/* --repo "${GH_REPO}" --title "${RELEASE_TAG}" --generate-notes
+            gh release create "${RELEASE_TAG}" dist/* --repo "${GH_REPO}" --title "${RELEASE_TAG}" --notes "$(cat release-notes.md)" --generate-notes
           fi
