@@ -203,6 +203,50 @@ class DevExScriptsTest(unittest.TestCase):
             self.assertIn("version: 9.9.9-rc.1", chart_text)
             self.assertIn('appVersion: "9.9.9-rc.1"', chart_text)
 
+    def test_ci_changes_classifier(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("ci_changes", ROOT / "scripts/ci-changes.py")
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Docs-only changes skip all heavy and code jobs.
+        docs_only = mod.classify_paths(
+            ["README.md", "docs/deployment.md", "website/src/content/docs/index.mdx"],
+            full=False,
+        )
+        self.assertFalse(docs_only["rust"])
+        self.assertFalse(docs_only["python"])
+        self.assertFalse(docs_only["console"])
+        self.assertFalse(docs_only["cloudflare"])
+        self.assertFalse(docs_only["bench"])
+        self.assertFalse(docs_only["container"])
+
+        # Normal Rust change runs fast core gates (Rust + Python 3.12), skips bench/container/rust_direct.
+        rust_change = mod.classify_paths(["crates/anyserve-core/src/lib.rs"], full=False)
+        self.assertTrue(rust_change["rust"])
+        self.assertTrue(rust_change["python"])
+        self.assertEqual(rust_change["python_versions"], ["3.12"])
+        self.assertFalse(rust_change["bench"])
+        self.assertFalse(rust_change["container"])
+        self.assertFalse(rust_change["rust_direct"])
+
+        # Dedicated bench/Dockerfile/direct changes opt in only those heavy jobs.
+        targeted = mod.classify_paths(
+            ["bench/load/console.py", "Dockerfile", "crates/anyserve-cli/tests/direct_runtime_e2e.rs"],
+            full=False,
+        )
+        self.assertTrue(targeted["bench"])
+        self.assertTrue(targeted["container"])
+        self.assertTrue(targeted["rust_direct"])
+
+        # Full mode (schedule / Release) enables everything and full Python matrix.
+        full_mode = mod.classify_paths(["README.md"], full=True)
+        for key in ("rust", "rust_direct", "python", "console", "cloudflare", "bench", "container", "helm"):
+            self.assertTrue(full_mode[key], f"expected {key}=True in full mode")
+        self.assertEqual(full_mode["python_versions"], ["3.10", "3.12", "3.14"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
