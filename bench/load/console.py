@@ -3,7 +3,8 @@
 
 Uses only Python's standard library and release anyserve/anyserve-bench binaries.
 Every case gets an isolated server, ports, FULL-sync journal and four echo workers.
-Seeded 16 MiB results are cold (not recovered into memory after server restart).
+Seeded 16 MiB result payloads stay cold in SQLite after server restart
+(only terminal job metadata is recovered into memory).
 """
 from __future__ import annotations
 
@@ -163,7 +164,9 @@ def run_case(args, seed_dir, seed, name, repetition):
     try:
         server.workers()
         connection = http.client.HTTPConnection("127.0.0.1", server.http)
-        assert get(connection, "/api/overview")["history"]["total"] == 0
+        overview = get(connection, "/api/overview")
+        assert overview["history"]["total"] == len(seed["job_ids"])
+        assert overview["budgets"]["result_bytes"] == 0
         connection.close()
         cold = name == "cold"
         polling = cold or name.endswith("-console")
