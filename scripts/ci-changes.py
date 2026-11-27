@@ -26,6 +26,7 @@ DOCS_ONLY_PATTERNS = (
 
 GLOBAL_CORE_FILES = {
     ".github/workflows/anyserve-ci.yml",
+    "scripts/ci-changes.py",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
@@ -77,7 +78,7 @@ def classify_paths(paths: list[str] | None, *, full: bool) -> dict[str, object]:
             "python_versions": FAST_PYTHON_VERSIONS,
         }
 
-    normalized = [p.strip().lstrip("./") for p in paths if p.strip()]
+    normalized = [p.strip().removeprefix("./") for p in paths if p.strip()]
     if not normalized or all(is_docs_only_file(p) for p in normalized):
         return {
             "full": False,

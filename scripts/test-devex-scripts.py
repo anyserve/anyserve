@@ -234,12 +234,20 @@ class DevExScriptsTest(unittest.TestCase):
 
         # Dedicated bench/Dockerfile/direct changes opt in only those heavy jobs.
         targeted = mod.classify_paths(
-            ["bench/load/console.py", "Dockerfile", "crates/anyserve-cli/tests/direct_runtime_e2e.rs"],
+            ["bench/load/console.py", ".dockerignore", "crates/anyserve-cli/tests/direct_runtime_e2e.rs"],
             full=False,
         )
         self.assertTrue(targeted["bench"])
         self.assertTrue(targeted["container"])
         self.assertTrue(targeted["rust_direct"])
+
+        # Dotfile workflow change (.github/workflows/anyserve-ci.yml) triggers all fast core gates.
+        ci_workflow = mod.classify_paths([".github/workflows/anyserve-ci.yml"], full=False)
+        for key in ("rust", "python", "console", "cloudflare", "helm"):
+            self.assertTrue(ci_workflow[key], f"expected {key}=True when CI workflow changes")
+        self.assertFalse(ci_workflow["bench"])
+        self.assertFalse(ci_workflow["container"])
+        self.assertFalse(ci_workflow["rust_direct"])
 
         # Full mode (schedule / Release) enables everything and full Python matrix.
         full_mode = mod.classify_paths(["README.md"], full=True)
