@@ -627,7 +627,6 @@ class HighLevelTests(unittest.TestCase):
         asyncio.run(run_check())
 
     def test_serve_sigterm_triggers_preemptive_drain_and_restores_handler(self):
-        import os
         import signal
 
         @worker(interface="sigterm.v1")
@@ -643,7 +642,7 @@ class HighLevelTests(unittest.TestCase):
                 pass
 
             def receive(self, timeout):
-                os.kill(os.getpid(), signal.SIGTERM)
+                signal.raise_signal(signal.SIGTERM)
                 time.sleep(0.05)
                 return None
 
@@ -1025,7 +1024,7 @@ class HighLevelTests(unittest.TestCase):
                 if self.messages:
                     return self.messages.popleft()
                 if sig_entered.is_set():
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    signal.raise_signal(signal.SIGTERM)
                     time.sleep(0.05)
                 else:
                     time.sleep(0.005)
