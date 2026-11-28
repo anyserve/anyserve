@@ -1,0 +1,66 @@
+---
+title: Triton Inference Server
+description: Put NVIDIA Triton models behind AnyServe with automatic READY model discovery and full dynamic batching.
+---
+
+Source: [`anyserve.universe/triton-inference-server`](https://github.com/anyserve/anyserve.universe/tree/main/triton-inference-server)
+
+`triton-inference-server/worker.py` registers each Triton model on `triton/<model>` and forwards KServe v2 inference payloads (`/v2/models/<model>/infer`) unchanged. Because the connector never parses tensor schemas, **ONNX Runtime, TensorRT, PyTorch, Python, and vLLM** backends all work out of the box while Triton retains model versioning and dynamic batching.
+
+If `--model` is omitted, the worker waits for `/v2/health/ready`, queries `/v2/repository/index`, and automatically registers every `READY` model.
+
+## Quickstart with the included dynamic-batching model
+
+The repository includes `demo_model_repository/batch_scorer`, a Triton Python-backend model configured with `dynamic_batching` (`preferred_batch_size: [4, 8, 16]`) that returns both the score and the dynamic batch size Triton formed:
+
+```bash
+# 1. Run Triton with the demo model repository
+docker run --rm -p 8000:8000 \
+  -v "$PWD/triton-inference-server/demo_model_repository:/models:ro" \
+  nvcr.io/nvidia/tritonserver:26.01-py3 \
+  tritonserver --model-repository=/models
+
+# 2. Start the outbound worker (waits for Triton and auto-discovers READY models)
+ANYSERVE_TOKEN="<worker-token>" python triton-inference-server/worker.py \
+  --triton http://127.0.0.1:8000 \
+  --concurrency 16 \
+  --attr site=lab
+
+# 3. Single inference call
+ANYSERVE_TOKEN="<client-token>" python triton-inference-server/client.py \
+  --model batch_scorer
+
+# 4. Concurrent benchmark exercising Triton's dynamic batcher
+ANYSERVE_TOKEN="<client-token>" python triton-inference-server/client.py \
+  --model batch_scorer --requests 200 --concurrency 16
+```
+
+## Calling from Python
+
+```python
+import json
+from anyserve import AnyserveClient
+
+payload = {
+    "inputs": [
+        {"name": "FEATURES", "shape": [1, 4], "datatype": "FP32", "data": [0.2, 0.5, 0.8, 1.0]}
+    ]
+}
+reply = json.loads(AnyserveClient().call("triton/batch_scorer", json.dumps(payload).encode()))
+print(reply["outputs"])
+```
+
+## Tuning tips
+
+- Set `--concurrency` (default `16`) high enough for Triton's dynamic batcher to form full batches across concurrent callers.
+- Unreachable Triton instances and HTTP 429/5xx responses raise `WorkerError(..., retryable=True)` so AnyServe reschedules on another Triton worker; malformed 4xx requests fail immediately.
+
+## Measured performance (Tesla T4, MiniLM cross-encoder ONNX Runtime)
+
+| Callers | Direct | Through AnyServe |
+|---|---|---|
+| 1 | 344 req/s, p50 2.9 ms | 248 req/s, p50 4.0 ms |
+| 8 | 1,546 req/s, p50 5.2 ms | 1,335 req/s, p50 5.9 ms |
+| 32 | 2,043 req/s, p50 15.9 ms | 1,538 req/s, p50 20.7 ms |
+
+With the included `batch_scorer` Python-backend model inside `nvcr.io/nvidia/tritonserver:26.01-py3` (200 requests across 16 concurrent callers over a Docker bridge network), `client.py` sustains **1,464 req/s** (**p50 10.2 ms**, dynamic batch size 4).

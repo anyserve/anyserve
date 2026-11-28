@@ -1,0 +1,62 @@
+---
+title: VLA Robot Policy (SmolVLA)
+description: Serve LeRobot SmolVLA vision-language-action policies over AnyServe for closed-loop robot control with real-time deadlines.
+---
+
+Source: [`anyserve.universe/vla`](https://github.com/anyserve/anyserve.universe/tree/main/vla)
+
+`vla/worker.py` serves [SmolVLA](https://huggingface.co/lerobot/smolvla_base) (450M parameters, ~1.2 GB VRAM) from LeRobot on `vla/<model>`. Each call sends one robot observation (natural-language instruction, joint state, and base64 JPEG/PNG camera frames) and returns a chunk of **50 joint actions**:
+
+```json
+// Request payload
+{
+  "instruction": "Pick up the block and place it in the bin.",
+  "state": [0.1, -0.2, 0.4, 0.0, 0.3, 0.1],
+  "images": {"camera1": "<base64 JPEG>", "camera2": "<base64 JPEG>"}
+}
+
+// Response
+{
+  "actions": [[...], ...],
+  "chunk_size": 50,
+  "joints": 6,
+  "inference_ms": 585.3
+}
+```
+
+This same `vla/<model>` interface is consumed directly by the [ROS 2 VLA control node](/anyserve/examples/ros2/).
+
+## Quickstart
+
+```bash
+pip install anyserve-runtime "lerobot[smolvla,dataset]"
+
+# 1. Start the policy worker on a GPU host
+ANYSERVE_TOKEN="<worker-token>" python vla/worker.py \
+  --model lerobot/smolvla_base \
+  --stats lerobot/svla_so100_pickplace \
+  --device cuda \
+  --attr gpu=t4
+
+# 2. Synthetic smoke test (no dataset download required)
+ANYSERVE_TOKEN="<client-token>" python vla/client.py \
+  --probe --budget-ms 5000 --attr gpu=t4
+
+# 3. Real-time LeRobot episode replay (30 Hz) with JSON report
+ANYSERVE_TOKEN="<client-token>" python vla/client.py \
+  --dataset lerobot/svla_so100_pickplace \
+  --execute 25 \
+  --budget-ms 1500 \
+  --out replay_report.json
+```
+
+Fine-tuned checkpoints embed normalization statistics for their target robot. The base checkpoint (`lerobot/smolvla_base`) does not, so pass `--stats <dataset-or-stats.json>` to unnormalize outputs into robot joint units.
+
+## Measured performance (Tesla T4, SO-100 episode at 30 Hz)
+
+```text
+454 ticks at 30 Hz: 19 calls, 0 dropped, 96% of ticks planned, latency p50 587.9 ms (inference 585.3 ms), max 597.3 ms
+```
+
+- One inference spans ~18 ticks while returning a 50-action chunk; refreshing every 25 ticks keeps the robot moving smoothly with **< 3 ms** transport overhead.
+- Late responses miss `--budget-ms` (`queue_timeout_ms = total_timeout_ms`, `max_attempts = 1`) and are dropped cleanly while the robot continues executing its active chunk.

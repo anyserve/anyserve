@@ -1,0 +1,56 @@
+---
+title: ComfyUI Custom Nodes
+description: Offload LLM/VLM prompt expansion, YOLO detection + inpainting masks, and custom workers from ComfyUI graphs over AnyServe.
+---
+
+Source: [`anyserve.universe/comfyui`](https://github.com/anyserve/anyserve.universe/tree/main/comfyui)
+
+The `comfyui-anyserve` custom node pack lets [ComfyUI](https://github.com/comfyanonymous/ComfyUI) workflows call remote GPU workers through AnyServe — over gRPC or `wss://` with zero open inbound ports. Run ComfyUI on a laptop, workstation, or lightweight CPU container while offloading LLM prompt rewriting, VLM captioning, YOLO detection/masking, Triton models, or custom image workers to remote GPUs behind NAT.
+
+## Included nodes
+
+All nodes appear under the **`AnyServe`** category in ComfyUI:
+
+| Node | AnyServe interface | Inputs → Outputs | Typical workflow use |
+|---|---|---|---|
+| **AnyServe Config** (`AnyServeConfig`) | — | `endpoint`, optional `token`/`namespace`, `timeout_ms`, required/preferred attributes, `priority` → `ANYSERVE_CONFIG` | Share connection and placement settings across nodes (leave `token` empty to read `ANYSERVE_TOKEN` from env) |
+| **AnyServe OpenAI Chat / VLM** (`AnyServeOpenAIChat`) | `openai/chat/<model>` | `model`, `prompt`, `system_prompt`, optional `IMAGE` → `STRING` | Expand prompts with a remote vLLM/Ollama worker or caption images with a remote VLM, wired directly to `CLIPTextEncode` |
+| **AnyServe YOLO Detect & Mask** (`AnyServeYOLODetect`) | `yolo/<model>` | `IMAGE` batch, `model`, `min_confidence`, `labels`, `mask_padding` → `annotated_image`, `MASK`, `detections_json`, `count` | Detect people/objects remotely and pipe `MASK` straight into `VAEEncodeForInpaint` or `ImageCompositeMasked` |
+| **AnyServe Invoke (Generic)** (`AnyServeInvoke`) | any `<interface>` | `interface`, `payload_mode` (`text`/`image_png`/`image_jpeg`), `output_mode` (`text`/`image`) → `text`, `IMAGE` | Call any custom Python or Rust AnyServe worker (upscaler, segmenter, Triton, etc.) directly inside ComfyUI |
+
+## Install into an existing ComfyUI
+
+```bash
+git clone https://github.com/anyserve/anyserve.universe.git
+cp -r anyserve.universe/comfyui /path/to/ComfyUI/custom_nodes/comfyui-anyserve
+pip install -r /path/to/ComfyUI/custom_nodes/comfyui-anyserve/requirements.txt
+```
+
+Set `ANYSERVE_ENDPOINT` and `ANYSERVE_TOKEN` in ComfyUI's environment before launching so credentials stay out of exported workflow JSON files.
+
+## Run in Docker (CPU ComfyUI + remote GPU workers)
+
+```bash
+docker build -t comfyui-anyserve anyserve.universe/comfyui
+docker run --rm -p 8188:8188 \
+  -e ANYSERVE_ENDPOINT=http://host.docker.internal:50052 \
+  -e ANYSERVE_TOKEN="<client-token>" \
+  comfyui-anyserve
+```
+
+## Execute the included API workflow
+
+[`workflow_api.json`](https://github.com/anyserve/anyserve.universe/blob/main/comfyui/workflow_api.json) connects `LoadImage` → `AnyServeYOLODetect` → `SaveImage` (annotated) + `MaskToImage` → `SaveImage` (detection mask), and chains `AnyServeOpenAIChat` → `AnyServeInvoke`:
+
+```bash
+curl -s http://127.0.0.1:8188/prompt \
+  -H 'Content-Type: application/json' \
+  -d "{\"prompt\": $(cat anyserve.universe/comfyui/workflow_api.json)}"
+```
+
+## Container verification
+
+Verified inside a CPU-only ComfyUI container calling authenticated AnyServe v0.7.0 workers on a Tesla T4:
+
+- All 4 nodes register in ComfyUI's `/object_info` under the `AnyServe` category.
+- Executing `workflow_api.json` via `/prompt` runs remote `yolo/yolo11n` detection (producing both an annotated PNG and binary inpainting mask PNG) alongside `openai/chat/qwen2.5:0.5b` → `AnyServeInvoke`.

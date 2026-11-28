@@ -39,6 +39,18 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Examples',
+          items: [
+            { slug: 'examples/overview' },
+            { slug: 'examples/openai' },
+            { slug: 'examples/triton' },
+            { slug: 'examples/yolo' },
+            { slug: 'examples/vla' },
+            { slug: 'examples/comfyui' },
+            { slug: 'examples/ros2' },
+          ],
+        },
+        {
           label: 'Reference',
           items: [
             { slug: 'reference/cli' },

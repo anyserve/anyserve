@@ -64,7 +64,7 @@ def predict(payload: bytes) -> bytes:
 serve(predict)
 ```
 
-Production connectors for vLLM, Ollama, Triton, YOLO, and VLA live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
+Production connectors and integrations — OpenAI/vLLM/Ollama (with local HTTP proxy), Triton, YOLO, SmolVLA, ComfyUI custom nodes, and ROS 2 nodes — live in [anyserve.universe](https://github.com/anyserve/anyserve.universe) and are documented in [Examples](docs/examples.md) ([Docs Website](https://anyserve.github.io/anyserve/examples/overview/)).
 
 ## Live Demo
 
@@ -128,7 +128,8 @@ ANYSERVE_ENDPOINT=https://anyserve.arcosx.org ANYSERVE_TOKEN=<client-token> \
 
 ## Documentation
 
-- **[Docs Website](https://anyserve.github.io/anyserve/)** — concise guides, CLI reference, and install instructions
+- **[Docs Website](https://anyserve.github.io/anyserve/)** — concise guides, examples, CLI reference, and install instructions
+- [Examples & Integrations](docs/examples.md) — OpenAI/vLLM/Ollama, Triton, YOLO, SmolVLA, ComfyUI custom nodes, and ROS 2 nodes
 - [Configuration & CLI](docs/configuration.md) — server TOML, zero-TOML flags & env vars, auth/TLS, limits
 - [Python SDK](docs/python-sdk.md) — sync/async clients, duplex streaming, `ExecutionOptions`, `@worker`
 - [Deployment & Recovery](docs/deployment.md) — Quick Tunnel, VPS, Fly.io, Docker, PostgreSQL HA, Helm, Cloudflare

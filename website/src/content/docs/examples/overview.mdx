@@ -1,0 +1,82 @@
+---
+title: Examples Overview
+description: Production connectors and host-application integrations from anyserve.universe — OpenAI/vLLM/Ollama, Triton, YOLO, SmolVLA, ComfyUI custom nodes, and ROS 2 nodes.
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+All ready-to-run examples live in [anyserve.universe](https://github.com/anyserve/anyserve.universe). None of them are baked into the `anyserve` binary: every inference worker and host integration speaks the standard Python SDK (`anyserve-runtime`) over outbound-only gRPC or WebSocket (`wss://`).
+
+```text
+  ComfyUI Custom Nodes ───┐                                       ┌── openai/worker.py  (vLLM, Ollama, llama.cpp, SGLang)
+  ROS 2 Nodes (Jazzy) ────┼──▶ AnyServe Control Plane ◀───────────┼── triton-inference-server/worker.py (Triton KServe v2)
+  OpenAI HTTP Proxy ──────┤        (gRPC / wss://)                ├── yolo/worker.py    (Ultralytics YOLO)
+  CLI / Python Clients ───┘                                       └── vla/worker.py     (LeRobot SmolVLA)
+```
+
+## Inference workers
+
+<CardGrid>
+  <Card title="OpenAI-compatible Servers" icon="rocket">
+    Put vLLM, Ollama, LM Studio, llama.cpp, SGLang, or embedding servers behind AnyServe with SSE token streaming, cooperative cancellation, and a local drop-in HTTP proxy (`proxy.py`).
+    [Read guide →](/anyserve/examples/openai/)
+  </Card>
+  <Card title="Triton Inference Server" icon="setting">
+    Auto-discover `READY` Triton models over `/v2/repository/index`, preserve dynamic batching across ONNX Runtime, TensorRT, PyTorch, and Python backends, and benchmark concurrency.
+    [Read guide →](/anyserve/examples/triton/)
+  </Card>
+  <Card title="YOLO Object Detection" icon="magnifier">
+    Serve Ultralytics YOLO frame-by-frame with per-request confidence/label filtering, headless annotated image & MP4 output, and hard latency budgets.
+    [Read guide →](/anyserve/examples/yolo/)
+  </Card>
+  <Card title="VLA Robot Policy (SmolVLA)" icon="puzzle">
+    Serve LeRobot SmolVLA action chunks (50 steps per inference) for real-time closed-loop robot control, with synthetic `--probe` smoke tests and LeRobot episode replay.
+    [Read guide →](/anyserve/examples/vla/)
+  </Card>
+</CardGrid>
+
+## Host-application integrations
+
+<CardGrid>
+  <Card title="ComfyUI Custom Nodes" icon="laptop">
+    Drop `comfyui-anyserve` into `ComfyUI/custom_nodes/` to run remote LLM/VLM prompt expansion, remote YOLO detection + inpainting `MASK` generation, or arbitrary AnyServe workers inside ComfyUI graphs.
+    [Read guide →](/anyserve/examples/comfyui/)
+  </Card>
+  <Card title="ROS 2 Perception & VLA Nodes" icon="random">
+    Installable `ament_python` package (`anyserve_ros2`) offloading `/camera/image_raw` to remote YOLO (`vision_msgs/Detection2DArray`) and running 30 Hz `/joint_commands` control loops backed by remote SmolVLA.
+    [Read guide →](/anyserve/examples/ros2/)
+  </Card>
+</CardGrid>
+
+## Clone & prerequisites
+
+```bash
+git clone https://github.com/anyserve/anyserve.universe.git
+cd anyserve.universe
+pip install anyserve-runtime
+```
+
+Start a local authenticated control plane (or use the hosted demo at [anyserve.arcosx.org/tokens](https://anyserve.arcosx.org/tokens)):
+
+```bash
+anyserve serve --console-listen 127.0.0.1:3001 --auto-token
+```
+
+Every worker follows the same conventions:
+- Registers `@worker(interface="<family>/<model>")` so each model has isolated queues, metrics, and routing policies.
+- Accepts `--endpoint`, `--pool`, and repeatable `--attr KEY=VALUE` for placement (`required_attributes` / `preferred_attributes`).
+- Reports transient backend failures (unreachable, HTTP 429, HTTP 5xx) with `WorkerError(..., retryable=True)` and fails invalid inputs fast without retrying.
+
+## Measured overhead
+
+Measured on a single Tesla T4 (client, control plane, worker, and backend on the same host; "Direct" bypasses AnyServe):
+
+| Example | Backend and workload | Direct | Through AnyServe |
+|---|---|---|---|
+| `openai/` | vLLM, Qwen2.5-0.5B-Instruct, 32 tokens, 32 callers | 95.4 req/s, p50 338 ms | 93.9 req/s, p50 335 ms |
+| `openai/` | Same, streaming TTFT | 19.5 ms | 19.7 ms |
+| `triton-inference-server/` | MiniLM cross-encoder (ONNX Runtime), 8 callers | 1,546 req/s, p50 5.2 ms | 1,335 req/s, p50 5.9 ms |
+| `yolo/` | YOLO11n on 640×480 video, 1 camera | 71 fps, 14.0 ms/frame | 62 fps, 15.6 ms/frame |
+| `vla/` | SmolVLA on SO-100 pick-and-place episode at 30 Hz | 585 ms/inference | 588 ms/call |
+
+AnyServe adds roughly **1 to 3 ms** per call on top of the inference backend.

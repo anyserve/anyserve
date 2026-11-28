@@ -1,0 +1,59 @@
+---
+title: YOLO Object Detection
+description: Serve Ultralytics YOLO behind AnyServe with per-request label filtering, headless annotated output, and live frame budgets.
+---
+
+Source: [`anyserve.universe/yolo`](https://github.com/anyserve/anyserve.universe/tree/main/yolo)
+
+`yolo/worker.py` loads an Ultralytics YOLO model on `yolo/<model>` (for example `yolo/yolo11n`). Each call accepts raw JPEG or PNG bytes and returns JSON detections plus image dimensions:
+
+```json
+{
+  "detections": [
+    {"label": "person", "confidence": 0.91, "box": [48.2, 398.1, 245.0, 902.7]}
+  ],
+  "image": {"width": 640, "height": 480},
+  "inference_ms": 10.5
+}
+```
+
+Clients can override confidence and class filters per request using `ExecutionOptions(metadata={"conf": "0.35", "labels": "person,bus"})`. The same `yolo/<model>` interface powers both the [ComfyUI custom nodes](/anyserve/examples/comfyui/) and the [ROS 2 perception node](/anyserve/examples/ros2/).
+
+## Quickstart
+
+```bash
+pip install anyserve-runtime ultralytics
+
+# 1. Start the GPU worker
+ANYSERVE_TOKEN="<worker-token>" python yolo/worker.py \
+  --model yolo11n.pt \
+  --device cuda:0 \
+  --attr gpu=t4
+
+# 2. Single image (headless annotated output + JSON)
+ANYSERVE_TOKEN="<client-token>" python yolo/client.py \
+  --source photo.jpg \
+  --out annotated.jpg \
+  --labels person,car \
+  --conf 0.3 \
+  --json
+
+# 3. Video file or live camera (drops frames exceeding --budget-ms)
+ANYSERVE_TOKEN="<client-token>" python yolo/client.py \
+  --source demo.mp4 \
+  --out annotated.mp4 \
+  --budget-ms 500
+```
+
+## Scaling across cameras and workers
+
+Each worker sets `max_active_leases=1` so the GPU runs one frame at a time without thrashing. Multiple cameras share a worker frame by frame, and starting additional workers scales throughput transparently without touching clients.
+
+## Measured performance (Tesla T4, YOLO11n, 640×480 video)
+
+| Setup | Per-camera throughput & latency |
+|---|---|
+| In-process (no AnyServe) | 71 fps, 14.0 ms/frame |
+| 1 camera, 1 worker | 62 fps, p50 15.6 ms |
+| 2 cameras, 1 worker | 37 fps, p50 26.9 ms |
+| 2 cameras, 2 workers on the same GPU | 56 fps, p50 17.0 ms |

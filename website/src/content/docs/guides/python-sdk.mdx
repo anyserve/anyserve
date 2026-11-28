@@ -80,4 +80,4 @@ serve(echo)  # multiplex multiple handlers: serve(h1, h2, endpoint=...)
 - **JSON codec**: pass `codec="json"` for automatic JSON encode/decode.
 - **Retries**: raise `WorkerError("transient", retryable=True)` to reschedule; unhandled exceptions fail without retry.
 - **Graceful drain**: `SIGTERM` on the main thread triggers preemptive drain so unexposed in-flight jobs reschedule cleanly.
-- **Ready-made AI connectors**: vLLM, Ollama, Triton, YOLO, and VLA workers live in [anyserve.universe](https://github.com/anyserve/anyserve.universe).
+- **Ready-made examples & integrations**: OpenAI/vLLM/Ollama (plus local HTTP proxy), Triton, YOLO, SmolVLA, ComfyUI custom nodes, and ROS 2 nodes are documented in [Examples](/anyserve/examples/overview/) ([anyserve.universe](https://github.com/anyserve/anyserve.universe)).

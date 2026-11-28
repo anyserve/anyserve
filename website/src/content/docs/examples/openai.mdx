@@ -1,0 +1,95 @@
+---
+title: OpenAI-Compatible Servers
+description: Expose vLLM, Ollama, llama.cpp, SGLang, or embedding servers over AnyServe with SSE streaming and a drop-in local HTTP proxy.
+---
+
+Source: [`anyserve.universe/openai`](https://github.com/anyserve/anyserve.universe/tree/main/openai)
+
+`openai/worker.py` wraps any server speaking the OpenAI HTTP API — **vLLM, Ollama, LM Studio, llama.cpp, SGLang, or embedding servers** — with zero open inbound ports. At startup it waits for `GET <base>/models` and registers one AnyServe interface per model and endpoint:
+
+| Interface | Upstream route |
+|---|---|
+| `openai/chat/<model>` | `POST <base>/chat/completions` |
+| `openai/completions/<model>` | `POST <base>/completions` |
+| `openai/embeddings/<model>` | `POST <base>/embeddings` |
+
+With `"stream": true`, each upstream SSE `data:` line is emitted as one AnyServe output frame. Closing the client `Invoke` stream cooperatively cancels generation and closes the upstream HTTP connection.
+
+## 1. Connect a local LLM worker
+
+```bash
+# Example A: vLLM
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --port 8000
+ANYSERVE_TOKEN="<worker-token>" python openai/worker.py \
+  --base-url http://127.0.0.1:8000/v1 \
+  --concurrency 16 \
+  --attr gpu=t4
+
+# Example B: Ollama (auto-discovers every pulled model)
+ollama pull qwen2.5:0.5b
+ANYSERVE_TOKEN="<worker-token>" python openai/worker.py \
+  --base-url http://127.0.0.1:11434/v1 \
+  --serve chat --serve embeddings \
+  --attr site=home
+```
+
+## 2. Call from the CLI client
+
+```bash
+# Streaming chat with TTFT & throughput stats
+ANYSERVE_TOKEN="<client-token>" python openai/client.py \
+  --model qwen2.5:0.5b \
+  --prompt "Explain outbound workers in one sentence." \
+  --stats --attr site=home
+
+# Embeddings
+ANYSERVE_TOKEN="<client-token>" python openai/client.py \
+  --model qwen2.5:0.5b \
+  --mode embeddings \
+  --prompt "AnyServe routes opaque bytes."
+```
+
+## 3. Drop-in local OpenAI HTTP proxy (`proxy.py`)
+
+Run `openai/proxy.py` on your laptop or application server to expose a standard `http://127.0.0.1:8080/v1` API backed by remote AnyServe workers. Existing tools (`curl`, OpenAI Python/JS SDKs, Open WebUI, Continue, LangChain) work with zero code changes:
+
+```bash
+ANYSERVE_TOKEN="<client-token>" python openai/proxy.py \
+  --listen 127.0.0.1:8080 \
+  --attr site=home
+```
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="anyserve")
+stream = client.chat.completions.create(
+    model="qwen2.5:0.5b",
+    messages=[{"role": "user", "content": "Hello from behind NAT!"}],
+    stream=True,
+)
+for chunk in stream:
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+## Key worker flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--base-url` | `http://127.0.0.1:8000/v1` | Upstream OpenAI-compatible base URL |
+| `--api-key` | `OPENAI_API_KEY` | Optional bearer token for the upstream server |
+| `--model` | all listed models | Restrict to specific models (repeatable) |
+| `--serve` | `chat` | Endpoints to register: `chat`, `completions`, `embeddings` (repeatable) |
+| `--concurrency` | `16` | Total concurrent requests in flight on this server |
+| `--pool` | `""` | Worker pool name for tiering and spillover |
+| `--attr KEY=VALUE` | — | Placement attribute (repeatable) |
+
+## Measured performance (Tesla T4, vLLM + Qwen2.5-0.5B-Instruct, 32 tokens)
+
+| Callers | Direct | Through AnyServe |
+|---|---|---|
+| 1 | 5.3 req/s, p50 188 ms | 5.3 req/s, p50 189 ms |
+| 8 | 36.8 req/s, p50 217 ms | 36.1 req/s, p50 221 ms |
+| 32 | 95.4 req/s, p50 338 ms | 93.9 req/s, p50 335 ms |
+
+Streaming time to first token: **19.5 ms** direct vs **19.7 ms** through AnyServe.

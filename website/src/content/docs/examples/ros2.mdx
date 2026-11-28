@@ -1,0 +1,79 @@
+---
+title: ROS 2 Perception & VLA Nodes
+description: Offload ROS 2 camera perception (YOLO) and closed-loop VLA policies (SmolVLA) to remote GPUs behind NAT over AnyServe.
+---
+
+Source: [`anyserve.universe/ros2`](https://github.com/anyserve/anyserve.universe/tree/main/ros2)
+
+`anyserve_ros2` is a standard ROS 2 `ament_python` package (tested on **ROS 2 Jazzy**, Ubuntu 24.04, Python 3.12) that bridges live robot DDS topics to remote GPU workers over AnyServe. Robots on Jetson, Raspberry Pi, or factory networks dial **out** over gRPC or `wss://` with zero open inbound ports.
+
+## Included ROS 2 nodes
+
+| Executable | Subscribes | AnyServe interface | Publishes |
+|---|---|---|---|
+| `yolo_node` | `/camera/image_raw` (`sensor_msgs/Image`) | `yolo/<model>` | `/detections` (`vision_msgs/Detection2DArray`), `/detections_json` (`std_msgs/String`), `/detections/image` (`sensor_msgs/Image`) |
+| `vla_node` | camera `sensor_msgs/Image` topics, `/joint_states` (`sensor_msgs/JointState`), `/vla/instruction` (`std_msgs/String`) | `vla/<model>` | `/joint_commands` (`sensor_msgs/JointState`, 30 Hz), `/vla/diagnostics` (`std_msgs/String`) |
+| `demo_publisher` | — | — | Synthetic/image-backed `/camera/image_raw`, `/joint_states`, and `/vla/instruction` for container testing |
+
+### Built for real-time robotics
+
+- **Latest-frame-wins**: camera callbacks never block the ROS 2 executor; a dedicated worker thread picks the freshest frame and drops stale frames under load.
+- **Hard deadline budgets**: requests set `queue_timeout_ms = total_timeout_ms = budget_ms` with `max_attempts = 1` so late frames or stale action chunks are dropped cleanly.
+- **Zero `cv_bridge` ABI conflicts**: converts `rgb8`, `bgr8`, `rgba8`, `bgra8`, and `mono8` images with pure NumPy + Pillow.
+- **Edge-to-cloud spillover**: configure `preferred_attributes` (for example `site=edge`) and `spillover_after_ms` to prefer a nearby edge GPU and spill over automatically when busy.
+
+## Build with `colcon`
+
+```bash
+git clone https://github.com/anyserve/anyserve.universe.git
+pip install anyserve-runtime
+
+mkdir -p ~/ros2_ws/src
+cp -r anyserve.universe/ros2 ~/ros2_ws/src/anyserve_ros2
+cd ~/ros2_ws
+colcon build --packages-select anyserve_ros2
+source install/setup.bash
+```
+
+## Launch nodes
+
+Start the remote `yolo/worker.py` and/or `vla/worker.py` on your GPU machine, then run on the robot:
+
+```bash
+export ANYSERVE_ENDPOINT="https://your-control-plane"
+export ANYSERVE_TOKEN="<client-token>"
+
+# Perception offload (YOLO -> vision_msgs/Detection2DArray + RViz annotated image)
+ros2 run anyserve_ros2 yolo_node --ros-args \
+  -p interface:=yolo/yolo11n \
+  -p image_topic:=/camera/image_raw \
+  -p budget_ms:=500 \
+  -p preferred_attributes:="site=edge"
+
+# Closed-loop 30 Hz VLA policy control (SmolVLA -> /joint_commands)
+ros2 run anyserve_ros2 vla_node --ros-args \
+  -p interface:=vla/lerobot/smolvla_base \
+  -p cameras:="camera1=/camera/top/image_raw,camera2=/camera/wrist/image_raw" \
+  -p control_hz:=30.0 \
+  -p execute_steps:=25 \
+  -p budget_ms:=1500
+```
+
+## Run in Docker
+
+```bash
+docker build -t anyserve-ros2 anyserve.universe/ros2
+docker run --rm --network host \
+  -e ANYSERVE_ENDPOINT=http://127.0.0.1:50052 \
+  -e ANYSERVE_TOKEN="<client-token>" \
+  anyserve-ros2 ros2 run anyserve_ros2 yolo_node
+```
+
+## Container verification (ROS 2 Jazzy + Tesla T4)
+
+Verified inside `ros:jazzy-ros-base` (`colcon build --packages-select anyserve_ros2`) against authenticated AnyServe v0.7.0 GPU workers over a Docker bridge network:
+
+| Node | Remote worker | Observed round-trip | GPU inference | Verified ROS 2 outputs |
+|---|---|---|---|---|
+| `yolo_node` | `yolo/yolo11n` (810×1080 JPEG) | **22.6 ms** | 14.7 ms | `vision_msgs/Detection2DArray`, `/detections_json`, annotated `/detections/image` |
+| `vla_node` | `vla/lerobot/smolvla_base` | **599.6 ms** | 595.2 ms | 50-action chunks streamed at 30 Hz on `/joint_commands` (`sensor_msgs/JointState`) + `/vla/diagnostics` |
