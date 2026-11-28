@@ -54,6 +54,7 @@ jobs:
     uses: ./.github/workflows/anyserve-ci.yml
     with:
       ref: ${{ needs.validate.outputs.ref }}
+      full: true
 
   build:
     name: Build ${{ matrix.target }}

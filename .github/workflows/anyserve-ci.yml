@@ -59,7 +59,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before || '' }}
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          FORCE_FULL: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_call' && inputs.full != false) || (github.event_name == 'workflow_dispatch' && inputs.full == true) }}
+          # In a reusable workflow, github.event_name is the *caller's* event (e.g. a tag push),
+          # so detect Release / manual runs via the `full` input instead (null on push/PR/schedule).
+          FORCE_FULL: ${{ github.event_name == 'schedule' || inputs.full == true }}
         run: |
           python3 scripts/ci-changes.py \
             --event "${EVENT_NAME}" \
