@@ -2,9 +2,9 @@
 # AnyServe CLI installer for macOS and Linux (x86_64 & arm64).
 # Usage:
 #   curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh
-#   curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh -s -- --version v0.6.0
+#   curl -fsSL https://anyserve.github.io/anyserve/install.sh | sh -s -- --version v0.7.0
 # Environment overrides:
-#   ANYSERVE_VERSION      Pin a release tag (e.g. v0.6.0 or 0.6.0)
+#   ANYSERVE_VERSION      Pin a release tag (e.g. v0.7.0 or 0.7.0)
 #   ANYSERVE_INSTALL_DIR  Install directory (default: $HOME/.local/bin)
 #   ANYSERVE_REPO         GitHub repo slug (default: anyserve/anyserve)
 #   ANYSERVE_BASE_URL     Custom release download base URL (for mirrors / tests)
@@ -35,7 +35,7 @@ Usage:
   install.sh [--version <tag>] [--dir <path>]
 
 Options:
-  -v, --version <tag>   Install a specific release tag (e.g. v0.6.0)
+  -v, --version <tag>   Install a specific release tag (e.g. v0.7.0)
   -d, --dir <path>      Destination directory (default: ~/.local/bin)
   -h, --help            Show this help message
 

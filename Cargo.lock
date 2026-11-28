@@ -156,7 +156,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "anyserve"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "anyserve-client",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-auth-github"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "anyserve-core",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-bench"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyserve-client",
  "anyserve-core",
@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "anyserve-proto",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "anyhow",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-demo"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "anyserve-client",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "prost",
  "tonic",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "anyserve-python"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "anyserve-client",

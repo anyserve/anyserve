@@ -2,7 +2,7 @@
 # Usage:
 #   irm https://anyserve.github.io/anyserve/install.ps1 | iex
 # Parameters / Environment overrides:
-#   -Version / $env:ANYSERVE_VERSION          Pin a release tag (e.g. v0.6.0 or 0.6.0)
+#   -Version / $env:ANYSERVE_VERSION          Pin a release tag (e.g. v0.7.0 or 0.7.0)
 #   -InstallDir / $env:ANYSERVE_INSTALL_DIR   Install directory (default: %LOCALAPPDATA%\anyserve\bin)
 #   $env:ANYSERVE_REPO                        GitHub repo slug (default: anyserve/anyserve)
 #   $env:ANYSERVE_BASE_URL                    Custom release download base URL

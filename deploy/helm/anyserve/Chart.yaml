@@ -3,4 +3,4 @@ name: anyserve
 description: AnyServe execution domain with a PostgreSQL leader-standby control plane or a single SQLite instance, and an optional worker fleet.
 type: application
 version: 0.2.0
-appVersion: "0.6.0"
+appVersion: "0.7.0"
