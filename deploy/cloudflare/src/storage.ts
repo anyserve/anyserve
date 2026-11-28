@@ -3,6 +3,7 @@ export const DEFAULT_PREVIEW_BYTES = 4_096;
 export const MAX_SCAN_LIMIT = 251;
 export const MAX_PURGE_BATCH_LIMIT = 500;
 export const MAX_R2_DELETE_CHUNK = 1_000;
+export const MAX_RECOVERED_WORKERS = 20_000;
 
 export type JobStateText =
   | "queued"
@@ -50,7 +51,7 @@ export interface AcquireRequest {
 
 export type AcquireResponse =
   | { acquired: false }
-  | { acquired: true; term: number; active: WireStoredJob[] };
+  | { acquired: true; term: number; active: WireStoredJob[]; workers: string[] };
 
 export interface RenewRequest {
   holder_id: string;
@@ -102,6 +103,18 @@ export type CommitOp =
       winning_lease_id: string | null;
       outcome_digest: string | null;
       at_ms: number;
+    }
+  | {
+      type: "worker_upsert";
+      namespace: string;
+      worker_id: string;
+      record_json: string;
+      updated_at_ms: number;
+    }
+  | {
+      type: "worker_forget";
+      namespace: string;
+      worker_id: string;
     }
   | {
       type: "probe";
@@ -520,6 +533,18 @@ type PreparedOp =
       atMs: number;
     }
   | {
+      type: "worker_upsert";
+      namespace: string;
+      workerId: string;
+      recordJson: string;
+      updatedAtMs: number;
+    }
+  | {
+      type: "worker_forget";
+      namespace: string;
+      workerId: string;
+    }
+  | {
       type: "probe";
     };
 
@@ -582,6 +607,15 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     worker_id TEXT NOT NULL,
     PRIMARY KEY (job_id, worker_id)
   )`,
+  `CREATE TABLE IF NOT EXISTS journal_workers (
+    namespace TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (namespace, worker_id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS journal_workers_updated
+    ON journal_workers(updated_at_ms DESC)`,
 ];
 
 const JOB_SELECT_COLUMNS = `job_id, namespace, state, spec_hash, spec_json,
@@ -745,7 +779,17 @@ export class JournalStorage {
         const failedWorkers = this.loadFailedWorkersSync(row.job_id);
         return { row, objects, failedWorkers };
       });
-      return { term, jobs };
+      const workers = this.storage.sql
+        .exec<{ record_json: string }>(
+          `SELECT record_json
+           FROM journal_workers
+           ORDER BY updated_at_ms DESC
+           LIMIT ?`,
+          MAX_RECOVERED_WORKERS,
+        )
+        .toArray()
+        .map((r) => r.record_json);
+      return { term, jobs, workers };
     });
 
     if (syncResult === null) {
@@ -793,7 +837,12 @@ export class JournalStorage {
       }
     }
 
-    return { acquired: true, term: syncResult.term, active };
+    return {
+      acquired: true,
+      term: syncResult.term,
+      active,
+      workers: syncResult.workers,
+    };
   }
 
   renew(raw: Record<string, unknown>): RenewResponse {
@@ -1505,6 +1554,38 @@ export class JournalStorage {
             atMs: assertNonNegativeInt(op.at_ms, `ops[${opIdx}].at_ms`),
           };
         }
+        case "worker_upsert":
+          return {
+            type: "worker_upsert",
+            namespace: assertNonEmptyString(
+              op.namespace,
+              `ops[${opIdx}].namespace`,
+            ),
+            workerId: assertNonEmptyString(
+              op.worker_id,
+              `ops[${opIdx}].worker_id`,
+            ),
+            recordJson: assertNonEmptyString(
+              op.record_json,
+              `ops[${opIdx}].record_json`,
+            ),
+            updatedAtMs: assertNonNegativeInt(
+              op.updated_at_ms,
+              `ops[${opIdx}].updated_at_ms`,
+            ),
+          };
+        case "worker_forget":
+          return {
+            type: "worker_forget",
+            namespace: assertNonEmptyString(
+              op.namespace,
+              `ops[${opIdx}].namespace`,
+            ),
+            workerId: assertNonEmptyString(
+              op.worker_id,
+              `ops[${opIdx}].worker_id`,
+            ),
+          };
         case "probe":
           return { type: "probe" };
         default:
@@ -1654,6 +1735,28 @@ export class JournalStorage {
         for (const obj of op.outputs) {
           this.insertObjectSync(op.jobId, "output", obj);
         }
+        break;
+      }
+      case "worker_upsert": {
+        this.storage.sql.exec(
+          `INSERT INTO journal_workers (namespace, worker_id, record_json, updated_at_ms)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(namespace, worker_id) DO UPDATE SET
+             record_json = excluded.record_json,
+             updated_at_ms = excluded.updated_at_ms`,
+          op.namespace,
+          op.workerId,
+          op.recordJson,
+          op.updatedAtMs,
+        );
+        break;
+      }
+      case "worker_forget": {
+        this.storage.sql.exec(
+          `DELETE FROM journal_workers WHERE namespace = ? AND worker_id = ?`,
+          op.namespace,
+          op.workerId,
+        );
         break;
       }
       case "probe": {

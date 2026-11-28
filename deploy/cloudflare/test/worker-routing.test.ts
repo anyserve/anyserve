@@ -345,6 +345,7 @@ describe("Worker routing, JournalGateway, and AnyserveControlPlaneDO", () => {
       acquired: true,
       term: 1,
       active: [],
+      workers: [],
     });
 
     // 3. Pre-upgrade WebSocket rejection (401/403/503) returns directly without incrementing activeWsCount.

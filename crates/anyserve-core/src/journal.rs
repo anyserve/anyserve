@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::RuntimeError;
 use crate::runtime::api::{
     Demand, ErrorInfo, ExecutionPolicy, JobSpec, JobState, JournalConfig, JournalStats, Metadata,
-    Object, ObjectPreview,
+    Object, ObjectPreview, WorkerRecord,
 };
 use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 
@@ -172,6 +172,15 @@ pub(crate) enum JournalOp {
     Accept(Box<AcceptRecord>),
     AttemptStart(AttemptStartRecord),
     Terminal(Box<TerminalRecord>),
+    /// Inserts or replaces the worker registry row keyed by
+    /// `(namespace, worker_id)`. Idempotent.
+    WorkerUpsert(Box<WorkerRecord>),
+    /// Deletes the worker registry row keyed by `(namespace, worker_id)`.
+    /// Idempotent; deleting a missing row is not an error.
+    WorkerForget {
+        namespace: String,
+        worker_id: String,
+    },
     /// Verifies that writes succeed again after a rollback.
     Probe,
 }
@@ -252,6 +261,9 @@ pub(crate) struct Recovery {
     /// `updated_at_ms`), restored into the in-memory read index without loading
     /// output payloads into memory.
     pub terminal: Vec<StoredJob>,
+    /// Every persisted worker registry row (online at crash time or offline),
+    /// in any order; the runtime applies retention and caps.
+    pub workers: Vec<WorkerRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -346,7 +358,33 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS journal_large_outputs_preview
         ON journal_objects(job_id, idx, uri, metadata_json, length(content))
         WHERE role = 'output' AND uri IS NULL AND length(content) > 4096",
+    // Worker registry: one row per (namespace, worker_id), outliving sessions.
+    "CREATE TABLE IF NOT EXISTS journal_workers (
+        namespace TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (namespace, worker_id)
+    )",
 ];
+
+/// Upper bound on worker registry rows read during recovery; the runtime
+/// enforces the real retention and caps.
+pub(crate) const MAX_RECOVERED_WORKERS: i64 = 20_000;
+
+/// Decodes stored worker registry rows, skipping (and logging) corrupt ones.
+pub(crate) fn decode_worker_records(rows: impl IntoIterator<Item = String>) -> Vec<WorkerRecord> {
+    rows.into_iter()
+        .filter_map(|json| match serde_json::from_str::<WorkerRecord>(&json) {
+            Ok(record) if !record.worker_id.is_empty() => Some(record),
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%error, "skipping unreadable worker registry row");
+                None
+            }
+        })
+        .collect()
+}
 
 const ROLE_INPUT: &str = "input";
 const ROLE_PARAMS: &str = "params";
@@ -998,10 +1036,18 @@ async fn load_recovery(
         terminal = rows.iter().map(job_from_row).collect::<Result<_>>()?;
         terminal.reverse();
     }
+    let worker_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT record_json FROM journal_workers ORDER BY updated_at_ms DESC LIMIT ?",
+    )
+    .bind(MAX_RECOVERED_WORKERS)
+    .fetch_all(&mut *conn)
+    .await
+    .context("load worker registry")?;
     Ok(Recovery {
         generation,
         active,
         terminal,
+        workers: decode_worker_records(worker_rows),
     })
 }
 
@@ -1205,6 +1251,32 @@ async fn apply_op(tx: &mut Transaction<'_, Sqlite>, op: &JournalOp) -> Result<()
                 .execute(&mut **tx)
                 .await?;
         }
+        JournalOp::WorkerUpsert(record) => {
+            let record_json = serde_json::to_string(record.as_ref())?;
+            sqlx::query(
+                "INSERT INTO journal_workers (namespace, worker_id, record_json, updated_at_ms)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(namespace, worker_id) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    updated_at_ms = excluded.updated_at_ms",
+            )
+            .bind(&record.namespace)
+            .bind(&record.worker_id)
+            .bind(record_json)
+            .bind(record.updated_at_ms() as i64)
+            .execute(&mut **tx)
+            .await?;
+        }
+        JournalOp::WorkerForget {
+            namespace,
+            worker_id,
+        } => {
+            sqlx::query("DELETE FROM journal_workers WHERE namespace = ? AND worker_id = ?")
+                .bind(namespace)
+                .bind(worker_id)
+                .execute(&mut **tx)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -1236,6 +1308,30 @@ async fn verify(conn: &mut SqliteConnection, op: &JournalOp) -> Result<bool> {
                 .is_some_and(|state| state == state_text(record.state))
         }
         JournalOp::Probe => false,
+        JournalOp::WorkerUpsert(record) => {
+            let expected = serde_json::to_string(record.as_ref())?;
+            sqlx::query_scalar::<_, String>(
+                "SELECT record_json FROM journal_workers WHERE namespace = ? AND worker_id = ?",
+            )
+            .bind(&record.namespace)
+            .bind(&record.worker_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some_and(|stored| stored == expected)
+        }
+        JournalOp::WorkerForget {
+            namespace,
+            worker_id,
+        } => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM journal_workers WHERE namespace = ? AND worker_id = ?",
+            )
+            .bind(namespace)
+            .bind(worker_id)
+            .fetch_one(&mut *conn)
+            .await?
+                == 0
+        }
     })
 }
 
@@ -2290,5 +2386,114 @@ mod tests {
         assert_eq!(page2.jobs.len(), 10);
         assert!(page2.next_page_token.is_none());
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_registry_upserts_replaces_forgets_and_recovers() {
+        let cfg = config("worker_reg");
+        let (journal, recovery) = Journal::open(&cfg).await.unwrap();
+        assert!(recovery.workers.is_empty());
+
+        let w1 = WorkerRecord {
+            namespace: "default".into(),
+            worker_id: "jetson-01".into(),
+            pool: "edge".into(),
+            interfaces: vec!["vision.detect.v1".into()],
+            attributes: Metadata::from([("arch".into(), "arm64".into())]),
+            total_capacity: crate::runtime::api::Capacity::from([("gpu".into(), 1)]),
+            max_concurrency: 4,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_500,
+            last_session_id: "sess-1".into(),
+            last_connected_at_ms: 1_000,
+            offline_since_ms: None,
+            offline_reason: None,
+        };
+        let w2 = WorkerRecord {
+            namespace: "tenant-a".into(),
+            worker_id: "rk3588-02".into(),
+            pool: "npu".into(),
+            interfaces: vec!["vision.embed.v1".into()],
+            max_concurrency: 2,
+            first_seen_ms: 2_000,
+            last_seen_ms: 2_500,
+            last_session_id: "sess-2".into(),
+            last_connected_at_ms: 2_000,
+            offline_since_ms: Some(2_600),
+            offline_reason: Some("disconnected".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            commit(&journal, JournalOp::WorkerUpsert(Box::new(w1.clone()))).await,
+            CommitOutcome::Committed
+        );
+        assert_eq!(
+            commit(&journal, JournalOp::WorkerUpsert(Box::new(w2.clone()))).await,
+            CommitOutcome::Committed
+        );
+
+        let mut w1_offline = w1.clone();
+        w1_offline.last_seen_ms = 3_000;
+        w1_offline.offline_since_ms = Some(3_100);
+        w1_offline.offline_reason = Some("worker session ended".into());
+        assert_eq!(
+            commit(
+                &journal,
+                JournalOp::WorkerUpsert(Box::new(w1_offline.clone()))
+            )
+            .await,
+            CommitOutcome::Committed
+        );
+
+        assert_eq!(
+            commit(
+                &journal,
+                JournalOp::WorkerForget {
+                    namespace: "tenant-a".into(),
+                    worker_id: "rk3588-02".into(),
+                }
+            )
+            .await,
+            CommitOutcome::Committed
+        );
+        // Forgetting a missing worker is idempotent.
+        assert_eq!(
+            commit(
+                &journal,
+                JournalOp::WorkerForget {
+                    namespace: "tenant-a".into(),
+                    worker_id: "rk3588-02".into(),
+                }
+            )
+            .await,
+            CommitOutcome::Committed
+        );
+
+        let mut verify_conn = connect(&cfg).await;
+        assert!(
+            verify(
+                &mut verify_conn,
+                &JournalOp::WorkerUpsert(Box::new(w1_offline.clone()))
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            verify(
+                &mut verify_conn,
+                &JournalOp::WorkerForget {
+                    namespace: "tenant-a".into(),
+                    worker_id: "rk3588-02".into(),
+                }
+            )
+            .await
+            .unwrap()
+        );
+        verify_conn.close().await.unwrap();
+        journal.close().await;
+
+        let (reopened, rec2) = Journal::open(&cfg).await.unwrap();
+        assert_eq!(rec2.workers, vec![w1_offline]);
+        reopened.close().await;
     }
 }

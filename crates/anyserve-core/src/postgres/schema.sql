@@ -1,6 +1,6 @@
--- Schema version 3: single-leader scheduler lease + durable journal.
+-- Schema version 4: single-leader scheduler lease, durable journal, and worker registry.
 CREATE TABLE IF NOT EXISTS cluster_schema (version BIGINT PRIMARY KEY);
-INSERT INTO cluster_schema VALUES (3) ON CONFLICT DO NOTHING;
+INSERT INTO cluster_schema VALUES (4) ON CONFLICT DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS scheduler_lease (
     id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -52,3 +52,14 @@ CREATE TABLE IF NOT EXISTS objects (
     metadata_json TEXT NOT NULL,
     PRIMARY KEY (job_id, role, idx)
 );
+
+CREATE TABLE IF NOT EXISTS workers (
+    namespace TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (namespace, worker_id)
+);
+
+CREATE INDEX IF NOT EXISTS workers_updated
+    ON workers(updated_at_ms DESC);

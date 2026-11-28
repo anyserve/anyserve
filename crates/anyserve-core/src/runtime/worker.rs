@@ -378,6 +378,11 @@ impl Runtime {
             );
         }
         st.index_session(&session_id);
+        if let Some(record) = st.upsert_live_worker(&session_id, now)
+            && inner.worker_registry_enabled()
+        {
+            inner.persist_worker_op(crate::journal::JournalOp::WorkerUpsert(Box::new(record)));
+        }
 
         // Leases the worker still holds move to this session when they belong
         // to the same worker and namespace in this generation; every other one is fenced.
@@ -519,6 +524,7 @@ impl Runtime {
             .filter(|session| session.connection == connection && session.tx.is_some())
             .ok_or_else(|| RuntimeError::stale("session is no longer current"))?;
         session.last_seen_ms = now;
+        let worker_key = (session.namespace.clone(), session.worker_id.clone());
         // Only messages that can open a slot are worth a dispatch pass.
         let mut may_free_slot = false;
         match message {
@@ -621,6 +627,9 @@ impl Runtime {
                     may_free_slot = true;
                 }
             }
+        }
+        if let Some(record) = st.workers.get_mut(&worker_key) {
+            record.last_seen_ms = record.last_seen_ms.max(now);
         }
         if may_free_slot {
             inner.dispatch_locked(&mut st, now);
@@ -1393,7 +1402,13 @@ mod tests {
             connection: handle.connection,
         });
         check(&runtime);
-        assert!(runtime.list_workers().is_empty());
+        assert_eq!(runtime.snapshot().workers.total, 0);
+        assert!(
+            runtime
+                .list_workers()
+                .iter()
+                .all(|w| !w.connected && w.offline_since_ms.is_some())
+        );
         assert_eq!(
             runtime.get_job(&first, false).await.unwrap().state,
             JobState::Queued
@@ -2119,7 +2134,14 @@ mod tests {
         });
         assert_eq!(runtime.disconnect_revoked_and_expired_sessions(&policy), 1);
         let workers = runtime.list_workers();
-        assert!(!workers.iter().any(|w| w.session_id == s_bad.session_id));
+        assert!(
+            !workers
+                .iter()
+                .any(|w| w.session_id == s_bad.session_id && w.offline_since_ms.is_none())
+        );
+        assert!(workers.iter().any(|w| w.session_id == s_bad.session_id
+            && !w.connected
+            && w.offline_since_ms.is_some()));
         assert!(
             workers
                 .iter()
@@ -2334,6 +2356,7 @@ mod tests {
                             generation: 1,
                             active: Vec::new(),
                             terminal: Vec::new(),
+                            workers: Vec::new(),
                         },
                         lease: LeaseHandle::always_held(),
                     }))
@@ -2586,7 +2609,13 @@ mod tests {
             revoked_jtis: vec!["jti-active".into()],
         });
         assert_eq!(runtime.disconnect_revoked_and_expired_sessions(&policy), 1);
-        assert!(runtime.list_workers().is_empty());
+        assert_eq!(runtime.snapshot().workers.total, 0);
+        assert!(
+            runtime
+                .list_workers()
+                .iter()
+                .all(|w| !w.connected && w.offline_since_ms.is_some())
+        );
         assert!(handle.messages.recv().await.is_none());
         assert_eq!(
             runtime
@@ -2660,7 +2689,7 @@ mod tests {
             !runtime
                 .list_workers()
                 .iter()
-                .any(|w| w.session_id == h_exp.session_id)
+                .any(|w| w.session_id == h_exp.session_id && w.offline_since_ms.is_none())
         );
 
         // Draining set while disconnected in reconnect grace survives reconnect and sends Drain.
@@ -2805,6 +2834,7 @@ mod tests {
                             generation: 1,
                             active: vec![recovered],
                             terminal: Vec::new(),
+                            workers: Vec::new(),
                         },
                         lease: LeaseHandle::always_held(),
                     }))
@@ -3290,5 +3320,132 @@ mod tests {
 
         drop(gh_sessions);
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_registry_retains_offline_enforces_cap_and_persists_across_sqlite_restart() {
+        let dir = std::env::temp_dir().join(format!("anyserve-wkreg-{}", new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal_path = dir.join("journal.sqlite");
+        let make_cfg = || RuntimeConfig {
+            max_offline_workers: 2,
+            worker_retention: Duration::from_secs(3600),
+            journal: Some(crate::runtime::api::JournalConfig::new(
+                journal_path.clone(),
+            )),
+            ..Default::default()
+        };
+
+        let rt1 = Runtime::start(make_cfg()).await.unwrap();
+        let make_hello = |worker_id: &str, iface: &str| pb::Hello {
+            worker_id: worker_id.into(),
+            pool: "edge".into(),
+            interfaces: vec![iface.into()],
+            max_concurrency: 4,
+            ..Default::default()
+        };
+
+        // Connect 3 workers and disconnect them sequentially; cap = 2 must evict oldest (wk-1).
+        for (wid, iface) in [
+            ("wk-1", "iface.old.v1"),
+            ("wk-2", "iface.keep.v1"),
+            ("wk-3", "iface.keep.v1"),
+        ] {
+            let s = rt1.open_session(make_hello(wid, iface)).unwrap();
+            assert_eq!(
+                rt1.list_workers()
+                    .iter()
+                    .filter(|w| w.worker_id == wid && w.offline_since_ms.is_none())
+                    .count(),
+                1
+            );
+            // Cannot forget while online.
+            assert_eq!(
+                rt1.forget_worker(None, "default", wid)
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Conflict
+            );
+            rt1.session_closed(&s.session_id, s.connection);
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        let listed = rt1.list_workers();
+        let ids: Vec<&str> = listed.iter().map(|w| w.worker_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["wk-2", "wk-3"],
+            "oldest offline wk-1 should be evicted by max_offline_workers=2"
+        );
+        assert!(
+            listed.iter().all(|w| w.offline_since_ms.is_some()
+                && w.offline_reason.as_deref() == Some("disconnected"))
+        );
+        assert!(rt1.find_worker("default", "wk-2").is_some());
+        assert!(rt1.find_worker("default", "wk-1").is_none());
+
+        // Snapshot exposes offline count & interface offline_workers while keeping live total = 0.
+        let snap = rt1.snapshot();
+        assert_eq!(snap.workers.total, 0);
+        assert_eq!(snap.workers.offline, 2);
+        let iface_stat = snap
+            .stats
+            .interfaces
+            .get("iface.keep.v1")
+            .expect("iface stat");
+        assert_eq!(iface_stat.sessions, 0);
+        assert_eq!(iface_stat.offline_workers, 2);
+        assert!(iface_stat.last_seen_at_ms.is_some());
+
+        // Reconnect wk-2: transitions back to online preserving first_seen_ms.
+        let orig_first_seen = rt1.find_worker("default", "wk-2").unwrap().first_seen_ms;
+        let s2 = rt1
+            .open_session(make_hello("wk-2", "iface.keep.v1"))
+            .unwrap();
+        let w2_live = rt1.find_worker("default", "wk-2").unwrap();
+        assert!(w2_live.connected);
+        assert!(w2_live.offline_since_ms.is_none());
+        assert_eq!(w2_live.first_seen_ms, orig_first_seen);
+
+        // Shut down while wk-2 is still live and wk-3 is offline -> flush journal, reopen.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        rt1.shutdown().await;
+        drop(s2);
+
+        let rt2 = Runtime::start(make_cfg()).await.unwrap();
+        let recovered = rt2.list_workers();
+        let r_ids: Vec<&str> = recovered.iter().map(|w| w.worker_id.as_str()).collect();
+        assert_eq!(r_ids, vec!["wk-2", "wk-3"]);
+        let r2 = rt2.find_worker("default", "wk-2").unwrap();
+        assert!(r2.offline_since_ms.is_some());
+        assert_eq!(
+            r2.offline_reason.as_deref(),
+            Some("control plane restarted")
+        );
+        let r3 = rt2.find_worker("default", "wk-3").unwrap();
+        assert_eq!(r3.offline_reason.as_deref(), Some("disconnected"));
+
+        // Forget wk-3 durably and verify it stays gone across another restart.
+        rt2.forget_worker(None, "default", "wk-3").await.unwrap();
+        assert_eq!(
+            rt2.forget_worker(None, "default", "wk-3")
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotFound
+        );
+        rt2.shutdown().await;
+
+        let rt3 = Runtime::start(make_cfg()).await.unwrap();
+        let r_ids_after: Vec<String> = rt3
+            .list_workers()
+            .into_iter()
+            .map(|w| w.worker_id)
+            .collect();
+        assert_eq!(r_ids_after, vec!["wk-2"]);
+        rt3.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

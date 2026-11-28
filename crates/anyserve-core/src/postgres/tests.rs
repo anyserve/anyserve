@@ -24,7 +24,7 @@ use tonic::transport::Server;
 use super::PgJournal;
 use crate::client_service::ClientGrpcService;
 use crate::error::ErrorKind;
-use crate::journal::JournalBackend;
+use crate::journal::{CommitOutcome, JournalBackend, JournalOp};
 use crate::runtime::Runtime;
 use crate::runtime::api::*;
 use crate::worker_service::WorkerGrpcService;
@@ -1277,5 +1277,166 @@ async fn postgres_scan_jobs_paginates_past_250_rows() {
     assert!(page2.next_page_token.is_none());
 
     runtime.shutdown().await;
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires ANYSERVE_TEST_POSTGRES_URL"]
+async fn postgres_worker_registry_persists_recovers_forgets_and_migrates_v3_to_v4() {
+    let schema = TestSchema::create("worker_reg").await;
+
+    // 1. Seed a legacy v3 schema with one durable job (no `workers` table yet).
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema.url)
+        .await
+        .unwrap();
+    sqlx::query(&format!("CREATE SCHEMA \"{}\"", schema.schema))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "SET search_path = \"{}\", pg_catalog",
+        schema.schema
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE cluster_schema (version BIGINT PRIMARY KEY);
+        INSERT INTO cluster_schema VALUES (3);
+        CREATE TABLE scheduler_lease (
+            id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+            holder_id TEXT NOT NULL,
+            generation BIGINT NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL
+        );
+        CREATE TABLE jobs (
+            job_id TEXT COLLATE "C" PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('queued', 'succeeded', 'failed', 'cancelled')),
+            spec_hash TEXT NOT NULL,
+            spec_json TEXT NOT NULL,
+            attempt_count BIGINT NOT NULL DEFAULT 0,
+            max_attempts BIGINT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            error_json TEXT,
+            winning_lease_id TEXT,
+            result_digest TEXT,
+            last_attempt_id TEXT,
+            last_worker_id TEXT
+        );
+        CREATE TABLE objects (
+            job_id TEXT COLLATE "C" NOT NULL
+                REFERENCES jobs(job_id) ON DELETE CASCADE DEFERRABLE INITIALLY IMMEDIATE,
+            role TEXT NOT NULL,
+            idx BIGINT NOT NULL,
+            uri TEXT,
+            content BYTEA,
+            metadata_json TEXT NOT NULL,
+            PRIMARY KEY (job_id, role, idx)
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let spec_json = serde_json::to_string(&crate::journal::StoredSpec {
+        demand: Demand {
+            interface: "demo.echo.v1".into(),
+            ..Default::default()
+        },
+        policy: ExecutionPolicy::default(),
+        metadata: Metadata::new(),
+    })
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (job_id, namespace, state, spec_hash, spec_json, max_attempts, created_at_ms, updated_at_ms)
+         VALUES ('v3-survives', 'default', 'succeeded', 'h3', $1, 3, 1000, 2000)",
+    )
+    .bind(&spec_json)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // 2. Opening PgJournal migrates v3 -> v4 in place and preserves existing v3 jobs.
+    let cfg = schema.journal_config(5_000, 50);
+    let j1 = PgJournal::open_concrete(&cfg).await.unwrap();
+    let l1 = j1.try_acquire_leadership().await.unwrap().unwrap();
+    assert!(l1.recovery.workers.is_empty());
+    assert_eq!(
+        j1.spec_hash("v3-survives").await.unwrap().as_deref(),
+        Some("h3")
+    );
+
+    let now = crate::now_ms();
+    let w1 = crate::runtime::api::WorkerRecord {
+        namespace: "default".into(),
+        worker_id: "pg-jetson-1".into(),
+        pool: "edge".into(),
+        interfaces: vec!["vision.v1".into()],
+        max_concurrency: 4,
+        first_seen_ms: now - 5_000,
+        last_seen_ms: now - 1_000,
+        last_session_id: "s-1".into(),
+        last_connected_at_ms: now - 5_000,
+        offline_since_ms: Some(now - 500),
+        offline_reason: Some("disconnected".into()),
+        ..Default::default()
+    };
+    let w2 = crate::runtime::api::WorkerRecord {
+        namespace: "tenant-b".into(),
+        worker_id: "pg-rk3588-2".into(),
+        pool: "npu".into(),
+        interfaces: vec!["vision.v1".into()],
+        max_concurrency: 2,
+        first_seen_ms: now - 4_000,
+        last_seen_ms: now - 2_000,
+        last_session_id: "s-2".into(),
+        last_connected_at_ms: now - 4_000,
+        offline_since_ms: Some(now - 1_500),
+        offline_reason: Some("worker session ended".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        j1.enqueue(l1.term, JournalOp::WorkerUpsert(Box::new(w1.clone())))
+            .unwrap()
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        j1.enqueue(l1.term, JournalOp::WorkerUpsert(Box::new(w2.clone())))
+            .unwrap()
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        j1.enqueue(
+            l1.term,
+            JournalOp::WorkerForget {
+                namespace: "tenant-b".into(),
+                worker_id: "pg-rk3588-2".into(),
+            }
+        )
+        .unwrap()
+        .await
+        .unwrap(),
+        CommitOutcome::Committed
+    );
+    l1.lease.relinquish().await;
+    j1.close().await;
+
+    // 3. Reopen and verify v4 schema + recovered worker registry.
+    let j2 = PgJournal::open_concrete(&cfg).await.unwrap();
+    let l2 = j2.try_acquire_leadership().await.unwrap().unwrap();
+    assert_eq!(l2.recovery.workers, vec![w1]);
+    l2.lease.relinquish().await;
+    j2.close().await;
+
     schema.drop_schema().await;
 }

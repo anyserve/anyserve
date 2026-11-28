@@ -515,6 +515,43 @@ pub struct WorkerView {
     pub connected: bool,
     pub connected_at_ms: u64,
     pub last_seen_ms: u64,
+    /// First time this `(namespace, worker_id)` registered with the control plane.
+    pub first_seen_ms: u64,
+    /// Set for registry-only entries: the worker has no session anymore.
+    pub offline_since_ms: Option<u64>,
+    pub offline_reason: Option<String>,
+}
+
+/// Registration record of a worker identity (`namespace`, `worker_id`) that
+/// outlives its sessions, so operators can still see and link to workers that
+/// went offline. Stored as JSON by every journal backend; keep field names stable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkerRecord {
+    pub namespace: String,
+    pub worker_id: String,
+    pub pool: String,
+    pub interfaces: Vec<String>,
+    pub attributes: Metadata,
+    pub total_capacity: Capacity,
+    pub max_concurrency: u32,
+    pub first_seen_ms: u64,
+    pub last_seen_ms: u64,
+    pub last_session_id: String,
+    pub last_connected_at_ms: u64,
+    /// `None` while the worker has a live session.
+    pub offline_since_ms: Option<u64>,
+    pub offline_reason: Option<String>,
+}
+
+impl WorkerRecord {
+    /// Last time the record changed; backends store it for ordering.
+    pub fn updated_at_ms(&self) -> u64 {
+        self.offline_since_ms
+            .unwrap_or(0)
+            .max(self.last_seen_ms)
+            .max(self.last_connected_at_ms)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -540,6 +577,10 @@ pub struct InterfaceStats {
     pub oldest_queued_age_ms: u64,
     pub sessions: usize,
     pub free_slots: u64,
+    /// Registered workers serving this interface that are currently offline.
+    pub offline_workers: usize,
+    /// Most recent `last_seen_ms` across live sessions and offline workers.
+    pub last_seen_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -567,6 +608,8 @@ pub struct WorkerStats {
     pub active_leases: u64,
     pub total_capacity: Capacity,
     pub last_seen_at_ms: Option<u64>,
+    /// Registered workers without a session (not included in `total`).
+    pub offline: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -983,6 +1026,11 @@ pub struct RuntimeConfig {
     /// `RESOURCE_EXHAUSTED`.
     pub max_result_bytes: u64,
     pub max_sessions: usize,
+    /// Offline worker registrations are forgotten after this long.
+    pub worker_retention: Duration,
+    /// At most this many offline worker registrations are kept; the oldest
+    /// offline ones are forgotten first. Zero disables the registry.
+    pub max_offline_workers: usize,
     pub tenant_quotas: TenantQuotas,
     pub limits: Limits,
     pub journal: Option<JournalConfig>,
@@ -1013,6 +1061,8 @@ impl Default for RuntimeConfig {
             max_event_bytes: 1024 * 1024 * 1024,
             max_result_bytes: 2 * 1024 * 1024 * 1024,
             max_sessions: 4_096,
+            worker_retention: Duration::from_secs(7 * 24 * 3600),
+            max_offline_workers: 1_000,
             tenant_quotas: TenantQuotas::default(),
             limits: Limits::default(),
             journal: None,

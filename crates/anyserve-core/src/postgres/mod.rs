@@ -19,9 +19,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::RuntimeError;
 use crate::journal::{
-    BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle, Recovery,
-    StoredJob, StoredJobPreview, StoredSpecRef, TerminalRecovery, job_from_row, metadata_to_json,
-    object_from_row, state_text,
+    BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle,
+    MAX_RECOVERED_WORKERS, Recovery, StoredJob, StoredJobPreview, StoredSpecRef, TerminalRecovery,
+    decode_worker_records, job_from_row, metadata_to_json, object_from_row, state_text,
 };
 use crate::runtime::api::{
     INSPECTION_PREVIEW_BYTES, JobState, JournalConfig, JournalStats, Object, ObjectPreview,
@@ -30,9 +30,22 @@ use crate::runtime::api::{
 use crate::runtime::events::{ByteBudget, Permit, budgeted_bytes};
 use crate::runtime::identity::{decode_scoped_id, encode_scoped_id};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const RECOVERY_BATCH: i64 = 256;
 const PURGE_BATCH: i64 = 500;
+
+const MIGRATE_V3_TO_V4_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS workers (
+    namespace TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    updated_at_ms BIGINT NOT NULL,
+    PRIMARY KEY (namespace, worker_id)
+);
+CREATE INDEX IF NOT EXISTS workers_updated
+    ON workers(updated_at_ms DESC);
+INSERT INTO cluster_schema VALUES (4) ON CONFLICT DO NOTHING;
+"#;
 
 const BATCH_WRITE_SQL: &str = r#"
 WITH lease AS (
@@ -100,6 +113,26 @@ ins_objs AS (
           o.role IN ('input', 'params')
           OR EXISTS (SELECT 1 FROM upd_terms ut WHERE ut.job_id = o.job_id)
       )
+    RETURNING 1
+),
+ups_workers AS (
+    INSERT INTO workers (namespace, worker_id, record_json, updated_at_ms)
+    SELECT u.namespace, u.worker_id, u.record_json, u.updated_at_ms
+    FROM UNNEST(
+        $27::text[], $28::text[], $29::text[], $30::bigint[]
+    ) AS u(namespace, worker_id, record_json, updated_at_ms)
+    WHERE EXISTS (SELECT 1 FROM lease)
+    ON CONFLICT (namespace, worker_id) DO UPDATE SET
+        record_json = EXCLUDED.record_json,
+        updated_at_ms = EXCLUDED.updated_at_ms
+    RETURNING 1
+),
+del_workers AS (
+    DELETE FROM workers AS w
+    USING UNNEST($31::text[], $32::text[]) AS u(namespace, worker_id)
+    WHERE EXISTS (SELECT 1 FROM lease)
+      AND w.namespace = u.namespace
+      AND w.worker_id = u.worker_id
     RETURNING 1
 )
 SELECT
@@ -291,7 +324,7 @@ impl PgJournal {
             .await
             .context("connect PostgreSQL read pool")?;
 
-        ensure_schema_v3(&read_pool, &config.schema).await?;
+        ensure_schema_v4(&read_pool, &config.schema).await?;
 
         let tx_timeout_sql = format!("SET transaction_timeout = '{stmt_timeout_ms}ms'");
         let write_pool = PgPoolOptions::new()
@@ -795,14 +828,16 @@ async fn renew_lease_loop(
     }
 }
 
-async fn ensure_schema_v3(pool: &PgPool, schema: &str) -> Result<()> {
+async fn ensure_schema_v4(pool: &PgPool, schema: &str) -> Result<()> {
     if let Some(v) = read_schema_version(pool).await? {
         if v == SCHEMA_VERSION {
             return Ok(());
         }
-        bail!(
-            "incompatible PostgreSQL schema version {v} in schema '{schema}'; single-leader Anyserve requires schema v{SCHEMA_VERSION} (drain existing deployment and recreate the schema)"
-        );
+        if v != 3 {
+            bail!(
+                "incompatible PostgreSQL schema version {v} in schema '{schema}'; single-leader Anyserve requires schema v{SCHEMA_VERSION} (drain existing deployment and recreate the schema)"
+            );
+        }
     }
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 42517))")
@@ -832,12 +867,24 @@ async fn ensure_schema_v3(pool: &PgPool, schema: &str) -> Result<()> {
         let v: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM cluster_schema")
             .fetch_one(&mut *tx)
             .await?;
-        if let Some(v) = v
-            && v != SCHEMA_VERSION
-        {
-            bail!(
-                "incompatible PostgreSQL schema version {v} in schema '{schema}'; recreate the schema for v{SCHEMA_VERSION}"
-            );
+        match v {
+            Some(v) if v == SCHEMA_VERSION => {}
+            Some(3) => {
+                sqlx::raw_sql(MIGRATE_V3_TO_V4_SQL)
+                    .execute(&mut *tx)
+                    .await
+                    .context("migrate PostgreSQL schema from v3 to v4")?;
+            }
+            Some(v) => {
+                bail!(
+                    "incompatible PostgreSQL schema version {v} in schema '{schema}'; recreate the schema for v{SCHEMA_VERSION}"
+                );
+            }
+            None => {
+                sqlx::raw_sql(include_str!("schema.sql"))
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
     } else {
         sqlx::raw_sql(include_str!("schema.sql"))
@@ -940,18 +987,29 @@ async fn load_recovery(
         terminal = rows.iter().map(job_from_row).collect::<Result<_>>()?;
         terminal.reverse();
     }
+    let worker_rows: Vec<String> =
+        sqlx::query_scalar("SELECT record_json FROM workers ORDER BY updated_at_ms DESC LIMIT $1")
+            .bind(MAX_RECOVERED_WORKERS)
+            .fetch_all(pool)
+            .await?;
     Ok(Recovery {
         generation,
         active,
         terminal,
+        workers: decode_worker_records(worker_rows),
     })
 }
 
-fn op_job_id(op: &JournalOp) -> Option<&str> {
+fn op_batch_key(op: &JournalOp) -> Option<String> {
     match op {
-        JournalOp::Accept(r) => Some(&r.job_id),
-        JournalOp::AttemptStart(r) => Some(&r.job_id),
-        JournalOp::Terminal(r) => Some(&r.job_id),
+        JournalOp::Accept(r) => Some(format!("j:{}", r.job_id)),
+        JournalOp::AttemptStart(r) => Some(format!("j:{}", r.job_id)),
+        JournalOp::Terminal(r) => Some(format!("j:{}", r.job_id)),
+        JournalOp::WorkerUpsert(r) => Some(format!("w:{}\0{}", r.namespace, r.worker_id)),
+        JournalOp::WorkerForget {
+            namespace,
+            worker_id,
+        } => Some(format!("w:{namespace}\0{worker_id}")),
         JournalOp::Probe => None,
     }
 }
@@ -1012,12 +1070,10 @@ async fn writer_loop(
                             reply: next_reply,
                         }) => {
                             let seen = seen_ids.get_or_insert_with(|| {
-                                op_job_id(&batch[0].0)
-                                    .map(str::to_string)
-                                    .into_iter()
-                                    .collect()
+                                op_batch_key(&batch[0].0).into_iter().collect()
                             });
-                            let duplicate = op_job_id(&next_op).is_some_and(|id| seen.contains(id));
+                            let next_key = op_batch_key(&next_op);
+                            let duplicate = next_key.as_ref().is_some_and(|k| seen.contains(k));
                             if next_term != term || duplicate {
                                 deferred = Some(WriteRequest::Op {
                                     term: next_term,
@@ -1026,8 +1082,8 @@ async fn writer_loop(
                                 });
                                 break;
                             }
-                            if let Some(id) = op_job_id(&next_op) {
-                                seen.insert(id.to_string());
+                            if let Some(key) = next_key {
+                                seen.insert(key);
                             }
                             batch.push((next_op, next_reply));
                         }
@@ -1116,6 +1172,14 @@ async fn execute_single_statement(
 
     let mut objs = PgObjects::default();
 
+    let mut wk_up_ns: Vec<&str> = Vec::new();
+    let mut wk_up_id: Vec<&str> = Vec::new();
+    let mut wk_up_json: Vec<String> = Vec::new();
+    let mut wk_up_at: Vec<i64> = Vec::new();
+
+    let mut wk_del_ns: Vec<&str> = Vec::new();
+    let mut wk_del_id: Vec<&str> = Vec::new();
+
     for op in ops {
         match op {
             JournalOp::Accept(r) => {
@@ -1169,6 +1233,21 @@ async fn execute_single_statement(
                 objs.push_slice(&r.job_id, "output", &r.outputs)?;
             }
             JournalOp::Probe => {}
+            JournalOp::WorkerUpsert(r) => {
+                let record_json = serde_json::to_string(r.as_ref())
+                    .map_err(|e| SingleStmtError::Sql(e.to_string()))?;
+                wk_up_ns.push(r.namespace.as_str());
+                wk_up_id.push(r.worker_id.as_str());
+                wk_up_json.push(record_json);
+                wk_up_at.push(r.updated_at_ms().min(i64::MAX as u64) as i64);
+            }
+            JournalOp::WorkerForget {
+                namespace,
+                worker_id,
+            } => {
+                wk_del_ns.push(namespace.as_str());
+                wk_del_id.push(worker_id.as_str());
+            }
         }
     }
 
@@ -1199,6 +1278,12 @@ async fn execute_single_statement(
         .bind(&objs.uri)
         .bind(&objs.content)
         .bind(&objs.meta)
+        .bind(&wk_up_ns)
+        .bind(&wk_up_id)
+        .bind(&wk_up_json)
+        .bind(&wk_up_at)
+        .bind(&wk_del_ns)
+        .bind(&wk_del_id)
         .fetch_one(write_pool)
         .await
         .map_err(|err| {
@@ -1253,6 +1338,30 @@ async fn verify_op(pool: &PgPool, op: &JournalOp) -> Result<bool> {
                 .is_some_and(|s| s == state_text(r.state))
         }
         JournalOp::Probe => false,
+        JournalOp::WorkerUpsert(r) => {
+            let expected = serde_json::to_string(r.as_ref())?;
+            sqlx::query_scalar::<_, String>(
+                "SELECT record_json FROM workers WHERE namespace = $1 AND worker_id = $2",
+            )
+            .bind(&r.namespace)
+            .bind(&r.worker_id)
+            .fetch_optional(pool)
+            .await?
+            .is_some_and(|stored| stored == expected)
+        }
+        JournalOp::WorkerForget {
+            namespace,
+            worker_id,
+        } => {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM workers WHERE namespace = $1 AND worker_id = $2",
+            )
+            .bind(namespace)
+            .bind(worker_id)
+            .fetch_one(pool)
+            .await?
+                == 0
+        }
     })
 }
 
@@ -1314,7 +1423,7 @@ fn op_committed(
         JournalOp::Accept(r) => accepted.contains(&r.job_id),
         JournalOp::AttemptStart(r) => started.contains(&r.job_id),
         JournalOp::Terminal(r) => terminal.contains(&r.job_id),
-        JournalOp::Probe => true,
+        JournalOp::Probe | JournalOp::WorkerUpsert(_) | JournalOp::WorkerForget { .. } => true,
     }
 }
 

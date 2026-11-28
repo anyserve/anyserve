@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::error::RuntimeError;
 use crate::journal::{
     BoxFuture, CommitOutcome, JournalBackend, JournalOp, Leadership, LeaseHandle, Recovery,
-    StoredJob, StoredJobPreview, StoredSpec, StoredSpecRef, state_text,
+    StoredJob, StoredJobPreview, StoredSpec, StoredSpecRef, decode_worker_records, state_text,
 };
 use crate::runtime::api::{
     CloudflareJournalConfig, INSPECTION_PREVIEW_BYTES, JobSpec, JobState, JournalConfig,
@@ -212,6 +212,7 @@ impl JournalBackend for CloudflareJournal {
                 generation: term,
                 active,
                 terminal: Vec::new(),
+                workers: decode_worker_records(resp.workers),
             };
 
             let (lost_tx, lost_rx) = watch::channel(false);
@@ -714,7 +715,7 @@ fn op_job_id(op: &JournalOp) -> Option<&str> {
         JournalOp::Accept(r) => Some(&r.job_id),
         JournalOp::AttemptStart(r) => Some(&r.job_id),
         JournalOp::Terminal(r) => Some(&r.job_id),
-        JournalOp::Probe => None,
+        JournalOp::Probe | JournalOp::WorkerUpsert(_) | JournalOp::WorkerForget { .. } => None,
     }
 }
 
@@ -996,6 +997,10 @@ async fn verify_op(client: &reqwest::Client, endpoint: &str, op: &JournalOp) -> 
             .await?;
             Ok(false)
         }
+        // Worker registry mutations are idempotent and best-effort; treat
+        // ambiguous transport errors as committed so durable job traffic is
+        // never stalled by a transient registry write glitch.
+        JournalOp::WorkerUpsert(_) | JournalOp::WorkerForget { .. } => Ok(true),
     }
 }
 
@@ -1308,6 +1313,8 @@ struct AcquireResponse {
     term: Option<u64>,
     #[serde(default)]
     active: Vec<WireStoredJob>,
+    #[serde(default)]
+    workers: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1364,6 +1371,16 @@ enum WireCommitOp {
         outcome_digest: Option<String>,
         at_ms: u64,
     },
+    WorkerUpsert {
+        namespace: String,
+        worker_id: String,
+        record_json: String,
+        updated_at_ms: u64,
+    },
+    WorkerForget {
+        namespace: String,
+        worker_id: String,
+    },
     Probe,
 }
 
@@ -1411,6 +1428,19 @@ impl TryFrom<&JournalOp> for WireCommitOp {
                 winning_lease_id: r.winning_lease_id.clone(),
                 outcome_digest: r.outcome_digest.clone(),
                 at_ms: r.at_ms,
+            },
+            JournalOp::WorkerUpsert(r) => Self::WorkerUpsert {
+                namespace: r.namespace.clone(),
+                worker_id: r.worker_id.clone(),
+                record_json: serde_json::to_string(r.as_ref())?,
+                updated_at_ms: r.updated_at_ms(),
+            },
+            JournalOp::WorkerForget {
+                namespace,
+                worker_id,
+            } => Self::WorkerForget {
+                namespace: namespace.clone(),
+                worker_id: worker_id.clone(),
             },
             JournalOp::Probe => Self::Probe,
         })
@@ -1600,6 +1630,7 @@ mod tests {
         jobs: BTreeMap<String, MockJobRow>,
         objects: BTreeMap<(String, String, usize), MockObjectRow>,
         failed_workers: BTreeMap<String, BTreeSet<String>>,
+        workers: BTreeMap<(String, String), (String, u64)>,
         r2: BTreeMap<String, Vec<u8>>,
         r2_spill_threshold: usize,
         expected_token: Option<String>,
@@ -1619,6 +1650,7 @@ mod tests {
                 jobs: BTreeMap::new(),
                 objects: BTreeMap::new(),
                 failed_workers: BTreeMap::new(),
+                workers: BTreeMap::new(),
                 r2: BTreeMap::new(),
                 r2_spill_threshold,
                 expected_token,
@@ -1913,10 +1945,18 @@ mod tests {
             .iter()
             .map(|row| db.job_to_wire(row, true, false))
             .collect();
+        let mut worker_rows: Vec<(u64, String)> = db
+            .workers
+            .values()
+            .map(|(json, updated)| (*updated, json.clone()))
+            .collect();
+        worker_rows.sort_by_key(|a| std::cmp::Reverse(a.0));
+        let workers: Vec<String> = worker_rows.into_iter().map(|(_, json)| json).collect();
         Ok(Json(serde_json::json!({
             "acquired": true,
             "term": term,
             "active": active,
+            "workers": workers,
         })))
     }
 
@@ -1982,6 +2022,7 @@ mod tests {
         let mut jobs = db.jobs.clone();
         let mut objects = db.objects.clone();
         let mut failed_workers = db.failed_workers.clone();
+        let mut workers = db.workers.clone();
         let mut r2_puts = Vec::new();
         let threshold = db.r2_spill_threshold;
 
@@ -2120,6 +2161,20 @@ mod tests {
                         objects.insert((job_id.clone(), "output".into(), idx), row);
                     }
                 }
+                WireCommitOp::WorkerUpsert {
+                    namespace,
+                    worker_id,
+                    record_json,
+                    updated_at_ms,
+                } => {
+                    workers.insert((namespace, worker_id), (record_json, updated_at_ms));
+                }
+                WireCommitOp::WorkerForget {
+                    namespace,
+                    worker_id,
+                } => {
+                    workers.remove(&(namespace, worker_id));
+                }
                 WireCommitOp::Probe => {}
             }
         }
@@ -2130,6 +2185,7 @@ mod tests {
         db.jobs = jobs;
         db.objects = objects;
         db.failed_workers = failed_workers;
+        db.workers = workers;
 
         if db.force_commit_500_after_apply {
             db.force_commit_500_after_apply = false;
@@ -3148,5 +3204,79 @@ mod tests {
             .await
             .expect("renewal outage past lease_duration must mark lease lost");
         assert!(!rt.health().live);
+    }
+
+    #[tokio::test]
+    async fn cloudflare_worker_registry_persists_recovers_and_forgets() {
+        let mock = MockServer::start(1024 * 1024, Some("cf-wk".into())).await;
+        let cfg = cf_journal_config(&mock.endpoint, 5_000, 30, Some("cf-wk"));
+
+        let j1 = CloudflareJournal::open(&cfg).await.unwrap();
+        let l1 = j1.try_acquire_leadership().await.unwrap().unwrap();
+        assert!(l1.recovery.workers.is_empty());
+
+        let rec1 = crate::runtime::api::WorkerRecord {
+            namespace: "default".into(),
+            worker_id: "cf-gpu-1".into(),
+            pool: "edge".into(),
+            interfaces: vec!["demo.echo.v1".into()],
+            max_concurrency: 4,
+            first_seen_ms: 100,
+            last_seen_ms: 200,
+            last_session_id: "sess-1".into(),
+            last_connected_at_ms: 100,
+            offline_since_ms: Some(250),
+            offline_reason: Some("disconnected".into()),
+            ..Default::default()
+        };
+        let rec2 = crate::runtime::api::WorkerRecord {
+            namespace: "tenant-a".into(),
+            worker_id: "cf-gpu-2".into(),
+            pool: "edge".into(),
+            interfaces: vec!["demo.echo.v1".into()],
+            max_concurrency: 2,
+            first_seen_ms: 300,
+            last_seen_ms: 400,
+            last_session_id: "sess-2".into(),
+            last_connected_at_ms: 300,
+            offline_since_ms: Some(450),
+            offline_reason: Some("worker session ended".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            j1.enqueue(l1.term, JournalOp::WorkerUpsert(Box::new(rec1.clone())))
+                .unwrap()
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        assert_eq!(
+            j1.enqueue(l1.term, JournalOp::WorkerUpsert(Box::new(rec2.clone())))
+                .unwrap()
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        assert_eq!(
+            j1.enqueue(
+                l1.term,
+                JournalOp::WorkerForget {
+                    namespace: "tenant-a".into(),
+                    worker_id: "cf-gpu-2".into(),
+                }
+            )
+            .unwrap()
+            .await
+            .unwrap(),
+            CommitOutcome::Committed
+        );
+        l1.lease.relinquish().await;
+        j1.close().await;
+
+        let j2 = CloudflareJournal::open(&cfg).await.unwrap();
+        let l2 = j2.try_acquire_leadership().await.unwrap().unwrap();
+        assert_eq!(l2.recovery.workers, vec![rec1]);
+        l2.lease.relinquish().await;
+        j2.close().await;
     }
 }

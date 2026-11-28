@@ -152,6 +152,115 @@ impl Inner {
         }
     }
 
+    pub(crate) fn worker_registry_enabled(&self) -> bool {
+        self.config.max_offline_workers > 0 && !self.config.worker_retention.is_zero()
+    }
+
+    /// Best-effort persistence for worker registry mutations: respects leader
+    /// fencing without letting registry write pressure fail durable jobs.
+    pub(crate) fn persist_worker_op(&self, op: JournalOp) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        if !self
+            .leader_active
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.lease_lost.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let term = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let receiver = match journal.enqueue(term, op) {
+            Ok(rx) => rx,
+            Err(error) => {
+                tracing::debug!(%error, "skipping best-effort worker registry persist");
+                return;
+            }
+        };
+        let me = self.me.clone();
+        tokio::spawn(async move {
+            match receiver.await {
+                Ok(CommitOutcome::Committed) => {}
+                Ok(CommitOutcome::Fenced(reason)) => {
+                    if let Some(inner) = me.upgrade() {
+                        inner.mark_lease_lost(&reason);
+                    }
+                }
+                Ok(other) => {
+                    tracing::warn!(outcome = ?other, "worker registry persist did not commit");
+                }
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Enforces `worker_retention` and `max_offline_workers` against offline
+    /// worker records, returning `WorkerForget` ops for evicted rows.
+    pub(crate) fn evict_offline_workers_locked(&self, st: &mut State, now: u64) -> Vec<JournalOp> {
+        if st.workers.is_empty() {
+            return Vec::new();
+        }
+        let retention_ms = ms(self.config.worker_retention);
+        let max_offline = self.config.max_offline_workers;
+        let cutoff = now.saturating_sub(retention_ms);
+
+        let mut expired: Vec<(String, String)> = Vec::new();
+        let mut kept_offline: Vec<(u64, u64, String, String)> = Vec::new();
+        for ((ns, wid), record) in &st.workers {
+            let Some(offline_since) = record.offline_since_ms else {
+                continue;
+            };
+            if st.has_live_session(ns, wid) {
+                continue;
+            }
+            if retention_ms == 0 || max_offline == 0 || offline_since < cutoff {
+                expired.push((ns.clone(), wid.clone()));
+            } else {
+                kept_offline.push((offline_since, record.last_seen_ms, ns.clone(), wid.clone()));
+            }
+        }
+
+        let mut ops = Vec::new();
+        for key in expired {
+            st.workers.remove(&key);
+            ops.push(JournalOp::WorkerForget {
+                namespace: key.0,
+                worker_id: key.1,
+            });
+        }
+        if kept_offline.len() > max_offline {
+            kept_offline.sort();
+            let overflow = kept_offline.len() - max_offline;
+            for (_, _, ns, wid) in kept_offline.into_iter().take(overflow) {
+                st.workers.remove(&(ns.clone(), wid.clone()));
+                ops.push(JournalOp::WorkerForget {
+                    namespace: ns,
+                    worker_id: wid,
+                });
+            }
+        }
+        ops
+    }
+
+    pub(crate) fn finish_removed_session_locked(
+        &self,
+        st: &mut State,
+        session_id: &str,
+        reason: &str,
+        now: u64,
+    ) {
+        let Some(removed) = st.remove_session(session_id) else {
+            return;
+        };
+        let retain = self.worker_registry_enabled();
+        if let Some(op) = st.mark_worker_session_ended(&removed, reason, now, retain) {
+            self.persist_worker_op(op);
+        }
+        for op in self.evict_offline_workers_locked(st, now) {
+            self.persist_worker_op(op);
+        }
+    }
+
     /// Queues `op`; `then` runs with the outcome once the writer is done,
     /// independently of whoever triggered the operation.
     pub(crate) fn commit(
@@ -1313,7 +1422,7 @@ impl Inner {
             // in-flight `push_frame`/`finish_attempt` are fenced immediately.
             self.release_lease_locked(st, &lease_id);
         }
-        st.remove_session(session_id);
+        self.finish_removed_session_locked(st, session_id, reason, now);
     }
 
     /// Ends the session's current connection; its leases wait `reconnect_grace`
@@ -1328,7 +1437,7 @@ impl Inner {
         session.tx = None;
         session.disconnected_at_ms = Some(now);
         if session.active.is_empty() {
-            st.remove_session(session_id);
+            self.finish_removed_session_locked(st, session_id, "disconnected", now);
             return;
         }
         let grace = self.session_reconnect_grace(session);

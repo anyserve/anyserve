@@ -402,6 +402,9 @@ impl Inner {
         {
             let mut st = self.lock();
             self.evict_terminal_locked(&mut st, now);
+            for op in self.evict_offline_workers_locked(&mut st, now) {
+                self.persist_worker_op(op);
+            }
             let expired: Vec<String> = st
                 .sessions
                 .iter()
@@ -456,12 +459,15 @@ impl Inner {
             st.generation = term;
             st.rng = term ^ 0x5DEE_CE66_D1CE_4E5B;
         }
-        self.recover(leadership.recovery);
+        let pending_worker_ops = self.recover(leadership.recovery);
         let lost_rx = leadership.lease.lost();
         *self.lease_handle.lock() = Some(leadership.lease);
         *self.journal_status.lock() = JournalStatus::Healthy;
         self.leader_active.store(true, Ordering::Release);
         self.leadership_tx.send_replace(true);
+        for op in pending_worker_ops {
+            self.persist_worker_op(op);
+        }
         tokio::spawn(lease_loss_watcher(
             self.me.clone(),
             lost_rx,
@@ -500,7 +506,7 @@ impl Inner {
         self.lease_lost_tx.send_replace(true);
     }
 
-    fn recover(&self, recovery: Recovery) {
+    fn recover(&self, recovery: Recovery) -> Vec<crate::journal::JournalOp> {
         let mut st = self.lock();
         let now = now_ms();
         for stored in recovery.active {
@@ -572,7 +578,32 @@ impl Inner {
                 st.released.jobs.push(evicted);
             }
         }
+        let mut pending_worker_ops = Vec::new();
+        if self.worker_registry_enabled() {
+            for mut record in recovery.workers {
+                if record.worker_id.is_empty() {
+                    continue;
+                }
+                if record.namespace.is_empty() {
+                    record.namespace = crate::auth::DEFAULT_NAMESPACE.to_owned();
+                }
+                let became_offline = record.offline_since_ms.is_none();
+                if became_offline {
+                    record.offline_since_ms = Some(now);
+                    record.offline_reason = Some("control plane restarted".to_owned());
+                }
+                let key = (record.namespace.clone(), record.worker_id.clone());
+                if became_offline {
+                    pending_worker_ops.push(crate::journal::JournalOp::WorkerUpsert(Box::new(
+                        record.clone(),
+                    )));
+                }
+                st.workers.insert(key, record);
+            }
+            pending_worker_ops.extend(self.evict_offline_workers_locked(&mut st, now));
+        }
         self.dispatch_locked(&mut st, now);
+        pending_worker_ops
     }
 }
 
@@ -1792,27 +1823,104 @@ impl Runtime {
 
     pub fn list_workers(&self) -> Vec<WorkerView> {
         let st = self.inner.lock();
+        let mut live_keys = ahash::AHashSet::with_capacity(st.sessions.len());
         let mut workers: Vec<WorkerView> = st
             .sessions
             .values()
-            .map(state::Session::worker_view)
+            .map(|session| {
+                let key = (session.namespace.clone(), session.worker_id.clone());
+                let first_seen = st.workers.get(&key).map(|r| r.first_seen_ms);
+                live_keys.insert(key);
+                session.worker_view(first_seen)
+            })
             .collect();
+        for (key, record) in &st.workers {
+            if record.offline_since_ms.is_some() && !live_keys.contains(key) {
+                workers.push(state::offline_worker_view(record));
+            }
+        }
         drop(st);
         workers.sort_by(|a, b| {
-            a.worker_id
-                .cmp(&b.worker_id)
-                .then(a.session_id.cmp(&b.session_id))
+            a.offline_since_ms
+                .is_some()
+                .cmp(&b.offline_since_ms.is_some())
+                .then_with(|| a.worker_id.cmp(&b.worker_id))
+                .then_with(|| a.session_id.cmp(&b.session_id))
         });
         workers
     }
 
     pub fn find_worker(&self, namespace: &str, worker_id: &str) -> Option<WorkerView> {
         let st = self.inner.lock();
-        st.sessions
+        if let Some(session) = st
+            .sessions
             .values()
             .filter(|session| session.namespace == namespace && session.worker_id == worker_id)
             .min_by(|a, b| a.id.cmp(&b.id))
-            .map(state::Session::worker_view)
+        {
+            let first_seen = st
+                .workers
+                .get(&(session.namespace.clone(), session.worker_id.clone()))
+                .map(|r| r.first_seen_ms);
+            return Some(session.worker_view(first_seen));
+        }
+        st.workers
+            .get(&(namespace.to_owned(), worker_id.to_owned()))
+            .filter(|record| record.offline_since_ms.is_some())
+            .map(state::offline_worker_view)
+    }
+
+    /// Removes an offline worker registration from memory and (when durable)
+    /// from the journal. Rejects active sessions with `Conflict`.
+    pub async fn forget_worker(
+        &self,
+        scope_namespace: Option<&str>,
+        namespace: &str,
+        worker_id: &str,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_active_leader()?;
+        if let Some(allowed) = scope_namespace
+            && allowed != namespace
+        {
+            return Err(RuntimeError::not_found("worker", worker_id));
+        }
+        let key = (namespace.to_owned(), worker_id.to_owned());
+        {
+            let mut st = self.inner.lock();
+            if st.has_live_session(namespace, worker_id) {
+                return Err(RuntimeError::conflict(format!(
+                    "worker '{worker_id}' has an active session; wait until it is offline before forgetting"
+                )));
+            }
+            if st.workers.remove(&key).is_none() {
+                return Err(RuntimeError::not_found("worker", worker_id));
+            }
+        }
+        if let Some(journal) = &self.inner.journal {
+            let term = self.inner.generation.load(Ordering::Acquire);
+            let rx = journal.enqueue(
+                term,
+                crate::journal::JournalOp::WorkerForget {
+                    namespace: namespace.to_owned(),
+                    worker_id: worker_id.to_owned(),
+                },
+            )?;
+            let outcome = rx.await.unwrap_or_else(|_| {
+                crate::journal::CommitOutcome::Unknown("journal writer stopped".into())
+            });
+            match outcome {
+                crate::journal::CommitOutcome::Committed => {}
+                crate::journal::CommitOutcome::Fenced(reason) => {
+                    self.inner.mark_lease_lost(&reason);
+                    return Err(RuntimeError::unavailable(reason));
+                }
+                crate::journal::CommitOutcome::RolledBack(reason)
+                | crate::journal::CommitOutcome::Unknown(reason) => {
+                    return Err(RuntimeError::unavailable(reason));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Immediately revokes and fences worker sessions (connected or in reconnect
@@ -1972,6 +2080,11 @@ impl Runtime {
                 let entry = interfaces.entry(interface.clone()).or_default();
                 entry.sessions += 1;
                 entry.free_slots += free;
+                entry.last_seen_at_ms = Some(
+                    entry
+                        .last_seen_at_ms
+                        .map_or(session.last_seen_ms, |m| m.max(session.last_seen_ms)),
+                );
 
                 let active_leases = if session.active.is_empty() {
                     0
@@ -2003,6 +2116,29 @@ impl Runtime {
                 pool_entry.sessions += 1;
                 pool_entry.free_slots += free;
                 pool_entry.active_leases += active_leases;
+            }
+        }
+        for ((ns, wid), record) in &st.workers {
+            if record.offline_since_ms.is_none() || st.has_live_session(ns, wid) {
+                continue;
+            }
+            if namespace_filter.is_some_and(|filter| ns != filter) {
+                continue;
+            }
+            workers.offline += 1;
+            workers.last_seen_at_ms = Some(
+                workers
+                    .last_seen_at_ms
+                    .map_or(record.last_seen_ms, |max| max.max(record.last_seen_ms)),
+            );
+            for interface in &record.interfaces {
+                let entry = interfaces.entry(interface.clone()).or_default();
+                entry.offline_workers += 1;
+                entry.last_seen_at_ms = Some(
+                    entry
+                        .last_seen_at_ms
+                        .map_or(record.last_seen_ms, |m| m.max(record.last_seen_ms)),
+                );
             }
         }
         let live = self.inner.live();
@@ -2321,6 +2457,7 @@ mod tests {
                             generation: term,
                             active: vec![recovered],
                             terminal: Vec::new(),
+                            workers: Vec::new(),
                         },
                         lease: LeaseHandle::new(lost_rx, move || {
                             Box::pin(async move {

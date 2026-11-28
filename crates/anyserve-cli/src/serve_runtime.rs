@@ -1296,7 +1296,13 @@ mod grpc_toggle_tests {
             .unwrap();
         assert!(sync_ok.load(Ordering::Relaxed));
         assert!(auth.is_jti_revoked("jti-revoked"));
-        assert!(runtime.list_workers().is_empty());
+        assert_eq!(runtime.snapshot().workers.total, 0);
+        assert!(
+            runtime
+                .list_workers()
+                .iter()
+                .all(|w| !w.connected && w.offline_since_ms.is_some())
+        );
 
         // 2. 304 Not Modified keeps sync_ok=true and updates last_sync.
         *mode.lock().unwrap() = MockMode::NotModified {
@@ -1337,7 +1343,7 @@ mod grpc_toggle_tests {
         )
         .unwrap();
         let _w_exp = connect_signed_worker(grpc_server.endpoint.clone(), tok_exp, "w-exp").await;
-        assert_eq!(runtime.list_workers().len(), 1);
+        assert_eq!(runtime.snapshot().workers.total, 1);
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
         *mode.lock().unwrap() = MockMode::ServerError;
@@ -1346,8 +1352,9 @@ mod grpc_toggle_tests {
             .unwrap_err();
         assert!(err.contains("500"), "{err}");
         assert!(!sync_ok.load(Ordering::Relaxed));
-        assert!(
-            runtime.list_workers().is_empty(),
+        assert_eq!(
+            runtime.snapshot().workers.total,
+            0,
             "expired session must still be disconnected when HTTP poll fails"
         );
 

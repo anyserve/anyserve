@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::api::{
     Capacity, Durability, ErrorInfo, ExecutionEvent, JobSpec, JobState, JobView, Metadata, Object,
-    WorkerLoad, WorkerView,
+    WorkerLoad, WorkerRecord, WorkerView,
 };
 use super::events::{JobLog, Permit};
 use super::index::JobIndex;
@@ -277,6 +277,9 @@ pub(crate) struct State {
     pub in_flight_concurrency: NsIfaceMap<usize>,
     pub sessions: AHashMap<String, Session>,
     pub sessions_by_interface: NsIfaceMap<AHashSet<String>>,
+    /// Worker registrations keyed by `(namespace, worker_id)`, retained after
+    /// sessions end so operators can inspect offline workers and historical jobs.
+    pub workers: AHashMap<(String, String), WorkerRecord>,
     pub leases: AHashMap<String, Lease>,
     /// Completion receipts of jobs held in memory: lease id -> (scoped job id,
     /// outcome digest). Receipts of evicted durable jobs are read from the
@@ -462,9 +465,132 @@ impl State {
         }
     }
 
-    pub(crate) fn remove_session(&mut self, id: &str) {
+    pub(crate) fn remove_session(&mut self, id: &str) -> Option<Session> {
         self.unindex_session(id);
-        self.sessions.remove(id);
+        self.sessions.remove(id)
+    }
+
+    pub(crate) fn has_live_session(&self, namespace: &str, worker_id: &str) -> bool {
+        self.sessions
+            .values()
+            .any(|s| s.namespace == namespace && s.worker_id == worker_id)
+    }
+
+    pub(crate) fn upsert_live_worker(
+        &mut self,
+        session_id: &str,
+        now: u64,
+    ) -> Option<WorkerRecord> {
+        let session = self.sessions.get(session_id)?;
+        let key = (session.namespace.clone(), session.worker_id.clone());
+        let first_seen_ms = self
+            .workers
+            .get(&key)
+            .map(|existing| existing.first_seen_ms)
+            .filter(|&ts| ts > 0)
+            .unwrap_or(now);
+        let record = WorkerRecord {
+            namespace: session.namespace.clone(),
+            worker_id: session.worker_id.clone(),
+            pool: session.pool.clone(),
+            interfaces: session.interfaces.iter().cloned().collect(),
+            attributes: session.attributes.clone(),
+            total_capacity: session.total_capacity.clone(),
+            max_concurrency: session.max_concurrency,
+            first_seen_ms,
+            last_seen_ms: session.last_seen_ms.max(now),
+            last_session_id: session.id.clone(),
+            last_connected_at_ms: session.connected_at_ms,
+            offline_since_ms: None,
+            offline_reason: None,
+        };
+        self.workers.insert(key, record.clone());
+        Some(record)
+    }
+
+    pub(crate) fn mark_worker_session_ended(
+        &mut self,
+        removed: &Session,
+        reason: &str,
+        now: u64,
+        retain_offline: bool,
+    ) -> Option<crate::journal::JournalOp> {
+        let key = (removed.namespace.clone(), removed.worker_id.clone());
+        if let Some(other) = self
+            .sessions
+            .values()
+            .filter(|s| s.namespace == removed.namespace && s.worker_id == removed.worker_id)
+            .max_by_key(|s| s.last_seen_ms)
+            .map(|s| s.id.clone())
+        {
+            return self
+                .upsert_live_worker(&other, now)
+                .filter(|_| retain_offline)
+                .map(|r| crate::journal::JournalOp::WorkerUpsert(Box::new(r)));
+        }
+        if !retain_offline {
+            self.workers.remove(&key);
+            return Some(crate::journal::JournalOp::WorkerForget {
+                namespace: removed.namespace.clone(),
+                worker_id: removed.worker_id.clone(),
+            });
+        }
+        let first_seen_ms = self
+            .workers
+            .get(&key)
+            .map(|existing| existing.first_seen_ms)
+            .filter(|&ts| ts > 0)
+            .unwrap_or(removed.connected_at_ms);
+        let last_seen_ms = self
+            .workers
+            .get(&key)
+            .map(|existing| existing.last_seen_ms)
+            .unwrap_or(0)
+            .max(removed.last_seen_ms);
+        let record = WorkerRecord {
+            namespace: removed.namespace.clone(),
+            worker_id: removed.worker_id.clone(),
+            pool: removed.pool.clone(),
+            interfaces: removed.interfaces.iter().cloned().collect(),
+            attributes: removed.attributes.clone(),
+            total_capacity: removed.total_capacity.clone(),
+            max_concurrency: removed.max_concurrency,
+            first_seen_ms,
+            last_seen_ms,
+            last_session_id: removed.id.clone(),
+            last_connected_at_ms: removed.connected_at_ms,
+            offline_since_ms: Some(now),
+            offline_reason: Some(reason.to_owned()),
+        };
+        self.workers.insert(key, record.clone());
+        Some(crate::journal::JournalOp::WorkerUpsert(Box::new(record)))
+    }
+}
+
+pub(crate) fn offline_worker_view(record: &WorkerRecord) -> WorkerView {
+    WorkerView {
+        session_id: record.last_session_id.clone(),
+        worker_id: record.worker_id.clone(),
+        namespace: record.namespace.clone(),
+        pool: record.pool.clone(),
+        interfaces: record.interfaces.clone(),
+        attributes: record.attributes.clone(),
+        total_capacity: record.total_capacity.clone(),
+        max_concurrency: record.max_concurrency,
+        active_leases: 0,
+        free_slots: 0,
+        load: WorkerLoad::default(),
+        draining: false,
+        connected: false,
+        connected_at_ms: record.last_connected_at_ms,
+        last_seen_ms: record.last_seen_ms,
+        first_seen_ms: if record.first_seen_ms > 0 {
+            record.first_seen_ms
+        } else {
+            record.last_connected_at_ms
+        },
+        offline_since_ms: Some(record.offline_since_ms.unwrap_or(record.last_seen_ms)),
+        offline_reason: record.offline_reason.clone(),
     }
 }
 
@@ -810,7 +936,7 @@ impl Session {
         }
     }
 
-    pub(crate) fn worker_view(&self) -> WorkerView {
+    pub(crate) fn worker_view(&self, first_seen_ms: Option<u64>) -> WorkerView {
         WorkerView {
             session_id: self.id.clone(),
             worker_id: self.worker_id.clone(),
@@ -827,6 +953,11 @@ impl Session {
             connected: self.tx.is_some(),
             connected_at_ms: self.connected_at_ms,
             last_seen_ms: self.last_seen_ms,
+            first_seen_ms: first_seen_ms
+                .filter(|&ts| ts > 0)
+                .unwrap_or(self.connected_at_ms),
+            offline_since_ms: None,
+            offline_reason: None,
         }
     }
 

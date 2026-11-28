@@ -97,7 +97,7 @@ describe("Contract C endpoints and durability semantics", () => {
       holder_id: "leader-a",
       lease_duration_ms: 5_000,
     });
-    expect(acq1).toEqual({ acquired: true, term: 1, active: [] });
+    expect(acq1).toEqual({ acquired: true, term: 1, active: [], workers: [] });
 
     // Contending acquire while lease is active fails.
     const acqContend = await ctx.journal.acquire({
@@ -138,7 +138,7 @@ describe("Contract C endpoints and durability semantics", () => {
       holder_id: "leader-b",
       lease_duration_ms: 5_000,
     });
-    expect(acq2).toEqual({ acquired: true, term: 2, active: [] });
+    expect(acq2).toEqual({ acquired: true, term: 2, active: [], workers: [] });
 
     // Stale term=1 commit_batch & purge are fenced and mutate nothing.
     const fencedCommit = await ctx.journal.commitBatch({
@@ -184,7 +184,7 @@ describe("Contract C endpoints and durability semantics", () => {
       holder_id: "leader-c",
       lease_duration_ms: 5_000,
     });
-    expect(acq3).toEqual({ acquired: true, term: 3, active: [] });
+    expect(acq3).toEqual({ acquired: true, term: 3, active: [], workers: [] });
   });
 
   it("commits > 150 ops in one batch without exceeding 100 SQL bound parameters", async () => {
@@ -899,7 +899,7 @@ describe("Contract C endpoints and durability semantics", () => {
           lease_duration_ms: 10_000,
         },
       );
-      expect(acq).toEqual({ acquired: true, term: 1, active: [] });
+      expect(acq).toEqual({ acquired: true, term: 1, active: [], workers: [] });
 
       const payload = filledBytes(64, 99);
       expect(
@@ -933,5 +933,101 @@ describe("Contract C endpoints and durability semantics", () => {
     } finally {
       await gateway.close();
     }
+  });
+
+  it("persists, forgets, fences, and recovers worker registry records", async () => {
+    const ctx = createTestJournal({ startMs: 1_000 });
+    const acq1 = await ctx.journal.acquire({
+      holder_id: "leader-1",
+      lease_duration_ms: 5_000,
+    });
+    expect(acq1).toEqual({ acquired: true, term: 1, active: [], workers: [] });
+
+    const recA = JSON.stringify({
+      namespace: "default",
+      worker_id: "jetson-orin-nx",
+      pool: "edge",
+      interfaces: ["vision.v1"],
+      last_seen_ms: 1_500,
+      offline_since_ms: 1_600,
+      offline_reason: "disconnected",
+    });
+    const recB = JSON.stringify({
+      namespace: "tenant-a",
+      worker_id: "rk3588-01",
+      pool: "npu",
+      interfaces: ["vision.v1"],
+      last_seen_ms: 1_800,
+      offline_since_ms: 1_900,
+      offline_reason: "worker session ended",
+    });
+
+    expect(
+      await ctx.journal.commitBatch({
+        holder_id: "leader-1",
+        term: 1,
+        ops: [
+          {
+            type: "worker_upsert",
+            namespace: "default",
+            worker_id: "jetson-orin-nx",
+            record_json: recA,
+            updated_at_ms: 1_600,
+          },
+          {
+            type: "worker_upsert",
+            namespace: "tenant-a",
+            worker_id: "rk3588-01",
+            record_json: recB,
+            updated_at_ms: 1_900,
+          },
+        ],
+      }),
+    ).toEqual({ outcome: "committed" });
+
+    // Stale term is fenced and cannot mutate workers.
+    expect(
+      await ctx.journal.commitBatch({
+        holder_id: "leader-1",
+        term: 99,
+        ops: [
+          {
+            type: "worker_forget",
+            namespace: "default",
+            worker_id: "jetson-orin-nx",
+          },
+        ],
+      }),
+    ).toMatchObject({ outcome: "fenced" });
+
+    // Forget tenant-a worker under valid term.
+    expect(
+      await ctx.journal.commitBatch({
+        holder_id: "leader-1",
+        term: 1,
+        ops: [
+          {
+            type: "worker_forget",
+            namespace: "tenant-a",
+            worker_id: "rk3588-01",
+          },
+        ],
+      }),
+    ).toEqual({ outcome: "committed" });
+
+    // Relinquish and re-acquire as leader-2 -> recovers only jetson-orin-nx.
+    expect(
+      ctx.journal.relinquish({ holder_id: "leader-1", term: 1 }),
+    ).toEqual({ ok: true });
+    const acq2 = await ctx.journal.acquire({
+      holder_id: "leader-2",
+      lease_duration_ms: 5_000,
+    });
+    expect(acq2).toEqual({
+      acquired: true,
+      term: 2,
+      active: [],
+      workers: [recA],
+    });
   });
 });

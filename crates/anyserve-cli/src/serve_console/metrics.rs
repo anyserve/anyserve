@@ -490,6 +490,7 @@ mod tests {
                 oldest_queued_age_ms: 500,
                 sessions: 2,
                 free_slots: 3,
+                ..Default::default()
             },
         );
         for i in 0..105 {
@@ -501,6 +502,7 @@ mod tests {
                     oldest_queued_age_ms: i as u64,
                     sessions: 0,
                     free_slots: 0,
+                    ..Default::default()
                 },
             );
         }
