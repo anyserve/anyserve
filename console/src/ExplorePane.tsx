@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AuthenticationError, getAnalyticsJobs, getJob } from "./api";
-import { MAX_DATA_BYTES, MAX_RESULT_ROWS, QUERY_PRESETS, resultCsv, type QueryResult } from "./analytics-data";
+import { estimateJobJsonBytes, MAX_DATA_BYTES, MAX_RESULT_ROWS, QUERY_PRESETS, resultCsv, type QueryResult } from "./analytics-data";
 import type { AnalyticsEngine } from "./analytics-engine";
 import { asErrorMessage, formatTimestamp, toDatetimeLocal } from "./format";
 import { JobInspector } from "./pane-inspector";
@@ -101,7 +101,6 @@ export default function ExplorePane({
       const db = await AnalyticsEngine.create(c.signal);
       database = db; engine.current = db;
       const next: Dataset = { count: 0, bytes: 0, limited: false, from: start, to: end, source };
-      const encoder = new TextEncoder();
       let cursor: string | null = null;
       const cursors = new Set<string>();
       do {
@@ -118,7 +117,7 @@ export default function ExplorePane({
         c.signal.throwIfAborted();
         const accepted = [];
         for (const job of res.jobs) {
-          const bytes = encoder.encode(JSON.stringify(job)).byteLength;
+          const bytes = estimateJobJsonBytes(job);
           if (next.bytes + bytes > MAX_DATA_BYTES || next.count === rowLimit) { next.limited = true; break; }
           accepted.push(job); next.bytes += bytes; next.count++;
         }
@@ -157,7 +156,12 @@ export default function ExplorePane({
     setBusy(false); setError(null); setDataset(null); setResult(null); setStatus("Cancelled. Load data to resume.");
   }
 
-  const filtered = useMemo(() => !filter ? result?.rows ?? [] : result?.rows.filter((r) => r.some((cell) => cell?.toLowerCase().includes(filter.toLowerCase()))) ?? [], [result, filter]);
+  const filtered = useMemo(() => {
+    const rows = result?.rows ?? [];
+    if (!filter) return rows;
+    const needle = filter.toLowerCase();
+    return rows.filter((r) => r.some((cell) => cell !== null && cell.toLowerCase().includes(needle)));
+  }, [result, filter]);
   const pageCount = Math.max(1, Math.ceil(filtered.length / 50));
   const jobCol = result?.columns.indexOf("job_id") ?? -1;
   const nsCol = result?.columns.indexOf("namespace") ?? -1;

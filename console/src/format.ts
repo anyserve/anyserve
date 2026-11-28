@@ -38,23 +38,70 @@ export function sortWorkers(workers: WorkerSummary[]): WorkerSummary[] {
   });
 }
 
+const TIME_CACHE_LIMIT = 1_024;
+const timestampSecondCache = new Map<number, [string, string]>();
+const shortTimeSecondCache = new Map<number, string>();
+const dateTimeAxisMinuteCache = new Map<number, string>();
+
 export function formatTimestamp(value: number | null | undefined): string {
   if (!value) return "N/A";
-  const date = new Date(value);
-  const ms = String(date.getMilliseconds()).padStart(3, "0");
-  return timeFormatter
-    .formatToParts(date)
-    .flatMap((part) => (part.type === "second" ? [part.value, ".", ms] : [part.value]))
-    .join("");
+  const sec = Math.floor(value / 1_000);
+  let pair = timestampSecondCache.get(sec);
+  if (!pair) {
+    const parts = timeFormatter.formatToParts(new Date(sec * 1_000));
+    let before = "";
+    let after = "";
+    let seenSecond = false;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]!;
+      if (!seenSecond) {
+        before += part.value;
+        if (part.type === "second") seenSecond = true;
+      } else {
+        after += part.value;
+      }
+    }
+    pair = [before, after];
+    if (timestampSecondCache.size >= TIME_CACHE_LIMIT) timestampSecondCache.clear();
+    timestampSecondCache.set(sec, pair);
+  }
+  const msNum = ((value % 1_000) + 1_000) % 1_000;
+  const ms = msNum < 10 ? `00${msNum}` : msNum < 100 ? `0${msNum}` : String(msNum);
+  return `${pair[0]}.${ms}${pair[1]}`;
 }
 
 export function formatShortTime(value: number | null | undefined): string {
-  return value ? shortTimeFormatter.format(new Date(value)) : "—";
+  if (!value) return "—";
+  const sec = Math.floor(value / 1_000);
+  let formatted = shortTimeSecondCache.get(sec);
+  if (formatted === undefined) {
+    formatted = shortTimeFormatter.format(new Date(sec * 1_000));
+    if (shortTimeSecondCache.size >= TIME_CACHE_LIMIT) shortTimeSecondCache.clear();
+    shortTimeSecondCache.set(sec, formatted);
+  }
+  return formatted;
 }
 
 export function formatAxisTime(value: number, spanMs: number): string {
   if (!Number.isFinite(value)) return "—";
-  return spanMs <= 6 * 3_600_000 ? shortTimeFormatter.format(new Date(value)) : dateTimeAxisFormatter.format(new Date(value));
+  if (spanMs <= 6 * 3_600_000) {
+    const sec = Math.floor(value / 1_000);
+    let formatted = shortTimeSecondCache.get(sec);
+    if (formatted === undefined) {
+      formatted = shortTimeFormatter.format(new Date(sec * 1_000));
+      if (shortTimeSecondCache.size >= TIME_CACHE_LIMIT) shortTimeSecondCache.clear();
+      shortTimeSecondCache.set(sec, formatted);
+    }
+    return formatted;
+  }
+  const min = Math.floor(value / 60_000);
+  let formatted = dateTimeAxisMinuteCache.get(min);
+  if (formatted === undefined) {
+    formatted = dateTimeAxisFormatter.format(new Date(min * 60_000));
+    if (dateTimeAxisMinuteCache.size >= TIME_CACHE_LIMIT) dateTimeAxisMinuteCache.clear();
+    dateTimeAxisMinuteCache.set(min, formatted);
+  }
+  return formatted;
 }
 
 export function toDatetimeLocal(ms: number): string {

@@ -230,6 +230,103 @@ export function WorkerMiniList(props: {
   );
 }
 
+const JobRow = memo(function JobRow({
+  job,
+  isSelected,
+  onSelect,
+  onOpenInterface,
+  onOpenWorker,
+  onFilterNamespace,
+}: {
+  job: JobSummary;
+  isSelected: boolean;
+  onSelect: (jobId: string) => void;
+  onOpenInterface?: (iface: string) => void;
+  onOpenWorker?: (workerId: string) => void;
+  onFilterNamespace?: (namespace: string) => void;
+}) {
+  const ns = job.namespace && job.namespace !== "default" ? job.namespace : null;
+  return (
+    <tr
+      className={isSelected ? "is-selected" : ""}
+      onClick={() => onSelect(job.job_id)}
+    >
+      <td>
+        <div className="cell-stack">
+          <StateBadge state={job.state} />
+          {job.error_code ? <span className="tag tag--danger ellipsis" title={job.error_code}>{job.error_code}</span> : null}
+        </div>
+      </td>
+      <td>
+        <div className="table__primary mono ellipsis" title={job.job_id}>{job.job_id}</div>
+        <div className="table__secondary">
+          <span className="ellipsis">{job.source ?? job.metadata.request_id ?? "direct"}</span>
+          {ns ? (
+            onFilterNamespace ? (
+              <button
+                type="button"
+                className="tag tag--link"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onFilterNamespace(ns);
+                }}
+              >
+                {ns}
+              </button>
+            ) : (
+              <span className="tag">{ns}</span>
+            )
+          ) : null}
+          {job.durability ? <span className="tag">{job.durability}</span> : null}
+        </div>
+      </td>
+      <td>
+        {onOpenInterface ? (
+          <button
+            type="button"
+            className="cell-link mono ellipsis"
+            title={`Open interface ${job.interface_name}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenInterface(job.interface_name);
+            }}
+          >
+            {job.interface_name}
+          </button>
+        ) : (
+          <span className="mono ellipsis" title={job.interface_name}>{job.interface_name}</span>
+        )}
+      </td>
+      <td>
+        {job.latest_worker_id && onOpenWorker ? (
+          <button
+            type="button"
+            className="cell-link mono ellipsis"
+            title={`Open worker ${job.latest_worker_id}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenWorker(job.latest_worker_id!);
+            }}
+          >
+            {job.latest_worker_id}
+          </button>
+        ) : (
+          <span className="mono ellipsis" title={job.latest_worker_id ?? "Unassigned"}>
+            {job.latest_worker_id ?? "Unassigned"}
+          </span>
+        )}
+      </td>
+      <td className="num">{job.attempt_count}</td>
+      <td>
+        <div className="mono table__timestamp" title={formatTimestamp(job.updated_at_ms)}>
+          {formatShortTime(job.updated_at_ms)}
+        </div>
+        {job.duration_ms != null ? <div className="table__secondary num">{formatDuration(job.duration_ms)}</div> : null}
+      </td>
+    </tr>
+  );
+});
+
 export const JobsTable = memo(function JobsTable(props: {
   jobs: JobSummary[];
   selectedJobId: string | null;
@@ -254,89 +351,17 @@ export const JobsTable = memo(function JobsTable(props: {
           </tr>
         </thead>
         <tbody>
-          {props.jobs.map((job) => {
-            const ns = job.namespace && job.namespace !== "default" ? job.namespace : null;
-            return (
-              <tr
-                key={`${job.namespace ?? "default"}::${job.job_id}`}
-                className={job.job_id === props.selectedJobId ? "is-selected" : ""}
-                onClick={() => props.onSelect(job.job_id)}
-              >
-                <td>
-                  <div className="cell-stack">
-                    <StateBadge state={job.state} />
-                    {job.error_code ? <span className="tag tag--danger ellipsis" title={job.error_code}>{job.error_code}</span> : null}
-                  </div>
-                </td>
-                <td>
-                  <div className="table__primary mono ellipsis" title={job.job_id}>{job.job_id}</div>
-                  <div className="table__secondary">
-                    <span className="ellipsis">{job.source ?? job.metadata.request_id ?? "direct"}</span>
-                    {ns ? (
-                      props.onFilterNamespace ? (
-                        <button
-                          type="button"
-                          className="tag tag--link"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            props.onFilterNamespace!(ns);
-                          }}
-                        >
-                          {ns}
-                        </button>
-                      ) : (
-                        <span className="tag">{ns}</span>
-                      )
-                    ) : null}
-                    {job.durability ? <span className="tag">{job.durability}</span> : null}
-                  </div>
-                </td>
-                <td>
-                  {props.onOpenInterface ? (
-                    <button
-                      type="button"
-                      className="cell-link mono ellipsis"
-                      title={`Open interface ${job.interface_name}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        props.onOpenInterface!(job.interface_name);
-                      }}
-                    >
-                      {job.interface_name}
-                    </button>
-                  ) : (
-                    <span className="mono ellipsis" title={job.interface_name}>{job.interface_name}</span>
-                  )}
-                </td>
-                <td>
-                  {job.latest_worker_id && props.onOpenWorker ? (
-                    <button
-                      type="button"
-                      className="cell-link mono ellipsis"
-                      title={`Open worker ${job.latest_worker_id}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        props.onOpenWorker!(job.latest_worker_id!);
-                      }}
-                    >
-                      {job.latest_worker_id}
-                    </button>
-                  ) : (
-                    <span className="mono ellipsis" title={job.latest_worker_id ?? "Unassigned"}>
-                      {job.latest_worker_id ?? "Unassigned"}
-                    </span>
-                  )}
-                </td>
-                <td className="num">{job.attempt_count}</td>
-                <td>
-                  <div className="mono table__timestamp" title={formatTimestamp(job.updated_at_ms)}>
-                    {formatShortTime(job.updated_at_ms)}
-                  </div>
-                  {job.duration_ms != null ? <div className="table__secondary num">{formatDuration(job.duration_ms)}</div> : null}
-                </td>
-              </tr>
-            );
-          })}
+          {props.jobs.map((job) => (
+            <JobRow
+              key={`${job.namespace ?? "default"}::${job.job_id}`}
+              job={job}
+              isSelected={job.job_id === props.selectedJobId}
+              onSelect={props.onSelect}
+              onOpenInterface={props.onOpenInterface}
+              onOpenWorker={props.onOpenWorker}
+              onFilterNamespace={props.onFilterNamespace}
+            />
+          ))}
         </tbody>
       </table>
     </div>

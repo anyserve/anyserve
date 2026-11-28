@@ -2,7 +2,7 @@ import * as duckdb from "@duckdb/duckdb-wasm";
 import wasmEh from "@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url";
 import workerEh from "@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url";
 import {
-  boundedQuery, cellText, ENGINE_SETTINGS, JOB_SCHEMA, jobsToIPC, metadataToIPC,
+  boundedQuery, cellText, ENGINE_SETTINGS, estimateRowJsonBytes, JOB_SCHEMA, jobsToIPC, metadataToIPC,
   MAX_RESULT_BYTES, MAX_RESULT_COLUMNS, MAX_RESULT_ROWS, QUERY_TIMEOUT_MS, type QueryResult,
 } from "./analytics-data";
 import type { AnalyticsJob } from "./types";
@@ -149,17 +149,19 @@ export class AnalyticsEngine {
           throw new Error(`Select at most ${MAX_RESULT_COLUMNS} result columns.`);
         }
         const result: QueryResult = { columns: reader.schema.fields.map(field => field.name), rows: [], truncated: false, clippedCells: 0, elapsedMs: 0 };
-        const encoder = new TextEncoder();
-        let bytes = encoder.encode(JSON.stringify(result.columns)).byteLength;
+        const colCount = result.columns.length;
+        let bytes = estimateRowJsonBytes(result.columns);
         for await (const batch of reader) {
+          const cols = Array.from({ length: colCount }, (_, c) => batch.getChildAt(c));
           for (let index = 0; index < batch.numRows; index++) {
             if (result.rows.length === MAX_RESULT_ROWS) { result.truncated = true; break; }
-            const row = batch.schema.fields.map((_, column) => {
-              let text = cellText(batch.getChildAt(column)?.get(index));
+            const row: (string | null)[] = new Array(colCount);
+            for (let column = 0; column < colCount; column++) {
+              let text = cellText(cols[column]?.get(index));
               if (text && text.length > 8_192) { text = text.slice(0, 8_192) + "…"; result.clippedCells++; }
-              return text;
-            });
-            bytes += encoder.encode(JSON.stringify(row)).byteLength + 1;
+              row[column] = text;
+            }
+            bytes += estimateRowJsonBytes(row);
             if (bytes > MAX_RESULT_BYTES) { result.truncated = true; break; }
             result.rows.push(row);
           }
