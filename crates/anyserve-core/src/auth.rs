@@ -866,6 +866,30 @@ pub struct AuthService<S> {
     policy: Arc<AuthPolicy>,
 }
 
+pin_project_lite::pin_project! {
+    #[project = AuthFutureProj]
+    pub enum AuthFuture<F> {
+        Inner { #[pin] fut: F },
+        Reject { response: Option<http::Response<BoxBody>> },
+    }
+}
+
+impl<F, E> Future for AuthFuture<F>
+where
+    F: Future<Output = Result<http::Response<BoxBody>, E>>,
+{
+    type Output = Result<http::Response<BoxBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            AuthFutureProj::Inner { fut } => fut.poll(cx),
+            AuthFutureProj::Reject { response } => {
+                Poll::Ready(Ok(response.take().expect("polled after completion")))
+            }
+        }
+    }
+}
+
 impl<S, B> Service<http::Request<B>> for AuthService<S>
 where
     S: Service<http::Request<B>, Response = http::Response<BoxBody>>,
@@ -873,23 +897,36 @@ where
 {
     type Response = http::Response<BoxBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = AuthFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
+        // Fast path when auth is disabled and no explicit namespace header needs validation:
+        // skip Principal/Extensions allocation and shared Arc<AuthPolicy> refcount contention.
+        if !self.policy.is_enabled() && !request.headers().contains_key(NAMESPACE_HEADER) {
+            return AuthFuture::Inner {
+                fut: self.inner.call(request),
+            };
+        }
         match self.policy.verify(request.uri().path(), request.headers()) {
             Ok(principal) => {
                 if let Some(principal) = principal {
                     request.extensions_mut().insert(principal.role);
                     request.extensions_mut().insert(principal);
-                    request.extensions_mut().insert(Arc::clone(&self.policy));
+                    if self.policy.is_enabled() {
+                        request.extensions_mut().insert(Arc::clone(&self.policy));
+                    }
                 }
-                Box::pin(self.inner.call(request))
+                AuthFuture::Inner {
+                    fut: self.inner.call(request),
+                }
             }
-            Err(status) => Box::pin(async move { Ok(status.into_http()) }),
+            Err(status) => AuthFuture::Reject {
+                response: Some(status.into_http()),
+            },
         }
     }
 }

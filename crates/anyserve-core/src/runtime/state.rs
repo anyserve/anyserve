@@ -2,10 +2,12 @@
 //! always under the single runtime lock.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, Bound, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, Bound, VecDeque};
 use std::sync::Arc;
 
+use ahash::{AHashMap, AHashSet};
 use anyserve_proto::v2 as pb;
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use super::api::{
@@ -39,7 +41,7 @@ pub(crate) struct QueueKey {
 #[derive(Default)]
 pub(crate) struct PriorityFairQueue {
     pub ring: VecDeque<String>,
-    pub subqueues: HashMap<String, BTreeSet<QueueKey>>,
+    pub subqueues: AHashMap<String, BTreeSet<QueueKey>>,
     pub total_len: usize,
 }
 
@@ -255,12 +257,12 @@ impl InterfaceQueue {
     }
 }
 
-pub(crate) type NsIfaceMap<T> = HashMap<String, HashMap<String, T>>;
+pub(crate) type NsIfaceMap<T> = AHashMap<String, AHashMap<String, T>>;
 
 #[derive(Default)]
 pub(crate) struct State {
     pub generation: u64,
-    pub jobs: HashMap<String, Job>,
+    pub jobs: AHashMap<String, Job>,
     pub job_index: JobIndex,
     /// Queued jobs per `namespace -> interface`, priority + round-robin fairness order.
     pub queues: NsIfaceMap<InterfaceQueue>,
@@ -273,14 +275,14 @@ pub(crate) struct State {
     pub unfinished_jobs: usize,
     /// Active in-flight attempts keyed by `namespace -> concurrency_key`.
     pub in_flight_concurrency: NsIfaceMap<usize>,
-    pub sessions: HashMap<String, Session>,
-    pub sessions_by_interface: NsIfaceMap<HashSet<String>>,
-    pub leases: HashMap<String, Lease>,
+    pub sessions: AHashMap<String, Session>,
+    pub sessions_by_interface: NsIfaceMap<AHashSet<String>>,
+    pub leases: AHashMap<String, Lease>,
     /// Completion receipts of jobs held in memory: lease id -> (scoped job id,
     /// outcome digest). Receipts of evicted durable jobs are read from the
     /// journal.
-    pub finished_leases: HashMap<String, (String, String)>,
-    pub terminal_order: VecDeque<(u64, String)>,
+    pub finished_leases: AHashMap<String, (String, String)>,
+    pub terminal_order: VecDeque<(u64, Arc<str>)>,
     pub rng: u64,
     pub connection_seq: u64,
     pub shutting_down: bool,
@@ -320,7 +322,7 @@ impl State {
         interface: &str,
     ) -> &mut InterfaceQueue {
         if !self.queues.contains_key(namespace) {
-            self.queues.insert(namespace.to_string(), HashMap::new());
+            self.queues.insert(namespace.to_string(), AHashMap::new());
         }
         let m = self
             .queues
@@ -397,7 +399,7 @@ impl State {
         &self,
         namespace: &str,
         interface: &str,
-    ) -> Option<&HashSet<String>> {
+    ) -> Option<&AHashSet<String>> {
         self.sessions_by_interface
             .get(namespace)
             .and_then(|m| m.get(interface))
@@ -434,7 +436,7 @@ impl State {
             if let Some(ids) = ns_map.get_mut(interface.as_str()) {
                 ids.insert(id.to_string());
             } else {
-                let mut set = HashSet::new();
+                let mut set = AHashSet::new();
                 set.insert(id.to_string());
                 ns_map.insert(interface.clone(), set);
             }
@@ -476,6 +478,15 @@ pub(crate) struct Released {
     /// Full specifications of jobs that just ended; their inputs go with them.
     pub specs: Vec<Arc<JobSpec>>,
     pub outputs: Vec<Vec<Object>>,
+}
+
+impl Released {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.jobs.is_empty()
+            && self.events.is_empty()
+            && self.specs.is_empty()
+            && self.outputs.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +537,87 @@ impl TerminalPlan {
     }
 }
 
+pub(crate) struct AttemptStreamState {
+    pub active: bool,
+    pub last_frame_seq: u64,
+    pub exposed: bool,
+    /// Cleared on deactivation so live gRPC/WS attempt handlers never keep an
+    /// evicted job's `JobLog` (and its `ByteBudget` reservation) alive.
+    pub log: Option<Arc<JobLog>>,
+}
+
+/// Per-attempt streaming state shared between `Attempt`/`Lease` and live
+/// attempt handlers so streaming frame ingestion bypasses the global runtime
+/// state lock on the fast path.
+///
+/// Lock ordering: always `State` -> `AttemptStream::state` -> `JobLog::inner`.
+pub(crate) struct AttemptStream {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub streamed: bool,
+    pub state: Mutex<AttemptStreamState>,
+}
+
+impl AttemptStream {
+    pub(crate) fn new(
+        job_id: String,
+        attempt_id: String,
+        streamed: bool,
+        log: Arc<JobLog>,
+    ) -> Self {
+        Self {
+            job_id,
+            attempt_id,
+            streamed,
+            state: Mutex::new(AttemptStreamState {
+                active: true,
+                last_frame_seq: 0,
+                exposed: false,
+                log: Some(log),
+            }),
+        }
+    }
+
+    pub(crate) fn deactivate(&self) {
+        let log = {
+            let mut st = self.state.lock();
+            st.active = false;
+            st.log.take()
+        };
+        drop(log);
+    }
+
+    /// Marks the stream inactive and returns whether it had already exposed
+    /// output to a live caller before deactivation.
+    pub(crate) fn deactivate_and_read_exposed(&self) -> bool {
+        let (exposed, log) = {
+            let mut st = self.state.lock();
+            st.active = false;
+            (st.exposed, st.log.take())
+        };
+        drop(log);
+        exposed
+    }
+
+    /// Atomically deactivates the stream only if it has not yet exposed output.
+    pub(crate) fn try_deactivate_if_unexposed(&self) -> bool {
+        let log = {
+            let mut st = self.state.lock();
+            if st.exposed {
+                return false;
+            }
+            st.active = false;
+            st.log.take()
+        };
+        drop(log);
+        true
+    }
+
+    pub(crate) fn last_frame_seq(&self) -> u64 {
+        self.state.lock().last_frame_seq
+    }
+}
+
 pub(crate) struct Attempt {
     pub attempt_id: String,
     pub lease_id: String,
@@ -534,8 +626,7 @@ pub(crate) struct Attempt {
     pub worker_id: String,
     pub started_at_ms: u64,
     pub inputs_via_attempt: bool,
-    pub last_frame_seq: u64,
-    pub exposed: bool,
+    pub stream: Arc<AttemptStream>,
     pub concurrency_counted: bool,
 }
 
@@ -543,6 +634,10 @@ pub(crate) struct Job {
     /// Internal scoped storage ID (`encode_scoped_id(namespace, raw_id)`).
     pub id: String,
     pub raw_id: String,
+    /// Reference-counted copies shared by `JobIndex` keys so state transitions
+    /// avoid heap-allocating `job_id` / `raw_id` strings.
+    pub index_id: Arc<str>,
+    pub raw_index_id: Arc<str>,
     pub namespace: String,
     pub spec: Arc<JobSpec>,
     pub durability: Durability,
@@ -564,7 +659,7 @@ pub(crate) struct Job {
     /// `TotalDeadline` timer across the whole job lifetime; cancelled when terminal.
     pub total_timer: Option<u64>,
     /// Sessions that explicitly rejected this job (`AssignReply.accepted = false`).
-    pub rejected_sessions: HashSet<String>,
+    pub rejected_sessions: AHashSet<String>,
     /// Worker IDs that failed, timed out, crashed on, or rejected this job.
     pub failed_workers: BTreeSet<String>,
     pub cancel_requested: Option<String>,
@@ -653,6 +748,7 @@ pub(crate) struct Lease {
     pub session_id: String,
     pub reserved: Capacity,
     pub cancelling: bool,
+    pub stream: Arc<AttemptStream>,
 }
 
 pub(crate) struct Session {
@@ -774,7 +870,7 @@ impl Session {
 #[cfg(test)]
 pub(crate) fn assert_reservations(st: &State) {
     super::index::assert_matches_jobs(st);
-    let mut expected_interfaces: NsIfaceMap<HashSet<String>> = HashMap::new();
+    let mut expected_interfaces: NsIfaceMap<AHashSet<String>> = AHashMap::new();
     for session in st.sessions.values() {
         for interface in &session.interfaces {
             expected_interfaces

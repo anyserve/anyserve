@@ -3,13 +3,16 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
-use tokio::sync::watch;
+use parking_lot::{Mutex, MutexGuard};
+use tokio::sync::Notify;
+use tokio::sync::futures::{Notified, OwnedNotified};
 
 use super::api::{EventKind, ExecutionEvent, Metadata};
+
+use std::sync::atomic::AtomicU64;
 
 /// A byte budget shared by many owners; reservations never exceed the limit
 /// unless forced.
@@ -117,16 +120,50 @@ pub(crate) fn budgeted_bytes(data: Bytes, permit: Permit) -> Bytes {
 pub(crate) struct JobLog {
     job_id: String,
     inner: Mutex<LogInner>,
-    /// Last appended sequence, for followers.
-    changed: watch::Sender<u64>,
-    /// Last sequence taken by the primary consumer, for back-pressured writers.
-    consumed: watch::Sender<u64>,
+    /// Wakes followers when new events are appended.
+    changed: Arc<Notify>,
+    /// Number of active `LogSubscription` followers.
+    followers: AtomicUsize,
+    /// Wakes back-pressured writers when the primary consumer makes progress or disconnects.
+    consumed: Notify,
+    /// Number of writers currently awaiting consumer progress.
+    consumed_waiters: AtomicUsize,
     budget: Arc<ByteBudget>,
     max_events: usize,
     max_bytes: usize,
     /// Set once an ephemeral job finishes: the log may then shrink to its
     /// outcome as soon as nobody follows it.
     compactable: AtomicBool,
+}
+
+/// Counts one active follower on a `JobLog`; dropping the last follower of a
+/// finished ephemeral job compacts its event log.
+pub(crate) struct LogSubscription {
+    pub(crate) log: Arc<JobLog>,
+}
+
+impl LogSubscription {
+    pub(crate) fn notified(&self) -> OwnedNotified {
+        Arc::clone(&self.log.changed).notified_owned()
+    }
+}
+
+impl Drop for LogSubscription {
+    fn drop(&mut self) {
+        self.log.followers.fetch_sub(1, Ordering::AcqRel);
+        self.log.compact_if_unfollowed();
+    }
+}
+
+/// Counts one back-pressured writer awaiting consumer progress on a `JobLog`.
+pub(crate) struct ConsumedWaiter<'a> {
+    log: &'a JobLog,
+}
+
+impl Drop for ConsumedWaiter<'_> {
+    fn drop(&mut self) {
+        self.log.consumed_waiters.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct LogInner {
@@ -184,12 +221,85 @@ impl JobLog {
                 finished: false,
                 primary: None,
             }),
-            changed: watch::channel(base_sequence).0,
-            consumed: watch::channel(0).0,
+            changed: Arc::new(Notify::new()),
+            followers: AtomicUsize::new(0),
+            consumed: Notify::new(),
+            consumed_waiters: AtomicUsize::new(0),
             budget,
             max_events: max_events.max(2),
             max_bytes,
             compactable: AtomicBool::new(false),
+        }
+    }
+
+    /// Constructs a primary-consumed log pre-populated with `Accepted` and
+    /// `Assigned` in one budget reservation and zero mutex acquisitions for the
+    /// direct ephemeral `Invoke` fast path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_direct_assigned(
+        job_id: String,
+        base_sequence: u64,
+        max_events: usize,
+        max_bytes: usize,
+        budget: Arc<ByteBudget>,
+        attempt_id: String,
+        worker_id: String,
+        at_ms: u64,
+    ) -> (Arc<Self>, LogSubscription) {
+        let total = 2 * EVENT_OVERHEAD;
+        if !budget.try_reserve(total) {
+            budget.force_reserve(total);
+        }
+        let accepted = ExecutionEvent {
+            job_id: job_id.clone(),
+            sequence: base_sequence + 1,
+            attempt_id: None,
+            at_ms,
+            kind: EventKind::Accepted,
+        };
+        let assigned = ExecutionEvent {
+            job_id: job_id.clone(),
+            sequence: base_sequence + 2,
+            attempt_id: Some(attempt_id),
+            at_ms,
+            kind: EventKind::Assigned {
+                worker_id,
+                attempt_number: 1,
+            },
+        };
+        let mut events = VecDeque::with_capacity(4);
+        events.push_back((accepted.clone(), EVENT_OVERHEAD));
+        events.push_back((assigned.clone(), EVENT_OVERHEAD));
+        let lifecycle = vec![accepted, assigned];
+        let log = Arc::new(Self {
+            job_id,
+            inner: Mutex::new(LogInner {
+                events,
+                lifecycle,
+                bytes: total,
+                last_sequence: base_sequence + 2,
+                evicted_through: 0,
+                finished: false,
+                primary: Some(0),
+            }),
+            changed: Arc::new(Notify::new()),
+            followers: AtomicUsize::new(1),
+            consumed: Notify::new(),
+            consumed_waiters: AtomicUsize::new(0),
+            budget,
+            max_events: max_events.max(2),
+            max_bytes,
+            compactable: AtomicBool::new(false),
+        });
+        let sub = LogSubscription {
+            log: Arc::clone(&log),
+        };
+        (log, sub)
+    }
+
+    fn notify_consumed(&self) {
+        if self.consumed_waiters.load(Ordering::Acquire) > 0 {
+            self.consumed.notify_waiters();
         }
     }
 
@@ -201,8 +311,8 @@ impl JobLog {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, LogInner> {
-        self.inner.lock().expect("job log poisoned")
+    fn lock(&self) -> MutexGuard<'_, LogInner> {
+        self.inner.lock()
     }
 
     fn evict_front(&self, inner: &mut LogInner) -> ExecutionEvent {
@@ -285,7 +395,7 @@ impl JobLog {
         self.push(&mut inner, event, size);
         inner.finished = finished;
         drop(inner);
-        self.changed.send_replace(sequence);
+        self.changed.notify_waiters();
         sequence
     }
 
@@ -296,11 +406,15 @@ impl JobLog {
     /// consumer, where the event is dropped and followers see a cursor gap.
     /// Followers are not woken here: on `Ok` the caller passes the sequence to
     /// `notify_appended` once it has let go of its own locks.
-    pub(crate) fn append_output(
+    ///
+    /// Takes `data` and `metadata` by mutable reference so the fast path moves
+    /// them into the event without cloning, while leaving them intact on `Err`
+    /// for retries.
+    pub(crate) fn append_output_owned(
         &self,
         attempt_id: &str,
-        data: &Bytes,
-        metadata: &Metadata,
+        data: &mut Bytes,
+        metadata: &mut Metadata,
         progress: bool,
         at_ms: u64,
         last_try: bool,
@@ -318,8 +432,8 @@ impl JobLog {
                 attempt_id: Some(attempt_id.to_owned()),
                 at_ms,
                 kind: EventKind::Output {
-                    data: data.clone(),
-                    metadata: metadata.clone(),
+                    data: std::mem::take(data),
+                    metadata: std::mem::take(metadata),
                     progress,
                 },
             };
@@ -339,9 +453,31 @@ impl JobLog {
         Ok(sequence)
     }
 
-    /// Wakes followers for output appended up to `sequence`.
-    pub(crate) fn notify_appended(&self, sequence: u64) {
-        self.changed.send_replace(sequence);
+    #[cfg(test)]
+    pub(crate) fn append_output(
+        &self,
+        attempt_id: &str,
+        data: &Bytes,
+        metadata: &Metadata,
+        progress: bool,
+        at_ms: u64,
+        last_try: bool,
+    ) -> Result<u64, LogFull> {
+        let mut owned_data = data.clone();
+        let mut owned_meta = metadata.clone();
+        self.append_output_owned(
+            attempt_id,
+            &mut owned_data,
+            &mut owned_meta,
+            progress,
+            at_ms,
+            last_try,
+        )
+    }
+
+    /// Wakes followers for newly appended output.
+    pub(crate) fn notify_appended(&self) {
+        self.changed.notify_waiters();
     }
 
     /// Management inspection snapshot: preserves lifecycle events (`Accepted`,
@@ -374,69 +510,77 @@ impl JobLog {
     /// `after` that was already dropped gives `Err` with the oldest readable
     /// sequence.
     pub(crate) fn read_after(&self, after: u64) -> Result<(Vec<ExecutionEvent>, bool), u64> {
-        self.read_after_for_primary(after, false)
-            .map(|(events, finished, _)| (events, finished))
+        let mut buf = VecDeque::new();
+        let (finished, _) = self.read_after_into(after, false, &mut buf)?;
+        Ok((buf.into(), finished))
     }
 
-    /// Same as `read_after`, and when `track_primary` is true with a single
-    /// non-terminal event, marks that event consumed under the same lock.
-    pub(crate) fn read_after_for_primary(
+    /// Appends events after `after` into `out` (reusing its allocation), and
+    /// when `track_primary` is true with a single non-terminal event, marks
+    /// that event consumed under the same lock. Returns `(finished, already_marked)`.
+    pub(crate) fn read_after_into(
         &self,
         after: u64,
         track_primary: bool,
-    ) -> Result<(Vec<ExecutionEvent>, bool, bool), u64> {
-        let (events, finished, marked) = {
+        out: &mut VecDeque<ExecutionEvent>,
+    ) -> Result<(bool, bool), u64> {
+        let (finished, marked, added) = {
             let mut inner = self.lock();
             if after != 0 && after < inner.evicted_through {
                 return Err(inner.evicted_through + 1);
             }
             if after >= inner.last_sequence {
-                return Ok((Vec::new(), inner.finished, false));
+                return Ok((inner.finished, false));
             }
             let start = inner
                 .events
                 .partition_point(|(event, _)| event.sequence <= after);
-            let mut events = Vec::with_capacity(inner.events.len() - start);
+            let count = inner.events.len() - start;
+            out.reserve(count);
             for (event, _) in inner.events.range(start..) {
-                events.push(event.clone());
+                out.push_back(event.clone());
             }
-            let mut marked = None;
+            let mut marked = false;
             if track_primary
-                && events.len() == 1
-                && !matches!(events[0].kind, EventKind::Finished { .. })
+                && count == 1
+                && let Some(first) = out.back()
+                && !matches!(first.kind, EventKind::Finished { .. })
                 && let Some(consumed) = inner.primary.as_mut()
-                && events[0].sequence > *consumed
+                && first.sequence > *consumed
             {
-                *consumed = events[0].sequence;
-                marked = Some(events[0].sequence);
+                *consumed = first.sequence;
+                marked = true;
             }
-            (events, inner.finished, marked)
+            (inner.finished, marked, count)
         };
-        if let Some(sequence) = marked
-            && self.consumed.receiver_count() > 0
-        {
-            self.consumed.send_replace(sequence);
+        if marked {
+            self.notify_consumed();
         }
-        let already_marked = track_primary && events.len() == 1;
-        Ok((events, finished, already_marked))
+        let already_marked = track_primary && added == 1;
+        Ok((finished, already_marked))
     }
 
-    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
-        self.changed.subscribe()
+    pub(crate) fn subscribe(self: &Arc<Self>) -> LogSubscription {
+        self.followers.fetch_add(1, Ordering::AcqRel);
+        LogSubscription {
+            log: Arc::clone(self),
+        }
     }
 
-    pub(crate) fn subscribe_consumed(&self) -> watch::Receiver<u64> {
-        self.consumed.subscribe()
+    pub(crate) fn register_consumed_waiter(&self) -> ConsumedWaiter<'_> {
+        self.consumed_waiters.fetch_add(1, Ordering::AcqRel);
+        ConsumedWaiter { log: self }
+    }
+
+    pub(crate) fn notified_consumed(&self) -> Notified<'_> {
+        self.consumed.notified()
     }
 
     pub(crate) fn set_primary(&self, enabled: bool) {
         let mut inner = self.lock();
         inner.primary = enabled.then_some(0);
         drop(inner);
-        if self.consumed.receiver_count() > 0 {
-            self.consumed
-                .send_modify(|value| *value = value.wrapping_add(1));
-        }
+        self.notify_consumed();
     }
 
     pub(crate) fn mark_consumed(&self, sequence: u64) {
@@ -448,11 +592,9 @@ impl JobLog {
         }
         drop(inner);
         // Only a writer that found this consumer behind waits for it, and it
-        // subscribes before retrying its append under the log lock: either
-        // that retry sees this progress, or the subscription is counted here.
-        if self.consumed.receiver_count() > 0 {
-            self.consumed.send_replace(sequence);
-        }
+        // registers its waiter before retrying its append under the log lock:
+        // either that retry sees this progress, or `consumed_waiters > 0` here.
+        self.notify_consumed();
     }
 
     fn compact_locked(&self, inner: &mut LogInner, removed: &mut Vec<ExecutionEvent>) {
@@ -497,16 +639,13 @@ impl JobLog {
             inner.finished
         };
         drop(removed);
-        if self.consumed.receiver_count() > 0 {
-            self.consumed
-                .send_modify(|value| *value = value.wrapping_add(1));
-        }
+        self.notify_consumed();
         finished
     }
 
-    /// Readers currently following this log; each holds a `changed` receiver.
+    /// Readers currently following this log; each holds a `LogSubscription`.
     pub(crate) fn follower_count(&self) -> usize {
-        self.changed.receiver_count()
+        self.followers.load(Ordering::Acquire)
     }
 
     /// An ephemeral job finished: its log keeps only the outcome once nobody
@@ -516,10 +655,7 @@ impl JobLog {
     pub(crate) fn finish_ephemeral(&self) -> Vec<ExecutionEvent> {
         self.compactable.store(true, Ordering::Release);
         let removed = self.compact_if_unfollowed();
-        if self.consumed.receiver_count() > 0 {
-            self.consumed
-                .send_modify(|value| *value = value.wrapping_add(1));
-        }
+        self.notify_consumed();
         removed
     }
 
@@ -538,7 +674,7 @@ impl JobLog {
 
 impl Drop for JobLog {
     fn drop(&mut self) {
-        let bytes = self.inner.get_mut().map(|inner| inner.bytes).unwrap_or(0);
+        let bytes = self.inner.get_mut().bytes;
         self.budget.release(bytes);
     }
 }
@@ -641,18 +777,18 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    #[test]
-    fn consumer_progress_is_sent_only_to_a_waiting_writer() {
+    #[tokio::test]
+    async fn consumer_progress_is_sent_only_to_a_waiting_writer() {
         let log = log(4, 1 << 20, 1 << 20);
         log.set_primary(true);
-        let before = *log.consumed.borrow();
-        // Nobody waits for this consumer: nothing to send.
+        // Nobody waits for this consumer: waiter count stays zero.
         log.mark_consumed(5);
-        assert_eq!(*log.consumed.borrow(), before);
-        let mut writer = log.subscribe_consumed();
+        assert_eq!(log.consumed_waiters.load(Ordering::Acquire), 0);
+        let _waiter = log.register_consumed_waiter();
+        let mut notified = std::pin::pin!(log.notified_consumed());
+        notified.as_mut().enable();
         log.mark_consumed(6);
-        assert!(writer.has_changed().unwrap());
-        assert_eq!(*writer.borrow_and_update(), 6);
+        notified.await;
     }
 
     #[test]
@@ -712,7 +848,7 @@ mod tests {
     #[test]
     fn a_followed_log_is_compacted_by_its_last_follower() {
         let budget = Arc::new(ByteBudget::new(1 << 20));
-        let log = JobLog::new("f".into(), 100, 100, 1 << 20, budget);
+        let log = Arc::new(JobLog::new("f".into(), 100, 100, 1 << 20, budget));
         let first = log.subscribe();
         let second = log.subscribe();
         log.append(None, EventKind::Accepted, 0);
@@ -734,10 +870,8 @@ mod tests {
             "followers still reading"
         );
         drop(first);
-        log.compact_if_unfollowed();
         assert_eq!(log.read_after(0).unwrap().0.len(), 3, "one follower left");
         drop(second);
-        log.compact_if_unfollowed();
         assert_eq!(log.read_after(0).unwrap().0.len(), 1);
     }
 

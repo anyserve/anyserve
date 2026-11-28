@@ -14,12 +14,20 @@ pub(crate) mod state;
 pub(crate) mod worker;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, VecDeque};
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
+use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use ahash::{AHashMap, AHashSet};
+use arc_swap::{ArcSwap, Guard as ArcSwapGuard};
+use futures::Stream;
+use parking_lot::{Mutex, MutexGuard};
+use pin_project_lite::pin_project;
 use tokio::sync::{Notify, oneshot, watch};
 
 use self::api::{
@@ -28,7 +36,7 @@ use self::api::{
     JobView, LiveRuntimeSettings, ObjectPreview, PoolStats, RuntimeConfig, RuntimeSnapshot,
     RuntimeStats, SubmitOutcome, SubmitRequest, WorkerStats, WorkerView, codes,
 };
-use self::events::{ByteBudget, JobLog, Permit};
+use self::events::{ByteBudget, JobLog, LogSubscription, Permit};
 use self::input::InputLog;
 use self::machine::{LeaseEnd, ms};
 use self::state::{Phase, State, TerminalPlan};
@@ -70,9 +78,9 @@ const TIMER_COMPACT_SLACK: usize = 4_096;
 struct TimerHeap {
     /// Due time and id; an id missing from `keys` was cancelled or fired.
     heap: BinaryHeap<Reverse<(u64, u64)>>,
-    keys: HashMap<u64, TimerKey>,
+    keys: AHashMap<u64, TimerKey>,
     /// Cancelled ids whose heap entries are still in place.
-    cancelled: HashSet<u64>,
+    cancelled: AHashSet<u64>,
     next: u64,
 }
 
@@ -93,7 +101,7 @@ impl Timers {
     }
 
     fn lock(&self) -> MutexGuard<'_, TimerHeap> {
-        self.inner.lock().expect("timers poisoned")
+        self.inner.lock()
     }
 
     /// Schedules `key` and returns the id that `cancel` takes.
@@ -174,7 +182,7 @@ impl Timers {
 
 pub(crate) struct Inner {
     pub(crate) config: RuntimeConfig,
-    pub(crate) live: RwLock<LiveRuntimeSettings>,
+    pub(crate) live: ArcSwap<LiveRuntimeSettings>,
     pub(crate) generation: AtomicU64,
     pub(crate) leader_active: AtomicBool,
     pub(crate) lease_lost: AtomicBool,
@@ -218,6 +226,10 @@ impl DerefMut for StateGuard<'_> {
 impl Drop for StateGuard<'_> {
     fn drop(&mut self) {
         if let Some(mut st) = self.state.take() {
+            if st.released.is_empty() {
+                drop(st);
+                return;
+            }
             let released = std::mem::take(&mut st.released);
             drop(st);
             drop(released);
@@ -226,13 +238,13 @@ impl Drop for StateGuard<'_> {
 }
 
 impl Inner {
-    pub(crate) fn live(&self) -> RwLockReadGuard<'_, LiveRuntimeSettings> {
-        self.live.read().expect("live runtime settings poisoned")
+    pub(crate) fn live(&self) -> ArcSwapGuard<Arc<LiveRuntimeSettings>> {
+        self.live.load()
     }
 
     pub(crate) fn lock(&self) -> StateGuard<'_> {
         StateGuard {
-            state: Some(self.state.lock().expect("runtime state poisoned")),
+            state: Some(self.state.lock()),
         }
     }
 
@@ -403,10 +415,7 @@ impl Inner {
                 self.dispatch_locked(&mut st, now);
             }
         }
-        if matches!(
-            *self.journal_status.lock().expect("journal status poisoned"),
-            JournalStatus::Degraded(_)
-        ) {
+        if matches!(*self.journal_status.lock(), JournalStatus::Degraded(_)) {
             let _ = self.commit(crate::journal::JournalOp::Probe, |_, _| {});
         }
     }
@@ -449,11 +458,8 @@ impl Inner {
         }
         self.recover(leadership.recovery);
         let lost_rx = leadership.lease.lost();
-        *self
-            .lease_handle
-            .lock()
-            .expect("lease handle mutex poisoned") = Some(leadership.lease);
-        *self.journal_status.lock().expect("journal status poisoned") = JournalStatus::Healthy;
+        *self.lease_handle.lock() = Some(leadership.lease);
+        *self.journal_status.lock() = JournalStatus::Healthy;
         self.leader_active.store(true, Ordering::Release);
         self.leadership_tx.send_replace(true);
         tokio::spawn(lease_loss_watcher(
@@ -471,11 +477,13 @@ impl Inner {
         self.leader_active.store(false, Ordering::Release);
         self.leadership_tx.send_replace(false);
         self.stop_tx.send_replace(true);
-        *self.journal_status.lock().expect("journal status poisoned") =
-            JournalStatus::Failed(reason.to_string());
+        *self.journal_status.lock() = JournalStatus::Failed(reason.to_string());
         {
             let mut st = self.lock();
             st.shutting_down = true;
+            for lease in st.leases.values() {
+                lease.stream.deactivate();
+            }
             for session in st.sessions.values_mut() {
                 session.tx = None;
             }
@@ -693,85 +701,129 @@ pub struct Runtime {
     pub(crate) inner: Arc<Inner>,
 }
 
-/// One reader of a job log. Its receiver counts it as a follower; when the
-/// reader finishes or goes away, the last follower of a finished ephemeral job
-/// compacts the log.
-struct Follower {
-    log: Arc<JobLog>,
-    changes: Option<watch::Receiver<u64>>,
+pin_project! {
+    /// Direct `Stream` reader over a `JobLog`, avoiding `async_stream` and
+    /// reusing a single `VecDeque` buffer across polls.
+    struct LogFollowStream {
+        sub: LogSubscription,
+        after: u64,
+        track_consumed: bool,
+        skip_gaps: bool,
+        pending: VecDeque<ExecutionEvent>,
+        pending_consumed_inline: bool,
+        finished: bool,
+        done: bool,
+        #[pin]
+        notified: Option<tokio::sync::futures::OwnedNotified>,
+    }
 }
 
-impl Follower {
-    fn mark_seen(&mut self) {
-        if let Some(changes) = self.changes.as_mut() {
-            changes.borrow_and_update();
+impl Stream for LogFollowStream {
+    type Item = Result<ExecutionEvent, RuntimeError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.done {
+            return Poll::Ready(None);
         }
-    }
-
-    async fn changed(&mut self) -> bool {
-        match self.changes.as_mut() {
-            Some(changes) => changes.changed().await.is_ok(),
-            None => false,
-        }
-    }
-}
-
-impl Drop for Follower {
-    fn drop(&mut self) {
-        self.changes.take();
-        self.log.compact_if_unfollowed();
-    }
-}
-
-/// Follows `log` from `after` with a receiver subscribed by the caller (while
-/// it held the runtime lock, so a follower is counted before its first poll).
-/// With `skip_gaps`, events dropped from the log are skipped instead of ending
-/// the stream with `CursorExpired`.
-fn follow(
-    log: Arc<JobLog>,
-    changes: watch::Receiver<u64>,
-    after: u64,
-    track_consumed: bool,
-    skip_gaps: bool,
-) -> EventStream {
-    EventStream::new(async_stream::stream! {
-        let mut follower = Follower {
-            log: Arc::clone(&log),
-            changes: Some(changes),
-        };
-        let mut after = after;
         loop {
-            follower.mark_seen();
-            match log.read_after_for_primary(after, track_consumed) {
-                Err(oldest) if skip_gaps => {
-                    after = oldest - 1;
+            if let Some(event) = this.pending.pop_front() {
+                *this.after = event.sequence;
+                let last = matches!(event.kind, EventKind::Finished { .. });
+                if *this.track_consumed && !*this.pending_consumed_inline && !last {
+                    this.sub.log.mark_consumed(event.sequence);
+                }
+                if last {
+                    *this.done = true;
+                }
+                return Poll::Ready(Some(Ok(event)));
+            }
+            if *this.finished {
+                *this.done = true;
+                return Poll::Ready(None);
+            }
+            if let Some(notified) = this.notified.as_mut().as_pin_mut() {
+                match notified.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(()) => this.notified.set(None),
+                }
+            }
+            match this
+                .sub
+                .log
+                .read_after_into(*this.after, *this.track_consumed, this.pending)
+            {
+                Err(oldest) if *this.skip_gaps => {
+                    *this.after = oldest - 1;
                     continue;
                 }
                 Err(oldest) => {
-                    yield Err(RuntimeError::cursor_expired(oldest));
-                    return;
+                    *this.done = true;
+                    return Poll::Ready(Some(Err(RuntimeError::cursor_expired(oldest))));
                 }
-                Ok((events, finished, consumed_inline)) => {
-                    for event in events {
-                        after = event.sequence;
-                        let last = matches!(event.kind, EventKind::Finished { .. });
-                        if track_consumed && !consumed_inline && !last {
-                            log.mark_consumed(event.sequence);
-                        }
-                        yield Ok(event);
-                        if last {
-                            return;
-                        }
-                    }
-                    if finished {
-                        return;
+                Ok((finished, consumed_inline)) => {
+                    *this.finished = finished;
+                    *this.pending_consumed_inline = consumed_inline;
+                    if !this.pending.is_empty() || *this.finished {
+                        continue;
                     }
                 }
             }
-            if !follower.changed().await {
-                return;
+            // Register waiter BEFORE re-checking the log so no append between
+            // the empty read and waiter registration can be missed.
+            this.notified.set(Some(this.sub.notified()));
+            if let Some(notified) = this.notified.as_mut().as_pin_mut() {
+                let _ = notified.enable();
+            }
+            match this
+                .sub
+                .log
+                .read_after_into(*this.after, *this.track_consumed, this.pending)
+            {
+                Err(oldest) if *this.skip_gaps => {
+                    this.notified.set(None);
+                    *this.after = oldest - 1;
+                    continue;
+                }
+                Err(oldest) => {
+                    this.notified.set(None);
+                    *this.done = true;
+                    return Poll::Ready(Some(Err(RuntimeError::cursor_expired(oldest))));
+                }
+                Ok((finished, consumed_inline)) => {
+                    *this.finished = finished;
+                    *this.pending_consumed_inline = consumed_inline;
+                    if !this.pending.is_empty() || *this.finished {
+                        this.notified.set(None);
+                        continue;
+                    }
+                }
+            }
+            if let Some(notified) = this.notified.as_mut().as_pin_mut() {
+                match notified.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(()) => this.notified.set(None),
+                }
             }
         }
+    }
+}
+
+/// Follows `log` from `after` with a subscription acquired by the caller (while
+/// it held the runtime lock, so a follower is counted before its first poll).
+/// With `skip_gaps`, events dropped from the log are skipped instead of ending
+/// the stream with `CursorExpired`.
+fn follow(sub: LogSubscription, after: u64, track_consumed: bool, skip_gaps: bool) -> EventStream {
+    EventStream::new(LogFollowStream {
+        sub,
+        after,
+        track_consumed,
+        skip_gaps,
+        pending: VecDeque::new(),
+        pending_consumed_inline: false,
+        finished: false,
+        done: false,
+        notified: None,
     })
 }
 
@@ -886,7 +938,7 @@ impl Runtime {
             result_budget: Arc::new(ByteBudget::new(result_budget)),
             me: me.clone(),
             config,
-            live: RwLock::new(live_initial),
+            live: ArcSwap::from_pointee(live_initial),
         });
         if let Some(leadership) = initial_leadership {
             inner.activate_leadership(leadership);
@@ -911,7 +963,7 @@ impl Runtime {
     }
 
     pub fn live_settings(&self) -> LiveRuntimeSettings {
-        self.inner.live().clone()
+        (**self.inner.live()).clone()
     }
 
     /// Validates and applies updated operational settings immediately without
@@ -922,14 +974,7 @@ impl Runtime {
     ) -> Result<LiveRuntimeSettings, RuntimeError> {
         next.validate(self.inner.config.max_attempts_limit)?;
         let max_terminal = next.max_terminal_jobs;
-        {
-            let mut guard = self
-                .inner
-                .live
-                .write()
-                .expect("live runtime settings poisoned");
-            *guard = next.clone();
-        }
+        self.inner.live.store(Arc::new(next.clone()));
         {
             let mut st = self.inner.lock();
             let now = now_ms();
@@ -949,14 +994,7 @@ impl Runtime {
     pub fn reset_live_settings(&self) -> LiveRuntimeSettings {
         let baseline = self.baseline_settings();
         let max_terminal = baseline.max_terminal_jobs;
-        {
-            let mut guard = self
-                .inner
-                .live
-                .write()
-                .expect("live runtime settings poisoned");
-            *guard = baseline.clone();
-        }
+        self.inner.live.store(Arc::new(baseline.clone()));
         {
             let mut st = self.inner.lock();
             let now = now_ms();
@@ -1299,7 +1337,7 @@ impl Runtime {
                 Arc::clone(&self.inner.input_budget),
             ))
         });
-        let (log, changes) = {
+        let (log, sub) = {
             let mut st = self.inner.lock();
             let now = now_ms();
             let input_permit = self.inner.admit(&st, namespace, &spec)?;
@@ -1334,16 +1372,16 @@ impl Runtime {
                     let iface = job.spec.demand.interface.clone();
                     let log = Arc::clone(&job.log);
                     log.set_primary(true);
-                    let changes = log.subscribe();
+                    let sub = log.subscribe();
                     self.inner
                         .dispatch_pair_locked(&mut st, namespace, &iface, now);
-                    (log, changes)
+                    (log, sub)
                 }
             }
         };
         Ok(Execution {
             job_id: raw_id,
-            events: follow(Arc::clone(&log), changes, 0, true, false),
+            events: follow(sub, 0, true, false),
             input: input.map(|log| InputSink { log }),
             _guard: CancelOnDrop {
                 me: Arc::downgrade(&self.inner),
@@ -1374,14 +1412,8 @@ impl Runtime {
         if let Some(job) = st.jobs.get(&scoped_id)
             && !job.cold_terminal
         {
-            let changes = job.log.subscribe();
-            return Ok(follow(
-                Arc::clone(&job.log),
-                changes,
-                after_sequence,
-                false,
-                false,
-            ));
+            let sub = job.log.subscribe();
+            return Ok(follow(sub, after_sequence, false, false));
         }
         if self.inner.journal.is_none() {
             return Err(RuntimeError::not_found("job", job_id));
@@ -1897,8 +1929,8 @@ impl Runtime {
         let [queued, running, succeeded, failed, cancelled] = counts;
         let generation = st.generation;
         let mut sessions_count = 0usize;
-        let mut pools_tmp: HashMap<(&str, &str, &str), PoolStats> = HashMap::new();
-        let mut session_lease_ifaces: HashMap<&str, usize> = HashMap::new();
+        let mut pools_tmp: AHashMap<(&str, &str, &str), PoolStats> = AHashMap::new();
+        let mut session_lease_ifaces: AHashMap<&str, usize> = AHashMap::new();
         let mut workers = WorkerStats::default();
         for session in st.sessions.values() {
             if namespace_filter.is_some_and(|ns| session.namespace != ns) {
@@ -2063,12 +2095,7 @@ impl Runtime {
         if let Some(journal) = &self.inner.journal {
             journal.close().await;
         }
-        let lease = self
-            .inner
-            .lease_handle
-            .lock()
-            .expect("lease handle mutex poisoned")
-            .take();
+        let lease = self.inner.lease_handle.lock().take();
         if let Some(lease) = lease {
             lease.relinquish().await;
         }

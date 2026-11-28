@@ -6,8 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ahash.workspace = true
 anyhow.workspace = true
 anyserve-proto = { path = "../anyserve-proto" }
+arc-swap.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -15,6 +17,8 @@ bytes.workspace = true
 fs2.workspace = true
 futures.workspace = true
 http.workspace = true
+parking_lot.workspace = true
+pin-project-lite.workspace = true
 prost.workspace = true
 reqwest.workspace = true
 serde.workspace = true

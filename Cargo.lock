@@ -242,9 +242,11 @@ dependencies = [
 name = "anyserve-core"
 version = "0.6.0"
 dependencies = [
+ "ahash",
  "anyhow",
  "anyserve-client",
  "anyserve-proto",
+ "arc-swap",
  "async-stream",
  "axum",
  "base64 0.22.1",
@@ -253,6 +255,8 @@ dependencies = [
  "futures",
  "http",
  "libsqlite3-sys",
+ "parking_lot",
+ "pin-project-lite",
  "prost",
  "reqwest 0.12.28",
  "serde",

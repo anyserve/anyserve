@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyserve_proto::v2 as pb;
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use super::Runtime;
 use super::api::{
@@ -18,7 +18,7 @@ use super::events::LogFull;
 use super::identity::outcome_digest;
 use super::input::InputLog;
 use super::machine::{LeaseEnd, new_id};
-use super::state::{FinishStatus, Phase, Session, TerminalPlan};
+use super::state::{AttemptStream, FinishStatus, Phase, Session, TerminalPlan};
 use crate::error::RuntimeError;
 use crate::now_ms;
 
@@ -94,6 +94,7 @@ pub(crate) enum AttemptLink {
         lease_id: String,
         resume_from: u64,
         inputs: Option<InputPlan>,
+        stream: Arc<AttemptStream>,
     },
     /// The lease already completed (possibly in an earlier generation): the
     /// worker may only resend its result, which is compared with the receipt.
@@ -548,10 +549,9 @@ impl Runtime {
                         let job_id = lease.job_id.clone();
                         let preemptable = st.jobs.get(&job_id).is_some_and(|job| {
                             matches!(job.phase, Phase::Assigned | Phase::Running)
-                                && job
-                                    .attempt
-                                    .as_ref()
-                                    .is_some_and(|a| a.lease_id == lease_id && !a.exposed)
+                                && job.attempt.as_ref().is_some_and(|a| {
+                                    a.lease_id == lease_id && a.stream.try_deactivate_if_unexposed()
+                                })
                         });
                         if preemptable {
                             inner.attempt_ended_locked(
@@ -776,7 +776,8 @@ impl Runtime {
             else {
                 return Err(RuntimeError::stale("lease is not the job's current attempt").into());
             };
-            let resume_from = attempt.last_frame_seq;
+            let resume_from = attempt.stream.last_frame_seq();
+            let stream = Arc::clone(&attempt.stream);
             let inputs = attempt.inputs_via_attempt.then(|| InputPlan {
                 objects: job.spec.inputs.clone(),
                 params: job.spec.params.clone(),
@@ -793,6 +794,7 @@ impl Runtime {
                     lease_id: open.lease_id.clone(),
                     resume_from,
                     inputs,
+                    stream,
                 },
                 resume_from,
             )));
@@ -810,11 +812,14 @@ impl Runtime {
         Ok(None)
     }
 
-    /// Appends one output frame. Waits while a streamed consumer is behind,
-    /// and fails the job if it stays behind for `consumer_stall_timeout`.
-    pub(crate) async fn push_frame(
+    /// Appends one output frame using the attempt's direct stream handle,
+    /// avoiding the global runtime state mutex on the fast path. Waits while a
+    /// streamed consumer is behind, and fails the job if it stays behind for
+    /// `consumer_stall_timeout`.
+    pub(crate) async fn push_frame_live(
         &self,
         lease_id: &str,
+        stream: &Arc<AttemptStream>,
         mut frame: pb::Frame,
     ) -> Result<u64, RuntimeError> {
         let limits = &self.inner.config.limits;
@@ -825,115 +830,184 @@ impl Runtime {
                 limits.max_chunk_bytes
             )));
         }
-        let metadata = to_metadata(std::mem::take(&mut frame.metadata));
-        if metadata_size(&metadata) > limits.max_metadata_bytes as usize {
-            return Err(RuntimeError::invalid("frame metadata is too large"));
-        }
-        let stall = self.inner.live().consumer_stall_timeout;
-        let deadline = tokio::time::Instant::now() + stall;
+        let mut metadata = if frame.metadata.is_empty() {
+            Metadata::new()
+        } else {
+            let meta = to_metadata(std::mem::take(&mut frame.metadata));
+            if metadata_size(&meta) > limits.max_metadata_bytes as usize {
+                return Err(RuntimeError::invalid("frame metadata is too large"));
+            }
+            meta
+        };
         // Terminal jobs are evicted for room at most once per frame.
         let mut reclaimed = false;
-        // Taken only once an append has failed, and followed by one more try:
-        // consumer progress after that try always wakes this writer.
-        let mut consumed: Option<watch::Receiver<u64>> = None;
+        let mut stall_deadline: Option<(Duration, tokio::time::Instant)> = None;
+        enum Step {
+            Reclaim(u64),
+            Wait(Arc<super::events::JobLog>),
+        }
         loop {
             let now = now_ms();
-            let (job_id, cause) = {
-                let mut st = self.inner.lock();
-                let lease = st
-                    .leases
-                    .get(lease_id)
-                    .filter(|lease| !lease.cancelling)
-                    .ok_or_else(|| RuntimeError::stale("lease is no longer active"))?;
-                let job_id = lease.job_id.clone();
-                let mut job = st.jobs.get_mut(&job_id).expect("leased job");
-                let attempt = job
-                    .attempt
-                    .as_ref()
-                    .filter(|attempt| attempt.lease_id == lease_id)
-                    .ok_or_else(|| RuntimeError::stale("lease is not the job's current attempt"))?;
-                if frame.sequence <= attempt.last_frame_seq {
-                    return Ok(attempt.last_frame_seq);
+            let step = {
+                let mut st = stream.state.lock();
+                if !st.active {
+                    return Err(RuntimeError::stale("lease is no longer active"));
                 }
-                if frame.sequence != attempt.last_frame_seq + 1 {
+                if frame.sequence <= st.last_frame_seq {
+                    return Ok(st.last_frame_seq);
+                }
+                if frame.sequence != st.last_frame_seq + 1 {
                     return Err(RuntimeError::invalid(format!(
                         "frame sequence {} does not follow {}",
-                        frame.sequence, attempt.last_frame_seq
+                        frame.sequence, st.last_frame_seq
                     )));
                 }
-                loop {
-                    let append_res = {
-                        let attempt = job.attempt.as_ref().expect("attempt");
-                        job.log.append_output(
-                            &attempt.attempt_id,
-                            &frame.data,
-                            &metadata,
-                            frame.progress,
-                            now,
-                            reclaimed,
-                        )
-                    };
-                    match append_res {
-                        Ok(sequence) => {
-                            let streamed = job.streamed;
-                            let attempt = job.attempt.as_mut().expect("attempt");
-                            attempt.last_frame_seq = frame.sequence;
-                            // A live caller may read it any moment: never
-                            // retry this attempt behind its back.
-                            if streamed && !frame.progress {
-                                attempt.exposed = true;
-                            }
-                            if matches!(job.phase, Phase::Assigned) {
-                                job.phase = Phase::Running;
-                            }
-                            let log = Arc::clone(&job.log);
-                            drop(st);
-                            // Followers wake once the lock is free.
-                            log.notify_appended(sequence);
-                            return Ok(frame.sequence);
+                let Some(log) = st.log.as_ref().map(Arc::clone) else {
+                    return Err(RuntimeError::stale("lease is no longer active"));
+                };
+                match log.append_output_owned(
+                    &stream.attempt_id,
+                    &mut frame.data,
+                    &mut metadata,
+                    frame.progress,
+                    now,
+                    reclaimed,
+                ) {
+                    Ok(_) => {
+                        st.last_frame_seq = frame.sequence;
+                        // A live caller may read it any moment: never
+                        // retry this attempt behind its back.
+                        if stream.streamed && !frame.progress {
+                            st.exposed = true;
                         }
-                        Err(LogFull::BudgetFull) if !reclaimed => {
-                            let needed = (frame.data.len() + metadata_size(&metadata) + 128) as u64;
-                            self.inner.reclaim_locked(&mut st, needed, false);
-                            reclaimed = true;
-                            job = st.jobs.get_mut(&job_id).expect("leased job");
-                        }
-                        Err(_) if consumed.is_none() => {
-                            consumed = Some(job.log.subscribe_consumed());
-                        }
-                        Err(cause) => break (job_id, cause),
+                        drop(st);
+                        // Followers wake once the lock is free.
+                        log.notify_appended();
+                        return Ok(frame.sequence);
                     }
+                    Err(LogFull::BudgetFull) if !reclaimed => {
+                        let needed = (frame.data.len() + metadata_size(&metadata) + 128) as u64;
+                        Step::Reclaim(needed)
+                    }
+                    Err(_) => Step::Wait(log),
                 }
             };
-            let consumed = consumed.as_mut().expect("subscribed before waiting");
-            // The frame stays unacknowledged meanwhile, so the worker's window
-            // stops it from sending more.
-            let woke = tokio::time::timeout_at(deadline, async {
-                match cause {
-                    LogFull::ConsumerBehind => consumed.changed().await.is_ok(),
-                    // Room comes from other jobs: retry periodically, and on
-                    // this job's consumer progress.
-                    LogFull::BudgetFull => tokio::select! {
-                        changed = consumed.changed() => changed.is_ok(),
-                        _ = tokio::time::sleep(BUDGET_RETRY) => true,
-                    },
+            match step {
+                Step::Reclaim(needed) => {
+                    // Release `stream.state` before taking `State` to preserve lock order.
+                    let mut st = self.inner.lock();
+                    self.inner.reclaim_locked(&mut st, needed, false);
+                    reclaimed = true;
                 }
-            })
-            .await;
-            match woke {
-                Ok(true) => continue,
-                Ok(false) => return Err(RuntimeError::stale("job ended")),
-                Err(_) if cause == LogFull::ConsumerBehind => {
-                    self.consumer_stalled(&job_id, lease_id, stall);
-                    return Err(RuntimeError::stale("the job's consumer stopped reading"));
-                }
-                // Other jobs held the budget throughout. The job is not failed
-                // here; the worker's Finish decides what happens next.
-                Err(_) => {
-                    return Err(RuntimeError::exhausted("event buffers stayed at capacity"));
+                Step::Wait(log) => {
+                    // Register our waiter and arm `Notify` BEFORE retrying once
+                    // under `stream.state`, so any consumer progress after the
+                    // retry is guaranteed to wake `notified`.
+                    let _waiter = log.register_consumed_waiter();
+                    let mut notified = std::pin::pin!(log.notified_consumed());
+                    notified.as_mut().enable();
+                    let retry_cause = {
+                        let mut st = stream.state.lock();
+                        if !st.active {
+                            return Err(RuntimeError::stale("lease is no longer active"));
+                        }
+                        if frame.sequence <= st.last_frame_seq {
+                            return Ok(st.last_frame_seq);
+                        }
+                        if frame.sequence != st.last_frame_seq + 1 {
+                            return Err(RuntimeError::invalid(format!(
+                                "frame sequence {} does not follow {}",
+                                frame.sequence, st.last_frame_seq
+                            )));
+                        }
+                        match log.append_output_owned(
+                            &stream.attempt_id,
+                            &mut frame.data,
+                            &mut metadata,
+                            frame.progress,
+                            now_ms(),
+                            reclaimed,
+                        ) {
+                            Ok(_) => {
+                                st.last_frame_seq = frame.sequence;
+                                if stream.streamed && !frame.progress {
+                                    st.exposed = true;
+                                }
+                                drop(st);
+                                log.notify_appended();
+                                return Ok(frame.sequence);
+                            }
+                            Err(cause) => cause,
+                        }
+                    };
+                    let (stall, deadline) = *stall_deadline.get_or_insert_with(|| {
+                        let stall = self.inner.live().consumer_stall_timeout;
+                        (stall, tokio::time::Instant::now() + stall)
+                    });
+                    // The frame stays unacknowledged meanwhile, so the worker's window
+                    // stops it from sending more.
+                    let woke = tokio::time::timeout_at(deadline, async {
+                        match retry_cause {
+                            LogFull::ConsumerBehind => {
+                                notified.await;
+                            }
+                            // Room comes from other jobs: retry periodically, and on
+                            // this job's consumer progress.
+                            LogFull::BudgetFull => tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep(BUDGET_RETRY) => {}
+                            },
+                        }
+                    })
+                    .await;
+                    match woke {
+                        Ok(()) => continue,
+                        Err(_) if retry_cause == LogFull::ConsumerBehind => {
+                            self.consumer_stalled(&stream.job_id, lease_id, stall);
+                            return Err(RuntimeError::stale("the job's consumer stopped reading"));
+                        }
+                        // Other jobs held the budget throughout. The job is not failed
+                        // here; the worker's Finish decides what happens next.
+                        Err(_) => {
+                            return Err(RuntimeError::exhausted(
+                                "event buffers stayed at capacity",
+                            ));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn push_frame(
+        &self,
+        lease_id: &str,
+        frame: pb::Frame,
+    ) -> Result<u64, RuntimeError> {
+        let stream = {
+            let mut st = self.inner.lock();
+            let lease = st
+                .leases
+                .get(lease_id)
+                .filter(|lease| !lease.cancelling)
+                .ok_or_else(|| RuntimeError::stale("lease is no longer active"))?;
+            let job_id = lease.job_id.clone();
+            let job = st.jobs.get_mut(&job_id).expect("leased job");
+            let attempt = job
+                .attempt
+                .as_ref()
+                .filter(|attempt| attempt.lease_id == lease_id)
+                .ok_or_else(|| RuntimeError::stale("lease is not the job's current attempt"))?;
+            let stream = Arc::clone(&attempt.stream);
+            if matches!(job.phase, Phase::Assigned) {
+                st.update_job(&job_id, |job| {
+                    job.phase = Phase::Running;
+                });
+            }
+            stream
+        };
+        self.push_frame_live(lease_id, &stream, frame).await
     }
 
     fn consumer_stalled(&self, job_id: &str, lease_id: &str, stall: Duration) {
@@ -1517,7 +1591,7 @@ mod tests {
             let free = self
                 .inner
                 .upgrade()
-                .is_some_and(|inner| inner.state.try_lock().is_ok());
+                .is_some_and(|inner| inner.state.try_lock().is_some());
             *self.lock_free.lock().unwrap() = Some(free);
         }
     }
