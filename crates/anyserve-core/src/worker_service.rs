@@ -252,6 +252,7 @@ impl Worker for WorkerGrpcService {
                 lease_id,
                 resume_from,
                 inputs,
+                stream,
             } => {
                 if let Some(plan) = inputs {
                     tokio::spawn(send_inputs(
@@ -264,6 +265,7 @@ impl Worker for WorkerGrpcService {
                     lease_id,
                     resume_from,
                     inputs: None,
+                    stream,
                 }
             }
             replay => replay,
@@ -512,6 +514,47 @@ impl ResultAssembler {
             {
                 self.overflow();
             }
+            if chunk.last {
+                // Single-chunk fast path: wrap `chunk.data` directly without allocating
+                // a `BytesMut` or copying payload bytes.
+                self.total = self.total.saturating_add(chunk.data.len() as u64);
+                if self.total > self.limits.max_inline_total_bytes
+                    || chunk.data.len() as u64 > self.limits.max_inline_object_bytes
+                {
+                    self.overflow();
+                }
+                if !self.too_large {
+                    if !chunk.uri.is_empty() {
+                        self.objects.push(Object::Uri {
+                            uri: chunk.uri,
+                            metadata,
+                        });
+                    } else {
+                        let mut permit = Permit::new(Arc::clone(&self.budget));
+                        if !permit.grow(chunk.data.len()) && {
+                            self.reclaim.reclaim_results(chunk.data.len());
+                            !permit.grow(chunk.data.len())
+                        } {
+                            return Err(Status::resource_exhausted(
+                                "result buffers are at capacity; retry the completion later",
+                            ));
+                        }
+                        // Small retained results copy into a tight buffer so
+                        // 10k retained jobs never pin multi-KiB HTTP/2 frames.
+                        let data = if chunk.data.len() >= 4096 {
+                            chunk.data
+                        } else {
+                            Bytes::copy_from_slice(&chunk.data)
+                        };
+                        self.objects.push(Object::Inline {
+                            data: budgeted_bytes(data, permit),
+                            metadata,
+                        });
+                    }
+                }
+                self.next_index = chunk.index + 1;
+                return Ok(());
+            }
             if !self.too_large {
                 self.current = Some(PendingObject {
                     index: chunk.index,
@@ -635,27 +678,27 @@ pub(crate) async fn receive_uploads<S>(
                         result_bytes: results.total,
                     })))
                 }
-                AttemptLink::Live { lease_id, .. } => {
-                    match runtime.push_frame(lease_id, frame).await {
-                        Ok(sequence) => {
-                            last_frame = sequence;
-                            Ok(down(pb::attempt_down::Msg::Ack(pb::Ack {
-                                up_to_sequence: sequence,
-                                result_bytes: results.total,
-                            })))
-                        }
-                        Err(error) if error.kind == ErrorKind::StaleLease => {
-                            let _ = tx
-                                .send(Ok(finished(
-                                    pb::attempt_finished::Status::Fenced,
-                                    error.message(),
-                                )))
-                                .await;
-                            break;
-                        }
-                        Err(error) => Err(error.into()),
+                AttemptLink::Live {
+                    lease_id, stream, ..
+                } => match runtime.push_frame_live(lease_id, stream, frame).await {
+                    Ok(sequence) => {
+                        last_frame = sequence;
+                        Ok(down(pb::attempt_down::Msg::Ack(pb::Ack {
+                            up_to_sequence: sequence,
+                            result_bytes: results.total,
+                        })))
                     }
-                }
+                    Err(error) if error.kind == ErrorKind::StaleLease => {
+                        let _ = tx
+                            .send(Ok(finished(
+                                pb::attempt_finished::Status::Fenced,
+                                error.message(),
+                            )))
+                            .await;
+                        break;
+                    }
+                    Err(error) => Err(error.into()),
+                },
             },
             pb::attempt_up::Msg::Result(chunk) => results.push(chunk).map(|()| {
                 down(pb::attempt_down::Msg::Ack(pb::Ack {

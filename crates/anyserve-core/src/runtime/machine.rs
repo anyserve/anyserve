@@ -5,10 +5,11 @@
 //! runtime, never through the RPC that caused them.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahash::AHashSet;
 use anyserve_proto::v2 as pb;
 use bytes::Bytes;
 use uuid::Uuid;
@@ -17,11 +18,12 @@ use super::api::{
     Durability, ErrorInfo, EventKind, InterfacePolicy, JobSpec, JobState, JournalHealth, Object,
     PoolTier, codes,
 };
-use super::events::{JobLog, Permit};
+use super::events::{JobLog, LogSubscription, Permit};
 use super::identity::decode_scoped_id;
 use super::input::InputLog;
 use super::state::{
-    Attempt, FinishStatus, Job, JobWaiter, Lease, Phase, QueueKey, Session, State, TerminalPlan,
+    Attempt, AttemptStream, FinishStatus, Job, JobWaiter, Lease, Phase, QueueKey, Session, State,
+    TerminalPlan,
 };
 use super::{Inner, JournalStatus, TimerKey};
 use crate::error::RuntimeError;
@@ -105,14 +107,11 @@ pub(crate) fn object_to_proto(object: &Object) -> pb::Object {
 
 impl Inner {
     pub(crate) fn journal_writable(&self) -> bool {
-        matches!(
-            *self.journal_status.lock().expect("journal status poisoned"),
-            JournalStatus::Healthy
-        )
+        matches!(*self.journal_status.lock(), JournalStatus::Healthy)
     }
 
     pub(crate) fn journal_health(&self) -> JournalHealth {
-        match &*self.journal_status.lock().expect("journal status poisoned") {
+        match &*self.journal_status.lock() {
             JournalStatus::Disabled => JournalHealth::Disabled,
             JournalStatus::Healthy => JournalHealth::Healthy,
             JournalStatus::Degraded(reason) | JournalStatus::Failed(reason) => {
@@ -126,7 +125,7 @@ impl Inner {
             self.mark_lease_lost(reason);
             return;
         }
-        let mut status = self.journal_status.lock().expect("journal status poisoned");
+        let mut status = self.journal_status.lock();
         match outcome {
             CommitOutcome::Fenced(_) => unreachable!(),
             CommitOutcome::Committed => {
@@ -287,7 +286,7 @@ impl Inner {
                 || st.accepting_count(namespace, interface) > 0;
             if !already_tracked {
                 let queued_ifaces = st.queues.get(namespace);
-                let mut distinct = queued_ifaces.map_or(0, HashMap::len);
+                let mut distinct = queued_ifaces.map_or(0, |m| m.len());
                 if let Some(accepting_ifaces) = st.accepting.get(namespace) {
                     for iface in accepting_ifaces.keys() {
                         if queued_ifaces.is_none_or(|q| !q.contains_key(iface)) {
@@ -339,9 +338,17 @@ impl Inner {
             st.inc_accepting(&namespace, &spec.demand.interface);
         }
         let log = self.new_log(st, &raw_id);
+        let index_id: Arc<str> = Arc::from(job_id.as_str());
+        let raw_index_id = if job_id == raw_id {
+            Arc::clone(&index_id)
+        } else {
+            Arc::from(raw_id.as_str())
+        };
         let job = Job {
             id: job_id.clone(),
             raw_id,
+            index_id,
+            raw_index_id,
             namespace,
             spec: Arc::new(spec),
             durability,
@@ -359,7 +366,7 @@ impl Inner {
             not_before_ms: 0,
             timers: Vec::new(),
             total_timer: None,
-            rejected_sessions: HashSet::new(),
+            rejected_sessions: AHashSet::new(),
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
             indeterminate: false,
@@ -495,6 +502,7 @@ impl Inner {
                 continue;
             };
             lease.cancelling = true;
+            lease.stream.deactivate();
             let session_id = lease.session_id.clone();
             if let Some(session) = st.sessions.get_mut(&session_id) {
                 session.detach(&lease_id, &lease.reserved);
@@ -733,7 +741,7 @@ impl Inner {
                 State::remove_nested(&mut st.scan_cursor, namespace, interface);
             }
             {
-                let seen: HashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
+                let seen: AHashSet<&str> = keys.iter().map(|k| k.job_id.as_str()).collect();
                 window.retain(|k| !seen.contains(k.job_id.as_str()));
             }
             keys.extend(window);
@@ -802,7 +810,7 @@ impl Inner {
         input: Option<Arc<InputLog>>,
         input_permit: &mut Option<Permit>,
         now: u64,
-    ) -> Option<(Arc<JobLog>, tokio::sync::watch::Receiver<u64>)> {
+    ) -> Option<(Arc<JobLog>, LogSubscription)> {
         let spec_ref = spec.as_ref().expect("spec");
         if st.shutting_down
             || st
@@ -845,16 +853,14 @@ impl Inner {
         } else {
             false
         };
-        let log = self.new_log(st, &raw_id);
-        log.set_primary(true);
-        let changes = log.subscribe();
-        log.append(None, EventKind::Accepted, now);
-        log.append(
-            Some(attempt_id.clone()),
-            EventKind::Assigned {
-                worker_id: worker_id.clone(),
-                attempt_number: 1,
-            },
+        let (log, sub) = JobLog::new_direct_assigned(
+            raw_id.clone(),
+            st.generation << 32,
+            self.config.event_log_max_events,
+            self.config.event_log_max_bytes,
+            Arc::clone(&self.event_budget),
+            attempt_id.clone(),
+            worker_id.clone(),
             now,
         );
         let total_timer = spec.policy.total_timeout.map(|total| {
@@ -877,9 +883,23 @@ impl Inner {
         }
         let inline_bytes = assign_inline_bytes(&spec);
         let reserved = spec.demand.required_capacity.clone();
+        let index_id: Arc<str> = Arc::from(scoped_id.as_str());
+        let raw_index_id = if scoped_id == raw_id {
+            Arc::clone(&index_id)
+        } else {
+            Arc::from(raw_id.as_str())
+        };
+        let stream = Arc::new(AttemptStream::new(
+            scoped_id.clone(),
+            attempt_id.clone(),
+            true,
+            Arc::clone(&log),
+        ));
         let job = Job {
             id: scoped_id.clone(),
             raw_id,
+            index_id,
+            raw_index_id,
             namespace: namespace.to_string(),
             spec: Arc::new(spec),
             durability: Durability::Ephemeral,
@@ -897,8 +917,7 @@ impl Inner {
                 worker_id: worker_id.clone(),
                 started_at_ms: now,
                 inputs_via_attempt: input.is_some() || inline_bytes > limit,
-                last_frame_seq: 0,
-                exposed: false,
+                stream: Arc::clone(&stream),
                 concurrency_counted,
             }),
             last_attempt_id: Some(attempt_id),
@@ -908,7 +927,7 @@ impl Inner {
             not_before_ms: 0,
             timers,
             total_timer,
-            rejected_sessions: HashSet::new(),
+            rejected_sessions: AHashSet::new(),
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
             indeterminate: false,
@@ -950,6 +969,7 @@ impl Inner {
                 session_id: session_id.clone(),
                 reserved,
                 cancelling: false,
+                stream,
             },
         );
         st.insert_job(job);
@@ -961,7 +981,7 @@ impl Inner {
             pb::server_message::Msg::Assign(assign),
             now,
         );
-        Some((log, changes))
+        Some((log, sub))
     }
 
     fn begin_attempt_locked(&self, st: &mut State, job_id: &str, session_id: &str, now: u64) {
@@ -993,6 +1013,12 @@ impl Inner {
         let job = st.jobs.get_mut(job_id).expect("queued job");
         job.attempt_count += 1;
         let inline_bytes = assign_inline_bytes(&job.spec);
+        let stream = Arc::new(AttemptStream::new(
+            job_id.to_string(),
+            attempt_id.clone(),
+            job.streamed,
+            Arc::clone(&job.log),
+        ));
         job.attempt = Some(Attempt {
             attempt_id: attempt_id.clone(),
             lease_id: lease_id.clone(),
@@ -1001,8 +1027,7 @@ impl Inner {
             worker_id: worker_id.clone(),
             started_at_ms: now,
             inputs_via_attempt: job.input.is_some() || inline_bytes > limit,
-            last_frame_seq: 0,
-            exposed: false,
+            stream: Arc::clone(&stream),
             concurrency_counted,
         });
         job.last_attempt_id = Some(attempt_id);
@@ -1016,6 +1041,7 @@ impl Inner {
                 session_id: session_id.to_string(),
                 reserved,
                 cancelling: false,
+                stream,
             },
         );
         if !durable {
@@ -1341,14 +1367,17 @@ impl Inner {
             let Some(attempt) = job.attempt.as_ref() else {
                 return false;
             };
+            // Deactivate before checking `exposed` so a concurrent streaming
+            // frame cannot flip `exposed` after the retry decision is made.
+            let exposed = attempt.stream.deactivate_and_read_exposed();
             let retry = error.retryable
-                && !attempt.exposed
+                && !exposed
                 && job.cancel_requested.is_none()
                 && !st.shutting_down
                 && job.attempt_count < job.max_attempts;
             (
                 attempt.lease_id.clone(),
-                attempt.exposed,
+                exposed,
                 attempt.session_id.clone(),
                 attempt.worker_id.clone(),
                 retry,
@@ -1460,10 +1489,11 @@ impl Inner {
     }
 
     pub(crate) fn release_lease_locked(&self, st: &mut State, lease_id: &str) {
-        if let Some(lease) = st.leases.remove(lease_id)
-            && let Some(session) = st.sessions.get_mut(&lease.session_id)
-        {
-            session.detach(lease_id, &lease.reserved);
+        if let Some(lease) = st.leases.remove(lease_id) {
+            lease.stream.deactivate();
+            if let Some(session) = st.sessions.get_mut(&lease.session_id) {
+                session.detach(lease_id, &lease.reserved);
+            }
         }
     }
 
@@ -1480,6 +1510,7 @@ impl Inner {
             return;
         };
         lease.cancelling = true;
+        lease.stream.deactivate();
         let session_id = lease.session_id.clone();
         self.send_locked(
             st,
@@ -1518,6 +1549,9 @@ impl Inner {
         plan.previous = Box::new(job.phase.clone());
         self.dequeue_locked(st, job_id);
         let job = st.jobs.get_mut(job_id).expect("job");
+        if let Some(attempt) = job.attempt.as_ref() {
+            attempt.stream.deactivate();
+        }
         if job.durability == Durability::Ephemeral {
             self.apply_terminal_locked(st, job_id, plan, now);
             return;
@@ -1664,12 +1698,17 @@ impl Inner {
         let output_bytes = outputs.iter().map(|o| o.inline_len() as u64).sum::<u64>();
         job.outputs = (plan.state == JobState::Succeeded).then(|| Arc::new(outputs.clone()));
         if let Some(attempt) = job.attempt.take() {
+            attempt.stream.deactivate();
             job.last_attempt_id = Some(attempt.attempt_id);
             job.last_worker_id = Some(attempt.worker_id);
         }
         // Inputs and params leave with the full spec, freed after the lock.
-        let slim = Arc::new(without_payload(&job.spec));
-        let full_spec = std::mem::replace(&mut job.spec, slim);
+        let full_spec = if !job.spec.inputs.is_empty() || !job.spec.params.is_empty() {
+            let slim = Arc::new(without_payload(&job.spec));
+            Some(std::mem::replace(&mut job.spec, slim))
+        } else {
+            None
+        };
         if let Some(input) = job.input.take() {
             input.abort();
         }
@@ -1714,11 +1753,14 @@ impl Inner {
         for waiter in job.finish_waiters.drain(..) {
             let _ = waiter.send(Ok(FinishStatus::Committed));
         }
+        let job_index_id = Arc::clone(&job.index_id);
         job.input_permit = None;
         st.released.events.append(&mut compacted);
-        st.released.specs.push(full_spec);
+        if let Some(full_spec) = full_spec {
+            st.released.specs.push(full_spec);
+        }
         st.unfinished_jobs -= 1;
-        st.terminal_order.push_back((now, job_id.to_string()));
+        st.terminal_order.push_back((now, job_index_id));
         if let Some((lease_id, digest)) = plan.finished {
             st.finished_leases
                 .insert(lease_id.clone(), (job_id.to_string(), digest));
@@ -1813,9 +1855,17 @@ impl Inner {
         log.mark_lost_before_base();
         let job_id = stored.job_id;
         let updated_at_ms = stored.updated_at_ms;
+        let index_id: Arc<str> = Arc::from(job_id.as_str());
+        let raw_index_id = if job_id == raw_id {
+            Arc::clone(&index_id)
+        } else {
+            Arc::from(raw_id.as_str())
+        };
         let job = Job {
             id: job_id.clone(),
             raw_id,
+            index_id,
+            raw_index_id,
             namespace,
             spec: Arc::new(without_payload(&stored.spec)),
             durability: Durability::Durable,
@@ -1833,7 +1883,7 @@ impl Inner {
             not_before_ms: 0,
             timers: Vec::new(),
             total_timer: None,
-            rejected_sessions: HashSet::new(),
+            rejected_sessions: AHashSet::new(),
             failed_workers: BTreeSet::new(),
             cancel_requested: None,
             indeterminate: false,
@@ -1850,8 +1900,9 @@ impl Inner {
             finish_waiters: Vec::new(),
             finished_leases: Vec::new(),
         };
+        let terminal_id = Arc::clone(&job.index_id);
         st.insert_job(job);
-        st.terminal_order.push_back((updated_at_ms, job_id));
+        st.terminal_order.push_back((updated_at_ms, terminal_id));
     }
 
     /// Takes the oldest terminal job out of memory and returns it for the
@@ -1860,10 +1911,14 @@ impl Inner {
     pub(crate) fn evict_oldest_terminal_locked(&self, st: &mut State) -> Option<Job> {
         loop {
             let (_, job_id) = st.terminal_order.pop_front()?;
-            if !st.jobs.get(&job_id).is_some_and(|job| job.is_terminal()) {
+            if !st
+                .jobs
+                .get(job_id.as_ref())
+                .is_some_and(|job| job.is_terminal())
+            {
                 continue;
             }
-            let job = st.remove_job(&job_id).expect("job");
+            let job = st.remove_job(job_id.as_ref()).expect("job");
             for lease in &job.finished_leases {
                 st.finished_leases.remove(lease);
             }

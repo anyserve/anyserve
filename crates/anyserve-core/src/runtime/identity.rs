@@ -1,6 +1,8 @@
 //! Canonical fingerprints: the idempotency hash of a job specification, the
 //! digest of a worker's result, and the bijective `(namespace, job_id)` storage key.
 
+use std::sync::OnceLock;
+
 use sha2::{Digest, Sha256};
 
 use super::api::{
@@ -39,6 +41,10 @@ impl Canonical {
         let mut this = Self(Sha256::new());
         this.bytes(domain.as_bytes());
         this
+    }
+
+    fn from_prefix(prefix: &Sha256) -> Self {
+        Self(prefix.clone())
     }
 
     fn bytes(&mut self, value: &[u8]) {
@@ -114,6 +120,42 @@ impl Canonical {
     }
 }
 
+fn spec_prefix() -> &'static Sha256 {
+    static PREFIX: OnceLock<Sha256> = OnceLock::new();
+    PREFIX.get_or_init(|| Canonical::new("anyserve.job.v1").0)
+}
+
+fn result_succeeded_prefix() -> &'static Sha256 {
+    static PREFIX: OnceLock<Sha256> = OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let mut c = Canonical::new("anyserve.result.v1");
+        c.str("succeeded");
+        c.0
+    })
+}
+
+/// Pre-hashes the 65-byte prefix `("anyserve.result.v1", "succeeded", 1, "inline")`,
+/// completing the first 64-byte SHA-256 block once at startup for the common
+/// single-inline-output completion path.
+fn result_succeeded_one_inline_prefix() -> &'static Sha256 {
+    static PREFIX: OnceLock<Sha256> = OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let mut c = Canonical::from_prefix(result_succeeded_prefix());
+        c.u64(1);
+        c.str("inline");
+        c.0
+    })
+}
+
+fn result_failed_prefix() -> &'static Sha256 {
+    static PREFIX: OnceLock<Sha256> = OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let mut c = Canonical::new("anyserve.result.v1");
+        c.str("failed");
+        c.0
+    })
+}
+
 fn optional_ms(value: Option<std::time::Duration>) -> u64 {
     value.map(|value| value.as_millis() as u64).unwrap_or(0)
 }
@@ -121,7 +163,7 @@ fn optional_ms(value: Option<std::time::Duration>) -> u64 {
 /// Fingerprint of everything that defines a job, except transport context and
 /// scheduling hints (`affinity_key`, `fairness_key`, `concurrency_key`).
 pub(crate) fn spec_hash(spec: &JobSpec, durability: Durability) -> String {
-    let mut hash = Canonical::new("anyserve.job.v1");
+    let mut hash = Canonical::from_prefix(spec_prefix());
     let demand = &spec.demand;
     hash.str(&demand.interface);
     hash.map(demand.required_attributes.iter());
@@ -156,33 +198,40 @@ pub(crate) fn spec_hash(spec: &JobSpec, durability: Durability) -> String {
 /// Digest of an attempt's reported outcome, used to recognise a repeated
 /// completion of the same lease.
 pub(crate) fn outcome_digest(outputs: &[Object], error: Option<&ErrorInfo>) -> String {
-    let mut hash = Canonical::new("anyserve.result.v1");
     match error {
         None => {
-            hash.str("succeeded");
+            if let [Object::Inline { data, metadata }] = outputs {
+                let mut hash = Canonical::from_prefix(result_succeeded_one_inline_prefix());
+                hash.bytes(data);
+                hash.map(metadata.iter());
+                return hash.finish();
+            }
+            let mut hash = Canonical::from_prefix(result_succeeded_prefix());
             hash.u64(outputs.len() as u64);
             for output in outputs {
                 hash.object(output);
             }
+            hash.finish()
         }
         Some(error) => {
-            hash.str("failed");
+            let mut hash = Canonical::from_prefix(result_failed_prefix());
             hash.str(&error.code);
             hash.str(&error.message);
             hash.u64(error.retryable as u64);
+            hash.finish()
         }
     }
-    hash.finish()
 }
 
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize]);
+        out.push(DIGITS[(byte & 0x0f) as usize]);
     }
-    out
+    // SAFETY: `DIGITS` contains only valid ASCII hex bytes.
+    String::from_utf8(out).expect("hex digits are ASCII")
 }
 
 #[cfg(test)]

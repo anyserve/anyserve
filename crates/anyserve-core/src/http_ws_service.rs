@@ -737,6 +737,7 @@ async fn handle_worker_attempt(
             lease_id,
             resume_from,
             inputs,
+            stream,
         } => {
             let abort = inputs.map(|plan| {
                 tokio::spawn(send_inputs(
@@ -751,6 +752,7 @@ async fn handle_worker_attempt(
                     lease_id,
                     resume_from,
                     inputs: None,
+                    stream,
                 },
                 abort,
             )

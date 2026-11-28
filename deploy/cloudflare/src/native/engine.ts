@@ -60,7 +60,6 @@ import {
   joinU64,
   normalizeBlob,
   parseCapacityJson,
-  parseSpecJson,
   serializeCapacityJson,
   splitU64,
   type CompletedAttemptObjectRef,
@@ -76,6 +75,7 @@ import {
   PROTOBUF_CONTENT_TYPE,
   DISPATCH_SCAN,
   CONN_SEQ_BLOCK,
+  JobRecord,
   metadataByteLen,
   resolveEngineConfig,
   nameToProtoState,
@@ -132,6 +132,11 @@ export class NativeEngine implements ConsoleBackend {
   readonly sessionsByInterface = new Map<string, Map<string, Set<string>>>();
   readonly leases = new Map<string, LeaseMem>();
   readonly jobs = new Map<string, JobMem>();
+  readonly activeJobs = new Set<string>();
+  readonly timedActiveJobs = new Set<string>();
+  readonly terminalJobsOrder = new Set<string>();
+  lastTerminalUpdatedAtMs = 0;
+  terminalOrderDirty = false;
   readonly queues = new Map<string, Map<string, FairPriorityQueue>>();
   readonly inFlightConcurrency = new Map<string, Map<string, number>>();
   readonly watchers = new Map<number, WatcherMem>();
@@ -142,6 +147,8 @@ export class NativeEngine implements ConsoleBackend {
   readonly socketsByConnId = new Map<number, NativeWebSocket>();
   readonly socketChains = new Map<number, Promise<void>>();
   readonly pumpingAttempts = new Set<string>();
+  readonly deliveringPrimary = new Set<string>();
+  readonly deliveringPrimaryAgain = new Set<string>();
   readonly pendingInvokeTraceHeaders = new Map<number, Record<string, string>>();
   readonly pendingSessionAuth = new Map<
     number,
@@ -365,106 +372,52 @@ export class NativeEngine implements ConsoleBackend {
       this.totalResultBytesHeld += lease.totalResultBytes;
     }
 
-    // 4. Load bounded job metadata (all unfinished jobs + retained terminal jobs; no bundle payloads!)
+    // 4. Load bounded job metadata (all unfinished jobs + retained terminal jobs; no bundle, event table, or full-table ORDER BY sort!)
     const jobRows = this.store.exec<Record<string, any>>(
-      `SELECT * FROM native_jobs ORDER BY created_at_ms ASC, scoped_job_id ASC`,
+      `SELECT * FROM native_jobs`,
     );
-    const eventStatRows = this.store.exec<{
-      scoped_job_id: string;
-      cnt: number;
-      bytes: number;
-    }>(
-      `SELECT scoped_job_id, COUNT(*) AS cnt, COALESCE(SUM(size_bytes), 0) AS bytes
-       FROM native_job_events GROUP BY scoped_job_id`,
-    );
-    const eventStatsByJob = new Map<string, { cnt: number; bytes: number }>();
-    for (const es of eventStatRows) {
-      eventStatsByJob.set(es.scoped_job_id, {
-        cnt: Number(es.cnt),
-        bytes: Number(es.bytes),
-      });
-    }
 
     this.store.reservedRetainedBytes = 0;
-    for (const r of jobRows) {
-      const scopedJobId = String(r.scoped_job_id);
-      const spec = parseSpecJson(String(r.spec_json));
-      const state = String(r.state) as JobStateName;
-      const es = eventStatsByJob.get(scopedJobId) ?? { cnt: 0, bytes: 0 };
-      const job: JobMem = {
-        scopedJobId,
-        rawJobId: String(r.raw_job_id),
-        namespace: String(r.namespace),
-        interfaceName: String(r.interface_name),
-        state,
-        durability: String(r.durability) as DurabilityName,
-        specHash: String(r.spec_hash),
-        spec,
-        priority: Number(r.priority),
-        fairnessKey: String(r.fairness_key),
-        concurrencyKey: String(r.concurrency_key),
-        affinityKey: String(r.affinity_key),
-        maxAttempts: Number(r.max_attempts),
-        attemptCount: Number(r.attempt_count),
-        createdAtMs: Number(r.created_at_ms),
-        updatedAtMs: Number(r.updated_at_ms),
-        queuedSinceMs: Number(r.queued_since_ms),
-        notBeforeMs: Number(r.not_before_ms),
-        queueDeadlineMs:
-          r.queue_deadline_ms !== null ? Number(r.queue_deadline_ms) : null,
-        totalDeadlineMs:
-          r.total_deadline_ms !== null ? Number(r.total_deadline_ms) : null,
-        spilloverAtMs:
-          r.spillover_at_ms !== null ? Number(r.spillover_at_ms) : null,
-        callerConnId:
-          r.caller_conn_id !== null ? Number(r.caller_conn_id) : null,
-        streamingInput: Number(r.streaming_input) === 1,
-        inputEnded: Number(r.input_ended) === 1,
-        streamChunkCount: Number(r.stream_chunk_count ?? 0),
-        totalInputBytes: Number(r.total_input_bytes ?? 0),
-        retainedBytesEst: Number(r.retained_bytes_est ?? 0),
-        cancelRequested:
-          r.cancel_requested !== null ? String(r.cancel_requested) : null,
-        error: r.error_json
-          ? (JSON.parse(String(r.error_json)) as StoredErrorInfo)
-          : null,
-        winningLeaseId:
-          r.winning_lease_id !== null ? String(r.winning_lease_id) : null,
-        resultDigest:
-          r.result_digest !== null ? String(r.result_digest) : null,
-        lastAttemptId:
-          r.last_attempt_id !== null ? String(r.last_attempt_id) : null,
-        lastWorkerId:
-          r.last_worker_id !== null ? String(r.last_worker_id) : null,
-        currentLeaseId: null,
-        failedWorkers: new Set(
-          JSON.parse(String(r.failed_workers_json)) as string[],
-        ),
-        rejectedSessions: new Set(
-          JSON.parse(String(r.rejected_sessions_json)) as string[],
-        ),
-        lastSequence: joinU64(r.last_seq_hi, r.last_seq_lo),
-        evictedThrough: joinU64(r.evicted_seq_hi, r.evicted_seq_lo),
-        primaryConsumed:
-          r.primary_seq_hi !== null
-            ? joinU64(r.primary_seq_hi, r.primary_seq_lo)
-            : null,
-        queueSeq: null,
-        eventLogBytes: es.bytes,
-        eventLogCount: es.cnt,
-        stalledSinceMs: null,
-        inlineAssign: null,
-      };
+    const queuedJobs: JobMem[] = [];
+    for (let i = 0; i < jobRows.length; i++) {
+      const job = JobRecord.fromDbRow(jobRows[i]!);
       if (job.callerConnId !== null) {
         this.noteConnId(job.callerConnId);
       }
-      this.jobs.set(scopedJobId, job);
+      this.jobs.set(job.scopedJobId, job);
       this.store.reservedRetainedBytes += job.retainedBytesEst;
-      this.totalEventBytesHeld += es.bytes;
+      this.totalEventBytesHeld += job.eventLogBytes;
+      const state = job.state;
       if (state === "queued" || state === "running") {
+        this.activeJobs.add(job.scopedJobId);
+        this.syncJobTimerTracking(job);
         this.totalInputBytesHeld += job.totalInputBytes;
+        if (state === "queued") {
+          queuedJobs.push(job);
+        }
+      } else {
+        if (job.updatedAtMs < this.lastTerminalUpdatedAtMs) {
+          this.terminalOrderDirty = true;
+        } else {
+          this.lastTerminalUpdatedAtMs = job.updatedAtMs;
+        }
+        this.terminalJobsOrder.add(job.scopedJobId);
       }
-      if (state === "queued") {
+    }
+    if (queuedJobs.length > 0) {
+      if (queuedJobs.length > 1) {
+        queuedJobs.sort((a, b) =>
+          a.createdAtMs !== b.createdAtMs
+            ? a.createdAtMs - b.createdAtMs
+            : a.scopedJobId < b.scopedJobId
+              ? -1
+              : a.scopedJobId > b.scopedJobId
+                ? 1
+                : 0,
+        );
+      }
+      for (let i = 0; i < queuedJobs.length; i++) {
+        const job = queuedJobs[i]!;
         this.queueSeq += 1n;
         job.queueSeq = this.queueSeq;
         this.getOrCreateQueue(job.namespace, job.interfaceName).insert(
@@ -551,13 +504,23 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
     const vanishedInvokes: JobMem[] = [];
-    for (const job of this.jobs.values()) {
-      if (
-        job.callerConnId !== null &&
-        (job.state === "queued" || job.state === "running") &&
-        !this.socketsByConnId.has(job.callerConnId)
-      ) {
+    let hasOverdueQueued = false;
+    for (const jid of this.activeJobs) {
+      const job = this.jobs.get(jid);
+      if (!job) continue;
+      if (job.callerConnId !== null && !this.socketsByConnId.has(job.callerConnId)) {
         vanishedInvokes.push(job);
+      }
+      if (!hasOverdueQueued) {
+        if (
+          (job.state === "queued" &&
+            ((job.notBeforeMs <= nowMs && this.hasMatchingFreeWorker(job, nowMs)) ||
+              (job.queueDeadlineMs !== null && job.queueDeadlineMs <= nowMs) ||
+              (job.totalDeadlineMs !== null && job.totalDeadlineMs <= nowMs))) ||
+          (job.state === "running" && job.totalDeadlineMs !== null && job.totalDeadlineMs <= nowMs)
+        ) {
+          hasOverdueQueued = true;
+        }
       }
     }
     const vanishedWatchers: number[] = [];
@@ -566,15 +529,6 @@ export class NativeEngine implements ConsoleBackend {
         vanishedWatchers.push(w.watchConnId);
       }
     }
-
-    const hasOverdueQueued = [...this.jobs.values()].some(
-      (j) =>
-        (j.state === "queued" &&
-          ((j.notBeforeMs <= nowMs && this.hasMatchingFreeWorker(j, nowMs)) ||
-            (j.queueDeadlineMs !== null && j.queueDeadlineMs <= nowMs) ||
-            (j.totalDeadlineMs !== null && j.totalDeadlineMs <= nowMs))) ||
-        (j.state === "running" && j.totalDeadlineMs !== null && j.totalDeadlineMs <= nowMs),
-    );
 
     const rehydrateNotifyJobs = new Set<string>();
     if (
@@ -1036,7 +990,10 @@ export class NativeEngine implements ConsoleBackend {
     } else if (att.kind === "invoke" && att.id) {
       const job = this.jobs.get(att.id);
       if (job) {
-        job.stalledSinceMs = null;
+        if (job.stalledSinceMs !== null) {
+          job.stalledSinceMs = null;
+          this.syncJobTimerTracking(job);
+        }
         void this.deliverPrimaryInvokeEvents(job.scopedJobId);
       }
     } else if (att.kind === "watch" && att.id) {
@@ -1288,9 +1245,9 @@ export class NativeEngine implements ConsoleBackend {
           const lease = this.leases.get(leaseId);
           if (sessionWs && sessionWs.readyState === WS_READY_STATE_OPEN) {
             try {
-              this.sendWsProtoSync(
+              this.sendWsRawSync(
                 sessionWs,
-                pb.encodeServerMessage({
+                pb.encodeServerMessageWsFrame({
                   msg: { case: "fence", value: { leaseId, reason } },
                 }),
               );
@@ -1303,9 +1260,9 @@ export class NativeEngine implements ConsoleBackend {
             this.socketsByConnId.delete(lease.attemptConnId);
             if (aws && aws.readyState === WS_READY_STATE_OPEN) {
               try {
-                this.sendWsProtoSync(
+                this.sendWsRawSync(
                   aws,
-                  pb.encodeAttemptDown({
+                  pb.encodeAttemptDownWsFrame({
                     msg: {
                       case: "finished",
                       value: {
@@ -1348,10 +1305,23 @@ export class NativeEngine implements ConsoleBackend {
     this.isolateBudget.refreshSockets();
 
     // 0. Refresh revocations when signed worker sessions exist and evict revoked/expired sessions
-    const hasTrackedJti =
-      this.auth.hasRevocationPolling() &&
-      ([...this.sessions.values()].some((s) => s.tokenJti !== null) ||
-        [...this.pendingSessionAuth.values()].some((a) => a.jti !== null));
+    let hasTrackedJti = false;
+    if (this.auth.hasRevocationPolling()) {
+      for (const s of this.sessions.values()) {
+        if (s.tokenJti !== null) {
+          hasTrackedJti = true;
+          break;
+        }
+      }
+      if (!hasTrackedJti) {
+        for (const a of this.pendingSessionAuth.values()) {
+          if (a.jti !== null) {
+            hasTrackedJti = true;
+            break;
+          }
+        }
+      }
+    }
     if (hasTrackedJti) {
       await this.auth.maybeSyncRevocations(nowMs);
     }
@@ -1458,9 +1428,10 @@ export class NativeEngine implements ConsoleBackend {
 
       // Job queue / execution / total / consumer_stall deadlines
       let handled = 0;
-      for (const job of [...this.jobs.values()]) {
+      for (const jid of [...this.activeJobs]) {
         if (handled >= 128) break;
-        if (job.state !== "queued" && job.state !== "running") {
+        const job = this.jobs.get(jid);
+        if (!job || (job.state !== "queued" && job.state !== "running")) {
           continue;
         }
         if (job.totalDeadlineMs !== null && job.totalDeadlineMs <= nowMs) {
@@ -1566,6 +1537,18 @@ export class NativeEngine implements ConsoleBackend {
       }
     };
 
+    // Background maintenance (>= 5s bucket): schedule connected-session liveness
+    // checks at `effectiveLastSeen + heartbeatTimeoutMs` (bucketed to maintenanceBucketMs,
+    // or exact when heartbeatTimeoutMs < maintenanceBucketMs) rather than waking every 5s!
+    const b = this.config.maintenanceBucketMs;
+    let maintenanceDue: number | null = null;
+    const considerMaintenance = (rawAtMs: number) => {
+      const bucketed = Math.ceil(Math.max(nowMs + 1, rawAtMs) / b) * b;
+      if (maintenanceDue === null || bucketed < maintenanceDue) {
+        maintenanceDue = bucketed;
+      }
+    };
+
     // Exact business timers (NEVER bucketed!)
     for (const [, ws] of this.socketsByConnId) {
       if (ws.readyState !== WS_READY_STATE_OPEN) continue;
@@ -1575,15 +1558,35 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
 
+    let hasSignedWorkerSession = false;
     for (const s of this.sessions.values()) {
-      if (!s.connected && s.graceDeadlineMs !== null) {
-        considerBusiness(s.graceDeadlineMs);
-      }
-      if (s.connected && s.cooldownUntilMs > nowMs) {
-        considerBusiness(s.cooldownUntilMs);
-      }
       if (s.tokenExp !== null) {
         considerBusiness(s.tokenExp * 1000);
+      }
+      if (s.connected) {
+        if (s.cooldownUntilMs > nowMs) {
+          considerBusiness(s.cooldownUntilMs);
+        }
+        if (s.tokenJti !== null) {
+          hasSignedWorkerSession = true;
+        }
+        const ws = this.socketsByConnId.get(s.currentConnId);
+        const att =
+          ws && ws.readyState === WS_READY_STATE_OPEN
+            ? readSocketAttachment(ws)
+            : null;
+        const effectiveLastSeen =
+          att && att.kind === "session" && att.connId === s.currentConnId
+            ? Math.max(s.lastSeenMs, att.lastSeenAtMs)
+            : s.lastSeenMs;
+        const rawTimeoutAt = effectiveLastSeen + this.config.heartbeatTimeoutMs;
+        if (this.config.heartbeatTimeoutMs < b) {
+          considerBusiness(rawTimeoutAt);
+        } else {
+          considerMaintenance(rawTimeoutAt);
+        }
+      } else if (s.graceDeadlineMs !== null) {
+        considerBusiness(s.graceDeadlineMs);
       }
     }
 
@@ -1595,10 +1598,9 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
 
-    for (const j of this.jobs.values()) {
-      if (j.state !== "queued" && j.state !== "running") {
-        continue;
-      }
+    for (const jid of this.timedActiveJobs) {
+      const j = this.jobs.get(jid);
+      if (!j) continue;
       considerBusiness(j.totalDeadlineMs);
       if (j.state === "queued") {
         considerBusiness(j.queueDeadlineMs);
@@ -1622,42 +1624,6 @@ export class NativeEngine implements ConsoleBackend {
       }
     }
 
-    // Background maintenance (>= 5s bucket): schedule connected-session liveness
-    // checks at `effectiveLastSeen + heartbeatTimeoutMs` (bucketed to maintenanceBucketMs,
-    // or exact when heartbeatTimeoutMs < maintenanceBucketMs) rather than waking every 5s!
-    const b = this.config.maintenanceBucketMs;
-    let maintenanceDue: number | null = null;
-    const considerMaintenance = (rawAtMs: number) => {
-      const bucketed = Math.ceil(Math.max(nowMs + 1, rawAtMs) / b) * b;
-      if (maintenanceDue === null || bucketed < maintenanceDue) {
-        maintenanceDue = bucketed;
-      }
-    };
-
-    let hasSignedWorkerSession = false;
-    for (const s of this.sessions.values()) {
-      if (s.connected) {
-        if (s.tokenJti !== null) {
-          hasSignedWorkerSession = true;
-        }
-        const ws = this.socketsByConnId.get(s.currentConnId);
-        const att =
-          ws && ws.readyState === WS_READY_STATE_OPEN
-            ? readSocketAttachment(ws)
-            : null;
-        const effectiveLastSeen =
-          att && att.kind === "session" && att.connId === s.currentConnId
-            ? Math.max(s.lastSeenMs, att.lastSeenAtMs)
-            : s.lastSeenMs;
-        const rawTimeoutAt = effectiveLastSeen + this.config.heartbeatTimeoutMs;
-        if (this.config.heartbeatTimeoutMs < b) {
-          considerBusiness(rawTimeoutAt);
-        } else {
-          considerMaintenance(rawTimeoutAt);
-        }
-      }
-    }
-
     if (hasSignedWorkerSession && this.auth.hasRevocationPolling()) {
       const pollInterval = this.auth.revocationPollIntervalMs();
       if (pollInterval < b) {
@@ -1672,15 +1638,14 @@ export class NativeEngine implements ConsoleBackend {
       considerMaintenance(r2GcDueMs);
     }
 
-    if (maintenanceDue === null && this.jobs.size > 0) {
-      // Schedule retention purge for retained terminal jobs
-      for (const j of this.jobs.values()) {
-        if (
-          j.state === "succeeded" ||
-          j.state === "failed" ||
-          j.state === "cancelled"
-        ) {
-          considerMaintenance(j.updatedAtMs + this.config.terminalRetentionMs);
+    if (maintenanceDue === null && this.terminalJobsOrder.size > 0) {
+      // Schedule retention purge for the oldest retained terminal job in O(1)
+      this.ensureTerminalOrderSorted();
+      for (const jid of this.terminalJobsOrder) {
+        const oldest = this.jobs.get(jid);
+        if (oldest) {
+          considerMaintenance(oldest.updatedAtMs + this.config.terminalRetentionMs);
+          break;
         }
       }
     }
@@ -1689,6 +1654,78 @@ export class NativeEngine implements ConsoleBackend {
       return Math.min(earliestBusiness, maintenanceDue);
     }
     return earliestBusiness ?? maintenanceDue;
+  }
+
+  syncJobTimerTracking(job: JobMem): void {
+    const hasTimer =
+      (job.state === "queued" &&
+        (job.totalDeadlineMs !== null ||
+          job.queueDeadlineMs !== null ||
+          job.notBeforeMs > 0 ||
+          job.spilloverAtMs !== null ||
+          (this.config.interfaces[job.interfaceName]?.poolTiers.length ?? 0) > 0)) ||
+      (job.state === "running" &&
+        (job.totalDeadlineMs !== null || job.stalledSinceMs !== null));
+    if (hasTimer) {
+      this.timedActiveJobs.add(job.scopedJobId);
+    } else {
+      this.timedActiveJobs.delete(job.scopedJobId);
+    }
+  }
+
+  earliestJobAndLeaseDueMs(job: JobMem, nowMs: number): number | null {
+    let earliest: number | null = null;
+    const consider = (atMs: number | null | undefined) => {
+      if (atMs === null || atMs === undefined) return;
+      const clamped = Math.max(nowMs, atMs);
+      if (earliest === null || clamped < earliest) earliest = clamped;
+    };
+    consider(job.totalDeadlineMs);
+    if (job.state === "queued") {
+      consider(job.queueDeadlineMs);
+      if (job.notBeforeMs > nowMs) consider(job.notBeforeMs);
+      if (job.spilloverAtMs !== null && job.spilloverAtMs > nowMs) consider(job.spilloverAtMs);
+      const ifacePolicy = this.config.interfaces[job.interfaceName];
+      if (ifacePolicy) {
+        for (const tier of ifacePolicy.poolTiers) {
+          const unlockAt = job.queuedSinceMs + tier.spilloverAfterMs;
+          if (tier.spilloverAfterMs > 0 && unlockAt > nowMs) consider(unlockAt);
+        }
+      }
+    } else if (job.state === "running") {
+      if (job.stalledSinceMs !== null) {
+        consider(job.stalledSinceMs + this.config.consumerStallTimeoutMs);
+      }
+      if (job.currentLeaseId) {
+        const l = this.leases.get(job.currentLeaseId);
+        if (l && !l.cancelling && l.executionDeadlineMs !== null) {
+          consider(l.executionDeadlineMs);
+        }
+      }
+    }
+    return earliest;
+  }
+
+  /**
+   * O(1) fast path for `refreshAlarm` when a newly inserted job cannot move the earliest
+   * due alarm earlier than an already-armed future alarm.
+   */
+  async refreshAlarmForAddedJob(job: JobMem | null, nowMs: number): Promise<void> {
+    if (job && this.armedAlarmMs !== null && this.armedAlarmMs > nowMs) {
+      const addedDue = this.earliestJobAndLeaseDueMs(job, nowMs);
+      if (addedDue === null || addedDue >= this.armedAlarmMs) {
+        return;
+      }
+      this.armedAlarmMs = addedDue;
+      this.store.recordAlarmSet(nowMs);
+      try {
+        await this.host.setAlarm(addedDue);
+      } catch {
+        this.armedAlarmMs = null;
+      }
+      return;
+    }
+    await this.refreshAlarm(nowMs);
   }
 
   async refreshAlarm(nowMs: number): Promise<void> {
@@ -1851,7 +1888,7 @@ export class NativeEngine implements ConsoleBackend {
         case "credit": {
           session.reportedFree = msg.value.freeSlots;
           session.assignedSinceReport = 0;
-          this.persistSessionRowInTxn(session);
+          this.persistSessionCreditInTxn(session);
           mayFreeSlot = true;
           break;
         }
@@ -2180,9 +2217,9 @@ export class NativeEngine implements ConsoleBackend {
     }
 
     // Section 4.2 & 5.3: Send Welcome FIRST, then Fence for invalid held leases, BEFORE any Assign!
-    this.sendWsProtoSync(
+    this.sendWsRawSync(
       ws,
-      pb.encodeServerMessage({
+      pb.encodeServerMessageWsFrame({
         msg: {
           case: "welcome",
           value: {
@@ -2203,9 +2240,9 @@ export class NativeEngine implements ConsoleBackend {
     );
 
     for (const fencedId of fencedLeaseIds) {
-      this.sendWsProtoSync(
+      this.sendWsRawSync(
         ws,
-        pb.encodeServerMessage({
+        pb.encodeServerMessageWsFrame({
           msg: {
             case: "fence",
             value: {
@@ -2270,97 +2307,120 @@ export class NativeEngine implements ConsoleBackend {
   // Scheduling & Dispatch (Mirrors machine.rs::dispatch_locked & pick_session)
   // ---------------------------------------------------------------------------
 
+  dispatchPairInTxn(
+    namespace: string,
+    interfaceName: string,
+    nowMs: number,
+    notifyJobs?: Set<string>,
+  ): number {
+    const queue = this.queues.get(namespace)?.get(interfaceName);
+    if (!queue || queue.totalLen === 0) return 0;
+    const ifaceSessions = this.sessionsByInterface
+      .get(namespace)
+      ?.get(interfaceName);
+    if (!ifaceSessions || ifaceSessions.size === 0) return 0;
+
+    const candidates: string[] = [];
+    for (const sid of ifaceSessions) {
+      const s = this.sessions.get(sid);
+      if (s && sessionFreeSlots(s) > 0) {
+        candidates.push(sid);
+      }
+    }
+    if (candidates.length === 0) return 0;
+
+    const policy = this.config.interfaces[interfaceName];
+    const entries =
+      queue.totalLen <= DISPATCH_SCAN
+        ? queue.collectCandidates(DISPATCH_SCAN)
+        : queue.collectAllOrdered();
+
+    let dispatchedCount = 0;
+    for (let i = 0; i < entries.length; i++) {
+      if (candidates.length === 0) break;
+      const job = this.jobs.get(entries[i]!.scopedJobId);
+      if (!job || job.state !== "queued") continue;
+
+      // Lazy deadline checks before dispatching!
+      if (job.totalDeadlineMs !== null && job.totalDeadlineMs <= nowMs) {
+        this.failJobInTxn(
+          job.scopedJobId,
+          RUNTIME_CODES.TOTAL_TIMEOUT,
+          "job exceeded its total timeout",
+          nowMs,
+        );
+        notifyJobs?.add(job.scopedJobId);
+        continue;
+      }
+      if (job.queueDeadlineMs !== null && job.queueDeadlineMs <= nowMs) {
+        this.failJobInTxn(
+          job.scopedJobId,
+          RUNTIME_CODES.QUEUE_TIMEOUT,
+          "no worker took the job within its queue timeout",
+          nowMs,
+        );
+        notifyJobs?.add(job.scopedJobId);
+        continue;
+      }
+
+      if (job.notBeforeMs > nowMs) {
+        continue;
+      }
+
+      // Concurrency key check
+      if (job.concurrencyKey.length > 0) {
+        const cap =
+          policy?.maxInFlightPerKey ??
+          this.config.defaultMaxInFlightPerKey ??
+          1;
+        if (this.getConcurrencyKeyCount(namespace, job.concurrencyKey) >= cap) {
+          continue;
+        }
+      }
+
+      const pickedSessionId = pickSessionForJob(
+        this,
+        job,
+        policy,
+        candidates,
+        nowMs,
+      );
+      if (!pickedSessionId) {
+        continue;
+      }
+
+      this.beginAttemptInTxn(job, pickedSessionId, nowMs);
+      queue.rotateKeyToBack(job.priority, job.fairnessKey);
+      notifyJobs?.add(job.scopedJobId);
+      dispatchedCount += 1;
+
+      const pickedSession = this.sessions.get(pickedSessionId);
+      if (!pickedSession || sessionFreeSlots(pickedSession) === 0) {
+        const cIdx = candidates.indexOf(pickedSessionId);
+        if (cIdx >= 0) {
+          candidates.splice(cIdx, 1);
+        }
+      }
+    }
+
+    return dispatchedCount;
+  }
+
   dispatchInTxn(nowMs: number, notifyJobs?: Set<string>): number {
+    if (this.activeJobs.size === 0 || this.sessions.size === 0) {
+      return 0;
+    }
     let dispatchedCount = 0;
 
     for (const [namespace, ifaceQueues] of this.queues) {
       for (const [interfaceName, queue] of ifaceQueues) {
         if (queue.totalLen === 0) continue;
-        const ifaceSessions = this.sessionsByInterface
-          .get(namespace)
-          ?.get(interfaceName);
-        if (!ifaceSessions || ifaceSessions.size === 0) continue;
-
-        const candidates: string[] = [];
-        for (const sid of ifaceSessions) {
-          const s = this.sessions.get(sid);
-          if (s && sessionFreeSlots(s) > 0) {
-            candidates.push(sid);
-          }
-        }
-        if (candidates.length === 0) continue;
-
-        const policy = this.config.interfaces[interfaceName];
-        const entries =
-          queue.totalLen <= DISPATCH_SCAN
-            ? queue.collectCandidates(DISPATCH_SCAN)
-            : queue.collectAllOrdered();
-
-        for (const qEntry of entries) {
-          if (candidates.length === 0) break;
-          const job = this.jobs.get(qEntry.scopedJobId);
-          if (!job || job.state !== "queued") continue;
-
-          // Lazy deadline checks before dispatching!
-          if (job.totalDeadlineMs !== null && job.totalDeadlineMs <= nowMs) {
-            this.failJobInTxn(
-              job.scopedJobId,
-              RUNTIME_CODES.TOTAL_TIMEOUT,
-              "job exceeded its total timeout",
-              nowMs,
-            );
-            notifyJobs?.add(job.scopedJobId);
-            continue;
-          }
-          if (job.queueDeadlineMs !== null && job.queueDeadlineMs <= nowMs) {
-            this.failJobInTxn(
-              job.scopedJobId,
-              RUNTIME_CODES.QUEUE_TIMEOUT,
-              "no worker took the job within its queue timeout",
-              nowMs,
-            );
-            notifyJobs?.add(job.scopedJobId);
-            continue;
-          }
-
-          if (job.notBeforeMs > nowMs) {
-            continue;
-          }
-
-          // Concurrency key check
-          if (job.concurrencyKey.length > 0) {
-            const cap =
-              policy?.maxInFlightPerKey ??
-              this.config.defaultMaxInFlightPerKey ??
-              1;
-            if (this.getConcurrencyKeyCount(namespace, job.concurrencyKey) >= cap) {
-              continue;
-            }
-          }
-
-          const pickedSessionId = pickSessionForJob(this, 
-            job,
-            policy,
-            candidates,
-            nowMs,
-          );
-          if (!pickedSessionId) {
-            continue;
-          }
-
-          this.beginAttemptInTxn(job, pickedSessionId, nowMs);
-          queue.rotateKeyToBack(job.priority, job.fairnessKey);
-          notifyJobs?.add(job.scopedJobId);
-          dispatchedCount += 1;
-
-          const pickedSession = this.sessions.get(pickedSessionId);
-          if (!pickedSession || sessionFreeSlots(pickedSession) === 0) {
-            const cIdx = candidates.indexOf(pickedSessionId);
-            if (cIdx >= 0) {
-              candidates.splice(cIdx, 1);
-            }
-          }
-        }
+        dispatchedCount += this.dispatchPairInTxn(
+          namespace,
+          interfaceName,
+          nowMs,
+          notifyJobs,
+        );
       }
     }
 
@@ -2412,7 +2472,7 @@ export class NativeEngine implements ConsoleBackend {
 
     this.attachLeaseToSessionMem(session, leaseId, job.spec.demand.required_capacity);
     session.assignedSinceReport += 1;
-    this.persistSessionRowInTxn(session);
+    this.persistSessionLeasesInTxn(session);
 
     const concurrencyCounted = job.concurrencyKey.length > 0;
     if (concurrencyCounted) {
@@ -2467,6 +2527,7 @@ export class NativeEngine implements ConsoleBackend {
     job.lastAttemptId = attemptId;
     job.lastWorkerId = session.workerId;
     job.updatedAtMs = nowMs;
+    this.syncJobTimerTracking(job);
 
     this.appendJobEventInTxn(
       job,
@@ -2483,7 +2544,8 @@ export class NativeEngine implements ConsoleBackend {
       `UPDATE native_jobs
        SET state = 'running', attempt_count = ?, updated_at_ms = ?,
            last_attempt_id = ?, last_worker_id = ?,
-           last_seq_hi = ?, last_seq_lo = ?
+           last_seq_hi = ?, last_seq_lo = ?,
+           event_log_count = ?, event_log_bytes = ?
        WHERE scoped_job_id = ?`,
       job.attemptCount,
       nowMs,
@@ -2491,6 +2553,8 @@ export class NativeEngine implements ConsoleBackend {
       session.workerId,
       lastSplit.hi,
       lastSplit.lo,
+      job.eventLogCount,
+      job.eventLogBytes,
       job.scopedJobId,
     );
 
@@ -2568,7 +2632,7 @@ export class NativeEngine implements ConsoleBackend {
         if (session.consecutiveFailures >= 3) {
           session.cooldownUntilMs = nowMs + 2_000;
         }
-        this.persistSessionRowInTxn(session);
+        this.persistSessionLeasesInTxn(session);
       }
     }
 
@@ -2603,6 +2667,7 @@ export class NativeEngine implements ConsoleBackend {
         null;
       job.queueDeadlineMs =
         queueTimeoutMs !== null ? nowMs + queueTimeoutMs : null;
+      this.syncJobTimerTracking(job);
 
       this.appendJobEventInTxn(
         job,
@@ -2629,16 +2694,19 @@ export class NativeEngine implements ConsoleBackend {
          SET state = 'queued', updated_at_ms = ?, queued_since_ms = ?,
              not_before_ms = ?, queue_deadline_ms = ?,
              failed_workers_json = ?, rejected_sessions_json = ?,
-             last_seq_hi = ?, last_seq_lo = ?
+             last_seq_hi = ?, last_seq_lo = ?,
+             event_log_count = ?, event_log_bytes = ?
          WHERE scoped_job_id = ?`,
         nowMs,
         nowMs,
         job.notBeforeMs,
         job.queueDeadlineMs,
-        JSON.stringify([...job.failedWorkers]),
-        JSON.stringify([...job.rejectedSessions]),
+        job.failedWorkers.size === 0 ? "[]" : JSON.stringify([...job.failedWorkers]),
+        job.rejectedSessions.size === 0 ? "[]" : JSON.stringify([...job.rejectedSessions]),
         lastSplit.hi,
         lastSplit.lo,
+        job.eventLogCount,
+        job.eventLogBytes,
         job.scopedJobId,
       );
 
@@ -2823,6 +2891,14 @@ export class NativeEngine implements ConsoleBackend {
     job.queueDeadlineMs = null;
     job.totalDeadlineMs = null;
     job.stalledSinceMs = null;
+    this.activeJobs.delete(job.scopedJobId);
+    this.timedActiveJobs.delete(job.scopedJobId);
+    if (nowMs < this.lastTerminalUpdatedAtMs) {
+      this.terminalOrderDirty = true;
+    } else {
+      this.lastTerminalUpdatedAtMs = nowMs;
+    }
+    this.terminalJobsOrder.add(job.scopedJobId);
 
     this.appendJobEventInTxn(
       job,
@@ -2842,19 +2918,22 @@ export class NativeEngine implements ConsoleBackend {
            winning_lease_id = ?, result_digest = ?,
            failed_workers_json = ?, rejected_sessions_json = ?,
            last_seq_hi = ?, last_seq_lo = ?,
-           evicted_seq_hi = ?, evicted_seq_lo = ?
+           evicted_seq_hi = ?, evicted_seq_lo = ?,
+           event_log_count = ?, event_log_bytes = ?
        WHERE scoped_job_id = ?`,
       terminalState,
       nowMs,
       error ? JSON.stringify(error) : null,
       winningLeaseId,
       resultDigest,
-      JSON.stringify([...job.failedWorkers]),
-      JSON.stringify([...job.rejectedSessions]),
+      job.failedWorkers.size === 0 ? "[]" : JSON.stringify([...job.failedWorkers]),
+      job.rejectedSessions.size === 0 ? "[]" : JSON.stringify([...job.rejectedSessions]),
       lastSplit.hi,
       lastSplit.lo,
       evSplit.hi,
       evSplit.lo,
+      job.eventLogCount,
+      job.eventLogBytes,
       job.scopedJobId,
     );
 
@@ -2915,9 +2994,9 @@ export class NativeEngine implements ConsoleBackend {
           this.socketsByConnId.delete(lease.attemptConnId);
           if (aws && aws.readyState === WS_READY_STATE_OPEN) {
             try {
-              this.sendWsProtoSync(
+              this.sendWsRawSync(
                 aws,
-                pb.encodeAttemptDown({
+                pb.encodeAttemptDownWsFrame({
                   msg: {
                     case: "finished",
                     value: {
@@ -3001,6 +3080,7 @@ export class NativeEngine implements ConsoleBackend {
           job.queuedSinceMs = nowMs;
           job.updatedAtMs = nowMs;
           job.notBeforeMs = 0;
+          this.syncJobTimerTracking(job);
           this.queueSeq += 1n;
           job.queueSeq = this.queueSeq;
           this.getOrCreateQueue(job.namespace, job.interfaceName).insert(
@@ -3189,7 +3269,7 @@ export class NativeEngine implements ConsoleBackend {
       if (!session.connected && session.activeLeases.size === 0) {
         this.removeSessionInTxn(session.sessionId);
       } else {
-        this.persistSessionRowInTxn(session);
+        this.persistSessionLeasesInTxn(session);
       }
     }
   }
@@ -3199,7 +3279,8 @@ export class NativeEngine implements ConsoleBackend {
     deleteR2Segments: boolean,
     nowMs: number,
   ): void {
-    if (deleteR2Segments) {
+    const lease = this.leases.get(leaseId);
+    if (deleteR2Segments && (!lease || lease.nextSegIndex > 0)) {
       const segRows = this.store.exec<{ r2_key: string | null }>(
         `SELECT r2_key FROM native_upload_segments WHERE lease_id = ? AND r2_key IS NOT NULL`,
         leaseId,
@@ -3209,7 +3290,6 @@ export class NativeEngine implements ConsoleBackend {
         this.store.queuePendingDeleteInTxn(r2Keys, nowMs);
       }
     }
-    const lease = this.leases.get(leaseId);
     if (lease && (lease.tailNextChunkSeq > 0 || lease.nextSegIndex > 0)) {
       this.store.exec(`DELETE FROM native_upload_tail WHERE lease_id = ?`, leaseId);
       this.store.exec(`DELETE FROM native_upload_segments WHERE lease_id = ?`, leaseId);
@@ -3380,6 +3460,33 @@ export class NativeEngine implements ConsoleBackend {
     );
   }
 
+  persistSessionLeasesInTxn(s: SessionMem): void {
+    this.store.exec(
+      `UPDATE native_sessions
+       SET reserved_capacity_json = ?, active_leases_json = ?,
+           assigned_since_report = ?, consecutive_failures = ?, cooldown_until_ms = ?
+       WHERE session_id = ?`,
+      serializeCapacityJson(s.reservedCapacity),
+      s.activeLeases.size === 0 ? "[]" : JSON.stringify([...s.activeLeases]),
+      s.assignedSinceReport,
+      s.consecutiveFailures,
+      s.cooldownUntilMs,
+      s.sessionId,
+    );
+  }
+
+  persistSessionCreditInTxn(s: SessionMem): void {
+    this.store.exec(
+      `UPDATE native_sessions
+       SET reported_free = ?, assigned_since_report = ?, last_seen_ms = ?
+       WHERE session_id = ?`,
+      s.reportedFree,
+      s.assignedSinceReport,
+      s.lastSeenMs,
+      s.sessionId,
+    );
+  }
+
   insertLeaseRowInTxn(l: LeaseMem): void {
     const fSplit = splitU64(l.lastFrameSeq);
     const iSplit = splitU64(l.inputSeq);
@@ -3539,41 +3646,60 @@ export class NativeEngine implements ConsoleBackend {
   // Retention & Purge (Section 4.5 & 6.4)
   // ---------------------------------------------------------------------------
 
-  enforceMaxTerminalJobsInTxn(nowMs: number): void {
-    const terminals: JobMem[] = [];
-    for (const j of this.jobs.values()) {
-      if (
-        j.state === "succeeded" ||
-        j.state === "failed" ||
-        j.state === "cancelled"
-      ) {
-        terminals.push(j);
-      }
-    }
-    if (terminals.length <= this.config.maxTerminalJobs) {
+  ensureTerminalOrderSorted(): void {
+    if (!this.terminalOrderDirty) {
       return;
     }
-    terminals.sort((a, b) => a.updatedAtMs - b.updatedAtMs);
-    const excess = terminals.length - this.config.maxTerminalJobs;
-    for (let i = 0; i < excess; i++) {
-      this.purgeSingleJobInTxn(terminals[i]!.scopedJobId, nowMs);
+    const ordered: JobMem[] = [];
+    for (const jid of this.terminalJobsOrder) {
+      const j = this.jobs.get(jid);
+      if (j) ordered.push(j);
+    }
+    ordered.sort((a, b) => a.updatedAtMs - b.updatedAtMs);
+    this.terminalJobsOrder.clear();
+    let maxUpdated = 0;
+    for (let i = 0; i < ordered.length; i++) {
+      const j = ordered[i]!;
+      this.terminalJobsOrder.add(j.scopedJobId);
+      if (j.updatedAtMs > maxUpdated) maxUpdated = j.updatedAtMs;
+    }
+    this.lastTerminalUpdatedAtMs = maxUpdated;
+    this.terminalOrderDirty = false;
+  }
+
+  enforceMaxTerminalJobsInTxn(nowMs: number): void {
+    const excess = this.terminalJobsOrder.size - this.config.maxTerminalJobs;
+    if (excess <= 0) {
+      return;
+    }
+    this.ensureTerminalOrderSorted();
+    let remaining = excess;
+    for (const jid of this.terminalJobsOrder) {
+      if (remaining <= 0) break;
+      this.purgeSingleJobInTxn(jid, nowMs);
+      remaining -= 1;
     }
   }
 
   purgeExpiredTerminalJobsInTxn(nowMs: number, maxCount: number): number {
+    if (this.terminalJobsOrder.size === 0 || maxCount <= 0) {
+      return 0;
+    }
+    this.ensureTerminalOrderSorted();
     const cutoff = nowMs - this.config.terminalRetentionMs;
     let purged = 0;
-    for (const j of [...this.jobs.values()]) {
+    for (const jid of this.terminalJobsOrder) {
       if (purged >= maxCount) break;
-      if (
-        (j.state === "succeeded" ||
-          j.state === "failed" ||
-          j.state === "cancelled") &&
-        j.updatedAtMs <= cutoff
-      ) {
-        this.purgeSingleJobInTxn(j.scopedJobId, nowMs);
-        purged += 1;
+      const j = this.jobs.get(jid);
+      if (!j) {
+        this.terminalJobsOrder.delete(jid);
+        continue;
       }
+      if (j.updatedAtMs > cutoff) {
+        break;
+      }
+      this.purgeSingleJobInTxn(jid, nowMs);
+      purged += 1;
     }
     return purged;
   }
@@ -3621,6 +3747,9 @@ export class NativeEngine implements ConsoleBackend {
       this.totalEventBytesHeld - job.eventLogBytes,
     );
     this.jobs.delete(scopedJobId);
+    this.activeJobs.delete(scopedJobId);
+    this.timedActiveJobs.delete(scopedJobId);
+    this.terminalJobsOrder.delete(scopedJobId);
   }
 
   // ---------------------------------------------------------------------------
@@ -3694,7 +3823,7 @@ export class NativeEngine implements ConsoleBackend {
       return;
     }
     try {
-      this.sendWsProtoSync(ws, pb.encodeServerMessage(msg));
+      this.sendWsRawSync(ws, pb.encodeServerMessageWsFrame(msg));
     } catch {
       this.disconnectSessionInTxn(sessionId, session.currentConnId, nowMs);
     }

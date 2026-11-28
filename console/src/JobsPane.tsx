@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 
 import {
   DEFAULT_TIME_FILTER, type JobScope, type JobStatusFilter, type PaneStat, type TimeFilterState,
@@ -118,6 +118,16 @@ export function JobsPane(props: JobsPaneProps) {
     setCustomOpen(false);
     props.onTimeFilterChange({ preset: "custom", fromMs, toMs });
   }
+
+  const { onTimeFilterChange } = props;
+  const handleZoomRange = useCallback((fromMs: number, toMs: number) => {
+    setCustomOpen(false);
+    onTimeFilterChange({ preset: "custom", fromMs, toMs });
+  }, [onTimeFilterChange]);
+  const handleResetTime = useCallback(() => {
+    setCustomOpen(false);
+    onTimeFilterChange(DEFAULT_TIME_FILTER);
+  }, [onTimeFilterChange]);
 
   return (
     <div className="content-grid">
@@ -243,14 +253,8 @@ export function JobsPane(props: JobsPaneProps) {
           histogram={props.histogram}
           timeFilter={props.timeFilter}
           refreshing={props.histogramRefreshing}
-          onZoomRange={(fromMs, toMs) => {
-            setCustomOpen(false);
-            props.onTimeFilterChange({ preset: "custom", fromMs, toMs });
-          }}
-          onResetTime={() => {
-            setCustomOpen(false);
-            props.onTimeFilterChange(DEFAULT_TIME_FILTER);
-          }}
+          onZoomRange={handleZoomRange}
+          onResetTime={handleResetTime}
         />
 
         <JobsTable

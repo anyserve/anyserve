@@ -118,15 +118,23 @@ export function isValidInterfaceName(name: string): boolean {
   return true;
 }
 
+const KIND_TO_COMPACT: Readonly<Record<SocketKind, CompactAttachment["k"]>> = {
+  session: "s",
+  attempt: "a",
+  invoke: "i",
+  watch: "w",
+};
+
+const COMPACT_TO_KIND: Readonly<Record<string, SocketKind>> = {
+  s: "session",
+  a: "attempt",
+  i: "invoke",
+  w: "watch",
+};
+
 export function encodeCompactAttachment(att: SocketAttachment): CompactAttachment {
-  const kindMap: Record<SocketKind, CompactAttachment["k"]> = {
-    session: "s",
-    attempt: "a",
-    invoke: "i",
-    watch: "w",
-  };
   const out: CompactAttachment = {
-    k: kindMap[att.kind],
+    k: KIND_TO_COMPACT[att.kind],
     c: att.connId,
     id: att.id,
     ns: att.namespace,
@@ -144,7 +152,7 @@ export function encodeCompactAttachment(att: SocketAttachment): CompactAttachmen
     out.r = att.running;
   }
   if (att.utilization !== 0) {
-    out.u = Number(att.utilization.toFixed(6));
+    out.u = Math.round(att.utilization * 1_000_000) / 1_000_000;
   }
   if (att.replay === 1) {
     out.rp = 1;
@@ -157,13 +165,7 @@ export function decodeCompactAttachment(raw: unknown): SocketAttachment | null {
     return null;
   }
   const obj = raw as Partial<CompactAttachment>;
-  const kindRev: Record<string, SocketKind> = {
-    s: "session",
-    a: "attempt",
-    i: "invoke",
-    w: "watch",
-  };
-  const kind = typeof obj.k === "string" ? kindRev[obj.k] : undefined;
+  const kind = typeof obj.k === "string" ? COMPACT_TO_KIND[obj.k] : undefined;
   if (
     !kind ||
     typeof obj.c !== "number" ||
@@ -196,21 +198,63 @@ export function decodeCompactAttachment(raw: unknown): SocketAttachment | null {
  */
 const attachmentCache = new WeakMap<object, SocketAttachment>();
 
+function isPlainAsciiJsonString(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c >= 0x7f || c === 0x22 || c === 0x5c) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Fast conservative upper bound on `utf8ByteLen(JSON.stringify(compact))`.
+ * Returns `true` when guaranteed `<= ATTACHMENT_MAX_BYTES`, avoiding `JSON.stringify`
+ * on the hot heartbeat path; falls back to exact `JSON.stringify` near or above the limit.
+ */
+function isCompactAttachmentGuaranteedUnderLimit(compact: CompactAttachment): boolean {
+  // Fixed JSON skeleton + numeric fields:
+  // {"k":"s","c":<16>,"id":"...","ns":"...","h":1,"oa":<16>,"ls":<16>} <= 96 bytes + id + ns
+  let est = 96 + compact.id.length + compact.ns.length;
+  if (compact.fp !== undefined) est += 8 + compact.fp.length;
+  if (compact.q !== undefined) est += 16;
+  if (compact.r !== undefined) est += 16;
+  if (compact.u !== undefined) est += 18;
+  if (compact.rp !== undefined) est += 7;
+  if (est > ATTACHMENT_MAX_BYTES) return false;
+  if (!isPlainAsciiJsonString(compact.id)) return false;
+  if (!isPlainAsciiJsonString(compact.ns)) return false;
+  if (compact.fp !== undefined && !isPlainAsciiJsonString(compact.fp)) return false;
+  return true;
+}
+
 export function writeSocketAttachment(ws: NativeWebSocket, att: SocketAttachment): void {
   const compact = encodeCompactAttachment(att);
-  const bytes = utf8ByteLen(JSON.stringify(compact));
-  if (bytes > ATTACHMENT_MAX_BYTES) {
-    throw new Error(
-      `WebSocket attachment exceeds ${ATTACHMENT_MAX_BYTES} bytes (${bytes} bytes)`,
-    );
+  if (!isCompactAttachmentGuaranteedUnderLimit(compact)) {
+    const bytes = utf8ByteLen(JSON.stringify(compact));
+    if (bytes > ATTACHMENT_MAX_BYTES) {
+      throw new Error(
+        `WebSocket attachment exceeds ${ATTACHMENT_MAX_BYTES} bytes (${bytes} bytes)`,
+      );
+    }
   }
   ws.serializeAttachment(compact);
-  const canonical = decodeCompactAttachment(compact);
-  if (canonical) {
-    attachmentCache.set(ws, Object.freeze(canonical));
-  } else {
-    attachmentCache.delete(ws);
-  }
+  const canonical: SocketAttachment = {
+    kind: att.kind,
+    connId: att.connId,
+    id: att.id,
+    namespace: att.namespace,
+    forcedPool: compact.fp ?? null,
+    handshakeDone: att.handshakeDone === 1 ? 1 : 0,
+    openedAtMs: att.openedAtMs,
+    lastSeenAtMs: att.lastSeenAtMs,
+    queued: compact.q ?? 0,
+    running: compact.r ?? 0,
+    utilization: compact.u ?? 0,
+    replay: att.replay === 1 ? 1 : 0,
+  };
+  attachmentCache.set(ws, Object.freeze(canonical));
 }
 
 export function readSocketAttachment(ws: NativeWebSocket): SocketAttachment | null {
@@ -231,11 +275,22 @@ export function boundCustomLoad(
   if (!raw) {
     return { custom: {}, dropped: 0 };
   }
+  if (raw instanceof Map) {
+    if (raw.size === 0) {
+      return { custom: {}, dropped: 0 };
+    }
+  } else {
+    let hasAny = false;
+    for (const _ in raw) {
+      hasAny = true;
+      break;
+    }
+    if (!hasAny) {
+      return { custom: {}, dropped: 0 };
+    }
+  }
   const entries: Array<[string, number]> =
     raw instanceof Map ? [...raw.entries()] : Object.entries(raw);
-  if (entries.length === 0) {
-    return { custom: {}, dropped: 0 };
-  }
   // Sort deterministically by UTF-8 byte order so retained subset is reproducible.
   entries.sort(([a], [b]) => compareUtf8Strings(a, b));
   const custom: Record<string, number> = {};

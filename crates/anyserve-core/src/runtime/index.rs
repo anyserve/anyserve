@@ -1,15 +1,23 @@
 //! Read indexes maintained alongside job transitions under the runtime lock.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ops::{Bound, ControlFlow};
+use std::sync::{Arc, OnceLock};
+
+use ahash::AHashMap;
 
 use super::api::{InterfaceStats, JobState};
 use super::state::Job;
 
-type OrderKey = (Reverse<u64>, String);
+type OrderKey = (Reverse<u64>, Arc<str>);
 type ByState = [BTreeSet<OrderKey>; 5];
 type Position = (JobState, u64, u64);
+
+fn empty_arc_str() -> Arc<str> {
+    static EMPTY: OnceLock<Arc<str>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::from("")))
+}
 
 const STATES: [JobState; 5] = [
     JobState::Queued,
@@ -32,20 +40,20 @@ fn slot(state: JobState) -> usize {
 #[derive(Default)]
 struct InterfaceIndex {
     jobs: ByState,
-    queued_since: BTreeSet<(u64, String)>,
+    queued_since: BTreeSet<(u64, Arc<str>)>,
 }
 
 #[derive(Default)]
 struct NamespaceIndex {
-    jobs: ByState,
+    counts: [usize; 5],
     interfaces: BTreeMap<String, InterfaceIndex>,
     /// Keyed by `(created_at_ms, raw_job_id)` -> `scoped_job_id`.
-    created: BTreeMap<(u64, String), String>,
+    created: BTreeMap<(u64, Arc<str>), Arc<str>>,
 }
 
 #[derive(Default)]
 pub(crate) struct JobIndex {
-    namespaces: HashMap<String, NamespaceIndex>,
+    namespaces: AHashMap<String, NamespaceIndex>,
     /// Maintained only when at least one `prefix_overrides` entry configures
     /// `max_total_pending_jobs`; deployments without it pay zero map/alloc cost.
     track_pending_namespaces: bool,
@@ -77,8 +85,9 @@ impl JobIndex {
     pub(crate) fn unfinished_ids(&self) -> impl Iterator<Item = &str> + Clone {
         self.namespaces
             .values()
-            .flat_map(|ns| ns.jobs[0].iter().chain(ns.jobs[1].iter()))
-            .map(|(_, id)| id.as_str())
+            .flat_map(|ns| ns.interfaces.values())
+            .flat_map(|iface| iface.jobs[0].iter().chain(iface.jobs[1].iter()))
+            .map(|(_, id)| id.as_ref())
     }
 
     #[cfg(test)]
@@ -91,11 +100,15 @@ impl JobIndex {
     }
 
     pub(crate) fn insert(&mut self, job: &Job) {
-        self.namespaces
-            .entry(job.namespace.clone())
-            .or_default()
-            .created
-            .insert((job.created_at_ms, job.raw_id.clone()), job.id.clone());
+        let ns = if let Some(ns) = self.namespaces.get_mut(&job.namespace) {
+            ns
+        } else {
+            self.namespaces.entry(job.namespace.clone()).or_default()
+        };
+        ns.created.insert(
+            (job.created_at_ms, Arc::clone(&job.raw_index_id)),
+            Arc::clone(&job.index_id),
+        );
         self.insert_state(job);
     }
 
@@ -105,22 +118,29 @@ impl JobIndex {
 
     fn insert_state_inner(&mut self, job: &Job, sync_pending: bool) {
         let state = slot(job.state());
-        let key = (Reverse(job.updated_at_ms), job.id.clone());
+        let key = (Reverse(job.updated_at_ms), Arc::clone(&job.index_id));
         self.counts[state] += 1;
-        let ns = self.namespaces.entry(job.namespace.clone()).or_default();
-        ns.jobs[state].insert(key.clone());
-        let ns_iface = ns
-            .interfaces
-            .entry(job.spec.demand.interface.clone())
-            .or_default();
+        let ns = if let Some(ns) = self.namespaces.get_mut(&job.namespace) {
+            ns
+        } else {
+            self.namespaces.entry(job.namespace.clone()).or_default()
+        };
+        ns.counts[state] += 1;
+        let ns_iface = if let Some(iface) = ns.interfaces.get_mut(&job.spec.demand.interface) {
+            iface
+        } else {
+            ns.interfaces
+                .entry(job.spec.demand.interface.clone())
+                .or_default()
+        };
         ns_iface.jobs[state].insert(key);
         if job.state() == JobState::Queued {
             ns_iface
                 .queued_since
-                .insert((job.queued_since_ms, job.id.clone()));
+                .insert((job.queued_since_ms, Arc::clone(&job.index_id)));
         }
         if self.track_pending_namespaces && sync_pending && state <= 1 {
-            let pending = ns.jobs[0].len() + ns.jobs[1].len();
+            let pending = ns.counts[0] + ns.counts[1];
             if let Some(count) = self.pending_namespaces.get_mut(&job.namespace) {
                 *count = pending;
             } else {
@@ -143,12 +163,13 @@ impl JobIndex {
 
     pub(crate) fn remove(&mut self, job: &Job, prune: bool) {
         if let Some(ns) = self.namespaces.get_mut(&job.namespace) {
-            ns.created.remove(&(job.created_at_ms, job.raw_id.clone()));
+            ns.created
+                .remove(&(job.created_at_ms, Arc::clone(&job.raw_index_id)));
         }
         self.remove_position(job, Self::position(job), prune);
         if prune
             && let Some(ns) = self.namespaces.get(&job.namespace)
-            && ns.jobs.iter().all(BTreeSet::is_empty)
+            && ns.counts.iter().all(|&c| c == 0)
             && ns.created.is_empty()
         {
             self.namespaces.remove(&job.namespace);
@@ -167,8 +188,11 @@ impl JobIndex {
         if limit == 0 || self.namespaces.is_empty() {
             return Vec::new();
         }
-        let lower = (from_ms, String::new());
-        let upper = before.unwrap_or((to_ms, String::new()));
+        let lower = (from_ms, empty_arc_str());
+        let upper = match before {
+            Some((ts, id)) => (ts, Arc::<str>::from(id)),
+            None => (to_ms, empty_arc_str()),
+        };
         if upper <= lower {
             return Vec::new();
         }
@@ -179,7 +203,7 @@ impl JobIndex {
                     .range((Included(lower), Excluded(upper)))
                     .rev()
                     .take(limit)
-                    .map(|(_, scoped)| scoped.as_str())
+                    .map(|(_, scoped)| scoped.as_ref())
                     .collect(),
                 None => Vec::new(),
             };
@@ -193,13 +217,13 @@ impl JobIndex {
                 .range((Included(lower), Excluded(upper)))
                 .rev()
                 .take(limit)
-                .map(|(_, scoped)| scoped.as_str())
+                .map(|(_, scoped)| scoped.as_ref())
                 .collect();
         }
         let range_upper = if upper.0 < to_ms {
-            (upper.0.saturating_add(1), String::new())
+            (upper.0.saturating_add(1), empty_arc_str())
         } else {
-            (to_ms, String::new())
+            (to_ms, empty_arc_str())
         };
         let mut items: Vec<(u64, &str)> = Vec::new();
         for index in self.namespaces.values() {
@@ -209,10 +233,10 @@ impl JobIndex {
                 .range((Included(lower.clone()), Excluded(range_upper.clone())))
                 .rev()
             {
-                if (*ts, scoped.as_str()) >= (upper.0, upper.1.as_str()) {
+                if (*ts, scoped.as_ref()) >= (upper.0, upper.1.as_ref()) {
                     continue;
                 }
-                items.push((*ts, scoped.as_str()));
+                items.push((*ts, scoped.as_ref()));
                 taken += 1;
                 if taken >= limit && *ts < upper.0 {
                     break;
@@ -238,23 +262,23 @@ impl JobIndex {
         let (previous_state, updated_at_ms, queued_since_ms) = position;
         let state = slot(previous_state);
         self.counts[state] = self.counts[state].saturating_sub(1);
-        let key = (Reverse(updated_at_ms), job.id.clone());
+        let key = (Reverse(updated_at_ms), Arc::clone(&job.index_id));
         let name = &job.spec.demand.interface;
         if let Some(ns) = self.namespaces.get_mut(&job.namespace) {
-            ns.jobs[state].remove(&key);
+            ns.counts[state] = ns.counts[state].saturating_sub(1);
             if let Some(ns_iface) = ns.interfaces.get_mut(name) {
                 ns_iface.jobs[state].remove(&key);
                 if previous_state == JobState::Queued {
                     ns_iface
                         .queued_since
-                        .remove(&(queued_since_ms, job.id.clone()));
+                        .remove(&(queued_since_ms, Arc::clone(&job.index_id)));
                 }
                 if prune && ns_iface.jobs.iter().all(BTreeSet::is_empty) {
                     ns.interfaces.remove(name);
                 }
             }
             if self.track_pending_namespaces && sync_pending && state <= 1 {
-                let pending = ns.jobs[0].len() + ns.jobs[1].len();
+                let pending = ns.counts[0] + ns.counts[1];
                 if pending == 0 {
                     self.pending_namespaces.remove(&job.namespace);
                 } else if let Some(count) = self.pending_namespaces.get_mut(&job.namespace) {
@@ -290,7 +314,9 @@ impl JobIndex {
             }
             (Some(ns), None) => {
                 if let Some(index) = self.namespaces.get(ns) {
-                    collect_states(&mut selected, filter_states, &index.jobs);
+                    for iface in index.interfaces.values() {
+                        collect_states(&mut selected, filter_states, &iface.jobs);
+                    }
                 }
             }
             (None, Some(name)) => {
@@ -302,7 +328,9 @@ impl JobIndex {
             }
             (None, None) => {
                 for index in self.namespaces.values() {
-                    collect_states(&mut selected, filter_states, &index.jobs);
+                    for iface in index.interfaces.values() {
+                        collect_states(&mut selected, filter_states, &iface.jobs);
+                    }
                 }
             }
         }
@@ -318,7 +346,7 @@ impl JobIndex {
         }
         if selected.len() == 1 {
             for (_, id) in selected[0] {
-                if visit(id.as_str()).is_break() {
+                if visit(id.as_ref()).is_break() {
                     break;
                 }
             }
@@ -333,7 +361,7 @@ impl JobIndex {
                 .min_by(|(_, a), (_, b)| a.cmp(b))
             {
                 if let Some((_, id)) = cursors[next].next()
-                    && visit(id.as_str()).is_break()
+                    && visit(id.as_ref()).is_break()
                 {
                     break;
                 }
@@ -349,7 +377,7 @@ impl JobIndex {
             }
         }
         while let Some(Reverse((key, idx))) = heap.pop() {
-            if visit(key.1.as_str()).is_break() {
+            if visit(key.1.as_ref()).is_break() {
                 break;
             }
             if let Some(next_key) = iters[idx].next() {
@@ -387,19 +415,19 @@ impl JobIndex {
         if self.namespaces.is_empty() {
             return;
         }
-        let lower = from_ms.map_or(Bound::Unbounded, |f| Bound::Included((f, String::new())));
-        let upper = to_ms.map_or(Bound::Unbounded, |t| Bound::Excluded((t, String::new())));
+        let lower = from_ms.map_or(Bound::Unbounded, |f| Bound::Included((f, empty_arc_str())));
+        let upper = to_ms.map_or(Bound::Unbounded, |t| Bound::Excluded((t, empty_arc_str())));
         if let Some(ns) = namespace {
             if let Some(index) = self.namespaces.get(ns) {
                 for (_, scoped) in index.created.range((lower, upper)) {
-                    visit(scoped.as_str());
+                    visit(scoped.as_ref());
                 }
             }
             return;
         }
         for index in self.namespaces.values() {
             for (_, scoped) in index.created.range((lower.clone(), upper.clone())) {
-                visit(scoped.as_str());
+                visit(scoped.as_ref());
             }
         }
     }
@@ -427,7 +455,7 @@ impl JobIndex {
                     .iter()
                     .skip(offset)
                     .take(limit)
-                    .map(|(_, id)| id.as_str())
+                    .map(|(_, id)| id.as_ref())
                     .collect(),
                 total,
             );
@@ -458,7 +486,7 @@ impl JobIndex {
     pub(crate) fn namespace_pending_count(&self, namespace: &str) -> usize {
         self.namespaces
             .get(namespace)
-            .map_or(0, |ns| ns.jobs[0].len() + ns.jobs[1].len())
+            .map_or(0, |ns| ns.counts[0] + ns.counts[1])
     }
 
     /// Counts unfinished (queued + running) jobs across all namespaces matching
@@ -492,16 +520,9 @@ impl JobIndex {
         let Some(ns) = self.namespaces.get(namespace) else {
             return ([0; 5], BTreeMap::new());
         };
-        let counts = [
-            ns.jobs[0].len(),
-            ns.jobs[1].len(),
-            ns.jobs[2].len(),
-            ns.jobs[3].len(),
-            ns.jobs[4].len(),
-        ];
         let mut interfaces = BTreeMap::new();
         Self::merge_namespace_interfaces(ns, now, &mut interfaces);
-        (counts, interfaces)
+        (ns.counts, interfaces)
     }
 
     fn merge_namespace_interfaces(
@@ -537,7 +558,10 @@ pub(crate) fn assert_matches_jobs(st: &super::state::State) {
         st.job_index
             .namespaces
             .values()
-            .flat_map(|ns| ns.created.iter().map(|((ts, _), id)| (*ts, id.clone())))
+            .flat_map(|ns| ns
+                .created
+                .iter()
+                .map(|((ts, _), id)| (*ts, id.as_ref().to_string())))
             .collect::<BTreeSet<_>>(),
         st.jobs
             .values()
@@ -710,12 +734,13 @@ mod tests {
                     if let Some(ns_idx_map) = st.job_index.namespaces.get_mut(&ns) {
                         ns_idx_map
                             .created
-                            .remove(&(job.created_at_ms, job.raw_id.clone()));
+                            .remove(&(job.created_at_ms, Arc::clone(&job.raw_index_id)));
                         job.created_at_ms = ts;
                         job.updated_at_ms = ts * 2;
-                        ns_idx_map
-                            .created
-                            .insert((job.created_at_ms, job.raw_id.clone()), job.id.clone());
+                        ns_idx_map.created.insert(
+                            (job.created_at_ms, Arc::clone(&job.raw_index_id)),
+                            Arc::clone(&job.index_id),
+                        );
                     }
                     st.job_index.insert_state(job);
                 }

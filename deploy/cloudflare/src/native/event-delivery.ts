@@ -11,7 +11,7 @@ import {
 } from "./host";
 import { joinU64, normalizeBlob, splitU64, type StoredErrorInfo } from "./store";
 import * as pb from "./proto";
-import { nameToProtoState, type JobMem } from "./engine-types";
+import { nameToProtoState, type JobMem, type PendingJobEvent } from "./engine-types";
 import {
   varintLen32,
   varintLen64,
@@ -25,6 +25,8 @@ import {
 import type { NativeEngine } from "./engine";
 
 const utf8Encoder = new TextEncoder();
+const EMPTY_BYTES = new Uint8Array(0);
+const EMPTY_META: Record<string, string> = {};
 
 export const eventDelivery = {
   appendJobEventInTxn(
@@ -78,9 +80,13 @@ export const eventDelivery = {
       );
       const evSplit = splitU64(job.evictedThrough);
       this.store.exec(
-        `UPDATE native_jobs SET evicted_seq_hi = ?, evicted_seq_lo = ? WHERE scoped_job_id = ?`,
+        `UPDATE native_jobs
+         SET evicted_seq_hi = ?, evicted_seq_lo = ?, event_log_count = ?, event_log_bytes = ?
+         WHERE scoped_job_id = ?`,
         evSplit.hi,
         evSplit.lo,
+        job.eventLogCount,
+        job.eventLogBytes,
         job.scopedJobId,
       );
     }
@@ -88,6 +94,7 @@ export const eventDelivery = {
     job.lastSequence += 1n;
     const seq = job.lastSequence;
     const sSplit = splitU64(seq);
+    const storedPayload = payload && payload.byteLength > 0 ? payload : null;
     this.store.exec(
       `INSERT INTO native_job_events (
         scoped_job_id, seq_hi, seq_lo, attempt_id, at_ms, kind, meta_json, payload, size_bytes
@@ -99,12 +106,26 @@ export const eventDelivery = {
       nowMs,
       kind,
       meta ? JSON.stringify(meta) : null,
-      payload && payload.byteLength > 0 ? payload : null,
+      storedPayload,
       sizeBytes,
     );
     job.eventLogCount += 1;
     job.eventLogBytes += sizeBytes;
     this.totalEventBytesHeld += sizeBytes;
+    if (job.pendingEvents !== null) {
+      if (job.pendingEvents.length < 256) {
+        job.pendingEvents.push({
+          seq,
+          attemptId,
+          atMs: nowMs,
+          kind,
+          meta,
+          payload: storedPayload,
+        });
+      } else {
+        job.pendingEvents = null;
+      }
+    }
     return seq;
   },
 
@@ -191,67 +212,163 @@ export const eventDelivery = {
   },
 
   async deliverPrimaryInvokeEvents(this: NativeEngine, scopedJobId: string): Promise<void> {
-    const job = this.jobs.get(scopedJobId);
-    if (!job || job.callerConnId === null) return;
-    const ws = this.socketsByConnId.get(job.callerConnId);
-    if (!ws || ws.readyState !== WS_READY_STATE_OPEN) return;
+    if (this.deliveringPrimary.has(scopedJobId)) {
+      this.deliveringPrimaryAgain.add(scopedJobId);
+      return;
+    }
+    this.deliveringPrimary.add(scopedJobId);
+    try {
+      do {
+        this.deliveringPrimaryAgain.delete(scopedJobId);
+        const job = this.jobs.get(scopedJobId);
+        if (!job || job.callerConnId === null) return;
+        const ws = this.socketsByConnId.get(job.callerConnId);
+        if (!ws || ws.readyState !== WS_READY_STATE_OPEN) return;
 
-    const afterSeq = job.primaryConsumed ?? 0n;
-    const rows = this.readJobEventsAfterSync(scopedJobId, afterSeq);
-    if (rows.length === 0) return;
+        const afterSeq = job.primaryConsumed ?? 0n;
+        let lastDeliveredSeq: bigint | null = null;
+        let deliveredFinished = false;
 
-    for (const ev of rows) {
-      if (ws.readyState !== WS_READY_STATE_OPEN) return;
-      const seq = joinU64(ev.seq_hi, ev.seq_lo);
-      if (ev.kind === "finished") {
-        await this.sendFinishedEventToSocket(
-          ws,
-          job,
-          seq,
-          ev.attempt_id,
-          Number(ev.at_ms),
-        );
-        this.store.transactionSync(() => {
-          job.primaryConsumed = null;
-          job.callerConnId = null;
-          this.store.exec(
-            `UPDATE native_jobs
-             SET caller_conn_id = NULL, primary_seq_hi = NULL, primary_seq_lo = NULL
-             WHERE scoped_job_id = ?`,
-            job.scopedJobId,
-          );
-        });
-        return;
-      }
+        try {
+          if (job.pendingEvents !== null) {
+            // Fast path: drain directly from the transient in-memory buffer (ZERO SQLite read + ZERO JSON.parse).
+            const pending = job.pendingEvents;
+            let consumed = 0;
+            while (consumed < pending.length && pending[consumed]!.seq <= afterSeq) {
+              consumed += 1;
+            }
+            if (consumed > 0) {
+              pending.splice(0, consumed);
+            }
+            if (pending.length === 0) {
+              continue;
+            }
+            const batch = pending.splice(0, pending.length);
+            for (let i = 0; i < batch.length; i++) {
+              const ev = batch[i]!;
+              if (ws.readyState !== WS_READY_STATE_OPEN) {
+                if (job.pendingEvents !== null) {
+                  job.pendingEvents.unshift(...batch.slice(i));
+                }
+                break;
+              }
+              if (ev.kind === "finished") {
+                await this.sendFinishedEventToSocket(
+                  ws,
+                  job,
+                  ev.seq,
+                  ev.attemptId,
+                  ev.atMs,
+                );
+                this.store.transactionSync(() => {
+                  job.primaryConsumed = null;
+                  job.callerConnId = null;
+                  job.pendingEvents = null;
+                  this.store.exec(
+                    `UPDATE native_jobs
+                     SET caller_conn_id = NULL, primary_seq_hi = NULL, primary_seq_lo = NULL
+                     WHERE scoped_job_id = ?`,
+                    job.scopedJobId,
+                  );
+                });
+                deliveredFinished = true;
+                return;
+              }
 
-      const encoded = this.encodeNonTerminalEventWsFrame(job.rawJobId, ev);
-      const permit = await this.isolateBudget.acquireOutboundSend(
-        ws,
-        encoded.byteLength,
-        0,
-      );
-      if (this.disposed || ws.readyState !== WS_READY_STATE_OPEN) {
-        permit.abort();
-        return;
-      }
-      try {
-        ws.send(encoded);
-        permit.completeSend();
-      } catch {
-        permit.abort();
-        return;
-      }
+              const encoded = this.encodePendingNonTerminalEventWsFrame(job.rawJobId, ev);
+              const permit = await this.isolateBudget.acquireOutboundSend(
+                ws,
+                encoded.byteLength,
+                0,
+              );
+              if (this.disposed || ws.readyState !== WS_READY_STATE_OPEN) {
+                permit.abort();
+                if (job.pendingEvents !== null) {
+                  job.pendingEvents.unshift(...batch.slice(i));
+                }
+                break;
+              }
+              try {
+                ws.send(encoded);
+                permit.completeSend();
+              } catch {
+                permit.abort();
+                if (job.pendingEvents !== null) {
+                  job.pendingEvents.unshift(...batch.slice(i));
+                }
+                break;
+              }
+              job.primaryConsumed = ev.seq;
+              lastDeliveredSeq = ev.seq;
+            }
+          } else {
+            const rows = this.readJobEventsAfterSync(scopedJobId, afterSeq);
+            if (rows.length === 0) continue;
 
-      this.store.transactionSync(() => {
-        job.primaryConsumed = seq;
-        const pSplit = splitU64(seq);
-        this.store.exec(
-          `UPDATE native_jobs SET primary_seq_hi = ?, primary_seq_lo = ? WHERE scoped_job_id = ?`,
-          pSplit.hi,
-          pSplit.lo,
-          job.scopedJobId,
-        );
-      });
+            for (const ev of rows) {
+              if (ws.readyState !== WS_READY_STATE_OPEN) break;
+              const seq = joinU64(ev.seq_hi, ev.seq_lo);
+              if (ev.kind === "finished") {
+                await this.sendFinishedEventToSocket(
+                  ws,
+                  job,
+                  seq,
+                  ev.attempt_id,
+                  Number(ev.at_ms),
+                );
+                this.store.transactionSync(() => {
+                  job.primaryConsumed = null;
+                  job.callerConnId = null;
+                  this.store.exec(
+                    `UPDATE native_jobs
+                     SET caller_conn_id = NULL, primary_seq_hi = NULL, primary_seq_lo = NULL
+                     WHERE scoped_job_id = ?`,
+                    job.scopedJobId,
+                  );
+                });
+                deliveredFinished = true;
+                return;
+              }
+
+              const encoded = this.encodeNonTerminalEventWsFrame(job.rawJobId, ev);
+              const permit = await this.isolateBudget.acquireOutboundSend(
+                ws,
+                encoded.byteLength,
+                0,
+              );
+              if (this.disposed || ws.readyState !== WS_READY_STATE_OPEN) {
+                permit.abort();
+                break;
+              }
+              try {
+                ws.send(encoded);
+                permit.completeSend();
+              } catch {
+                permit.abort();
+                break;
+              }
+              job.primaryConsumed = seq;
+              lastDeliveredSeq = seq;
+            }
+          }
+        } finally {
+          if (!deliveredFinished && lastDeliveredSeq !== null && job.callerConnId !== null) {
+            const seqToPersist = lastDeliveredSeq;
+            this.store.transactionSync(() => {
+              const pSplit = splitU64(seqToPersist);
+              this.store.exec(
+                `UPDATE native_jobs SET primary_seq_hi = ?, primary_seq_lo = ? WHERE scoped_job_id = ?`,
+                pSplit.hi,
+                pSplit.lo,
+                job.scopedJobId,
+              );
+            });
+          }
+        }
+      } while (this.deliveringPrimaryAgain.has(scopedJobId));
+    } finally {
+      this.deliveringPrimary.delete(scopedJobId);
+      this.deliveringPrimaryAgain.delete(scopedJobId);
     }
   },
 
@@ -419,6 +536,58 @@ export const eventDelivery = {
       s.hi,
       s.lo,
     );
+  },
+
+  encodePendingNonTerminalEventWsFrame(
+    this: NativeEngine,
+    rawJobId: string,
+    ev: PendingJobEvent,
+  ): Uint8Array {
+    const meta = ev.meta;
+    let variant: pb.ExecutionEventVariantInput;
+    switch (ev.kind) {
+      case "accepted":
+        variant = { case: "accepted", value: {} };
+        break;
+      case "assigned":
+        variant = {
+          case: "assigned",
+          value: {
+            workerId: String(meta?.workerId ?? ""),
+            attemptNumber: Number(meta?.attemptNumber ?? 1),
+          },
+        };
+        break;
+      case "output":
+      case "progress":
+        variant = {
+          case: "output",
+          value: {
+            data: ev.payload ?? EMPTY_BYTES,
+            metadata: (meta?.metadata as Record<string, string>) ?? EMPTY_META,
+            progress: ev.kind === "progress" || Boolean(meta?.progress),
+          },
+        };
+        break;
+      case "attempt_restarted":
+        variant = {
+          case: "attemptRestarted",
+          value: {
+            previousAttemptId: String(meta?.previousAttemptId ?? ""),
+            reason: meta?.reason as StoredErrorInfo | undefined,
+          },
+        };
+        break;
+      default:
+        variant = { case: "accepted", value: {} };
+    }
+    return pb.encodeExecutionEventWsFrame({
+      jobId: rawJobId,
+      sequence: ev.seq,
+      attemptId: ev.attemptId ?? "",
+      atMs: BigInt(ev.atMs),
+      event: variant,
+    });
   },
 
   encodeNonTerminalEventWsFrame(

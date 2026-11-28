@@ -152,7 +152,10 @@ export function joinU64(hi: number | null | undefined, lo: number | null | undef
   if (hi === null || hi === undefined || lo === null || lo === undefined) {
     return 0n;
   }
-  return ((BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0));
+  if (hi === 0) {
+    return lo === 0 ? 0n : BigInt(lo >>> 0);
+  }
+  return (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0);
 }
 
 export interface InlineAssignInput {
@@ -364,15 +367,14 @@ export function parseSpecJson(raw: string): StoredSpecMetadata {
 }
 
 export function serializeCapacityJson(cap: Record<string, bigint>): string {
-  const entries = Object.entries(cap);
-  if (entries.length === 0) {
-    return "{}";
+  let out: Record<string, string> | null = null;
+  for (const k in cap) {
+    if (out === null) {
+      out = {};
+    }
+    out[k] = cap[k]!.toString();
   }
-  const out: Record<string, string> = {};
-  for (const [k, v] of entries) {
-    out[k] = v.toString();
-  }
-  return JSON.stringify(out);
+  return out === null ? "{}" : JSON.stringify(out);
 }
 
 export function parseCapacityJson(raw: string | null | undefined): Record<string, bigint> {
@@ -478,7 +480,9 @@ const SCHEMA_STATEMENTS: readonly string[] = [
     evicted_seq_hi INTEGER NOT NULL,
     evicted_seq_lo INTEGER NOT NULL,
     primary_seq_hi INTEGER,
-    primary_seq_lo INTEGER
+    primary_seq_lo INTEGER,
+    event_log_count INTEGER NOT NULL DEFAULT 0,
+    event_log_bytes INTEGER NOT NULL DEFAULT 0
   ) WITHOUT ROWID`,
   `CREATE INDEX IF NOT EXISTS idx_native_jobs_state
     ON native_jobs(namespace, state, updated_at_ms DESC, scoped_job_id ASC)`,
@@ -649,6 +653,8 @@ export class NativeStore {
   // Live quota counters (loaded from native_quota_meter on init, flushed in blocks inside write txns)
   private dayUtc = "";
   private monthUtc = "";
+  private dayStartMs = -1;
+  private dayEndMs = -1;
   private doRequests = 0;
   private wsMessages = 0;
   private wsMsgRemainder = 0;
@@ -711,6 +717,8 @@ export class NativeStore {
     const { dayUtc, monthUtc } = utcDayAndMonth(nowMs);
     this.dayUtc = dayUtc;
     this.monthUtc = monthUtc;
+    this.dayStartMs = Math.floor(nowMs / 86_400_000) * 86_400_000;
+    this.dayEndMs = this.dayStartMs + 86_400_000;
 
     let existingMeta: Array<{ key: string; value: string }> | null = null;
     try {
@@ -738,7 +746,7 @@ export class NativeStore {
           `INSERT OR IGNORE INTO native_runtime_meta (key, value) VALUES ('queue_seq', '0')`,
         );
         this.exec(
-          `INSERT OR IGNORE INTO native_runtime_meta (key, value) VALUES ('schema_version', '2')`,
+          `INSERT OR IGNORE INTO native_runtime_meta (key, value) VALUES ('schema_version', '3')`,
         );
       });
       existingMeta = this.exec<{ key: string; value: string }>(
@@ -801,6 +809,34 @@ export class NativeStore {
         }
         this.setMeta("schema_version", "2");
       });
+      schemaVersion = 2;
+    }
+
+    // Additive migration for pre-v3 DO SQLite databases lacking event_log_count/event_log_bytes.
+    if (!freshInit && schemaVersion < 3) {
+      const jobCols = new Set(
+        this.exec<{ name: string }>(`PRAGMA table_info(native_jobs)`).map(
+          (c) => c.name,
+        ),
+      );
+      this.transactionSync(() => {
+        if (!jobCols.has("event_log_count")) {
+          this.exec(
+            `ALTER TABLE native_jobs ADD COLUMN event_log_count INTEGER NOT NULL DEFAULT 0`,
+          );
+        }
+        if (!jobCols.has("event_log_bytes")) {
+          this.exec(
+            `ALTER TABLE native_jobs ADD COLUMN event_log_bytes INTEGER NOT NULL DEFAULT 0`,
+          );
+        }
+        this.exec(
+          `UPDATE native_jobs SET
+             event_log_count = COALESCE((SELECT COUNT(*) FROM native_job_events e WHERE e.scoped_job_id = native_jobs.scoped_job_id), 0),
+             event_log_bytes = COALESCE((SELECT SUM(size_bytes) FROM native_job_events e WHERE e.scoped_job_id = native_jobs.scoped_job_id), 0)`,
+        );
+        this.setMeta("schema_version", "3");
+      });
     }
 
     const meterRow = this.exec<{
@@ -839,7 +875,12 @@ export class NativeStore {
   }
 
   rolloverQuotaClock(nowMs: number): void {
+    if (nowMs >= this.dayStartMs && nowMs < this.dayEndMs) {
+      return;
+    }
     const { dayUtc, monthUtc } = utcDayAndMonth(nowMs);
+    this.dayStartMs = Math.floor(nowMs / 86_400_000) * 86_400_000;
+    this.dayEndMs = this.dayStartMs + 86_400_000;
     if (dayUtc !== this.dayUtc) {
       this.dayUtc = dayUtc;
       this.doRequests = 0;

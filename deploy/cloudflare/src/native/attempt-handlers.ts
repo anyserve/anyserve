@@ -120,18 +120,43 @@ export const attemptHandlers = {
 
     if (isLive && lease) {
       const prevAttemptConnId = lease.attemptConnId;
+      const isCleanInitialOpen =
+        prevAttemptConnId === null &&
+        lease.tailNextChunkSeq === 0 &&
+        lease.nextSegIndex === 0 &&
+        lease.nextObjIndex === 0 &&
+        lease.curObjIndex === null &&
+        lease.totalResultBytes === 0 &&
+        lease.inputSeq === 0n &&
+        lease.inputItemIdx === 0 &&
+        lease.inputByteOff === 0;
+
       // Section 4.4: A new AttemptOpen (new attempt_conn_id) discards uncommitted tail & segments!
       this.store.transactionSync(() => {
-        const segRows = this.store.exec<{ r2_key: string | null }>(
-          `SELECT r2_key FROM native_upload_segments WHERE lease_id = ? AND r2_key IS NOT NULL`,
-          lease.leaseId,
-        );
-        const r2Keys = segRows.map((r) => r.r2_key!).filter(Boolean);
-        if (r2Keys.length > 0) {
-          this.store.queuePendingDeleteInTxn(r2Keys, nowMs);
+        if (isCleanInitialOpen) {
+          lease.attemptConnId = att.connId;
+          lease.accepted = true;
+          this.store.exec(
+            `UPDATE native_active_leases SET attempt_conn_id = ?, accepted = 1 WHERE lease_id = ?`,
+            att.connId,
+            lease.leaseId,
+          );
+          return;
         }
-        this.store.exec(`DELETE FROM native_upload_tail WHERE lease_id = ?`, lease.leaseId);
-        this.store.exec(`DELETE FROM native_upload_segments WHERE lease_id = ?`, lease.leaseId);
+        if (lease.nextSegIndex > 0) {
+          const segRows = this.store.exec<{ r2_key: string | null }>(
+            `SELECT r2_key FROM native_upload_segments WHERE lease_id = ? AND r2_key IS NOT NULL`,
+            lease.leaseId,
+          );
+          const r2Keys = segRows.map((r) => r.r2_key!).filter(Boolean);
+          if (r2Keys.length > 0) {
+            this.store.queuePendingDeleteInTxn(r2Keys, nowMs);
+          }
+        }
+        if (lease.tailNextChunkSeq > 0 || lease.nextSegIndex > 0) {
+          this.store.exec(`DELETE FROM native_upload_tail WHERE lease_id = ?`, lease.leaseId);
+          this.store.exec(`DELETE FROM native_upload_segments WHERE lease_id = ?`, lease.leaseId);
+        }
 
         this.totalResultBytesHeld = Math.max(
           0,
@@ -180,9 +205,9 @@ export const attemptHandlers = {
       });
 
       // Section 5.3: AttemptOpened MUST precede any InputData!
-      this.sendWsProtoSync(
+      this.sendWsRawSync(
         ws,
-        pb.encodeAttemptDown({
+        pb.encodeAttemptDownWsFrame({
           msg: {
             case: "opened",
             value: {
@@ -435,23 +460,21 @@ export const attemptHandlers = {
             curSeq += 1n;
             const meta =
               curOff === 0 && "m" in entry && entry.m ? entry.m : {};
-            const frame = pb.encodeWsDataFrame(
-              pb.encodeAttemptDown({
-                msg: {
-                  case: "input",
-                  value: {
-                    sequence: curSeq,
-                    data: slice,
-                    last: false,
-                    metadata: meta,
-                    objectIndex: curIdx,
-                    uri: "",
-                    parameterChunk: false,
-                    objectEnd: isEnd,
-                  },
+            const frame = pb.encodeAttemptDownWsFrame({
+              msg: {
+                case: "input",
+                value: {
+                  sequence: curSeq,
+                  data: slice,
+                  last: false,
+                  metadata: meta,
+                  objectIndex: curIdx,
+                  uri: "",
+                  parameterChunk: false,
+                  objectEnd: isEnd,
                 },
-              }),
-            );
+              },
+            });
             batchPayloadBytes += slice.byteLength;
             if (isEnd) {
               const nextIdx = curIdx + 1;
@@ -497,23 +520,21 @@ export const attemptHandlers = {
             const newOff = curOff + slice.byteLength;
             const isEnd = newOff >= totalLen;
             curSeq += 1n;
-            const frame = pb.encodeWsDataFrame(
-              pb.encodeAttemptDown({
-                msg: {
-                  case: "input",
-                  value: {
-                    sequence: curSeq,
-                    data: slice,
-                    last: false,
-                    metadata: {},
-                    objectIndex: undefined, // params carry NO object_index!
-                    uri: "",
-                    parameterChunk: true,
-                    objectEnd: isEnd,
-                  },
+            const frame = pb.encodeAttemptDownWsFrame({
+              msg: {
+                case: "input",
+                value: {
+                  sequence: curSeq,
+                  data: slice,
+                  last: false,
+                  metadata: {},
+                  objectIndex: undefined, // params carry NO object_index!
+                  uri: "",
+                  parameterChunk: true,
+                  objectEnd: isEnd,
                 },
-              }),
-            );
+              },
+            });
             batchPayloadBytes += slice.byteLength;
             if (isEnd) {
               curStage = job.streamingInput ? 2 : 3;
@@ -568,23 +589,21 @@ export const attemptHandlers = {
             const meta =
               curOff === 0 && "m" in entry && entry.m ? entry.m : {};
             const logicalObjIndex = staticInputs.length + curIdx;
-            const frame = pb.encodeWsDataFrame(
-              pb.encodeAttemptDown({
-                msg: {
-                  case: "input",
-                  value: {
-                    sequence: curSeq,
-                    data: slice,
-                    last: false,
-                    metadata: meta,
-                    objectIndex: logicalObjIndex,
-                    uri: "",
-                    parameterChunk: false,
-                    objectEnd: isEnd,
-                  },
+            const frame = pb.encodeAttemptDownWsFrame({
+              msg: {
+                case: "input",
+                value: {
+                  sequence: curSeq,
+                  data: slice,
+                  last: false,
+                  metadata: meta,
+                  objectIndex: logicalObjIndex,
+                  uri: "",
+                  parameterChunk: false,
+                  objectEnd: isEnd,
                 },
-              }),
-            );
+              },
+            });
             batchPayloadBytes += slice.byteLength;
             if (isEnd) {
               curIdx += 1;
@@ -605,23 +624,21 @@ export const attemptHandlers = {
           if (curStage === 3) {
             // Final trailer (`objectIndex = undefined`, `last = true`)
             curSeq += 1n;
-            const frame = pb.encodeWsDataFrame(
-              pb.encodeAttemptDown({
-                msg: {
-                  case: "input",
-                  value: {
-                    sequence: curSeq,
-                    data: new Uint8Array(0),
-                    last: true,
-                    metadata: {},
-                    objectIndex: undefined,
-                    uri: "",
-                    parameterChunk: false,
-                    objectEnd: false,
-                  },
+            const frame = pb.encodeAttemptDownWsFrame({
+              msg: {
+                case: "input",
+                value: {
+                  sequence: curSeq,
+                  data: new Uint8Array(0),
+                  last: true,
+                  metadata: {},
+                  objectIndex: undefined,
+                  uri: "",
+                  parameterChunk: false,
+                  objectEnd: false,
                 },
-              }),
-            );
+              },
+            });
             curStage = 4;
             planned.push({
               encodedFrame: frame,
@@ -731,7 +748,8 @@ export const attemptHandlers = {
         `frame of ${frame.data.byteLength} bytes exceeds max_chunk_bytes ${this.config.maxChunkBytes}`,
       );
     }
-    if (metadataByteLen(frame.metadata) > MAX_METADATA_BYTES) {
+    const frameMetaBytes = metadataByteLen(frame.metadata);
+    if (frameMetaBytes > MAX_METADATA_BYTES) {
       throw GrpcStatusError.invalidArgument("frame metadata is too large");
     }
 
@@ -793,8 +811,7 @@ export const attemptHandlers = {
       );
     }
 
-    const eventSize =
-      EVENT_OVERHEAD_BYTES + frame.data.byteLength + metadataByteLen(frame.metadata);
+    const eventSize = EVENT_OVERHEAD_BYTES + frame.data.byteLength + frameMetaBytes;
 
     // Primary Invoke consumer back-pressure (section 5.2: 8 MiB per-job event cap; stalls worker ACK and fails at consumer_stall_timeout!)
     if (job.callerConnId !== null) {
@@ -806,6 +823,7 @@ export const attemptHandlers = {
       if (consumerOverloaded) {
         if (job.stalledSinceMs === null) {
           job.stalledSinceMs = nowMs;
+          this.syncJobTimerTracking(job);
           await this.refreshAlarm(nowMs);
         }
         if (nowMs - job.stalledSinceMs >= this.config.consumerStallTimeoutMs) {
@@ -892,27 +910,38 @@ export const attemptHandlers = {
         lease.exposed ? 1 : 0,
         lease.leaseId,
       );
+      let hasFrameMeta = false;
+      for (const _ in frame.metadata) {
+        hasFrameMeta = true;
+        break;
+      }
       this.appendJobEventInTxn(
         job,
         lease.attemptId,
         frame.progress ? "progress" : "output",
-        { metadata: frame.metadata, progress: frame.progress },
+        hasFrameMeta || frame.progress
+          ? { metadata: frame.metadata, progress: frame.progress }
+          : null,
         frame.data,
         eventSize,
         nowMs,
       );
       const lastSplit = splitU64(job.lastSequence);
       this.store.exec(
-        `UPDATE native_jobs SET last_seq_hi = ?, last_seq_lo = ? WHERE scoped_job_id = ?`,
+        `UPDATE native_jobs
+         SET last_seq_hi = ?, last_seq_lo = ?, event_log_count = ?, event_log_bytes = ?
+         WHERE scoped_job_id = ?`,
         lastSplit.hi,
         lastSplit.lo,
+        job.eventLogCount,
+        job.eventLogBytes,
         job.scopedJobId,
       );
     });
 
-    this.sendWsProtoSync(
+    this.sendWsRawSync(
       ws,
-      pb.encodeAttemptDown({
+      pb.encodeAttemptDownWsFrame({
         msg: {
           case: "ack",
           value: {
@@ -1032,9 +1061,9 @@ export const attemptHandlers = {
         this.persistLeaseResultStateInTxn(lease);
       });
 
-      this.sendWsProtoSync(
+      this.sendWsRawSync(
         ws,
-        pb.encodeAttemptDown({
+        pb.encodeAttemptDownWsFrame({
           msg: {
             case: "ack",
             value: {
@@ -1526,9 +1555,9 @@ export const attemptHandlers = {
     }
 
     if (ws.readyState === WS_READY_STATE_OPEN) {
-      this.sendWsProtoSync(
+      this.sendWsRawSync(
         ws,
-        pb.encodeAttemptDown({
+        pb.encodeAttemptDownWsFrame({
           msg: {
             case: "finished",
             value: {

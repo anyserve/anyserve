@@ -403,17 +403,37 @@ export default function App() {
 
   const visibleJobs = useMemo(() => {
     const q = deferredSearch.trim().toLowerCase();
+    if (
+      !q &&
+      effectiveStates.length === 0 &&
+      filters.iface === "all" &&
+      filters.ns === "all" &&
+      filters.worker === "all"
+    ) {
+      return loadedJobs;
+    }
     return loadedJobs.filter((j) => {
       if (effectiveStates.length > 0 && !effectiveStates.includes(j.state)) return false;
       if (filters.iface !== "all" && j.interface_name !== filters.iface) return false;
       if (filters.ns !== "all" && (j.namespace ?? "default") !== filters.ns) return false;
       if (filters.worker !== "all" && j.latest_worker_id !== filters.worker) return false;
-      return (
-        !q ||
-        [j.job_id, j.interface_name, j.namespace, j.source, j.last_error, j.error_code, j.latest_worker_id, ...Object.values(j.metadata)].some((f) =>
-          (f ?? "").toLowerCase().includes(q),
-        )
-      );
+      if (!q) return true;
+      if (
+        j.job_id.toLowerCase().includes(q) ||
+        j.interface_name.toLowerCase().includes(q) ||
+        (j.namespace != null && j.namespace.toLowerCase().includes(q)) ||
+        (j.source != null && j.source.toLowerCase().includes(q)) ||
+        (j.last_error != null && j.last_error.toLowerCase().includes(q)) ||
+        (j.error_code != null && j.error_code.toLowerCase().includes(q)) ||
+        (j.latest_worker_id != null && j.latest_worker_id.toLowerCase().includes(q))
+      ) {
+        return true;
+      }
+      const meta = j.metadata;
+      for (const k in meta) {
+        if (meta[k]!.toLowerCase().includes(q)) return true;
+      }
+      return false;
     });
   }, [loadedJobs, effectiveStates, filters.iface, filters.ns, filters.worker, deferredSearch]);
 
@@ -601,6 +621,18 @@ export default function App() {
     (s) => s.status === "online" || s.status === "busy",
   ).length;
 
+  const handleTimeFilterChange = useCallback((next: TimeFilterState) => {
+    resetExtraJobs();
+    setTimeFilter(next);
+  }, []);
+  const handleSelectJob = useCallback((id: string) => {
+    setPinnedJobByScope((c) => (c[jobScope] === id ? c : { ...c, [jobScope]: id }));
+    setSelectedJobByScope((c) => (c[jobScope] === id ? c : { ...c, [jobScope]: id }));
+  }, [jobScope]);
+  const handleFilterTrace = useCallback(
+    (traceId: string) => jumpToJobs({ scope: "all", q: traceId }),
+    [jumpToJobs],
+  );
   const handleToggleTheme = useCallback(
     () =>
       setThemeMode((c) => {
@@ -731,12 +763,9 @@ export default function App() {
               histogram={jobsPage.histogram}
               histogramRefreshing={!jobsQueryMatches && jobsPage.loadedKey !== null}
               timeFilter={timeFilter}
-              onTimeFilterChange={(next) => { resetExtraJobs(); setTimeFilter(next); }}
+              onTimeFilterChange={handleTimeFilterChange}
               selectedJobId={selectedJob?.job_id ?? null}
-              onSelect={(id) => {
-                setPinnedJobByScope((c) => ({ ...c, [jobScope]: id }));
-                setSelectedJobByScope((c) => ({ ...c, [jobScope]: id }));
-              }}
+              onSelect={handleSelectJob}
               onOpenInterface={openInterface} onOpenWorker={openWorker} onFilterNamespace={filterJobNamespace}
               statusFilter={filters.status} onStatusFilterChange={handleStatusFilterChange}
               interfaceFilter={filters.iface} interfaceOptions={filterOptions.iface} onInterfaceFilterChange={(iface) => { resetExtraJobs(); setFilters((f) => ({ ...f, iface })); }}
@@ -759,7 +788,7 @@ export default function App() {
                   onOpenWorker={openWorker}
                   onOpenInterface={openInterface}
                   onFilterNamespace={filterJobNamespace}
-                  onFilterTrace={(traceId) => jumpToJobs({ scope: "all", q: traceId })}
+                  onFilterTrace={handleFilterTrace}
                 />
               }
             />

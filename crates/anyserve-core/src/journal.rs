@@ -322,11 +322,11 @@ const SCHEMA: &[&str] = &[
         last_attempt_id TEXT,
         last_worker_id TEXT
     )",
-    "CREATE INDEX IF NOT EXISTS journal_jobs_state_updated
-        ON journal_jobs(state, updated_at_ms)",
+    "DROP INDEX IF EXISTS journal_jobs_state_updated",
     "CREATE INDEX IF NOT EXISTS journal_jobs_recovery
         ON journal_jobs(created_at_ms, job_id) WHERE state = 'queued'",
-    "CREATE INDEX IF NOT EXISTS journal_jobs_winner ON journal_jobs(winning_lease_id)",
+    "CREATE INDEX IF NOT EXISTS journal_jobs_winner ON journal_jobs(winning_lease_id)
+        WHERE winning_lease_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS journal_jobs_history ON journal_jobs(created_at_ms, job_id)
         WHERE state IN ('succeeded', 'failed', 'cancelled')",
     "CREATE INDEX IF NOT EXISTS journal_jobs_terminal_updated ON journal_jobs(updated_at_ms DESC, job_id DESC)
@@ -448,7 +448,11 @@ impl Journal {
             } else {
                 SqliteSynchronous::Normal
             })
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("cache_size", "-8192")
+            .pragma("temp_store", "MEMORY")
+            .pragma("mmap_size", "67108864")
+            .pragma("wal_autocheckpoint", "4000");
         let mut conn = SqliteConnection::connect_with(&options)
             .await
             .with_context(|| format!("open journal {}", config.path.display()))?;
@@ -641,7 +645,7 @@ impl Journal {
     pub(crate) async fn receipt(&self, lease_id: &str) -> Result<Option<(String, String)>> {
         let row = sqlx::query(
             "SELECT job_id, result_digest FROM journal_jobs
-             WHERE winning_lease_id = ? AND result_digest IS NOT NULL",
+             WHERE winning_lease_id = ? AND winning_lease_id IS NOT NULL AND result_digest IS NOT NULL",
         )
         .bind(lease_id)
         .fetch_optional(&self.read_pool)
@@ -1466,6 +1470,11 @@ async fn flush_batch(
     hit_full
 }
 
+/// Brief adaptive group-commit coalesce window used only when concurrent
+/// writers are active (`prev_batch_size > 1`), leaving single-client latency
+/// untouched while amortizing WAL fsyncs under load.
+const GROUP_COMMIT_COALESCE: Duration = Duration::from_micros(500);
+
 #[allow(clippy::too_many_arguments)]
 async fn writer(
     mut conn: SqliteConnection,
@@ -1479,6 +1488,7 @@ async fn writer(
 ) {
     let mut deferred = None;
     let mut batch = Vec::with_capacity(max_batch.max(1));
+    let mut prev_batch_size = 0usize;
     loop {
         let request = match deferred.take() {
             Some(request) => request,
@@ -1528,7 +1538,37 @@ async fn writer(
                         Err(_) => break,
                     }
                 }
+                if prev_batch_size > 1 && deferred.is_none() && batch.len() < max_batch {
+                    let deadline = tokio::time::Instant::now() + GROUP_COMMIT_COALESCE;
+                    while batch.len() < max_batch {
+                        match tokio::time::timeout_at(deadline, rx.recv()).await {
+                            Ok(Some(Request::Op { op, reply })) => {
+                                batch.push((op, reply));
+                                while batch.len() < max_batch {
+                                    match rx.try_recv() {
+                                        Ok(Request::Op { op, reply }) => batch.push((op, reply)),
+                                        Ok(other) => {
+                                            deferred = Some(other);
+                                            break;
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                if deferred.is_some() {
+                                    break;
+                                }
+                            }
+                            Ok(Some(other)) => {
+                                deferred = Some(other);
+                                break;
+                            }
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                }
+                let flushed = batch.len();
                 let hit_full = flush_batch(&mut conn, &mut batch, &pending, &stats).await;
+                prev_batch_size = flushed;
                 if hit_full && let Some(cap) = max_bytes {
                     emergency_purge_on_full(&mut conn, cap, page_size).await;
                 }

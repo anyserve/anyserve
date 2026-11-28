@@ -108,20 +108,6 @@ export const consoleQueries = {
       }
     }
 
-    // Refresh scalar load from open session socket attachments
-    for (const s of this.sessions.values()) {
-      if (s.connected) {
-        const ws = this.socketsByConnId.get(s.currentConnId);
-        const att = ws ? readSocketAttachment(ws) : null;
-        if (att) {
-          s.lastSeenMs = Math.max(s.lastSeenMs, att.lastSeenAtMs);
-          s.queued = att.queued;
-          s.running = att.running;
-          s.utilization = att.utilization;
-        }
-      }
-    }
-
     let wHealthy = 0;
     let wDraining = 0;
     let wActiveLeases = 0;
@@ -143,29 +129,50 @@ export const consoleQueries = {
 
     let sessionsCount = 0;
     for (const s of this.sessions.values()) {
+      // Refresh scalar load from open session socket attachments in the same pass
+      if (s.connected) {
+        const ws = this.socketsByConnId.get(s.currentConnId);
+        const att = ws ? readSocketAttachment(ws) : null;
+        if (att) {
+          if (att.lastSeenAtMs > s.lastSeenMs) {
+            s.lastSeenMs = att.lastSeenAtMs;
+          }
+          s.queued = att.queued;
+          s.running = att.running;
+          s.utilization = att.utilization;
+        }
+      }
       if (namespace !== undefined && s.namespace !== namespace) continue;
       sessionsCount += 1;
       const free = sessionFreeSlots(s);
-      wActiveLeases += s.activeLeases.size;
+      const leaseCount = s.activeLeases.size;
+      wActiveLeases += leaseCount;
       wLastSeen = wLastSeen === null ? s.lastSeenMs : Math.max(wLastSeen, s.lastSeenMs);
       if (s.draining) wDraining += 1;
       if (s.connected && !s.draining) {
         wHealthy += 1;
-        for (const [k, v] of Object.entries(s.totalCapacity)) {
-          wTotalCap[k] = (wTotalCap[k] ?? 0) + Number(v);
+        for (const k in s.totalCapacity) {
+          wTotalCap[k] = (wTotalCap[k] ?? 0) + Number(s.totalCapacity[k]);
         }
       }
+      const singleIface = s.interfaces.length === 1;
       for (const iface of s.interfaces) {
         const st = ensureIface(iface);
         st.sessions += 1;
         st.freeSlots += free;
 
         let activeOnIface = 0;
-        for (const lid of s.activeLeases) {
-          const lease = this.leases.get(lid);
-          const job = lease ? this.jobs.get(lease.scopedJobId) : undefined;
-          if (job && job.interfaceName === iface) {
-            activeOnIface += 1;
+        if (leaseCount > 0) {
+          if (singleIface) {
+            activeOnIface = leaseCount;
+          } else {
+            for (const lid of s.activeLeases) {
+              const lease = this.leases.get(lid);
+              const job = lease ? this.jobs.get(lease.scopedJobId) : undefined;
+              if (job && job.interfaceName === iface) {
+                activeOnIface += 1;
+              }
+            }
           }
         }
         const pKey = `${s.namespace}\0${iface}\0${s.pool}`;
@@ -301,71 +308,88 @@ export const consoleQueries = {
     histogram: ConsoleHistogram | null;
   } {
     const needle = query.search ? query.search.trim().toLowerCase() : null;
-    const matched: JobMem[] = [];
-    const samples: Array<{ ts: number; state: JobStateName }> = [];
+    const hasNeedle = needle !== null && needle.length > 0;
+    const filterStates = query.states.length > 0;
+    let stateMask = 0;
+    if (filterStates) {
+      for (let i = 0; i < query.states.length; i++) {
+        stateMask |= jobStateBit(query.states[i]!);
+      }
+    }
+    const ifaceFilter = query.interfaceName;
+    const nsFilter = query.namespace;
+    const fromMs = query.fromMs;
+    const toMs = query.toMs;
+    const workerFilter = query.workerId;
 
+    const matched: JobMem[] = [];
     for (const job of this.jobs.values()) {
-      if (query.states.length > 0 && !query.states.includes(job.state)) {
+      if (filterStates && (stateMask & jobStateBit(job.state)) === 0) {
         continue;
       }
-      if (query.interfaceName !== null && job.interfaceName !== query.interfaceName) {
+      if (ifaceFilter !== null && job.interfaceName !== ifaceFilter) {
         continue;
       }
-      if (query.namespace !== null && job.namespace !== query.namespace) {
+      if (nsFilter !== null && job.namespace !== nsFilter) {
         continue;
       }
-      if (query.fromMs !== null && job.createdAtMs < query.fromMs) {
+      if (fromMs !== null && job.createdAtMs < fromMs) {
         continue;
       }
-      if (query.toMs !== null && job.createdAtMs >= query.toMs) {
+      if (toMs !== null && job.createdAtMs >= toMs) {
         continue;
       }
-      if (query.workerId !== null && job.lastWorkerId !== query.workerId) {
+      if (workerFilter !== null && job.lastWorkerId !== workerFilter) {
         continue;
       }
-      if (needle !== null && needle.length > 0) {
-        const hit =
+      if (hasNeedle) {
+        let hit =
           job.rawJobId.toLowerCase().includes(needle) ||
           job.interfaceName.toLowerCase().includes(needle) ||
           job.namespace.toLowerCase().includes(needle) ||
-          (job.lastWorkerId?.toLowerCase().includes(needle) ?? false) ||
-          (job.error?.code.toLowerCase().includes(needle) ?? false) ||
-          (job.error?.message.toLowerCase().includes(needle) ?? false) ||
-          Object.entries(job.spec.metadata).some(
-            ([k, v]) =>
-              k.toLowerCase().includes(needle) || v.toLowerCase().includes(needle),
-          );
+          (job.lastWorkerId !== null && job.lastWorkerId.toLowerCase().includes(needle)) ||
+          (job.error !== null &&
+            (job.error.code.toLowerCase().includes(needle) ||
+              job.error.message.toLowerCase().includes(needle)));
+        if (!hit) {
+          const meta = job.spec.metadata;
+          for (const k in meta) {
+            if (k.toLowerCase().includes(needle) || meta[k]!.toLowerCase().includes(needle)) {
+              hit = true;
+              break;
+            }
+          }
+        }
         if (!hit) continue;
       }
       matched.push(job);
-      if (query.histogramBuckets > 0) {
-        samples.push({ ts: job.createdAtMs, state: job.state });
-      }
     }
 
-    // Order matches JobIndex: (updated_at_ms DESC, scoped_job_id ASC)
-    matched.sort((a, b) => {
-      if (b.updatedAtMs !== a.updatedAtMs) {
-        return b.updatedAtMs - a.updatedAtMs;
-      }
-      return a.scopedJobId < b.scopedJobId
-        ? -1
-        : a.scopedJobId > b.scopedJobId
-          ? 1
-          : 0;
-    });
-
     const total = matched.length;
-    const matchedPage = matched.slice(query.offset, query.offset + query.limit);
-    const nextOffset = query.offset + query.limit;
-    const nextPageToken = nextOffset < total ? String(nextOffset) : null;
-    const histogram = buildConsoleHistogram(
-      query.fromMs,
-      query.toMs,
-      query.histogramBuckets,
-      samples,
-      nowMs,
-    );
+    const endIdx = query.offset + query.limit;
+    let matchedPage: JobMem[];
+    if (query.offset >= total || query.limit <= 0) {
+      matchedPage = [];
+    } else if (total > 64 && endIdx > 0 && endIdx < (total >> 2)) {
+      // Partial top-K selection (Order: updated_at_ms DESC, scoped_job_id ASC)
+      const topK = selectTopKJobs(matched, endIdx);
+      matchedPage = query.offset > 0 ? topK.slice(query.offset) : topK;
+    } else {
+      matched.sort(compareJobsUpdatedDesc);
+      matchedPage = matched.slice(query.offset, endIdx);
+    }
+
+    const nextPageToken = endIdx < total ? String(endIdx) : null;
+    const histogram =
+      query.histogramBuckets > 0
+        ? buildConsoleHistogramFromJobs(
+            query.fromMs,
+            query.toMs,
+            query.histogramBuckets,
+            matched,
+            nowMs,
+          )
+        : null;
 
     return { matchedPage, total, nextPageToken, histogram };
   },
@@ -574,6 +598,217 @@ export const consoleQueries = {
 
 export type ConsoleQueries = typeof consoleQueries;
 
+function jobStateBit(state: JobStateName): number {
+  switch (state) {
+    case "queued":
+      return 1;
+    case "running":
+      return 2;
+    case "succeeded":
+      return 4;
+    case "failed":
+      return 8;
+    case "cancelled":
+      return 16;
+  }
+}
+
+function compareJobsUpdatedDesc(a: JobMem, b: JobMem): number {
+  if (b.updatedAtMs !== a.updatedAtMs) {
+    return b.updatedAtMs - a.updatedAtMs;
+  }
+  return a.scopedJobId < b.scopedJobId ? -1 : a.scopedJobId > b.scopedJobId ? 1 : 0;
+}
+
+/**
+ * Selects the top `k` jobs in `(updatedAtMs DESC, scopedJobId ASC)` order using a fixed-size
+ * max-heap of the "worst" element among the current top-K (so root is replaced whenever a better
+ * job arrives), then sorts the `k` winners.
+ */
+function selectTopKJobs(items: readonly JobMem[], k: number): JobMem[] {
+  const heap: JobMem[] = new Array(k);
+  for (let i = 0; i < k; i++) {
+    heap[i] = items[i]!;
+  }
+  // Heapify so heap[0] is the WORST (largest compareJobsUpdatedDesc) element in the top-k set.
+  const siftDown = (idx: number) => {
+    let i = idx;
+    const half = k >>> 1;
+    const item = heap[i]!;
+    while (i < half) {
+      let child = (i << 1) + 1;
+      const right = child + 1;
+      if (right < k && compareJobsUpdatedDesc(heap[right]!, heap[child]!) > 0) {
+        child = right;
+      }
+      if (compareJobsUpdatedDesc(heap[child]!, item) <= 0) {
+        break;
+      }
+      heap[i] = heap[child]!;
+      i = child;
+    }
+    heap[i] = item;
+  };
+  for (let i = (k >>> 1) - 1; i >= 0; i--) {
+    siftDown(i);
+  }
+  for (let i = k; i < items.length; i++) {
+    const cand = items[i]!;
+    if (compareJobsUpdatedDesc(cand, heap[0]!) < 0) {
+      heap[0] = cand;
+      siftDown(0);
+    }
+  }
+  heap.sort(compareJobsUpdatedDesc);
+  return heap;
+}
+
+function buildConsoleHistogramCore(
+  fromMs: number | null,
+  toMs: number | null,
+  bucketsRequested: number,
+  count: number,
+  minTs: number,
+  maxTs: number,
+  nowMs: number,
+): {
+  startMs: number;
+  endMs: number;
+  totalSpan: number;
+  numBuckets: number;
+  buckets: ConsoleHistogramBucket[];
+  useFastFloat: boolean;
+} | null {
+  let startMs: number;
+  let rawEndMs: number;
+  if (fromMs !== null && toMs !== null) {
+    startMs = fromMs;
+    rawEndMs = Math.max(toMs, fromMs + 1);
+  } else if (fromMs !== null) {
+    const upper = count === 0 ? nowMs : maxTs;
+    startMs = fromMs;
+    rawEndMs = Math.max(upper, fromMs) + 1;
+  } else if (toMs !== null) {
+    if (count === 0) return null;
+    startMs = Math.min(minTs, Math.max(0, toMs - 1));
+    rawEndMs = Math.max(1, toMs);
+  } else {
+    if (count === 0) return null;
+    startMs = minTs;
+    rawEndMs = maxTs + 1;
+  }
+
+  const numBuckets = Math.max(8, Math.min(96, bucketsRequested));
+  const totalSpan = Math.max(numBuckets, rawEndMs - startMs);
+  const endMs = startMs + totalSpan;
+  const useFastFloat = totalSpan * numBuckets <= Number.MAX_SAFE_INTEGER;
+  const buckets: ConsoleHistogramBucket[] = new Array(numBuckets);
+
+  if (useFastFloat) {
+    let prevBound = startMs;
+    for (let i = 0; i < numBuckets; i++) {
+      const nextBound = startMs + Math.floor(((i + 1) * totalSpan) / numBuckets);
+      buckets[i] = {
+        start_ms: prevBound,
+        end_ms: nextBound,
+        active: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+      };
+      prevBound = nextBound;
+    }
+  } else {
+    const spanBig = BigInt(totalSpan);
+    const bBig = BigInt(numBuckets);
+    const maxSafeBig = BigInt(Number.MAX_SAFE_INTEGER);
+    const bound = (i: number) => {
+      const q = (BigInt(i) * spanBig) / bBig;
+      return startMs + (q <= maxSafeBig ? Number(q) : 0);
+    };
+    let prevBound = bound(0);
+    for (let i = 0; i < numBuckets; i++) {
+      const nextBound = bound(i + 1);
+      buckets[i] = {
+        start_ms: prevBound,
+        end_ms: nextBound,
+        active: 0,
+        succeeded: 0,
+        failed: 0,
+        cancelled: 0,
+      };
+      prevBound = nextBound;
+    }
+  }
+
+  return { startMs, endMs, totalSpan, numBuckets, buckets, useFastFloat };
+}
+
+function addSampleToBucket(b: ConsoleHistogramBucket, state: JobStateName): void {
+  if (state === "queued" || state === "running") b.active += 1;
+  else if (state === "succeeded") b.succeeded += 1;
+  else if (state === "failed") b.failed += 1;
+  else if (state === "cancelled") b.cancelled += 1;
+}
+
+function buildConsoleHistogramFromJobs(
+  fromMs: number | null,
+  toMs: number | null,
+  bucketsRequested: number,
+  jobs: readonly JobMem[],
+  nowMs: number,
+): ConsoleHistogram | null {
+  if (bucketsRequested <= 0) return null;
+  let minTs = Number.MAX_SAFE_INTEGER;
+  let maxTs = 0;
+  for (let i = 0; i < jobs.length; i++) {
+    const ts = jobs[i]!.createdAtMs;
+    if (ts < minTs) minTs = ts;
+    if (ts > maxTs) maxTs = ts;
+  }
+  const core = buildConsoleHistogramCore(
+    fromMs,
+    toMs,
+    bucketsRequested,
+    jobs.length,
+    minTs,
+    maxTs,
+    nowMs,
+  );
+  if (!core) return null;
+
+  const { startMs, endMs, totalSpan, numBuckets, buckets, useFastFloat } = core;
+  if (useFastFloat) {
+    const lastIdx = numBuckets - 1;
+    for (let i = 0; i < jobs.length; i++) {
+      const j = jobs[i]!;
+      const ts = j.createdAtMs;
+      if (ts < startMs || ts >= endMs) continue;
+      let idx = Math.floor(((ts - startMs + 1) * numBuckets - 1) / totalSpan);
+      if (idx > lastIdx) idx = lastIdx;
+      addSampleToBucket(buckets[idx]!, j.state);
+    }
+  } else {
+    const bBig = BigInt(numBuckets);
+    const spanBig = BigInt(totalSpan);
+    for (let i = 0; i < jobs.length; i++) {
+      const j = jobs[i]!;
+      const ts = j.createdAtMs;
+      if (ts < startMs || ts >= endMs) continue;
+      const rel = BigInt(ts - startMs);
+      const idx = Math.min(numBuckets - 1, Number(((rel + 1n) * bBig - 1n) / spanBig));
+      addSampleToBucket(buckets[idx]!, j.state);
+    }
+  }
+
+  return {
+    start_ms: startMs,
+    end_ms: endMs,
+    bucket_ms: Math.max(1, Math.floor(totalSpan / numBuckets)),
+    buckets,
+  };
+}
+
 export function buildConsoleHistogram(
   fromMs: number | null,
   toMs: number | null,
@@ -584,63 +819,42 @@ export function buildConsoleHistogram(
   if (bucketsRequested <= 0) return null;
   let minTs = Number.MAX_SAFE_INTEGER;
   let maxTs = 0;
-  for (const s of samples) {
-    if (s.ts < minTs) minTs = s.ts;
-    if (s.ts > maxTs) maxTs = s.ts;
+  for (let i = 0; i < samples.length; i++) {
+    const ts = samples[i]!.ts;
+    if (ts < minTs) minTs = ts;
+    if (ts > maxTs) maxTs = ts;
   }
-  let startMs: number;
-  let rawEndMs: number;
-  if (fromMs !== null && toMs !== null) {
-    startMs = fromMs;
-    rawEndMs = Math.max(toMs, fromMs + 1);
-  } else if (fromMs !== null) {
-    const upper = samples.length === 0 ? nowMs : maxTs;
-    startMs = fromMs;
-    rawEndMs = Math.max(upper, fromMs) + 1;
-  } else if (toMs !== null) {
-    if (samples.length === 0) return null;
-    startMs = Math.min(minTs, Math.max(0, toMs - 1));
-    rawEndMs = Math.max(1, toMs);
+  const core = buildConsoleHistogramCore(
+    fromMs,
+    toMs,
+    bucketsRequested,
+    samples.length,
+    minTs,
+    maxTs,
+    nowMs,
+  );
+  if (!core) return null;
+
+  const { startMs, endMs, totalSpan, numBuckets, buckets, useFastFloat } = core;
+  if (useFastFloat) {
+    const lastIdx = numBuckets - 1;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i]!;
+      if (s.ts < startMs || s.ts >= endMs) continue;
+      let idx = Math.floor(((s.ts - startMs + 1) * numBuckets - 1) / totalSpan);
+      if (idx > lastIdx) idx = lastIdx;
+      addSampleToBucket(buckets[idx]!, s.state);
+    }
   } else {
-    if (samples.length === 0) return null;
-    startMs = minTs;
-    rawEndMs = maxTs + 1;
-  }
-
-  const numBuckets = Math.max(8, Math.min(96, bucketsRequested));
-  const totalSpan = Math.max(numBuckets, rawEndMs - startMs);
-  const endMs = startMs + totalSpan;
-  const bound = (i: number) =>
-    startMs + Math.floor((BigInt(i) * BigInt(totalSpan)) / BigInt(numBuckets) <= BigInt(Number.MAX_SAFE_INTEGER)
-      ? Number((BigInt(i) * BigInt(totalSpan)) / BigInt(numBuckets))
-      : 0);
-
-  const buckets: ConsoleHistogramBucket[] = [];
-  for (let i = 0; i < numBuckets; i++) {
-    buckets.push({
-      start_ms: bound(i),
-      end_ms: bound(i + 1),
-      active: 0,
-      succeeded: 0,
-      failed: 0,
-      cancelled: 0,
-    });
-  }
-
-  const bBig = BigInt(numBuckets);
-  const spanBig = BigInt(totalSpan);
-  for (const s of samples) {
-    if (s.ts < startMs || s.ts >= endMs) continue;
-    const rel = BigInt(s.ts - startMs);
-    const idx = Math.min(
-      numBuckets - 1,
-      Number(((rel + 1n) * bBig - 1n) / spanBig),
-    );
-    const b = buckets[idx]!;
-    if (s.state === "queued" || s.state === "running") b.active += 1;
-    else if (s.state === "succeeded") b.succeeded += 1;
-    else if (s.state === "failed") b.failed += 1;
-    else if (s.state === "cancelled") b.cancelled += 1;
+    const bBig = BigInt(numBuckets);
+    const spanBig = BigInt(totalSpan);
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i]!;
+      if (s.ts < startMs || s.ts >= endMs) continue;
+      const rel = BigInt(s.ts - startMs);
+      const idx = Math.min(numBuckets - 1, Number(((rel + 1n) * bBig - 1n) / spanBig));
+      addSampleToBucket(buckets[idx]!, s.state);
+    }
   }
 
   return {

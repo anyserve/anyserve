@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 import type { TimeFilterState, TimePreset } from "./app-constants";
 import { formatAxisTime, formatDuration, formatNumber } from "./format";
-import type { JobsHistogram } from "./types";
+import type { JobsHistogram as JobsHistogramData } from "./types";
 
 export type { TimeFilterState, TimePreset };
 
@@ -27,7 +27,7 @@ export const TIME_PRESET_MS: Record<Exclude<TimePreset, "all" | "custom">, numbe
 const PLACEHOLDER_COUNT = 32;
 
 interface JobsHistogramProps {
-  histogram: JobsHistogram | null;
+  histogram: JobsHistogramData | null;
   timeFilter: TimeFilterState;
   refreshing?: boolean;
   onZoomRange: (fromMs: number, toMs: number) => void;
@@ -50,7 +50,7 @@ function activeTimeSummary(filter: TimeFilterState): string {
   return filter.preset === "all" ? "All time" : `Last ${filter.preset}`;
 }
 
-export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, onResetTime }: JobsHistogramProps) {
+export const JobsHistogram = memo(function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, onResetTime }: JobsHistogramProps) {
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
   const [brush, setBrush] = useState<{ anchor: number; current: number } | null>(null);
   const barsRef = useRef<HTMLDivElement | null>(null);
@@ -60,20 +60,24 @@ export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, 
   brushRef.current = brush;
 
   const totals = useMemo(() => {
-    if (!histogram) return { maxBucket: 0, succeeded: 0, errors: 0, active: 0, sum: 0 };
+    if (!histogram) return { maxBucket: 0, succeeded: 0, errors: 0, active: 0, sum: 0, labels: [] as string[] };
     let maxBucket = 0;
     let succeeded = 0;
     let errors = 0;
     let active = 0;
-    for (const b of histogram.buckets) {
+    const spanMs = Math.max(1, histogram.end_ms - histogram.start_ms);
+    const labels: string[] = new Array(histogram.buckets.length);
+    for (let i = 0; i < histogram.buckets.length; i++) {
+      const b = histogram.buckets[i]!;
       const err = b.failed + b.cancelled;
       const total = b.succeeded + err + b.active;
       if (total > maxBucket) maxBucket = total;
       succeeded += b.succeeded;
       errors += err;
       active += b.active;
+      labels[i] = `${formatAxisTime(b.start_ms, spanMs)}–${formatAxisTime(b.end_ms, spanMs)}: ${summarizeBucketCounts(b.succeeded, err, b.active)}`;
     }
-    return { maxBucket, succeeded, errors, active, sum: succeeded + errors + active };
+    return { maxBucket, succeeded, errors, active, sum: succeeded + errors + active, labels };
   }, [histogram]);
 
   useEffect(() => {
@@ -206,7 +210,7 @@ export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, 
           const total = bucket.succeeded + errors + bucket.active;
           const heightPct = total === 0 || totals.maxBucket === 0 ? 0 : Math.max(8, Math.round((total / totals.maxBucket) * 100));
           const inBrush = brushLo != null && brushHi != null && idx >= brushLo && idx <= brushHi;
-          const label = `${formatAxisTime(bucket.start_ms, spanMs)}–${formatAxisTime(bucket.end_ms, spanMs)}: ${summarizeBucketCounts(bucket.succeeded, errors, bucket.active)}`;
+          const label = totals.labels[idx]!;
 
           return (
             <button
@@ -251,4 +255,4 @@ export function JobsHistogram({ histogram, timeFilter, refreshing, onZoomRange, 
       </div>
     </div>
   );
-}
+});

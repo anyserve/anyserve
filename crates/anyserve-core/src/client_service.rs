@@ -6,10 +6,12 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyserve_proto::v2::{self as pb, client_server::Client};
 use futures::{Stream, StreamExt};
+use pin_project_lite::pin_project;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{
@@ -55,6 +57,66 @@ impl ClientGrpcService {
     }
 }
 type EventStream = Pin<Box<dyn Stream<Item = Result<pb::ExecutionEvent, Status>> + Send>>;
+
+pin_project! {
+    /// Direct `Stream` for non-streaming-input invocations without expiring
+    /// bearer credentials: avoids `async_stream` and `tokio::select!` overhead
+    /// per output frame while preserving `CancelOnDrop` and unexpected-input checks.
+    struct DirectInvokeStream {
+        #[pin]
+        execution: api::Execution,
+        incoming: Option<Streaming<pb::InvokeRequest>>,
+        done: bool,
+    }
+}
+
+impl Stream for DirectInvokeStream {
+    type Item = Result<pb::ExecutionEvent, Status>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.project();
+        if *this.done {
+            return Poll::Ready(None);
+        }
+        if let Some(incoming) = this.incoming.as_mut() {
+            match Pin::new(incoming).poll_next(cx) {
+                Poll::Ready(Some(Ok(_))) => {
+                    *this.done = true;
+                    return Poll::Ready(Some(Err(Status::invalid_argument(
+                        "unexpected invocation input message",
+                    ))));
+                }
+                Poll::Ready(Some(Err(status))) => {
+                    *this.done = true;
+                    return Poll::Ready(Some(Err(status)));
+                }
+                Poll::Ready(None) => {
+                    *this.incoming = None;
+                }
+                Poll::Pending => {}
+            }
+        }
+        match this.execution.poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(event))) => {
+                if matches!(event.kind, api::EventKind::Finished { .. }) {
+                    *this.done = true;
+                }
+                Poll::Ready(Some(Ok(event_to_proto(event))))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                *this.done = true;
+                Poll::Ready(Some(Err(err.into())))
+            }
+            Poll::Ready(None) => {
+                *this.done = true;
+                Poll::Ready(Some(Err(Status::unavailable(
+                    "execution ended without a terminal event",
+                ))))
+            }
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl Client for ClientGrpcService {
@@ -104,6 +166,17 @@ impl Client for ClientGrpcService {
         merge_grpc_trace_headers(start.spec.as_mut(), &headers);
         let mut execution = start_invoke(&self.runtime, namespace, start).await?;
         let input = execution.take_input();
+        let has_credential_expiry = auth.is_some()
+            && principal
+                .as_ref()
+                .is_some_and(|p| p.jti.is_some() || p.exp.is_some());
+        if input.is_none() && !has_credential_expiry {
+            return Ok(Response::new(Box::pin(DirectInvokeStream {
+                execution,
+                incoming: Some(incoming),
+                done: false,
+            })));
+        }
         let stream = async_stream::try_stream! {
             // Execution owns the cancellation guard. Its Drop runs even if the
             // HTTP/2 caller disappears before this generator is first polled.
