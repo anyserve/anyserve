@@ -17,7 +17,7 @@ export interface RustDuration { secs: number; nanos: number; }
 export interface HealthSummary { live: boolean; ready: boolean; journal: { status: "disabled" | "healthy" | "unavailable"; message: string | null }; }
 
 export interface WorkerRollup {
-  total: number; healthy: number; unavailable: number; draining?: number;
+  total: number; healthy: number; unavailable: number; draining?: number; offline?: number;
   active_leases: number; total_capacity: CapacityMap; last_seen_at_ms: number | null;
 }
 
@@ -29,7 +29,9 @@ export interface InterfacePolicySummary {
 
 export interface InterfaceSummary {
   name: string; queued: number; running: number; oldest_queued_age_ms: number;
-  sessions: number; free_slots: number; policy?: InterfacePolicySummary | null;
+  sessions: number; free_slots: number;
+  offline_workers?: number; last_seen_at_ms?: number | null;
+  policy?: InterfacePolicySummary | null;
 }
 
 export interface InfoResponse {
@@ -154,15 +156,24 @@ export interface WorkerLoadSummary {
   queued: number; running: number; utilization: number; custom: Record<string, number>;
 }
 
+export type WorkerLifecycleState = "healthy" | "draining" | "disconnected" | "offline";
+
 export interface WorkerSummary {
   worker_id: string; session_id?: string; namespace?: string; pool?: string;
+  state?: WorkerLifecycleState;
   healthy: boolean; interfaces: string[]; attributes: MetadataMap; total_capacity: CapacityMap;
   max_concurrency: number; free_slots: number; utilization: number; connected: boolean; draining: boolean;
-  active_leases: number; connected_at_ms?: number; last_seen_at_ms: number; load?: WorkerLoadSummary;
+  active_leases: number; connected_at_ms?: number; first_seen_ms?: number; last_seen_at_ms: number;
+  offline_since_ms?: number | null; offline_reason?: string | null;
+  load?: WorkerLoadSummary;
+}
+
+export function isOfflineWorker(worker: Pick<WorkerSummary, "state" | "offline_since_ms">): boolean {
+  return worker.state === "offline" || worker.offline_since_ms != null;
 }
 
 export interface WorkersResponse {
-  workers: WorkerSummary[]; total: number; healthy: number; draining?: number; disconnected?: number;
+  workers: WorkerSummary[]; total: number; healthy: number; draining?: number; disconnected?: number; offline?: number;
 }
 
 export interface JobDetailResponse {

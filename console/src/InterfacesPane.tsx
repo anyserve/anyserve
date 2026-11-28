@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 
-import { formatDuration, formatNumber, formatPool, poolKey } from "./format";
+import { formatDuration, formatNumber, formatPool, formatTimestamp, poolKey } from "./format";
 import { InspectorGroup, InspectorSection, InspectorShell, MetaGrid } from "./pane-inspector";
 import { EmptyState, InterfacesTable, PanelHeader, SearchInput, TierChain, WorkerMiniList } from "./pane-tables";
 import type { InterfaceSummary, PoolSummary, WorkerSummary } from "./types";
@@ -54,7 +54,11 @@ export function InterfacesPane(props: InterfacesPaneProps) {
         emptyHint="Select an interface"
         emptyMessage="Select an interface to inspect its routing policy, spillover chain, and sessions."
         title={activeItem?.name ?? ""}
-        subtitle={activeItem ? `${formatNumber(activeItem.sessions)} Sessions · ${formatNumber(activeItem.free_slots)} Free slots` : null}
+        subtitle={
+          activeItem
+            ? `${formatNumber(activeItem.sessions)} Sessions${(activeItem.offline_workers ?? 0) > 0 ? ` · ${formatNumber(activeItem.offline_workers!)} Offline` : ""} · ${formatNumber(activeItem.free_slots)} Free slots`
+            : null
+        }
         actions={
           activeItem ? (
             <button type="button" className="button button--primary" onClick={() => onViewJobs(activeItem.name)}>
@@ -65,6 +69,13 @@ export function InterfacesPane(props: InterfacesPaneProps) {
       >
         {activeItem ? (
           <>
+            {activeItem.sessions === 0 ? (
+              <p className="inline-notice" role="status">
+                {(activeItem.offline_workers ?? 0) > 0
+                  ? `All registered workers for this interface are offline${activeItem.last_seen_at_ms ? ` (last seen ${formatTimestamp(activeItem.last_seen_at_ms)})` : ""}.`
+                  : `No registered workers for this interface; shown from ${activeItem.policy ? "routing policy or retained job history" : "retained job history"}.`}
+              </p>
+            ) : null}
             <MetaGrid
               items={[
                 { label: "Queued", value: formatNumber(activeItem.queued) },
@@ -121,8 +132,8 @@ export function InterfacesPane(props: InterfacesPaneProps) {
               )}
             </InspectorSection>
 
-            <InspectorSection title="Connected Workers">
-              <WorkerMiniList workers={matchingWorkers} emptyMessage="No workers currently serving this interface." onSelect={onOpenWorker} />
+            <InspectorSection title="Registered Workers">
+              <WorkerMiniList workers={matchingWorkers} emptyMessage="No workers registered for this interface." onSelect={onOpenWorker} />
             </InspectorSection>
           </>
         ) : null}

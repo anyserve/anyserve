@@ -5,8 +5,9 @@ import { IconPlus } from "./icons";
 import { InspectorGroup, InspectorSection, InspectorShell, KeyValueGrid, MetaGrid, SubtitlePair } from "./pane-inspector";
 import { EmptyState, PanelHeader, ProgressMeter, SearchInput, SelectField, StatsRow, WorkerStateBadge } from "./pane-tables";
 import type { OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
+import { isOfflineWorker } from "./types";
 
-export type HealthFilter = "all" | "healthy" | "draining" | "disconnected";
+export type HealthFilter = "all" | "healthy" | "draining" | "disconnected" | "offline";
 
 export interface WorkerFilterSeed {
   health: HealthFilter;
@@ -26,9 +27,16 @@ interface WorkersPaneProps {
   onOpenPool: (namespace: string, interfaceName: string | undefined, pool: string) => void;
   onOpenConnect: () => void;
   onDrainWorker?: (sessionId: string) => Promise<void> | void;
+  onForgetWorker?: (workerId: string, namespace?: string) => Promise<void> | void;
 }
 
-const HEALTH_LABELS: Record<HealthFilter, string> = { all: "All", healthy: "Healthy", draining: "Draining", disconnected: "Disconnected" };
+const HEALTH_LABELS: Record<HealthFilter, string> = {
+  all: "All",
+  healthy: "Healthy",
+  draining: "Draining",
+  disconnected: "Disconnected",
+  offline: "Offline",
+};
 
 export function WorkersPane(props: WorkersPaneProps) {
   const {
@@ -44,12 +52,14 @@ export function WorkersPane(props: WorkersPaneProps) {
     onOpenPool,
     onOpenConnect,
     onDrainWorker,
+    onForgetWorker,
   } = props;
   const [healthFilter, setHealthFilter] = useState<HealthFilter>("all");
   const [poolFilter, setPoolFilter] = useState("all");
   const [interfaceFilter, setInterfaceFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [drainingId, setDrainingId] = useState<string | null>(null);
+  const [forgettingKey, setForgettingKey] = useState<string | null>(null);
   const prevSelectedWorker = useRef<string | null>(selectedWorkerId);
 
   useEffect(() => {
@@ -66,9 +76,11 @@ export function WorkersPane(props: WorkersPaneProps) {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return workers.filter((w) => {
-      if (healthFilter === "healthy" && !w.healthy) return false;
-      if (healthFilter === "draining" && !(w.connected && w.draining)) return false;
-      if (healthFilter === "disconnected" && w.connected) return false;
+      const offline = isOfflineWorker(w);
+      if (healthFilter === "healthy" && (offline || !w.healthy)) return false;
+      if (healthFilter === "draining" && (offline || !(w.connected && w.draining))) return false;
+      if (healthFilter === "disconnected" && (offline || w.connected)) return false;
+      if (healthFilter === "offline" && !offline) return false;
       if (poolFilter !== "all" && formatPool(w.pool) !== poolFilter) return false;
       if (interfaceFilter !== "all" && !w.interfaces.includes(interfaceFilter)) return false;
       return !q || [w.worker_id, w.session_id, formatPool(w.pool), w.namespace].some((s) => (s ?? "").toLowerCase().includes(q));
@@ -87,21 +99,25 @@ export function WorkersPane(props: WorkersPaneProps) {
   }, [selectedWorkerId, workers, filtered]);
 
   const activeWorker = filtered.find((w) => w.worker_id === selectedWorkerId) ?? filtered[0] ?? null;
+  const activeOffline = activeWorker ? isOfflineWorker(activeWorker) : false;
   const publicEndpoint = overview?.control_plane?.public_endpoint?.trim() ?? "";
   const isWebSocketTransport =
     overview?.control_plane?.grpc_enabled === false ||
     publicEndpoint.startsWith("ws://") ||
     publicEndpoint.startsWith("wss://");
 
+  const offlineCount = workersResponse?.offline ?? overview?.workers.offline ?? workers.filter((w) => isOfflineWorker(w)).length;
+
   return (
     <div className="content-grid">
       <section className="panel">
         <StatsRow
           stats={[
-            { label: "Total", value: workersResponse?.total ?? overview?.workers.total ?? workers.length },
-            { label: "Healthy", value: workersResponse?.healthy ?? overview?.workers.healthy ?? workers.filter((w) => w.healthy).length },
-            { label: "Draining", value: workersResponse?.draining ?? workers.filter((w) => w.connected && w.draining).length },
-            { label: "Disconnected", value: workersResponse?.disconnected ?? workers.filter((w) => !w.connected).length },
+            { label: "Total", value: workersResponse?.total ?? overview?.workers.total ?? workers.filter((w) => !isOfflineWorker(w)).length },
+            { label: "Healthy", value: workersResponse?.healthy ?? overview?.workers.healthy ?? workers.filter((w) => !isOfflineWorker(w) && w.healthy).length },
+            { label: "Draining", value: workersResponse?.draining ?? workers.filter((w) => !isOfflineWorker(w) && w.connected && w.draining).length },
+            { label: "Disconnected", value: workersResponse?.disconnected ?? workers.filter((w) => !isOfflineWorker(w) && !w.connected).length },
+            { label: "Offline", value: offlineCount },
             { label: "Active leases", value: overview?.workers.active_leases ?? 0 },
           ]}
         />
@@ -118,7 +134,7 @@ export function WorkersPane(props: WorkersPaneProps) {
 
         <div className="panel__toolbar panel__toolbar--wrap">
           <div className="seg-control" role="group" aria-label="Worker health filter">
-            {(["all", "healthy", "draining", "disconnected"] as const).map((item) => (
+            {(["all", "healthy", "draining", "disconnected", "offline"] as const).map((item) => (
               <button key={item} type="button" className={`seg-control__btn${healthFilter === item ? " is-active" : ""}`} aria-pressed={healthFilter === item} onClick={() => setHealthFilter(item)}>
                 {HEALTH_LABELS[item]}
               </button>
@@ -156,16 +172,26 @@ export function WorkersPane(props: WorkersPaneProps) {
               </thead>
               <tbody>
                 {filtered.map((worker) => {
+                  const offline = isOfflineWorker(worker);
                   const slotRatio = worker.max_concurrency > 0 ? worker.active_leases / worker.max_concurrency : 0;
                   const ifaces = worker.interfaces.join(", ") || "None";
                   const poolName = formatPool(worker.pool);
                   const ns = worker.namespace ?? "default";
+                  const rowKey = `${ns}::${worker.worker_id}::${offline ? "offline" : (worker.session_id ?? "live")}`;
                   return (
-                    <tr key={worker.session_id ?? worker.worker_id} className={activeWorker?.worker_id === worker.worker_id ? "is-selected" : ""} onClick={() => onSelectWorker(worker.worker_id)}>
+                    <tr
+                      key={rowKey}
+                      className={`${activeWorker?.worker_id === worker.worker_id ? "is-selected" : ""}${offline ? " is-offline" : ""}`.trim()}
+                      onClick={() => onSelectWorker(worker.worker_id)}
+                    >
                       <td><WorkerStateBadge worker={worker} /></td>
                       <td>
                         <div className="table__primary mono ellipsis" title={worker.worker_id}>{worker.worker_id}</div>
-                        {worker.session_id ? <div className="table__secondary mono ellipsis" title={worker.session_id}>{worker.session_id}</div> : null}
+                        {worker.session_id ? (
+                          <div className="table__secondary mono ellipsis" title={worker.session_id}>
+                            {offline ? `last: ${worker.session_id}` : worker.session_id}
+                          </div>
+                        ) : null}
                       </td>
                       <td>
                         <button
@@ -217,13 +243,17 @@ export function WorkersPane(props: WorkersPaneProps) {
                         )}
                       </td>
                       <td>
-                        <div className="occupancy-cell" title={`${worker.active_leases} active / ${worker.max_concurrency} max (${worker.free_slots} free)`}>
-                          <div className="occupancy-cell__row num">
-                            <span>{worker.active_leases} / {worker.max_concurrency}</span>
-                            <span className="muted">{formatPercent(slotRatio)}</span>
+                        {offline ? (
+                          <span className="muted" title={worker.offline_reason ?? "Worker offline"}>Offline</span>
+                        ) : (
+                          <div className="occupancy-cell" title={`${worker.active_leases} active / ${worker.max_concurrency} max (${worker.free_slots} free)`}>
+                            <div className="occupancy-cell__row num">
+                              <span>{worker.active_leases} / {worker.max_concurrency}</span>
+                              <span className="muted">{formatPercent(slotRatio)}</span>
+                            </div>
+                            <ProgressMeter percent={slotRatio * 100} />
                           </div>
-                          <ProgressMeter percent={slotRatio * 100} />
-                        </div>
+                        )}
                       </td>
                       <td className="mono table__timestamp" title={formatTimestamp(worker.last_seen_at_ms)}>{formatShortTime(worker.last_seen_at_ms)}</td>
                     </tr>
@@ -261,7 +291,7 @@ export function WorkersPane(props: WorkersPaneProps) {
           activeWorker ? (
             <>
               <WorkerStateBadge worker={activeWorker} />
-              {activeWorker.connected && !activeWorker.draining && activeWorker.session_id && onDrainWorker ? (
+              {!activeOffline && activeWorker.connected && !activeWorker.draining && activeWorker.session_id && onDrainWorker ? (
                 <button
                   type="button"
                   className="button"
@@ -279,6 +309,25 @@ export function WorkersPane(props: WorkersPaneProps) {
                   {drainingId === activeWorker.session_id ? "Draining…" : "Drain"}
                 </button>
               ) : null}
+              {activeOffline && onForgetWorker ? (
+                <button
+                  type="button"
+                  className="button button--danger"
+                  disabled={forgettingKey === `${activeWorker.namespace ?? "default"}::${activeWorker.worker_id}`}
+                  onClick={async () => {
+                    const ns = activeWorker.namespace ?? "default";
+                    const fkey = `${ns}::${activeWorker.worker_id}`;
+                    setForgettingKey(fkey);
+                    try {
+                      await onForgetWorker(activeWorker.worker_id, ns);
+                    } finally {
+                      setForgettingKey((cur) => (cur === fkey ? null : cur));
+                    }
+                  }}
+                >
+                  {forgettingKey === `${activeWorker.namespace ?? "default"}::${activeWorker.worker_id}` ? "Forgetting…" : "Forget"}
+                </button>
+              ) : null}
               <button type="button" className="button button--primary" onClick={() => onViewJobsForWorker(activeWorker.worker_id)}>
                 View Worker Jobs
               </button>
@@ -288,47 +337,68 @@ export function WorkersPane(props: WorkersPaneProps) {
       >
         {activeWorker ? (
           <>
-            {!activeWorker.connected && activeWorker.active_leases > 0 ? (
+            {activeOffline ? (
+              <p className="inline-notice" role="status">
+                Worker offline since {formatTimestamp(activeWorker.offline_since_ms ?? activeWorker.last_seen_at_ms)}
+                {activeWorker.offline_reason ? ` (${activeWorker.offline_reason})` : ""}. Registration is retained for inspection and resumes automatically on reconnect.
+              </p>
+            ) : !activeWorker.connected && activeWorker.active_leases > 0 ? (
               <p className="inline-notice" role="status">Session disconnected; active leases survive until reconnect grace expires.</p>
             ) : null}
 
             <InspectorGroup
-              title="Outbound Session"
+              title={activeOffline ? "Registration Record" : "Outbound Session"}
               meta={
-                isWebSocketTransport
-                  ? activeWorker.connected
-                    ? "WebSocket session active"
-                    : "WebSocket session closed"
-                  : activeWorker.connected
-                    ? "gRPC stream active"
-                    : "gRPC stream closed"
+                activeOffline
+                  ? "Offline · no active session"
+                  : isWebSocketTransport
+                    ? activeWorker.connected
+                      ? "WebSocket session active"
+                      : "WebSocket session closed"
+                    : activeWorker.connected
+                      ? "gRPC stream active"
+                      : "gRPC stream closed"
               }
             >
               <MetaGrid
-                items={[
-                  { label: "Session ID", value: activeWorker.session_id ?? "N/A", mono: true },
-                  { label: "Transport state", value: `${activeWorker.connected ? "connected" : "disconnected"}${activeWorker.draining ? " · draining" : ""}` },
-                  { label: "Connected at", value: formatTimestamp(activeWorker.connected_at_ms), mono: true },
-                  { label: "Last seen", value: formatTimestamp(activeWorker.last_seen_at_ms), mono: true },
-                ]}
+                items={
+                  activeOffline
+                    ? [
+                        { label: "Last session ID", value: activeWorker.session_id || "N/A", mono: true },
+                        { label: "Offline since", value: formatTimestamp(activeWorker.offline_since_ms ?? activeWorker.last_seen_at_ms), mono: true },
+                        { label: "Offline reason", value: activeWorker.offline_reason ?? "disconnected" },
+                        { label: "Last seen", value: formatTimestamp(activeWorker.last_seen_at_ms), mono: true },
+                        { label: "First seen", value: formatTimestamp(activeWorker.first_seen_ms ?? activeWorker.connected_at_ms), mono: true },
+                        { label: "Last connected", value: formatTimestamp(activeWorker.connected_at_ms), mono: true },
+                      ]
+                    : [
+                        { label: "Session ID", value: activeWorker.session_id ?? "N/A", mono: true },
+                        { label: "Transport state", value: `${activeWorker.connected ? "connected" : "disconnected"}${activeWorker.draining ? " · draining" : ""}` },
+                        { label: "Connected at", value: formatTimestamp(activeWorker.connected_at_ms), mono: true },
+                        { label: "Last seen", value: formatTimestamp(activeWorker.last_seen_at_ms), mono: true },
+                        ...(activeWorker.first_seen_ms ? [{ label: "First seen", value: formatTimestamp(activeWorker.first_seen_ms), mono: true }] : []),
+                      ]
+                }
               />
             </InspectorGroup>
 
-            <InspectorGroup title="Reported Load" meta={`${activeWorker.active_leases} / ${activeWorker.max_concurrency} leases`}>
-              <MetaGrid
-                items={[
-                  { label: "Worker queued", value: formatNumber(activeWorker.load?.queued ?? 0) },
-                  { label: "Worker running", value: formatNumber(activeWorker.load?.running ?? activeWorker.active_leases) },
-                  { label: "Utilization", value: formatPercent(activeWorker.load?.utilization ?? activeWorker.utilization) },
-                  { label: "Free slots", value: formatNumber(activeWorker.free_slots) },
-                ]}
-              />
-              {activeWorker.load && Object.keys(activeWorker.load.custom).length > 0 ? (
-                <InspectorSection title="Custom load metrics">
-                  <KeyValueGrid entries={activeWorker.load.custom} emptyMessage="None" />
-                </InspectorSection>
-              ) : null}
-            </InspectorGroup>
+            {!activeOffline ? (
+              <InspectorGroup title="Reported Load" meta={`${activeWorker.active_leases} / ${activeWorker.max_concurrency} leases`}>
+                <MetaGrid
+                  items={[
+                    { label: "Worker queued", value: formatNumber(activeWorker.load?.queued ?? 0) },
+                    { label: "Worker running", value: formatNumber(activeWorker.load?.running ?? activeWorker.active_leases) },
+                    { label: "Utilization", value: formatPercent(activeWorker.load?.utilization ?? activeWorker.utilization) },
+                    { label: "Free slots", value: formatNumber(activeWorker.free_slots) },
+                  ]}
+                />
+                {activeWorker.load && Object.keys(activeWorker.load.custom).length > 0 ? (
+                  <InspectorSection title="Custom load metrics">
+                    <KeyValueGrid entries={activeWorker.load.custom} emptyMessage="None" />
+                  </InspectorSection>
+                ) : null}
+              </InspectorGroup>
+            ) : null}
 
             <InspectorGroup title="Capacity & Attributes" meta={formatCapacityMap(activeWorker.total_capacity)}>
               <InspectorSection title="Total capacity">

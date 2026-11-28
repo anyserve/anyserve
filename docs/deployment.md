@@ -46,9 +46,9 @@ max_connections = 8
 Provide the PostgreSQL URL through `ANYSERVE_DATABASE_URL`, preferably from a
 secret manager. All control-plane instances point to the same writable primary
 database and schema. PostgreSQL's own HA replication, synchronous commit policy,
-backups and connection pooling remain database responsibilities. Schema v3
-(`scheduler_lease`, `jobs`, `objects`) is a clean break from older releases:
-drain existing work and recreate the schema before upgrading.
+backups and connection pooling remain database responsibilities. Schema v4 (`scheduler_lease`, `jobs`, `objects`, `workers`) migrates existing v3
+schemas in place automatically; legacy v1/v2 releases must drain and recreate the
+schema before upgrading.
 
 Exactly one instance holds the single-row `scheduler_lease` (`generation`
 fencing token + database `clock_timestamp()` expiry) and runs the scheduler.

@@ -1010,7 +1010,7 @@ async fn management_metrics_follow_native_jobs_and_worker_reservations() {
         "anyserve_active_leases 0\n",
         "anyserve_budget_bytes{budget=\"input\"} 0\n",
         "# TYPE anyserve_journal_committed_ops_total counter\n",
-        "anyserve_journal_committed_ops_total 3\n",
+        "anyserve_journal_committed_ops_total 4\n",
         "# TYPE anyserve_journal_committed_batches_total counter\n",
         "# TYPE anyserve_journal_last_commit_duration_seconds gauge\n",
     ] {
@@ -2699,4 +2699,190 @@ async fn settings_api_enforces_operator_auth_updates_live_persists_and_resets() 
     drop(c);
     runtime.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn worker_registry_retains_offline_workers_exposes_interface_status_and_forgets() {
+    let auth = AuthPolicy::new(["op-tok".into()], ["wk-tok".into()]).with_scoped_tokens([
+        ScopedToken {
+            token: "alice-cli".into(),
+            role: Role::Client,
+            namespace: "alice".into(),
+            subject: "alice".into(),
+            forced_pool: None,
+        },
+        ScopedToken {
+            token: "bob-cli".into(),
+            role: Role::Client,
+            namespace: "bob".into(),
+            subject: "bob".into(),
+            forced_pool: None,
+        },
+        ScopedToken {
+            token: "alice-wk".into(),
+            role: Role::Worker,
+            namespace: "alice".into(),
+            subject: "alice-w".into(),
+            forced_pool: None,
+        },
+    ]);
+    let runtime = Runtime::start(RuntimeConfig::default()).await.unwrap();
+    let c = spawn_console_auth(runtime.clone(), auth).await;
+    let ws_ep = c.base.replacen("http://", "ws://", 1);
+
+    // 1. Register an alice worker, execute a job, then disconnect idle.
+    let mut worker = WorkerSession::connect_with_namespace(
+        &ws_ep,
+        Some("alice-wk"),
+        None,
+        v2::Hello {
+            worker_id: "jetson-alice-01".into(),
+            pool: "orin".into(),
+            interfaces: vec!["vision.detect.v1".into()],
+            max_concurrency: 2,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let Some(v2::server_message::Msg::Welcome(w)) =
+        worker.messages.message().await.unwrap().unwrap().msg
+    else {
+        panic!("missing Welcome");
+    };
+    let limits = w.limits.unwrap();
+    let hb = Duration::from_millis(u64::from(w.heartbeat_timeout_ms));
+    send_msg(
+        &mut worker,
+        v2::worker_message::Msg::Credit(v2::Credit { free_slots: 2 }),
+    )
+    .await;
+
+    let job_id = submit(
+        &runtime,
+        Some("alice"),
+        spec("vision.detect.v1", Durability::Ephemeral),
+    )
+    .await;
+    let assign = accept_assign(&mut worker).await;
+    Attempt::open(&mut worker.data, &assign, &limits, hb)
+        .await
+        .unwrap()
+        .finish(&[], v2::finish::Outcome::Succeeded(v2::Succeeded {}))
+        .await
+        .unwrap();
+    wait_until(|| {
+        runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.worker_id == "jetson-alice-01" && w.active_leases == 0)
+    })
+    .await;
+
+    // Cannot forget while online -> 409 Conflict.
+    assert_eq!(
+        c.status(
+            Method::POST,
+            "/api/workers/jetson-alice-01/forget?namespace=alice",
+            Some("op-tok"),
+        )
+        .await,
+        409
+    );
+
+    // Drop worker -> goes offline cleanly and stays registered.
+    drop(worker);
+    wait_until(|| {
+        runtime
+            .list_workers()
+            .iter()
+            .any(|w| w.worker_id == "jetson-alice-01" && w.offline_since_ms.is_some())
+    })
+    .await;
+
+    let workers_res = c.json(Method::GET, "/api/workers", Some("alice-cli")).await;
+    assert_eq!(workers_res["total"], 0);
+    assert_eq!(workers_res["offline"], 1);
+    assert_eq!(workers_res["disconnected"], 0);
+    let w = &workers_res["workers"][0];
+    assert_eq!(w["worker_id"], "jetson-alice-01");
+    assert_eq!(w["state"], "offline");
+    assert_eq!(w["connected"], false);
+    assert_eq!(w["offline_reason"], "disconnected");
+    assert!(w["offline_since_ms"].as_u64().is_some());
+
+    // Overview shows interface with sessions=0, offline_workers=1, last_seen_at_ms set.
+    let ov = c
+        .json(Method::GET, "/api/overview", Some("alice-cli"))
+        .await;
+    assert_eq!(ov["workers"]["total"], 0);
+    assert_eq!(ov["workers"]["offline"], 1);
+    let iface = ov["interfaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "vision.detect.v1")
+        .expect("interface present");
+    assert_eq!(iface["sessions"], 0);
+    assert_eq!(iface["offline_workers"], 1);
+    assert!(iface["last_seen_at_ms"].as_u64().is_some());
+
+    let metrics_before = c.text("/metrics", Some("op-tok")).await;
+    assert!(
+        metrics_before.contains("anyserve_offline_workers 1\n"),
+        "expected anyserve_offline_workers 1, got:\n{metrics_before}"
+    );
+
+    // Job detail still resolves latest_worker to the offline record!
+    let detail = c
+        .json(
+            Method::GET,
+            &format!("/api/jobs/{job_id}?namespace=alice"),
+            Some("alice-cli"),
+        )
+        .await;
+    assert_eq!(detail["latest_worker"]["worker_id"], "jetson-alice-01");
+    assert_eq!(detail["latest_worker"]["state"], "offline");
+
+    // Cross-namespace forget is forbidden (403).
+    assert_eq!(
+        c.status(
+            Method::POST,
+            "/api/workers/jetson-alice-01/forget?namespace=alice",
+            Some("bob-cli"),
+        )
+        .await,
+        403
+    );
+
+    // Alice can forget her own offline worker (200); repeating returns 404.
+    let forgotten = c
+        .json(
+            Method::POST,
+            "/api/workers/jetson-alice-01/forget",
+            Some("alice-cli"),
+        )
+        .await;
+    assert_eq!(forgotten["forgotten"], true);
+    assert_eq!(forgotten["namespace"], "alice");
+
+    assert_eq!(
+        c.status(
+            Method::POST,
+            "/api/workers/jetson-alice-01/forget",
+            Some("alice-cli"),
+        )
+        .await,
+        404
+    );
+
+    let after = c.json(Method::GET, "/api/workers", Some("alice-cli")).await;
+    assert_eq!(after["offline"], 0);
+    assert!(after["workers"].as_array().unwrap().is_empty());
+
+    let metrics_after = c.text("/metrics", Some("op-tok")).await;
+    assert!(metrics_after.contains("anyserve_offline_workers 0\n"));
+
+    drop(c);
+    runtime.shutdown().await;
 }

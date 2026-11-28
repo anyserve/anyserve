@@ -1,4 +1,5 @@
 import type { JobDetailResponse, JobsHistogram, JobSummary, PoolSummary, RustDuration, WorkerSummary } from "./types";
+import { isOfflineWorker } from "./types";
 
 const timeFormatter = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -32,6 +33,9 @@ export function sortJobs(jobs: JobSummary[]): JobSummary[] {
 
 export function sortWorkers(workers: WorkerSummary[]): WorkerSummary[] {
   return [...workers].sort((a, b) => {
+    const aOff = isOfflineWorker(a);
+    const bOff = isOfflineWorker(b);
+    if (aOff !== bOff) return Number(aOff) - Number(bOff);
     if (a.healthy !== b.healthy) return Number(b.healthy) - Number(a.healthy);
     if (a.connected !== b.connected) return Number(b.connected) - Number(a.connected);
     return b.last_seen_at_ms - a.last_seen_at_ms;
@@ -192,12 +196,16 @@ export function sameJobs(a: JobSummary[], b: JobSummary[]): boolean {
 export function sameWorkers(a: WorkerSummary[], b: WorkerSummary[]): boolean {
   return a.length === b.length && a.every((x, i) =>
     x.worker_id === b[i].worker_id &&
+    x.namespace === b[i].namespace &&
     x.session_id === b[i].session_id &&
+    x.state === b[i].state &&
     x.healthy === b[i].healthy &&
     x.draining === b[i].draining &&
     x.connected === b[i].connected &&
     x.active_leases === b[i].active_leases &&
-    x.last_seen_at_ms === b[i].last_seen_at_ms,
+    x.last_seen_at_ms === b[i].last_seen_at_ms &&
+    x.offline_since_ms === b[i].offline_since_ms &&
+    x.offline_reason === b[i].offline_reason,
   );
 }
 

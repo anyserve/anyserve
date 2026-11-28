@@ -316,8 +316,8 @@ For leader-standby high availability, select `backend="postgres"`, omit `path`, 
 `lease_duration_ms=5000` (500–300,000 ms), `poll_interval_ms=100` (10 ms up to half
 the lease), and `max_connections=8` (at least 2, plus dedicated write and lease
 connections). `full_sync=false` and the embedded SQLite `max_bytes` cap are rejected
-for PG. PostgreSQL uses schema v3 (`scheduler_lease`, `jobs`, `objects`) and rejects
-legacy v1/v2 schemas at startup. `--journal PATH` explicitly selects SQLite and
+for PG. PostgreSQL uses schema v4 (`scheduler_lease`, `jobs`, `objects`, `workers`),
+migrating v3 schemas in place while rejecting legacy v1/v2 schemas at startup. `--journal PATH` explicitly selects SQLite and
 `--ephemeral` disables persistence. See
 [PG deployment](deployment.md#postgresql-high-availability) for failover and routing.
 

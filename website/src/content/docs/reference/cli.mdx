@@ -37,7 +37,8 @@ When `--console-listen` / `[console]` is enabled:
 | `GET /metrics` | Operator only | Prometheus text exposition format. |
 | `GET/PUT /api/settings`, `POST /api/settings/reset` | Operator only | Read, update, or reset live runtime settings. |
 | `/api/overview`, `/api/jobs`, `/api/workers`, `/api/analytics/jobs` | Operator or tenant client | Console API (tenant tokens restricted to their namespace). |
+| `POST /api/workers/:worker_id/forget` | Operator or tenant client | Forget an offline worker registration (`?namespace=...` for operators; `409` while live). |
 
 ## Prometheus metrics
 
-`/metrics` exports runtime gauges (retained jobs by state, interfaces, pools, worker sessions, byte budgets, journal status) and cumulative counters (`anyserve_jobs_submitted_total`, `anyserve_jobs_completed_total`, `anyserve_attempts_started_total`, `anyserve_auth_rejections_total`, `anyserve_auth_revocation_sync_ok`, `anyserve_auth_revocation_last_sync_age_seconds`).
+`/metrics` exports runtime gauges (retained jobs by state, interfaces, pools, live & offline workers via `anyserve_live_workers` / `anyserve_offline_workers`, byte budgets, journal status) and cumulative counters (`anyserve_jobs_submitted_total`, `anyserve_jobs_completed_total`, `anyserve_attempts_started_total`, `anyserve_auth_rejections_total`, `anyserve_auth_revocation_sync_ok`, `anyserve_auth_revocation_last_sync_age_seconds`).

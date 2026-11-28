@@ -10,6 +10,7 @@ import {
   drainWorker,
   fetchGuestStatus,
   fetchInfo,
+  forgetWorker,
   getJob,
   getJobs,
   getOverview,
@@ -29,6 +30,7 @@ vi.mock("./api", async (importOriginal) => {
     cancelJob: vi.fn(),
     createGuestSandbox: vi.fn(),
     drainWorker: vi.fn(),
+    forgetWorker: vi.fn(),
     fetchGuestStatus: vi.fn().mockResolvedValue({ guest_enabled: false }),
     fetchInfo: vi.fn().mockResolvedValue({ auth_enabled: false, grpc_enabled: true }),
     getJob: vi.fn(),
@@ -1514,4 +1516,126 @@ it("offers 1-click Try Live Demo guest sandbox on auth gate, opens /playground, 
 
   const workerInput = screen.getByPlaceholderText(/Paste worker token/i) as HTMLInputElement;
   expect(workerInput.value).toBe("asv1.guest-worker.sig");
+});
+
+it("navigates from Jobs to an offline worker profile, shows offline interface status, and forgets offline worker", async () => {
+  window.history.replaceState(null, "", "/jobs");
+  const now = 1_700_000_050_000;
+  const offlineWorker = {
+    worker_id: "jetson-orin-01",
+    session_id: "sess-old-1",
+    namespace: "default",
+    pool: "edge",
+    state: "offline" as const,
+    healthy: false,
+    connected: false,
+    draining: false,
+    interfaces: ["vision.detect.v1"],
+    attributes: { board: "orin-nx" },
+    total_capacity: { gpu: 1 },
+    max_concurrency: 4,
+    active_leases: 0,
+    free_slots: 0,
+    utilization: 0,
+    connected_at_ms: now - 60_000,
+    first_seen_ms: now - 120_000,
+    last_seen_at_ms: now - 10_000,
+    offline_since_ms: now - 5_000,
+    offline_reason: "disconnected",
+  };
+  vi.mocked(getOverview).mockResolvedValue({
+    ...richOverview(),
+    workers: {
+      total: 0,
+      healthy: 0,
+      draining: 0,
+      unavailable: 0,
+      offline: 1,
+      active_leases: 0,
+      total_capacity: {},
+      last_seen_at_ms: now - 10_000,
+    },
+    interfaces: [
+      {
+        name: "vision.detect.v1",
+        queued: 0,
+        running: 0,
+        oldest_queued_age_ms: 0,
+        sessions: 0,
+        free_slots: 0,
+        offline_workers: 1,
+        last_seen_at_ms: now - 10_000,
+        policy: null,
+      },
+      {
+        name: "legacy.history.v1",
+        queued: 0,
+        running: 0,
+        oldest_queued_age_ms: 0,
+        sessions: 0,
+        free_slots: 0,
+        offline_workers: 0,
+        last_seen_at_ms: null,
+        policy: null,
+      },
+    ],
+  });
+  vi.mocked(getWorkers).mockResolvedValue({
+    total: 0,
+    healthy: 0,
+    draining: 0,
+    disconnected: 0,
+    offline: 1,
+    workers: [offlineWorker],
+  });
+  vi.mocked(getJobs).mockResolvedValue({
+    jobs: [
+      summary("job-hist-1", {
+        state: "succeeded",
+        interface_name: "vision.detect.v1",
+        latest_worker_id: "jetson-orin-01",
+      }),
+    ],
+    total: 1,
+    next_page_token: null,
+  });
+  vi.mocked(getJob).mockResolvedValue({
+    ...detail("job-hist-1", { state: "succeeded", interface_name: "vision.detect.v1" }),
+    latest_worker: offlineWorker,
+  });
+  vi.mocked(forgetWorker).mockResolvedValue({
+    worker_id: "jetson-orin-01",
+    namespace: "default",
+    forgotten: true,
+  });
+
+  render(<App />);
+
+  // Click offline worker directly from the Jobs table -> opens Workers pane with offline profile selected.
+  const workerBtn = await screen.findByRole("button", { name: "jetson-orin-01" });
+  fireEvent.click(workerBtn);
+
+  expect(await screen.findByText(/Worker offline since/i)).toBeTruthy();
+  expect(screen.getByText("disconnected")).toBeTruthy();
+
+  // Check Interfaces pane clearly differentiates Offline vs History-only interfaces.
+  fireEvent.click(screen.getByRole("button", { name: /Interfaces/i }));
+  expect(await screen.findByText(/1 worker/i)).toBeTruthy();
+  expect(screen.getByText(/History only · no workers/i)).toBeTruthy();
+
+  // Return to Workers pane, click Forget, verify API call & UI removal.
+  fireEvent.click(screen.getByRole("button", { name: /^Workers/i }));
+  const forgetBtn = await screen.findByRole("button", { name: "Forget" });
+  vi.mocked(getWorkers).mockResolvedValue({
+    total: 0,
+    healthy: 0,
+    draining: 0,
+    disconnected: 0,
+    offline: 0,
+    workers: [],
+  });
+  fireEvent.click(forgetBtn);
+
+  await waitFor(() => expect(forgetWorker).toHaveBeenCalledWith("jetson-orin-01", "default"));
+  expect(await screen.findByText(/No workers currently connected/i)).toBeTruthy();
 });

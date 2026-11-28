@@ -9,8 +9,8 @@ The React Web Console is embedded directly in release binaries and the official 
 
 - **Overview (`/`)**: Live queue depth, worker health, interface activity, and recent jobs.
 - **Jobs (`/jobs`)**: Filter by status, interface, namespace, worker, time range, or search text; inspect inputs/outputs and the W3C Trace Waterfall separating scheduling/queue delay from handler runtime.
-- **Interfaces & Pools (`/interfaces`, `/pools`)**: Inspect registered interfaces, pool tiers, spillover policy, and active capacity.
-- **Workers (`/workers`)**: Live worker sessions, active leases, load metrics, one-click drain, and the **Connect Worker** onboarding modal (Python SDK, AI Connectors, Rust SDK, Docker/Helm, and CLI one-line install).
+- **Interfaces & Pools (`/interfaces`, `/pools`)**: Inspect registered interfaces (including live vs. offline worker counts and last-seen times), pool tiers, spillover policy, and active capacity.
+- **Workers (`/workers`)**: Live worker sessions alongside persisted offline worker registrations (retained across restarts for 7 days / up to 1,000 offline workers), active leases, load metrics, one-click drain, offline **Forget**, and the **Connect Worker** onboarding modal (Python SDK, AI Connectors, Rust SDK, Docker/Helm, and CLI one-line install).
 - **Playground (`/playground`)**: Run an in-browser Dedicated Web Worker (`demo.browser_echo.v1`), test live failover, or compare WebSocket Relay vs. optional WebRTC P2P data-plane transfer.
 - **Explore (`/explore`)**: Load bounded job metadata into in-browser DuckDB-WASM and run read-only SQL queries with CSV export.
 - **Settings (`/settings`)**: Configure both local Console preferences and live server runtime settings.

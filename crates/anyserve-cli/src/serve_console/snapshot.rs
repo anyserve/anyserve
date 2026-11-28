@@ -80,6 +80,7 @@ pub(crate) fn worker_rollup(workers: WorkerStats) -> WorkerRollup {
         healthy: workers.healthy,
         draining: workers.draining,
         unavailable: workers.total.saturating_sub(workers.healthy),
+        offline: workers.offline,
         active_leases: workers.active_leases,
         total_capacity: workers.total_capacity,
         last_seen_at_ms: workers.last_seen_at_ms,
@@ -173,13 +174,24 @@ pub(crate) fn job_summary(job: JobView) -> JobSummary {
 }
 
 pub(crate) fn worker_summary(worker: WorkerView) -> WorkerSummary {
-    let healthy = worker.connected && !worker.draining;
+    let offline = worker.offline_since_ms.is_some();
+    let healthy = !offline && worker.connected && !worker.draining;
+    let state = if offline {
+        "offline"
+    } else if !worker.connected {
+        "disconnected"
+    } else if worker.draining {
+        "draining"
+    } else {
+        "healthy"
+    };
     let utilization = worker.load.utilization;
     WorkerSummary {
         session_id: worker.session_id,
         worker_id: worker.worker_id,
         namespace: worker.namespace,
         pool: worker.pool,
+        state,
         healthy,
         interfaces: worker.interfaces,
         attributes: worker.attributes,
@@ -197,7 +209,10 @@ pub(crate) fn worker_summary(worker: WorkerView) -> WorkerSummary {
         connected: worker.connected,
         draining: worker.draining,
         connected_at_ms: worker.connected_at_ms,
+        first_seen_ms: worker.first_seen_ms,
         last_seen_at_ms: worker.last_seen_ms,
+        offline_since_ms: worker.offline_since_ms,
+        offline_reason: worker.offline_reason,
     }
 }
 

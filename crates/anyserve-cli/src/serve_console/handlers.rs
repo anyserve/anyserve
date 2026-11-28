@@ -22,8 +22,9 @@ use axum::{Json, Router};
 use super::api::{
     AnalyticsQuery, AnalyticsResponse, AnalyticsSource, ApiError, AppState, BudgetsSummary,
     CancelJobResponse, ConsoleScopeSummary, ControlPlaneSummary, DrainWorkerResponse,
-    HistorySummary, InfoResponse, InterfaceSummary, JobDetailResponse, JobsQuery, JobsResponse,
-    NamespaceQuery, OverviewResponse, PoolSummary, QueueSummary, WorkersResponse,
+    ForgetWorkerResponse, HistorySummary, InfoResponse, InterfaceSummary, JobDetailResponse,
+    JobsQuery, JobsResponse, NamespaceQuery, OverviewResponse, PoolSummary, QueueSummary,
+    WorkersResponse,
 };
 use super::settings::{
     RuntimeSettingsDto, SettingsLimitsMeta, SettingsResponse, render_server_toml_snippet,
@@ -49,6 +50,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/api/jobs/:job_id/cancel", post(cancel_job))
         .route("/api/workers", get(list_workers))
         .route("/api/workers/:session_id/drain", post(drain_worker))
+        .route("/api/workers/:worker_id/forget", post(forget_worker))
         .route("/api/settings", get(get_settings).put(update_settings))
         .route("/api/settings/reset", post(reset_settings))
         .with_state(state)
@@ -166,6 +168,8 @@ async fn overview(
                 oldest_queued_age_ms: current.map_or(0, |s| s.oldest_queued_age_ms),
                 sessions: current.map_or(0, |s| s.sessions),
                 free_slots: current.map_or(0, |s| s.free_slots),
+                offline_workers: current.map_or(0, |s| s.offline_workers),
+                last_seen_at_ms: current.and_then(|s| s.last_seen_at_ms),
                 policy: principal
                     .is_operator
                     .then(|| live.interfaces.get(name).map(interface_policy_summary))
@@ -379,31 +383,39 @@ async fn list_workers(
 ) -> Result<Json<WorkersResponse>, ApiError> {
     state.runtime.ensure_active_leader().map_err(api_error)?;
     let workers_view = state.runtime.list_workers();
+    let mut live_total = 0usize;
     let mut healthy = 0usize;
     let mut draining = 0usize;
     let mut disconnected = 0usize;
+    let mut offline = 0usize;
     let mut workers = Vec::with_capacity(workers_view.len());
     for worker in workers_view {
         if !principal.is_operator && worker.namespace != principal.namespace {
             continue;
         }
         let summary = worker_summary(worker);
-        if summary.healthy {
-            healthy += 1;
-        }
-        if summary.draining {
-            draining += 1;
-        }
-        if !summary.connected {
-            disconnected += 1;
+        if summary.offline_since_ms.is_some() {
+            offline += 1;
+        } else {
+            live_total += 1;
+            if summary.healthy {
+                healthy += 1;
+            }
+            if summary.draining {
+                draining += 1;
+            }
+            if !summary.connected {
+                disconnected += 1;
+            }
         }
         workers.push(summary);
     }
     Ok(Json(WorkersResponse {
-        total: workers.len(),
+        total: live_total,
         healthy,
         draining,
         disconnected,
+        offline,
         workers,
     }))
 }
@@ -421,6 +433,27 @@ async fn drain_worker(
     Ok(Json(DrainWorkerResponse {
         session_id,
         draining: true,
+    }))
+}
+
+async fn forget_worker(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(worker_id): Path<String>,
+    Query(query): Query<NamespaceQuery>,
+) -> Result<Json<ForgetWorkerResponse>, ApiError> {
+    let ns = enforce_namespace(&state.auth, &principal, query.namespace, false)?
+        .unwrap_or_else(|| DEFAULT_NAMESPACE.to_owned());
+    let scope_ns = (!principal.is_operator).then_some(principal.namespace.as_str());
+    state
+        .runtime
+        .forget_worker(scope_ns, &ns, &worker_id)
+        .await
+        .map_err(api_error)?;
+    Ok(Json(ForgetWorkerResponse {
+        worker_id,
+        namespace: ns,
+        forgotten: true,
     }))
 }
 

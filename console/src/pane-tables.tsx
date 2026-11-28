@@ -4,6 +4,7 @@ import type { JobStatusFilter, PaneStat } from "./app-constants";
 import { formatDuration, formatNumber, formatPool, formatShortTime, formatTimestamp } from "./format";
 import { IconCheck, IconClose, IconCopy, IconSearch } from "./icons";
 import type { InterfaceSummary, JobState, JobSummary, PoolTierPolicy, WorkerSummary } from "./types";
+import { isOfflineWorker } from "./types";
 
 export function CopyButton({ text, label = "Copy", resetKey }: { text: string | (() => string); label?: string; resetKey?: string }) {
   const [copied, setCopied] = useState(false);
@@ -142,8 +143,20 @@ export function StateBadge({ state }: { state: JobState }) {
   );
 }
 
-export function WorkerStateBadge({ worker }: { worker: Pick<WorkerSummary, "healthy" | "connected" | "draining"> }) {
-  const kind = !worker.connected ? "disconnected" : worker.draining ? "draining" : worker.healthy ? "healthy" : "unavailable";
+export function WorkerStateBadge({
+  worker,
+}: {
+  worker: Pick<WorkerSummary, "healthy" | "connected" | "draining" | "state" | "offline_since_ms">;
+}) {
+  const kind = isOfflineWorker(worker)
+    ? "offline"
+    : !worker.connected
+      ? "disconnected"
+      : worker.draining
+        ? "draining"
+        : worker.healthy
+          ? "healthy"
+          : "unavailable";
   return (
     <span className={`badge badge--worker-${kind}`}>
       <i className="badge__dot" aria-hidden="true" />
@@ -216,16 +229,24 @@ export function WorkerMiniList(props: {
   if (props.workers.length === 0) return <EmptyState message={props.emptyMessage} inline />;
   return (
     <div className="mini-list">
-      {props.workers.map((worker) => (
-        <button key={worker.worker_id} type="button" className="mini-row" onClick={() => props.onSelect(worker.worker_id)}>
-          <span className="mono ellipsis" title={worker.worker_id}>{worker.worker_id}</span>
-          <span className="mini-row__meta">
-            {props.showLeases ? <span className="num">{worker.active_leases}/{worker.max_concurrency}</span> : null}
-            {!props.showLeases ? <span className="tag">{formatPool(worker.pool)}</span> : null}
-            <WorkerStateBadge worker={worker} />
-          </span>
-        </button>
-      ))}
+      {props.workers.map((worker) => {
+        const offline = isOfflineWorker(worker);
+        return (
+          <button
+            key={`${worker.namespace ?? "default"}::${worker.worker_id}::${offline ? "offline" : (worker.session_id ?? "live")}`}
+            type="button"
+            className="mini-row"
+            onClick={() => props.onSelect(worker.worker_id)}
+          >
+            <span className="mono ellipsis" title={worker.worker_id}>{worker.worker_id}</span>
+            <span className="mini-row__meta">
+              {props.showLeases && !offline ? <span className="num">{worker.active_leases}/{worker.max_concurrency}</span> : null}
+              {(!props.showLeases || offline) ? <span className="tag">{formatPool(worker.pool)}</span> : null}
+              <WorkerStateBadge worker={worker} />
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -401,7 +422,24 @@ export const InterfacesTable = memo(function InterfacesTable(props: {
                 className={selectedName === item.name ? "is-selected" : ""}
                 onClick={onSelect ? () => onSelect(item.name) : undefined}
               >
-                <td className="table__primary mono ellipsis" title={item.name}>{item.name}</td>
+                <td>
+                  <div className="table__primary mono ellipsis" title={item.name}>{item.name}</div>
+                  {item.sessions === 0 ? (
+                    <div className="table__secondary ellipsis">
+                      {(item.offline_workers ?? 0) > 0 ? (
+                        <>
+                          <span className="tag">Offline</span>
+                          <span>
+                            {formatNumber(item.offline_workers!)} worker{item.offline_workers === 1 ? "" : "s"}
+                            {item.last_seen_at_ms ? ` · ${formatShortTime(item.last_seen_at_ms)}` : ""}
+                          </span>
+                        </>
+                      ) : (
+                        <span className="muted">{item.policy ? "Policy only · no workers" : "History only · no workers"}</span>
+                      )}
+                    </div>
+                  ) : null}
+                </td>
                 <td className="num">{formatNumber(item.queued)}</td>
                 <td className="num">{formatNumber(item.running)}</td>
                 {!compact ? <td className="num">{formatDuration(item.oldest_queued_age_ms)}</td> : null}

@@ -188,6 +188,7 @@ pub(crate) struct WorkerRollup {
     pub(crate) healthy: usize,
     pub(crate) draining: usize,
     pub(crate) unavailable: usize,
+    pub(crate) offline: usize,
     pub(crate) active_leases: u64,
     pub(crate) total_capacity: BTreeMap<String, i64>,
     pub(crate) last_seen_at_ms: Option<u64>,
@@ -216,6 +217,8 @@ pub(crate) struct InterfaceSummary {
     pub(crate) oldest_queued_age_ms: u64,
     pub(crate) sessions: usize,
     pub(crate) free_slots: u64,
+    pub(crate) offline_workers: usize,
+    pub(crate) last_seen_at_ms: Option<u64>,
     pub(crate) policy: Option<InterfacePolicySummary>,
 }
 
@@ -347,6 +350,7 @@ pub(crate) struct WorkerSummary {
     pub(crate) worker_id: String,
     pub(crate) namespace: String,
     pub(crate) pool: String,
+    pub(crate) state: &'static str,
     pub(crate) healthy: bool,
     pub(crate) interfaces: Vec<String>,
     pub(crate) attributes: BTreeMap<String, String>,
@@ -359,7 +363,10 @@ pub(crate) struct WorkerSummary {
     pub(crate) connected: bool,
     pub(crate) draining: bool,
     pub(crate) connected_at_ms: u64,
+    pub(crate) first_seen_ms: u64,
     pub(crate) last_seen_at_ms: u64,
+    pub(crate) offline_since_ms: Option<u64>,
+    pub(crate) offline_reason: Option<String>,
 }
 #[derive(Serialize)]
 pub(crate) struct WorkersResponse {
@@ -368,6 +375,13 @@ pub(crate) struct WorkersResponse {
     pub(crate) healthy: usize,
     pub(crate) draining: usize,
     pub(crate) disconnected: usize,
+    pub(crate) offline: usize,
+}
+#[derive(Serialize)]
+pub(crate) struct ForgetWorkerResponse {
+    pub(crate) worker_id: String,
+    pub(crate) namespace: String,
+    pub(crate) forgotten: bool,
 }
 #[derive(Serialize)]
 pub(crate) struct CancelJobResponse {

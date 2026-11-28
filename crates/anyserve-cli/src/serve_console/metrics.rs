@@ -138,6 +138,14 @@ pub(super) fn render(
 
     write_header(
         &mut out,
+        "anyserve_offline_workers",
+        "gauge",
+        "Registered workers currently offline (retained in worker registry).",
+    );
+    let _ = writeln!(out, "anyserve_offline_workers {}", snapshot.workers.offline);
+
+    write_header(
+        &mut out,
         "anyserve_sessions",
         "gauge",
         "Retained worker sessions, including reconnect grace.",

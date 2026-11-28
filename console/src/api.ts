@@ -233,6 +233,15 @@ export function drainWorker(sessionId: string): Promise<{ session_id: string; dr
   return request(`/api/workers/${encodeURIComponent(sessionId)}/drain`, { method: "POST" });
 }
 
+export function forgetWorker(
+  workerId: string,
+  namespace?: string,
+): Promise<{ worker_id: string; namespace: string; forgotten: boolean }> {
+  return request(withNamespace(`/api/workers/${encodeURIComponent(workerId)}/forget`, namespace), {
+    method: "POST",
+  });
+}
+
 export function getSettings(signal?: AbortSignal): Promise<SettingsResponse> {
   return request("/api/settings", { signal });
 }

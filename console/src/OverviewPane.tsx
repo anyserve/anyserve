@@ -3,12 +3,13 @@ import { budgetPercent, formatBytes, formatCapacityMap, formatDuration, formatMi
 import { IconArrowRight } from "./icons";
 import { EmptyState, InterfacesTable, PanelHeader, ProgressMeter } from "./pane-tables";
 import type { JobState, OverviewResponse } from "./types";
+import type { HealthFilter } from "./WorkersPane";
 
 interface OverviewPaneProps {
   overview: OverviewResponse | null;
   onNavigate: (tab: ConsoleTab) => void;
   onOpenJobs: (scope: JobScope, status?: JobState) => void;
-  onOpenWorkersHealth: (health: "all" | "draining") => void;
+  onOpenWorkersHealth: (health: HealthFilter) => void;
   onOpenInterface: (interfaceName: string) => void;
   onOpenPool: (poolKey: string) => void;
   onOpenPoolByTier: (interfaceName: string, poolName: string) => void;
@@ -133,6 +134,11 @@ export function OverviewPane({
                 ) : (
                   <span>Draining <strong className="num">0</strong></span>
                 )
+              ) : null}
+              {(overview?.workers.offline ?? 0) > 0 ? (
+                <button type="button" className="stat-link" onClick={() => onOpenWorkersHealth("offline")}>
+                  Offline <strong className="num">{formatNumber(overview!.workers.offline!)}</strong>
+                </button>
               ) : null}
             </div>
             {overview && Object.keys(overview.workers.total_capacity).length > 0 ? (

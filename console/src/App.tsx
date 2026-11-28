@@ -9,6 +9,7 @@ import {
   drainWorker,
   fetchGuestStatus,
   fetchInfo,
+  forgetWorker,
   getJob,
   getJobs,
   getOverview,
@@ -37,6 +38,7 @@ import { PoolsPane, type PoolFilterSeed } from "./PoolsPane";
 import { SettingsPane } from "./SettingsPane";
 import { Sidebar } from "./Sidebar";
 import type { InfoResponse, JobDetailResponse, JobsHistogram, JobState, JobSummary, OverviewResponse, WorkerSummary, WorkersResponse } from "./types";
+import { isOfflineWorker } from "./types";
 import { usePollingEffect } from "./usePollingEffect";
 import { WorkersPane, type HealthFilter, type WorkerFilterSeed } from "./WorkersPane";
 
@@ -829,11 +831,39 @@ export default function App() {
                     return {
                       ...cur,
                       workers: nextWorkers,
-                      healthy: nextWorkers.filter((w) => w.healthy).length,
-                      draining: nextWorkers.filter((w) => w.connected && w.draining).length,
-                      disconnected: nextWorkers.filter((w) => !w.connected).length,
+                      healthy: nextWorkers.filter((w) => !isOfflineWorker(w) && w.healthy).length,
+                      draining: nextWorkers.filter((w) => !isOfflineWorker(w) && w.connected && w.draining).length,
+                      disconnected: nextWorkers.filter((w) => !isOfflineWorker(w) && !w.connected).length,
+                      offline: nextWorkers.filter((w) => isOfflineWorker(w)).length,
                     };
                   });
+                  setManualRefreshSeq((s) => s + 1);
+                  setError(null);
+                } catch (err) {
+                  handleError(err);
+                }
+              }}
+              onForgetWorker={async (workerId, namespace) => {
+                try {
+                  await forgetWorker(workerId, namespace);
+                  const targetNs = namespace ?? "default";
+                  const keep = (w: WorkerSummary) =>
+                    !(isOfflineWorker(w) && w.worker_id === workerId && (w.namespace ?? "default") === targetNs);
+                  setWorkers((cur) => cur.filter(keep));
+                  setWorkersResponse((cur) => {
+                    if (!cur) return cur;
+                    const nextWorkers = cur.workers.filter(keep);
+                    return {
+                      ...cur,
+                      workers: nextWorkers,
+                      total: nextWorkers.filter((w) => !isOfflineWorker(w)).length,
+                      healthy: nextWorkers.filter((w) => !isOfflineWorker(w) && w.healthy).length,
+                      draining: nextWorkers.filter((w) => !isOfflineWorker(w) && w.connected && w.draining).length,
+                      disconnected: nextWorkers.filter((w) => !isOfflineWorker(w) && !w.connected).length,
+                      offline: nextWorkers.filter((w) => isOfflineWorker(w)).length,
+                    };
+                  });
+                  setSelectedWorkerId((cur) => (cur === workerId ? null : cur));
                   setManualRefreshSeq((s) => s + 1);
                   setError(null);
                 } catch (err) {
