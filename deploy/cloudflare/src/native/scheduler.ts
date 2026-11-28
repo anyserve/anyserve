@@ -21,21 +21,100 @@ export function nextRandom64(rng: { state: bigint }): bigint {
   return (x * 0x2545_f491_4f6c_dd1dn) & MASK_64;
 }
 
+const INV_2_32 = 2.3283064365386963e-10; // 1 / 2^32
+
+// Mutable 2-word scratch for zero-allocation 64-bit FNV-1a + SplitMix64 mixing.
+let hashOutHi = 0;
+let hashOutLo = 0;
+
+function fnv1aFeedString(hi: number, lo: number, str: string): void {
+  let h = hi;
+  let l = lo;
+  let ascii = true;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c >= 0x80) {
+      ascii = false;
+      break;
+    }
+    l = (l ^ c) >>> 0;
+    const prodLo = l * 0x1b3;
+    const nextLo = prodLo >>> 0;
+    const carry = (prodLo - nextLo) * INV_2_32;
+    h = (Math.imul(h, 0x1b3) + ((l << 8) >>> 0) + carry) >>> 0;
+    l = nextLo;
+  }
+  if (!ascii) {
+    h = hi;
+    l = lo;
+    const bytes = utf8Encoder.encode(str);
+    for (let i = 0; i < bytes.byteLength; i++) {
+      l = (l ^ bytes[i]!) >>> 0;
+      const prodLo = l * 0x1b3;
+      const nextLo = prodLo >>> 0;
+      const carry = (prodLo - nextLo) * INV_2_32;
+      h = (Math.imul(h, 0x1b3) + ((l << 8) >>> 0) + carry) >>> 0;
+      l = nextLo;
+    }
+  }
+  hashOutHi = h;
+  hashOutLo = l;
+}
+
+function fnv1aFeedSepAndFinalize(
+  prefixHi: number,
+  prefixLo: number,
+  workerId: string,
+): void {
+  fnv1aFeedString(prefixHi, prefixLo, workerId);
+  let hi = hashOutHi;
+  let lo = hashOutLo;
+
+  // hash = ((hash ^ (hash >> 30)) * 0xbf58_476d_1ce4_e5b9) & MASK_64
+  lo = (lo ^ ((lo >>> 30) | (hi << 2))) >>> 0;
+  hi = (hi ^ (hi >>> 30)) >>> 0;
+  let a00 = lo & 0xffff;
+  let a16 = lo >>> 16;
+  let c00 = a00 * 0xe5b9;
+  let c16 = (c00 >>> 16) + a16 * 0xe5b9;
+  let c32 = c16 >>> 16;
+  c16 = (c16 & 0xffff) + a00 * 0x1ce4;
+  c32 += c16 >>> 16;
+  hi = (c32 + Math.imul(a16, 0x1ce4) + Math.imul(hi, 0x1ce4e5b9) + Math.imul(lo, 0xbf58476d)) >>> 0;
+  lo = ((c16 << 16) | (c00 & 0xffff)) >>> 0;
+
+  // hash = ((hash ^ (hash >> 27)) * 0x94d0_49bb_1331_11eb) & MASK_64
+  lo = (lo ^ ((lo >>> 27) | (hi << 5))) >>> 0;
+  hi = (hi ^ (hi >>> 27)) >>> 0;
+  a00 = lo & 0xffff;
+  a16 = lo >>> 16;
+  c00 = a00 * 0x11eb;
+  c16 = (c00 >>> 16) + a16 * 0x11eb;
+  c32 = c16 >>> 16;
+  c16 = (c16 & 0xffff) + a00 * 0x1331;
+  c32 += c16 >>> 16;
+  hi = (c32 + Math.imul(a16, 0x1331) + Math.imul(hi, 0x133111eb) + Math.imul(lo, 0x94d049bb)) >>> 0;
+  lo = ((c16 << 16) | (c00 & 0xffff)) >>> 0;
+
+  // hash = (hash ^ (hash >> 31)) & MASK_64
+  hashOutLo = (lo ^ ((lo >>> 31) | (hi << 1))) >>> 0;
+  hashOutHi = (hi ^ (hi >>> 31)) >>> 0;
+}
+
+function rendezvousPrefix(affinityKey: string): void {
+  fnv1aFeedString(0xcbf29ce4, 0x84222325, affinityKey);
+  const loXor = (hashOutLo ^ 0xff) >>> 0;
+  const prodLo = loXor * 0x1b3;
+  const nextLo = prodLo >>> 0;
+  const carry = (prodLo - nextLo) * INV_2_32;
+  hashOutHi = (Math.imul(hashOutHi, 0x1b3) + ((loXor << 8) >>> 0) + carry) >>> 0;
+  hashOutLo = nextLo;
+}
+
 export function rendezvousHash64(affinityKey: string, workerId: string): bigint {
-  let hash = 0xcbf2_9ce4_8422_2325n;
-  const keyBytes = utf8Encoder.encode(affinityKey);
-  const workerBytes = utf8Encoder.encode(workerId);
-  for (let i = 0; i < keyBytes.byteLength; i++) {
-    hash = ((hash ^ BigInt(keyBytes[i]!)) * 0x0100_0000_01b3n) & MASK_64;
-  }
-  hash = ((hash ^ 0xffn) * 0x0100_0000_01b3n) & MASK_64;
-  for (let i = 0; i < workerBytes.byteLength; i++) {
-    hash = ((hash ^ BigInt(workerBytes[i]!)) * 0x0100_0000_01b3n) & MASK_64;
-  }
-  hash = ((hash ^ (hash >> 30n)) * 0xbf58_476d_1ce4_e5b9n) & MASK_64;
-  hash = ((hash ^ (hash >> 27n)) * 0x94d0_49bb_1331_11ebn) & MASK_64;
-  hash = (hash ^ (hash >> 31n)) & MASK_64;
-  return hash;
+  rendezvousPrefix(affinityKey);
+  fnv1aFeedSepAndFinalize(hashOutHi, hashOutLo, workerId);
+  return (BigInt(hashOutHi) << 32n) | BigInt(hashOutLo);
 }
 
 export interface QueueEntry {
@@ -43,10 +122,41 @@ export interface QueueEntry {
   scopedJobId: string;
 }
 
+interface FairSubqueue {
+  items: Array<QueueEntry | undefined>;
+  head: number;
+  liveCount: number;
+  posById: Map<string, number>;
+  tailSeq: bigint;
+  tailId: string;
+}
+
+function compactSubqueue(sub: FairSubqueue): void {
+  const next: Array<QueueEntry | undefined> = new Array(sub.liveCount);
+  const posById = sub.posById;
+  posById.clear();
+  let write = 0;
+  for (let i = sub.head; i < sub.items.length; i++) {
+    const item = sub.items[i];
+    if (item !== undefined) {
+      next[write] = item;
+      posById.set(item.scopedJobId, write);
+      write += 1;
+    }
+  }
+  sub.items = next;
+  sub.head = 0;
+  if (write > 0) {
+    const tail = next[write - 1]!;
+    sub.tailSeq = tail.seq;
+    sub.tailId = tail.scopedJobId;
+  }
+}
+
 export class FairPriorityQueue {
   private readonly levels: Array<{
     ring: string[];
-    subqueues: Map<string, QueueEntry[]>;
+    subqueues: Map<string, FairSubqueue>;
     count: number;
   }> = [];
   totalLen = 0;
@@ -61,26 +171,57 @@ export class FairPriorityQueue {
     const fkey = fairnessKey || DEFAULT_FAIRNESS_KEY;
     let sub = level.subqueues.get(fkey);
     if (!sub) {
-      sub = [];
+      sub = {
+        items: [],
+        head: 0,
+        liveCount: 0,
+        posById: new Map(),
+        tailSeq: 0n,
+        tailId: "",
+      };
       level.subqueues.set(fkey, sub);
       level.ring.push(fkey);
     }
-    if (sub.some((e) => e.scopedJobId === entry.scopedJobId)) {
+    if (sub.posById.has(entry.scopedJobId)) {
       return;
     }
-    // Insert sorted by (seq ASC, scopedJobId ASC)
-    let pos = sub.length;
-    while (pos > 0) {
-      const prev = sub[pos - 1]!;
-      if (
-        prev.seq < entry.seq ||
-        (prev.seq === entry.seq && prev.scopedJobId < entry.scopedJobId)
-      ) {
-        break;
+    if (
+      sub.liveCount === 0 ||
+      entry.seq > sub.tailSeq ||
+      (entry.seq === sub.tailSeq && entry.scopedJobId > sub.tailId)
+    ) {
+      // O(1) monotonic append (the common case for queueSeq)
+      const pos = sub.items.length;
+      sub.items.push(entry);
+      sub.posById.set(entry.scopedJobId, pos);
+      sub.liveCount += 1;
+      sub.tailSeq = entry.seq;
+      sub.tailId = entry.scopedJobId;
+    } else {
+      // Out-of-order insert: compact tombstones if needed, then splice in sorted order.
+      if (sub.head > 0 || sub.liveCount !== sub.items.length) {
+        compactSubqueue(sub);
       }
-      pos -= 1;
+      let pos = sub.items.length;
+      while (pos > 0) {
+        const prev = sub.items[pos - 1]!;
+        if (
+          prev.seq < entry.seq ||
+          (prev.seq === entry.seq && prev.scopedJobId < entry.scopedJobId)
+        ) {
+          break;
+        }
+        pos -= 1;
+      }
+      sub.items.splice(pos, 0, entry);
+      for (let i = pos; i < sub.items.length; i++) {
+        sub.posById.set(sub.items[i]!.scopedJobId, i);
+      }
+      sub.liveCount += 1;
+      const tail = sub.items[sub.items.length - 1]!;
+      sub.tailSeq = tail.seq;
+      sub.tailId = tail.scopedJobId;
     }
-    sub.splice(pos, 0, entry);
     level.count += 1;
     this.totalLen += 1;
   }
@@ -99,19 +240,40 @@ export class FairPriorityQueue {
     if (!sub) {
       return false;
     }
-    const pos = sub.findIndex((e) => e.scopedJobId === scopedJobId);
-    if (pos < 0) {
+    const pos = sub.posById.get(scopedJobId);
+    if (pos === undefined) {
       return false;
     }
-    sub.splice(pos, 1);
+    sub.posById.delete(scopedJobId);
+    sub.items[pos] = undefined;
+    sub.liveCount -= 1;
     level.count -= 1;
     this.totalLen -= 1;
-    if (sub.length === 0) {
+
+    if (sub.liveCount === 0) {
       level.subqueues.delete(fkey);
       const rIdx = level.ring.indexOf(fkey);
       if (rIdx >= 0) {
         level.ring.splice(rIdx, 1);
       }
+      return true;
+    }
+
+    if (pos === sub.head) {
+      while (sub.head < sub.items.length && sub.items[sub.head] === undefined) {
+        sub.head += 1;
+      }
+    }
+    if (pos === sub.items.length - 1) {
+      while (sub.items.length > sub.head && sub.items[sub.items.length - 1] === undefined) {
+        sub.items.pop();
+      }
+      const tail = sub.items[sub.items.length - 1]!;
+      sub.tailSeq = tail.seq;
+      sub.tailId = tail.scopedJobId;
+    }
+    if (sub.items.length >= 64 && sub.liveCount * 2 <= sub.items.length) {
+      compactSubqueue(sub);
     }
     return true;
   }
@@ -140,23 +302,36 @@ export class FairPriorityQueue {
       }
       const need = limit - out.length;
       if (level.ring.length === 1) {
-        const sub = level.subqueues.get(level.ring[0]!) ?? [];
-        for (let i = 0; i < sub.length && out.length < limit; i++) {
-          out.push(sub[i]!);
+        const sub = level.subqueues.get(level.ring[0]!);
+        if (sub) {
+          const items = sub.items;
+          for (let i = sub.head; i < items.length && out.length < limit; i++) {
+            const item = items[i];
+            if (item !== undefined) {
+              out.push(item);
+            }
+          }
         }
         continue;
       }
-      const cursors = level.ring
-        .map((k) => level.subqueues.get(k))
-        .filter((s): s is QueueEntry[] => Boolean(s && s.length > 0))
-        .map((sub) => ({ sub, pos: 0 }));
+      const cursors: Array<{ items: Array<QueueEntry | undefined>; pos: number }> = [];
+      for (let r = 0; r < level.ring.length; r++) {
+        const sub = level.subqueues.get(level.ring[r]!);
+        if (sub && sub.liveCount > 0) {
+          cursors.push({ items: sub.items, pos: sub.head });
+        }
+      }
       let added = 0;
       while (added < need && cursors.length > 0) {
         let progressed = false;
         for (let i = 0; i < cursors.length && added < need; i++) {
           const c = cursors[i]!;
-          if (c.pos < c.sub.length) {
-            out.push(c.sub[c.pos]!);
+          const items = c.items;
+          while (c.pos < items.length && items[c.pos] === undefined) {
+            c.pos += 1;
+          }
+          if (c.pos < items.length) {
+            out.push(items[c.pos]!);
             c.pos += 1;
             added += 1;
             progressed = true;
@@ -181,6 +356,13 @@ export interface SchedulerView {
   readonly rng: { state: bigint };
 }
 
+function hasAnyKey(obj: Record<string, unknown>): boolean {
+  for (const _ in obj) {
+    return true;
+  }
+  return false;
+}
+
 export function pickSessionForJob(
   view: SchedulerView,
   job: JobMem,
@@ -189,13 +371,24 @@ export function pickSessionForJob(
   nowMs: number,
 ): string | null {
   const demand = job.spec.demand;
-  const hasPreferred = Object.keys(demand.preferred_attributes).length > 0;
+  const reqAttrs = demand.required_attributes;
+  const hasReqAttrs = hasAnyKey(reqAttrs);
+  const prefAttrs = demand.preferred_attributes;
+  let prefCount = 0;
+  for (const _ in prefAttrs) {
+    prefCount += 1;
+  }
+  const hasPreferred = prefCount > 0;
+  const hasReqCap = hasAnyKey(demand.required_capacity);
   const spillOpen =
     !hasPreferred ||
     job.spilloverAtMs === null ||
     nowMs >= job.spilloverAtMs;
-  const tiers: PoolTierConfig[] = policy?.poolTiers ?? [];
+  const tiers: readonly PoolTierConfig[] = policy?.poolTiers ?? EMPTY_TIERS;
+  const hasTiers = tiers.length > 0;
   const elapsedMs = Math.max(0, nowMs - job.queuedSinceMs);
+  const hasFailedWorkers = job.failedWorkers.size > 0;
+  const hasRejectedSessions = job.rejectedSessions.size > 0;
 
   let best: SessionMem[] = [];
   let bestHealthy = false;
@@ -203,44 +396,33 @@ export function pickSessionForJob(
   let bestTierIdx = Number.MAX_SAFE_INTEGER; // smaller tier index is higher rank!
   let bestMatches = -1;
 
-  const isBetterRank = (
-    h: boolean,
-    nc: boolean,
-    tIdx: number,
-    m: number,
-  ): number => {
-    if (h !== bestHealthy) return h ? 1 : -1;
-    if (nc !== bestNotCooled) return nc ? 1 : -1;
-    if (tIdx !== bestTierIdx) return tIdx < bestTierIdx ? 1 : -1;
-    if (m !== bestMatches) return m > bestMatches ? 1 : -1;
-    return 0;
-  };
-
-  for (const sid of candidates) {
-    const s = view.sessions.get(sid);
+  for (let i = 0; i < candidates.length; i++) {
+    const s = view.sessions.get(candidates[i]!);
     if (!s || sessionFreeSlots(s) === 0) continue;
 
-    const tIdx = tierIndexForSession(tiers, s.pool, elapsedMs);
+    const tIdx = hasTiers ? tierIndexForSession(tiers, s.pool, elapsedMs) : 0;
     if (tIdx === null) continue;
 
-    if (!matchesRequiredAttributes(demand.required_attributes, s.attributes)) {
+    if (hasReqAttrs && !matchesRequiredAttributes(reqAttrs, s.attributes)) {
       continue;
     }
-    const prefKeys = Object.entries(demand.preferred_attributes);
     let matches = 0;
-    for (const [k, v] of prefKeys) {
-      if (s.attributes[k] === v) matches += 1;
+    if (hasPreferred) {
+      for (const k in prefAttrs) {
+        if (s.attributes[k] === prefAttrs[k]) matches += 1;
+      }
+      if (!spillOpen && matches < prefCount) {
+        continue;
+      }
     }
-    if (!spillOpen && matches < prefKeys.length) {
-      continue;
-    }
-    if (!sessionFitsCapacity(s, demand.required_capacity)) {
+    if (hasReqCap && !sessionFitsCapacity(s, demand.required_capacity)) {
       continue;
     }
 
     const healthy =
-      !job.failedWorkers.has(s.workerId) && !job.rejectedSessions.has(s.sessionId);
-    const notCooled = nowMs >= s.cooldownUntilMs;
+      (!hasFailedWorkers || !job.failedWorkers.has(s.workerId)) &&
+      (!hasRejectedSessions || !job.rejectedSessions.has(s.sessionId));
+    const notCooled = s.cooldownUntilMs === 0 || nowMs >= s.cooldownUntilMs;
 
     if (best.length === 0) {
       best = [s];
@@ -249,7 +431,12 @@ export function pickSessionForJob(
       bestTierIdx = tIdx;
       bestMatches = matches;
     } else {
-      const cmp = isBetterRank(healthy, notCooled, tIdx, matches);
+      let cmp = 0;
+      if (healthy !== bestHealthy) cmp = healthy ? 1 : -1;
+      else if (notCooled !== bestNotCooled) cmp = notCooled ? 1 : -1;
+      else if (tIdx !== bestTierIdx) cmp = tIdx < bestTierIdx ? 1 : -1;
+      else if (matches !== bestMatches) cmp = matches > bestMatches ? 1 : -1;
+
       if (cmp > 0) {
         best = [s];
         bestHealthy = healthy;
@@ -268,27 +455,35 @@ export function pickSessionForJob(
 
   // Wait up to 5s if a healthy / non-cooldown peer exists on the interface (currently busy)
   if ((!bestHealthy || !bestNotCooled) && elapsedMs < 5_000) {
-    const allSids =
-      view.sessionsByInterface.get(job.namespace)?.get(job.interfaceName) ??
-      new Set<string>();
-    for (const peerSid of allSids) {
-      const peer = view.sessions.get(peerSid);
-      if (!peer || !peer.connected || peer.draining) continue;
-      if (tierIndexForSession(tiers, peer.pool, elapsedMs) === null) continue;
-      if (!matchesRequiredAttributes(demand.required_attributes, peer.attributes)) {
-        continue;
-      }
-      const totalCapOk = Object.entries(demand.required_capacity).every(
-        ([name, needed]) =>
-          needed <= 0n || (peer.totalCapacity[name] ?? 0n) >= needed,
-      );
-      if (!totalCapOk) continue;
-      const peerBetter = !bestHealthy
-        ? !job.failedWorkers.has(peer.workerId) &&
-          !job.rejectedSessions.has(peer.sessionId)
-        : nowMs >= peer.cooldownUntilMs;
-      if (peerBetter) {
-        return null;
+    const allSids = view.sessionsByInterface
+      .get(job.namespace)
+      ?.get(job.interfaceName);
+    if (allSids) {
+      for (const peerSid of allSids) {
+        const peer = view.sessions.get(peerSid);
+        if (!peer || !peer.connected || peer.draining) continue;
+        if (hasTiers && tierIndexForSession(tiers, peer.pool, elapsedMs) === null) continue;
+        if (hasReqAttrs && !matchesRequiredAttributes(reqAttrs, peer.attributes)) {
+          continue;
+        }
+        if (hasReqCap) {
+          let totalCapOk = true;
+          for (const name in demand.required_capacity) {
+            const needed = demand.required_capacity[name]!;
+            if (needed > 0n && (peer.totalCapacity[name] ?? 0n) < needed) {
+              totalCapOk = false;
+              break;
+            }
+          }
+          if (!totalCapOk) continue;
+        }
+        const peerBetter = !bestHealthy
+          ? (!hasFailedWorkers || !job.failedWorkers.has(peer.workerId)) &&
+            (!hasRejectedSessions || !job.rejectedSessions.has(peer.sessionId))
+          : nowMs >= peer.cooldownUntilMs;
+        if (peerBetter) {
+          return null;
+        }
       }
     }
   }
@@ -299,23 +494,32 @@ export function pickSessionForJob(
 
   // Bounded-load Rendezvous Hashing for `affinity_key` (< 0.85 utilization)
   if (demand.affinity_key.length > 0) {
-    const underLoad = best.filter(
-      (s) => s.activeLeases.size / Math.max(1, s.maxConcurrency) < 0.85,
-    );
-    if (underLoad.length > 0) {
-      let winner = underLoad[0]!;
-      let winnerScore = rendezvousHash64(demand.affinity_key, winner.workerId);
-      for (let i = 1; i < underLoad.length; i++) {
-        const cand = underLoad[i]!;
-        const score = rendezvousHash64(demand.affinity_key, cand.workerId);
-        if (
-          score > winnerScore ||
-          (score === winnerScore && cand.workerId > winner.workerId)
-        ) {
-          winner = cand;
-          winnerScore = score;
-        }
+    rendezvousPrefix(demand.affinity_key);
+    const prefixHi = hashOutHi;
+    const prefixLo = hashOutLo;
+    let winner: SessionMem | null = null;
+    let winHi = 0;
+    let winLo = 0;
+    for (let i = 0; i < best.length; i++) {
+      const cand = best[i]!;
+      const conc = cand.maxConcurrency > 1 ? cand.maxConcurrency : 1;
+      if (cand.activeLeases.size / conc >= 0.85) {
+        continue;
       }
+      fnv1aFeedSepAndFinalize(prefixHi, prefixLo, cand.workerId);
+      const hi = hashOutHi;
+      const lo = hashOutLo;
+      if (
+        winner === null ||
+        hi > winHi ||
+        (hi === winHi && (lo > winLo || (lo === winLo && cand.workerId > winner.workerId)))
+      ) {
+        winner = cand;
+        winHi = hi;
+        winLo = lo;
+      }
+    }
+    if (winner !== null) {
       return winner.sessionId;
     }
   }
@@ -334,6 +538,8 @@ export function pickSessionForJob(
     : a.sessionId;
 }
 
+const EMPTY_TIERS: readonly PoolTierConfig[] = [];
+
 export function tierIndexForSession(
   tiers: readonly PoolTierConfig[],
   pool: string,
@@ -342,25 +548,26 @@ export function tierIndexForSession(
   if (tiers.length === 0) {
     return 0;
   }
-  const idx = tiers.findIndex((t) => t.pool === pool);
-  if (idx < 0) {
-    return null;
+  for (let i = 0; i < tiers.length; i++) {
+    if (tiers[i]!.pool === pool) {
+      return elapsedMs >= tiers[i]!.spilloverAfterMs ? i : null;
+    }
   }
-  return elapsedMs >= tiers[idx]!.spilloverAfterMs ? idx : null;
+  return null;
 }
 
 export function matchesRequiredAttributes(
   required: Record<string, string>,
   actual: Record<string, string>,
 ): boolean {
-  for (const [k, v] of Object.entries(required)) {
-    if (actual[k] !== v) return false;
+  for (const k in required) {
+    if (actual[k] !== required[k]) return false;
   }
   return true;
 }
 
 export function sessionLoadScore(s: SessionMem): number {
-  const conc = Math.max(1, s.maxConcurrency);
+  const conc = s.maxConcurrency > 1 ? s.maxConcurrency : 1;
   return (
     s.activeLeases.size / conc +
     s.utilization * 0.5 +
@@ -370,16 +577,19 @@ export function sessionLoadScore(s: SessionMem): number {
 
 export function sessionFreeSlots(s: SessionMem): number {
   if (!s.connected || s.draining) return 0;
-  const byServer = Math.max(0, s.maxConcurrency - s.activeLeases.size);
-  const byWorker = Math.max(0, s.reportedFree - s.assignedSinceReport);
-  return Math.min(byServer, byWorker);
+  const byServer = s.maxConcurrency - s.activeLeases.size;
+  if (byServer <= 0) return 0;
+  const byWorker = s.reportedFree - s.assignedSinceReport;
+  if (byWorker <= 0) return 0;
+  return byServer < byWorker ? byServer : byWorker;
 }
 
 export function sessionFitsCapacity(
   s: SessionMem,
   demand: Record<string, bigint>,
 ): boolean {
-  for (const [name, needed] of Object.entries(demand)) {
+  for (const name in demand) {
+    const needed = demand[name]!;
     if (needed <= 0n) continue;
     const total = s.totalCapacity[name];
     if (total === undefined) return false;

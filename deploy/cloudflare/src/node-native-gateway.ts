@@ -15,7 +15,7 @@ import {
 import { registerHooks, stripTypeScriptTypes } from "node:module";
 import type { Socket } from "node:net";
 import { dirname } from "node:path";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -107,9 +107,23 @@ function ensureNodeTsHooks(): void {
 // Node SQLite Storage Adapter (enforces Cloudflare DO SQLite invariants)
 // ---------------------------------------------------------------------------
 
+interface CachedSqlEntry {
+  stmt: StatementSync | null;
+  isSelect: boolean;
+  isReturning: boolean;
+  isDdl: boolean;
+  indexWriteFactor: number;
+}
+
+const MAX_UTF16_LEN_UNDER_2MIB = Math.floor(SQL_MAX_VALUE_BYTES / 3);
+const MAX_UTF16_LEN_UNDER_QUERY_LIMIT = Math.floor(SQL_MAX_QUERY_BYTES / 3);
+
 export class NodeNativeSqliteStorage implements NativeDurableStorage {
   readonly db: DatabaseSync;
   private savepointSeq = 0;
+  private readonly stmtCache = new Map<string, CachedSqlEntry>();
+  private readonly pageCountStmt: StatementSync;
+  private readonly pageSizeStmt: StatementSync;
   totalRowsWritten = 0;
   totalRowsRead = 0;
 
@@ -123,6 +137,8 @@ export class NodeNativeSqliteStorage implements NativeDurableStorage {
 
   constructor(db: DatabaseSync) {
     this.db = db;
+    this.pageCountStmt = db.prepare("PRAGMA page_count");
+    this.pageSizeStmt = db.prepare("PRAGMA page_size");
     const self = this;
     this.sql = {
       exec<T extends Record<string, unknown> = Record<string, unknown>>(
@@ -133,94 +149,84 @@ export class NodeNativeSqliteStorage implements NativeDurableStorage {
       },
       get databaseSize(): number {
         const pc = Number(
-          (
-            self.db.prepare("PRAGMA page_count").get() as
-              | { page_count?: number }
-              | undefined
-          )?.page_count ?? 0,
+          (self.pageCountStmt.get() as { page_count?: number } | undefined)
+            ?.page_count ?? 0,
         );
         const ps = Number(
-          (
-            self.db.prepare("PRAGMA page_size").get() as
-              | { page_size?: number }
-              | undefined
-          )?.page_size ?? 4096,
+          (self.pageSizeStmt.get() as { page_size?: number } | undefined)
+            ?.page_size ?? 4096,
         );
         return pc * ps;
       },
     };
   }
 
+  private getOrPrepareSql(query: string): CachedSqlEntry {
+    const cached = this.stmtCache.get(query);
+    if (cached !== undefined) {
+      return cached;
+    }
+    if (query.length > MAX_UTF16_LEN_UNDER_QUERY_LIMIT) {
+      const sqlBytes = Buffer.byteLength(query, "utf8");
+      if (sqlBytes > SQL_MAX_QUERY_BYTES) {
+        throw new Error(
+          `Cloudflare DO SQLite limit exceeded: ${sqlBytes} SQL bytes (max ${SQL_MAX_QUERY_BYTES})`,
+        );
+      }
+    }
+    const trimmed = query.trim();
+    const upper = trimmed.toUpperCase();
+    const isSelect = upper.startsWith("SELECT") || upper.startsWith("PRAGMA");
+    const isReturning = !isSelect && /\bRETURNING\b/i.test(trimmed);
+    const isDdl =
+      !isSelect &&
+      (upper.startsWith("CREATE ") ||
+        upper.startsWith("DROP ") ||
+        upper.startsWith("ALTER "));
+
+    let indexWriteFactor = 0;
+    if (!isSelect && !isDdl && /\bnative_jobs\b/i.test(trimmed)) {
+      if (upper.startsWith("INSERT") || upper.startsWith("DELETE")) {
+        indexWriteFactor = 2;
+      } else if (upper.startsWith("UPDATE")) {
+        if (
+          /\bstate\s*=/i.test(trimmed) ||
+          /\bupdated_at_ms\s*=/i.test(trimmed)
+        ) {
+          indexWriteFactor += 1;
+        }
+        if (/\bwinning_lease_id\s*=/i.test(trimmed)) {
+          indexWriteFactor += 1;
+        }
+      }
+    }
+
+    const entry: CachedSqlEntry = {
+      stmt: isDdl ? null : this.db.prepare(query),
+      isSelect,
+      isReturning,
+      isDdl,
+      indexWriteFactor,
+    };
+    if (!isDdl && this.stmtCache.size < 256) {
+      this.stmtCache.set(query, entry);
+    }
+    return entry;
+  }
+
   private execInternal<T extends Record<string, unknown>>(
     query: string,
     bindings: unknown[],
   ): NativeSqlCursor<T> {
-    const sqlBytes = Buffer.byteLength(query, "utf8");
-    if (sqlBytes > SQL_MAX_QUERY_BYTES) {
-      throw new Error(
-        `Cloudflare DO SQLite limit exceeded: ${sqlBytes} SQL bytes (max ${SQL_MAX_QUERY_BYTES})`,
-      );
-    }
     if (bindings.length > SQL_MAX_BOUND_PARAMS) {
       throw new Error(
         `Cloudflare DO SQLite limit exceeded: ${bindings.length} bound parameters (max ${SQL_MAX_BOUND_PARAMS})`,
       );
     }
 
-    const normalized: SQLInputValue[] = bindings.map((b) => {
-      if (b === undefined || b === null) {
-        return null;
-      }
-      if (b instanceof Uint8Array) {
-        if (b.byteLength > SQL_MAX_VALUE_BYTES) {
-          throw new Error(
-            `SQLite BLOB binding exceeds 2 MiB DO row limit (${b.byteLength} bytes)`,
-          );
-        }
-        return b;
-      }
-      if (b instanceof ArrayBuffer) {
-        if (b.byteLength > SQL_MAX_VALUE_BYTES) {
-          throw new Error(
-            `SQLite ArrayBuffer binding exceeds 2 MiB DO row limit (${b.byteLength} bytes)`,
-          );
-        }
-        return new Uint8Array(b);
-      }
-      if (ArrayBuffer.isView(b)) {
-        const view = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-        if (view.byteLength > SQL_MAX_VALUE_BYTES) {
-          throw new Error(
-            `SQLite view binding exceeds 2 MiB DO row limit (${view.byteLength} bytes)`,
-          );
-        }
-        return view;
-      }
-      if (typeof b === "string") {
-        const byteLen = Buffer.byteLength(b, "utf8");
-        if (byteLen > SQL_MAX_VALUE_BYTES) {
-          throw new Error(
-            `SQLite TEXT binding exceeds 2 MiB DO row limit (${byteLen} bytes)`,
-          );
-        }
-        return b;
-      }
-      if (typeof b === "number" || typeof b === "bigint") {
-        return b;
-      }
-      throw new TypeError(`Unsupported SQL binding type: ${typeof b}`);
-    });
-
-    const trimmed = query.trim();
-    const upper = trimmed.toUpperCase();
-    const isSelect = upper.startsWith("SELECT") || upper.startsWith("PRAGMA");
-    const isReturning = /\bRETURNING\b/i.test(trimmed);
-    const isDdl =
-      upper.startsWith("CREATE ") ||
-      upper.startsWith("DROP ") ||
-      upper.startsWith("ALTER ");
-
-    if (isDdl) {
+    const meta = this.getOrPrepareSql(query);
+    if (meta.isDdl) {
+      this.stmtCache.clear();
       this.db.exec(query);
       this.totalRowsWritten += 1;
       return {
@@ -230,13 +236,58 @@ export class NodeNativeSqliteStorage implements NativeDurableStorage {
       };
     }
 
-    const stmt = this.db.prepare(query);
+    const n = bindings.length;
+    const normalized: SQLInputValue[] = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const b = bindings[i];
+      if (b === undefined || b === null) {
+        normalized[i] = null;
+      } else if (typeof b === "number" || typeof b === "bigint") {
+        normalized[i] = b;
+      } else if (typeof b === "string") {
+        if (b.length > MAX_UTF16_LEN_UNDER_2MIB) {
+          const byteLen = Buffer.byteLength(b, "utf8");
+          if (byteLen > SQL_MAX_VALUE_BYTES) {
+            throw new Error(
+              `SQLite TEXT binding exceeds 2 MiB DO row limit (${byteLen} bytes)`,
+            );
+          }
+        }
+        normalized[i] = b;
+      } else if (b instanceof Uint8Array) {
+        if (b.byteLength > SQL_MAX_VALUE_BYTES) {
+          throw new Error(
+            `SQLite BLOB binding exceeds 2 MiB DO row limit (${b.byteLength} bytes)`,
+          );
+        }
+        normalized[i] = b;
+      } else if (b instanceof ArrayBuffer) {
+        if (b.byteLength > SQL_MAX_VALUE_BYTES) {
+          throw new Error(
+            `SQLite ArrayBuffer binding exceeds 2 MiB DO row limit (${b.byteLength} bytes)`,
+          );
+        }
+        normalized[i] = new Uint8Array(b);
+      } else if (ArrayBuffer.isView(b)) {
+        const view = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+        if (view.byteLength > SQL_MAX_VALUE_BYTES) {
+          throw new Error(
+            `SQLite view binding exceeds 2 MiB DO row limit (${view.byteLength} bytes)`,
+          );
+        }
+        normalized[i] = view;
+      } else {
+        throw new TypeError(`Unsupported SQL binding type: ${typeof b}`);
+      }
+    }
+
+    const stmt = meta.stmt!;
     let rows: T[] = [];
     let baseChanges = 0;
 
-    if (isSelect) {
+    if (meta.isSelect) {
       rows = stmt.all(...normalized) as T[];
-    } else if (isReturning) {
+    } else if (meta.isReturning) {
       rows = stmt.all(...normalized) as T[];
       baseChanges = rows.length;
     } else {
@@ -244,25 +295,10 @@ export class NodeNativeSqliteStorage implements NativeDurableStorage {
       baseChanges = Number(info.changes ?? 0);
     }
 
-    let indexWrites = 0;
-    if (!isSelect && baseChanges > 0 && /\bnative_jobs\b/i.test(trimmed)) {
-      if (upper.startsWith("INSERT") || upper.startsWith("DELETE")) {
-        indexWrites = 2 * baseChanges;
-      } else if (upper.startsWith("UPDATE")) {
-        if (
-          /\bstate\s*=/i.test(trimmed) ||
-          /\bupdated_at_ms\s*=/i.test(trimmed)
-        ) {
-          indexWrites += baseChanges;
-        }
-        if (/\bwinning_lease_id\s*=/i.test(trimmed)) {
-          indexWrites += baseChanges;
-        }
-      }
-    }
-
-    const rowsWritten = isSelect ? 0 : baseChanges + indexWrites;
-    const rowsRead = isSelect ? Math.max(1, rows.length) : baseChanges;
+    const indexWrites =
+      !meta.isSelect && baseChanges > 0 ? meta.indexWriteFactor * baseChanges : 0;
+    const rowsWritten = meta.isSelect ? 0 : baseChanges + indexWrites;
+    const rowsRead = meta.isSelect ? Math.max(1, rows.length) : baseChanges;
     this.totalRowsWritten += rowsWritten;
     this.totalRowsRead += rowsRead;
 

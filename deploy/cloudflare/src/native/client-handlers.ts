@@ -28,6 +28,7 @@ import { utf8ByteLen } from "./utf8";
 import * as pb from "./proto";
 import {
   INLINE_ASSIGN_CACHE_MAX_BYTES,
+  JobRecord,
   metadataByteLen,
   toNumberClamped,
   protoStateToName,
@@ -201,6 +202,7 @@ export const clientHandlers = {
 
     const notifyJobs = new Set<string>([scopedJobId]);
     let committed = false;
+    let createdJob: JobMem | null = null;
     this.store.transactionSync(() => {
       if (ws.readyState !== WS_READY_STATE_OPEN) {
         return;
@@ -214,7 +216,7 @@ export const clientHandlers = {
         handshakeDone: 1,
         lastSeenAtMs: nowMs,
       });
-      this.insertAcceptedJobInTxn({
+      createdJob = this.insertAcceptedJobInTxn({
         scopedJobId,
         rawJobId,
         namespace: att.namespace,
@@ -229,7 +231,12 @@ export const clientHandlers = {
         bundleRows: bundlePlan.rows,
         nowMs,
       });
-      this.dispatchInTxn(nowMs, notifyJobs);
+      this.dispatchPairInTxn(
+        att.namespace,
+        normalized.spec.demand.interface,
+        nowMs,
+        notifyJobs,
+      );
       committed = true;
     });
 
@@ -241,7 +248,7 @@ export const clientHandlers = {
     for (const jid of notifyJobs) {
       await this.notifyJobFollowers(jid);
     }
-    await this.refreshAlarm(nowMs);
+    await this.refreshAlarmForAddedJob(createdJob, nowMs);
   },
 
   async handleExecuteRpc(
@@ -272,11 +279,12 @@ export const clientHandlers = {
 
     const notifyJobs = new Set<string>([scopedJobId]);
     let committed = false;
+    let createdJob: JobMem | null = null;
     this.store.transactionSync(() => {
       if (!this.store.claimStagedUploadsInTxn(bundlePlan.stagedUploads)) {
         return;
       }
-      this.insertAcceptedJobInTxn({
+      createdJob = this.insertAcceptedJobInTxn({
         scopedJobId,
         rawJobId,
         namespace,
@@ -291,7 +299,12 @@ export const clientHandlers = {
         bundleRows: bundlePlan.rows,
         nowMs,
       });
-      this.dispatchInTxn(nowMs, notifyJobs);
+      this.dispatchPairInTxn(
+        namespace,
+        normalized.spec.demand.interface,
+        nowMs,
+        notifyJobs,
+      );
       committed = true;
     });
 
@@ -326,7 +339,7 @@ export const clientHandlers = {
       for (const jid of notifyJobs) {
         await this.notifyJobFollowers(jid);
       }
-      await this.refreshAlarm(nowMs);
+      await this.refreshAlarmForAddedJob(createdJob, nowMs);
       return await waitPromise;
     } finally {
       signal?.removeEventListener("abort", onAbort);
@@ -507,7 +520,12 @@ export const clientHandlers = {
           bundleRows: bundlePlan.rows,
           nowMs,
         });
-        this.dispatchInTxn(nowMs, notifyJobs);
+        this.dispatchPairInTxn(
+          namespace,
+          normalized.spec.demand.interface,
+          nowMs,
+          notifyJobs,
+        );
       });
     } catch (err) {
       await this.store.compensateUnpublishedUploads(bundlePlan.stagedUploads, nowMs);
@@ -525,7 +543,7 @@ export const clientHandlers = {
     for (const jid of notifyJobs) {
       await this.notifyJobFollowers(jid);
     }
-    await this.refreshAlarm(nowMs);
+    await this.refreshAlarmForAddedJob(createdJob, nowMs);
 
     return {
       job: await this.jobMemToProto(createdJob!, false, nowMs),
@@ -868,13 +886,7 @@ export const clientHandlers = {
     interfaceName: string,
     payloadBytes: number,
   ): void {
-    let unfinished = 0;
-    for (const j of this.jobs.values()) {
-      if (j.state === "queued" || j.state === "running") {
-        unfinished += 1;
-      }
-    }
-    if (unfinished >= this.config.maxPendingJobs) {
+    if (this.activeJobs.size >= this.config.maxPendingJobs) {
       throw GrpcStatusError.resourceExhausted("unfinished job limit reached");
     }
     const maxQueue =
@@ -928,7 +940,7 @@ export const clientHandlers = {
     this.queueSeq += 1n;
     const qSeq = this.queueSeq;
 
-    const job: JobMem = {
+    const job: JobMem = new JobRecord({
       scopedJobId: params.scopedJobId,
       rawJobId: params.rawJobId,
       namespace: params.namespace,
@@ -936,7 +948,8 @@ export const clientHandlers = {
       state: "queued",
       durability: params.durability,
       specHash: params.specHash,
-      spec: params.spec,
+      specParsed: params.spec,
+      specRawJson: null,
       priority: params.spec.policy.priority,
       fairnessKey: params.spec.policy.fairness_key,
       concurrencyKey: params.spec.policy.concurrency_key,
@@ -973,7 +986,20 @@ export const clientHandlers = {
       eventLogCount: 1,
       stalledSinceMs: null,
       inlineAssign: null,
-    };
+      pendingEvents:
+        params.callerConnId !== null
+          ? [
+              {
+                seq: acceptedSeq,
+                attemptId: null,
+                atMs: params.nowMs,
+                kind: "accepted",
+                meta: null,
+                payload: null,
+              },
+            ]
+          : null,
+    });
 
     const lastSplit = splitU64(job.lastSequence);
     const primSplit =
@@ -990,7 +1016,7 @@ export const clientHandlers = {
         winning_lease_id, result_digest, last_attempt_id, last_worker_id,
         failed_workers_json, rejected_sessions_json,
         last_seq_hi, last_seq_lo, evicted_seq_hi, evicted_seq_lo,
-        primary_seq_hi, primary_seq_lo
+        primary_seq_hi, primary_seq_lo, event_log_count, event_log_bytes
       ) VALUES (
         ?, ?, ?, ?, 'queued', ?,
         ?, ?, ?, ?, ?, ?,
@@ -1001,7 +1027,7 @@ export const clientHandlers = {
         NULL, NULL, NULL, NULL,
         '[]', '[]',
         ?, ?, 0, 0,
-        ?, ?
+        ?, ?, 1, ?
       )`,
       job.scopedJobId,
       job.rawJobId,
@@ -1030,6 +1056,7 @@ export const clientHandlers = {
       lastSplit.lo,
       primSplit ? primSplit.hi : null,
       primSplit ? primSplit.lo : null,
+      EVENT_OVERHEAD_BYTES,
     );
 
     if (params.bundleRows.length > 0 && (params.spec.input_count > 0 || params.spec.params_len > 0)) {
@@ -1065,6 +1092,8 @@ export const clientHandlers = {
       }
     }
     this.jobs.set(job.scopedJobId, job);
+    this.activeJobs.add(job.scopedJobId);
+    this.syncJobTimerTracking(job);
     this.store.reservedRetainedBytes += job.retainedBytesEst;
     this.totalInputBytesHeld += job.totalInputBytes;
     this.totalEventBytesHeld += EVENT_OVERHEAD_BYTES;
